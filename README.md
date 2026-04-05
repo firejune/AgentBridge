@@ -145,6 +145,28 @@ Always use **single quotes** for parameter values. Double quotes with `!` trigge
 --message "Task completed!" --session-id "5671c52b-..."
 ```
 
+## Best Practices
+
+### File-Based Reporting
+
+For detailed reports, write a markdown file and send only the file path as a single-line message. The CLI agent can then read the file for full context.
+
+```bash
+# Step 1: IDE agent writes report to a shared location
+# e.g., .openclaw/reports/<request-id>-<task-name>.md
+
+# Step 2: Send file path as reply
+./scripts/reply-from-agent.sh \
+  --session-id '<uuid>' \
+  --message 'Task complete. Report: .openclaw/reports/abc123-deploy.md'
+```
+
+This avoids message formatting issues and keeps a persistent record of all reports.
+
+### Keep Reply Messages Short
+
+The `reply-from-agent.sh` `-m` parameter works best with **single-line messages**. Multi-line content may cause rendering issues in some CLI agent UIs.
+
 ## Documentation
 
 - [`docs/ide-agent-side-setup.md`](docs/ide-agent-side-setup.md) — IDE agent (receiver) setup guide
