@@ -43,6 +43,33 @@ export function activate(context: vscode.ExtensionContext) {
             return;
         }
 
+        if (req.method === 'POST' && req.url === '/run') {
+            let body = '';
+            req.on('data', chunk => { body += chunk.toString(); });
+            req.on('end', async () => {
+                try {
+                    const data = JSON.parse(body);
+                    const cmd = data.command;
+                    const args = data.args || [];
+                    
+                    if (!cmd) {
+                        res.writeHead(400);
+                        return res.end(JSON.stringify({ status: 'error', message: 'No command provided (requires "command" field).' }));
+                    }
+
+                    console.log(`[Luna Bridge] Executing dynamic command: ${cmd} with args:`, args);
+                    const result = await vscode.commands.executeCommand(cmd, ...args);
+                    
+                    res.writeHead(200);
+                    res.end(JSON.stringify({ status: 'success', command: cmd, result: result || null }));
+                } catch (e) {
+                    res.writeHead(500);
+                    res.end(JSON.stringify({ status: 'error', error: String(e) }));
+                }
+            });
+            return;
+        }
+
         if (req.method === 'POST' && req.url === '/trigger') {
             let body = '';
             req.on('data', chunk => {
