@@ -5,7 +5,6 @@
 set -euo pipefail
 
 # ── 기본값 ──
-AUTO_SUBMIT="true"
 SESSION_ID=""
 REQUEST_ID=""
 DRY_RUN="false"
@@ -17,7 +16,6 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --session-id) SESSION_ID="$2";  shift 2 ;;
     --request-id) REQUEST_ID="$2";  shift 2 ;;
-    --no-submit)  AUTO_SUBMIT="false"; shift ;;
     --dry-run)    DRY_RUN="true";   shift ;;
     -*)           echo "❌ 알 수 없는 옵션: $1"; exit 1 ;;
     *)
@@ -79,39 +77,12 @@ fi
 # ── JSON 이스케이프 ──
 ESCAPED_MSG=$(printf '%s' "$BRIDGED_MESSAGE" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
 
-# Step 1: 클립보드 복사 (익스텐션)
+# Step 1: 루나 에이전트로 API 주입
 curl -s -X POST http://127.0.0.1:18880/trigger \
   -H "Content-Type: application/json" \
-  -d "{\"msg\":${ESCAPED_MSG},\"autoSubmit\":false}" > /dev/null
+  -d "{\"msg\":${ESCAPED_MSG}}" > /dev/null
 
-# Step 2: Antigravity 활성화
-osascript -e 'tell application id "com.google.antigravity" to activate'
-sleep 0.8
-
-# Step 3: 포커스 재요청 (앱 활성화 후)
-curl -s -X POST http://127.0.0.1:18880/focus > /dev/null
-sleep 0.8
-
-# Step 4: 메뉴 기반 붙여넣기
-osascript <<'EOF'
-tell application "System Events"
-  tell process "Electron"
-    try
-      click menu item "Paste" of menu "Edit" of menu bar 1
-    on error
-      key code 9 using command down
-    end try
-  end tell
-end tell
-EOF
-
-echo "[$(date)] 📋 붙여넣기 완료" >> "$LOG_FILE"
-
-if [ "$AUTO_SUBMIT" = "true" ]; then
-  sleep 0.5
-  osascript -e 'tell application "System Events" to key code 36'
-  echo "[$(date)] ⏎ Enter 전송" >> "$LOG_FILE"
-fi
+echo "[$(date)] 💉 내부 API 주입 완료" >> "$LOG_FILE"
 
 echo "✅ 루나 브릿지 완료 (request_id: ${REQUEST_ID})"
 exit 0

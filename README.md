@@ -16,8 +16,8 @@ AgentBridge enables **bidirectional, zero-human-intervention messaging** between
     └── CLI Agent receives result
 ```
 
-1. **CLI Agent sends a task** — The shell script injects a message into the IDE chat panel via a local HTTP bridge (VS Code extension) + clipboard + macOS menu-based paste
-2. **IDE Agent works autonomously** — Receives the prompt with a routing header, performs the requested task
+1. **CLI Agent sends a task** — The shell script injects a message into the IDE agent via a local HTTP bridge (VS Code extension) pushing directly to the agent's internal API (`antigravity.sendPromptToAgentPanel`).
+2. **IDE Agent works autonomously** — Receives the prompt silently in the background with a routing header, performs the requested task without stealing user focus.
 3. **IDE Agent replies** — Sends the result back to the CLI agent's session
 
 ## Components
@@ -28,11 +28,10 @@ A lightweight HTTP server (port `18880`) running inside the IDE that provides:
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/health` | GET | Health check with version |
+| `/health` | GET | Health check with version (1.2.0) |
 | `/status` | GET | Last injection result |
-| `/trigger` | POST | Copy message to clipboard + open/focus chat panel |
-| `/focus` | POST | Re-focus chat input |
-| `/debug/commands` | GET | List registered IDE commands |
+| `/trigger` | POST | Call IDE API (`antigravity.sendPromptToAgentPanel`) to send prompt directly |
+| `/debug/commands` | GET | List registered IDE commands (useful for discovery) |
 
 ### Shell Scripts (`scripts/`)
 
@@ -60,7 +59,7 @@ Actual task instructions here
 
 ```bash
 # Use the IDE's own CLI to avoid mis-installation to other editors
-/path/to/your-ide --install-extension luna-antigravity-bridge-1.1.0.vsix --force
+/path/to/your-ide --install-extension luna-antigravity-bridge-1.2.0.vsix --force
 ```
 
 Then reload the IDE window (`Cmd + R`).
@@ -99,7 +98,7 @@ Preview the assembled message without sending:
 
 ## Architecture Decisions
 
-This project went through 6 iterations to find a stable approach:
+This project went through 7 iterations to find a stable approach:
 
 | Attempt | Approach | Result |
 |---------|----------|--------|
@@ -107,10 +106,11 @@ This project went through 6 iterations to find a stable approach:
 | 2 | Extension + Node.js exec | Failed — UI event lock conflict |
 | 3 | Virtual Document + API | Partial — no auto-submit |
 | 4 | VSIX packaging fixes | Root cause found for IDE mis-install |
-| 5 | Chat API direct injection | Failed — commands not registered in runtime |
-| 6 | **Hybrid: Extension (clipboard+focus) + osascript (activate+paste+enter)** | **Success** |
+| 5 | Chat API direct injection | Failed — standard `chat` commands not registered |
+| 6 | Hybrid: Extension (clipboard) + osascript | Succeeded but Flaky — stealing focus, UI flakes |
+| 7 | **Ideal: Extension direct internal API call** | **Success** — Silent, background execution via `antigravity.sendPromptToAgentPanel` without UI automation |
 
-The key insight: split responsibilities between the extension (clipboard + focus management) and osascript (app activation + menu-based paste + enter), avoiding the limitations of each approach alone.
+The key insight: By digging into the proprietary internal command palette, we discovered the `antigravity.sendPromptToAgentPanel` command, which allows completely bypassing brittle UI automation for a perfectly silent, native bridge experience.
 
 ## Parameters Reference
 
@@ -121,7 +121,6 @@ The key insight: split responsibilities between the extension (clipboard + focus
 | message (positional) | ✅ | Task instructions for the IDE agent |
 | `--session-id` | ✅ | CLI agent's session UUID for reply routing |
 | `--request-id` | ❌ | Request tracking ID (auto-generated if omitted) |
-| `--no-submit` | ❌ | Paste only, don't press Enter |
 | `--dry-run` | ❌ | Preview assembled message without sending |
 
 ### `reply-from-agent.sh`

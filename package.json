@@ -2,7 +2,7 @@
   "name": "luna-antigravity-bridge",
   "displayName": "Luna Antigravity Bridge",
   "description": "Local HTTP Bridge for external triggers to Antigravity System.",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "engines": {
     "vscode": "^1.80.0"
   },
@@ -10,8 +10,12 @@
     "Other"
   ],
   "activationEvents": [
-    "*"
+    "onStartupFinished"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/firejune/luna-antigravity-bridge.git"
+  },
   "main": "./out/extension.js",
   "contributes": {},
   "scripts": {
