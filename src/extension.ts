@@ -91,6 +91,7 @@ export function activate(context: vscode.ExtensionContext) {
                     // Fire and Forget 주입
                     (async () => {
                         try {
+                            await vscode.commands.executeCommand('antigravity.startNewConversation');
                             await vscode.commands.executeCommand('antigravity.sendPromptToAgentPanel', msg);
                             lastStatus = {
                                 time: new Date().toISOString(),
