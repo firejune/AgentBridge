@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Bridge"
+  short_description: "사령탑 세션을 찾아 채널로 연결하고 실시간 질문·답변을 주고받기"
+  default_prompt: "Use $agent-bridge to find the peer commander session and connect our project channels."
