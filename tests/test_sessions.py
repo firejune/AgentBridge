@@ -9,6 +9,7 @@ import uuid
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import bridge
 import sessions
+from support import RunningBroker
 
 
 class DiscoveryTests(unittest.TestCase):
@@ -118,26 +119,24 @@ for line in sys.stdin:
         self.assertEqual(len(result['providers']['claude']['sessions']),2)
 
     def test_discovered_registration_infers_path_and_rejects_mismatch(self):
-        dbpath=self.root/'mail.db'
-        exe=self.fake_codex()
-        args=[sys.executable,bridge.__file__,'--db',str(dbpath),'register','naru',
-              '--project','demo','--transport','codex','--session',self.sid,
-              '--discover','--executable',exe,'--codex-mode','saved']
-        result=subprocess.run(args,capture_output=True,text=True,check=True)
-        self.assertEqual(json.loads(result.stdout)['cwd'],str(self.root))
-        failed=subprocess.run([*args,'--cwd','/another/path'],capture_output=True,text=True)
-        self.assertEqual(failed.returncode,1)
-        self.assertIn('differs',failed.stderr)
-        db=bridge.connect(dbpath)
-        self.assertEqual(bridge.endpoint(db,'demo','naru')['cwd'],str(self.root))
-        db.close()
+        with RunningBroker() as server:
+            exe=self.fake_codex()
+            args=[sys.executable,bridge.__file__,'--socket',server.path,'register','naru',
+                  '--project','demo','--transport','codex','--session',self.sid,
+                  '--discover','--executable',exe,'--codex-mode','saved']
+            result=subprocess.run(args,capture_output=True,text=True,check=True)
+            self.assertEqual(json.loads(result.stdout)['cwd'],str(self.root))
+            failed=subprocess.run([*args,'--cwd','/another/path'],capture_output=True,text=True)
+            self.assertEqual(failed.returncode,1)
+            self.assertIn('differs',failed.stdout)
+            self.assertEqual(server.call('routes',project='demo')[0]['cwd'],str(self.root))
 
-    def test_session_list_does_not_create_mailbox(self):
-        dbpath=self.root/'must-not-exist.db'
-        result=subprocess.run([sys.executable,bridge.__file__,'--db',str(dbpath),'sessions',
+    def test_session_list_does_not_require_broker(self):
+        socketpath=self.root/'must-not-exist.sock'
+        result=subprocess.run([sys.executable,bridge.__file__,'--socket',str(socketpath),'sessions',
              '--provider','claude','--claude-executable',self.fake_claude()],capture_output=True,text=True,check=True)
         self.assertEqual(len(json.loads(result.stdout)['providers']['claude']['sessions']),2)
-        self.assertFalse(dbpath.exists())
+        self.assertFalse(socketpath.exists())
 
 
 if __name__=='__main__':

@@ -1,240 +1,229 @@
+import asyncio
 import concurrent.futures
 import json
 from pathlib import Path
-import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
 import uuid
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import bridge
+import broker
+from support import RunningBroker
 
 
-class BridgeTests(unittest.TestCase):
+class StateTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
-        self.path = self.root / 'mail.db'
-        self.db = bridge.connect(self.path)
-        for name in ('naru', 'roa'):
-            bridge.register(self.db,'demo',name,'inbox',None,str(self.root),None)
+        self.state = broker.State()
+        for name in ('naru','roa'):
+            self.call('register',project='demo',name=name,cwd='/tmp',transport='realtime')
+            self.call('channel-bind',project='demo',name=name,owner=name,description=name)
 
-    def tearDown(self):
-        self.db.close()
-        self.temp.cleanup()
+    def call(self,op,**args):
+        return self.state.action({'op':op,**args})
 
-    def send(self, key='request-1'):
-        return bridge.post(self.db,'demo','roa','naru','Review the view',key)
+    def send(self,key='request',body='Question'):
+        return self.call('send',project='demo',sender_channel='roa',channel='naru',body=body,key=key)
 
-    def fake(self, transport='codex', output=None, exit_code=0):
-        exe = self.root / 'fake-cli'
-        # Argument capture proves the shell never interprets message text.
-        exe.write_text('#!' + sys.executable + '\nimport sys,json\n'
-                       'from pathlib import Path\n'
-                       f'Path({str(self.root / "argv.json")!r}).write_text(json.dumps(sys.argv))\n'
-                       f'print({(output or "queued")!r})\nraise SystemExit({exit_code})\n')
+    def test_idempotence_and_conflicting_content(self):
+        first=self.send()
+        self.assertEqual(self.send()['id'],first['id'])
+        with self.assertRaisesRegex(ValueError,'different content'):
+            self.send(body='Changed')
+
+    def test_reply_freezes_both_addresses_and_conversation(self):
+        first=self.send()
+        for name in ('naru','roa'):
+            self.call('register',project='demo',name=name,transport='codex',session=str(uuid.uuid4()),cwd='/tmp')
+            self.call('channel-bind',project='demo',name=name,owner=name,description='new',expect_generation=1)
+        second=self.send('new')
+        self.assertEqual(second['route']['generation'],2)
+        answer=self.call('reply',id=first['id'],body='Answer',key='answer')
+        self.assertEqual(answer['route'],first['return_route'])
+        self.assertEqual(answer['return_route'],first['route'])
+        self.assertEqual(answer['conversation'],first['conversation'])
+        self.assertEqual(len(self.call('conversation',id=answer['id'])),2)
+        self.assertEqual(self.send()['id'],first['id'])
+
+    def test_generation_and_project_scope(self):
+        with self.assertRaisesRegex(ValueError,'generation'):
+            self.call('channel-bind',project='demo',name='naru',owner='naru',description='bad')
+        with self.assertRaisesRegex(ValueError,'missing or closed'):
+            self.state.route('another-project',channel='naru')
+
+    def test_closed_channel_refuses_new_requests_but_accepts_original_reply(self):
+        first=self.send()
+        self.call('channel-close',project='demo',name='roa',expect_generation=1)
+        with self.assertRaises(ValueError):self.send('new')
+        self.assertEqual(self.call('reply',id=first['id'],body='Done',key='reply')['channel'],'roa')
+
+    def test_ack_and_progress_do_not_generate_answers(self):
+        m=self.send()
+        self.call('ack',id=m['id'])
+        self.call('progress',id=m['id'],note='Reviewing')
+        self.assertEqual(m['state'],'in_progress')
+        self.assertFalse(self.state.answers[m['id']].is_set())
+        self.assertEqual(len(self.state.messages),1)
+
+    def test_slow_subscriber_gets_an_error_instead_of_silent_loss(self):
+        sub={'route':broker.route_key(self.state.route('demo',channel='naru')),
+             'queue':asyncio.Queue(maxsize=1),'overflow':False}
+        self.state.subscribers.append(sub)
+        self.send('one');self.send('two');self.send('three')
+        self.assertTrue(sub['overflow'])
+        self.assertIn('fell behind',sub['queue'].get_nowait()['error'])
+        self.assertTrue(sub['queue'].empty())
+
+    def test_message_capacity_and_size_are_explicit(self):
+        self.state.max_messages=1
+        self.send()
+        with self.assertRaisesRegex(ValueError,'limit reached'):self.send('second')
+        with self.assertRaisesRegex(ValueError,'32768'):self.send('big','x'*32769)
+
+
+class SocketTests(unittest.TestCase):
+    def setUp(self):
+        self.server=RunningBroker().__enter__()
+        self.addCleanup(self.server.__exit__,None,None,None)
+        self.server.register_pair()
+
+    def send(self,key='socket-request'):
+        return self.server.call('send',project='demo',sender_channel='roa',channel='naru',body='Question',key=key)
+
+    def watch(self,name,**extra):
+        stream=broker.stream(self.server.path,{'op':'watch','project':'demo','channel':name,**extra},timeout=3)
+        self.addCleanup(stream.close)
+        ready=next(stream)
+        self.assertEqual(ready['type'],'subscribed')
+        return stream,ready
+
+    def test_two_clients_receive_request_and_reply_immediately(self):
+        naru,_=self.watch('naru')
+        roa,_=self.watch('roa')
+        m=self.send()
+        event=next(naru)
+        self.assertEqual(event['message']['id'],m['id'])
+        answer=self.server.call('reply',id=m['id'],body='Answer',key='answer')
+        self.assertEqual(next(roa)['message']['id'],answer['id'])
+        result=self.server.call('wait',id=m['id'],timeout=0.1)
+        self.assertFalse(result['timed_out'])
+        self.assertEqual(result['replies'][0]['id'],answer['id'])
+
+    def test_wait_timeout_is_not_cancellation(self):
+        m=self.send()
+        result=self.server.call('wait',id=m['id'],timeout=0.02)
+        self.assertTrue(result['timed_out'])
+        self.assertEqual(self.server.call('show',id=m['id'])['state'],'pending')
+        self.server.call('reply',id=m['id'],body='Late answer',key='late')
+        self.assertFalse(self.server.call('wait',id=m['id'],timeout=0.02)['timed_out'])
+
+    def test_reconnect_replays_events_and_rejects_wrong_instance(self):
+        watcher,ready=self.watch('naru')
+        watcher.close()
+        m=self.send()
+        replay,_=self.watch('naru',after=ready['seq'],instance=ready['instance'])
+        self.assertEqual(next(replay)['message']['id'],m['id'])
+        failed=broker.stream(self.server.path,{'op':'watch','project':'demo','channel':'naru','after':0,'instance':'old'},timeout=2)
+        with self.assertRaisesRegex(ValueError,'instance changed'):next(failed)
+        failed.close()
+
+    def test_handoff_keeps_old_watch_bound_to_original_generation(self):
+        old,_=self.watch('naru')
+        first=self.send()
+        self.assertEqual(next(old)['message']['route']['generation'],1)
+        self.server.call('register',project='demo',name='naru',transport='realtime',session=str(uuid.uuid4()),cwd=self.server.temp.name)
+        self.server.call('channel-bind',project='demo',name='naru',owner='naru',description='new',expect_generation=1)
+        new,_=self.watch('naru')
+        second=self.send('second')
+        self.assertEqual(next(new)['message']['id'],second['id'])
+        self.server.call('reply',id=first['id'],body='Old session answer',key='old-answer')
+        event=next(old)
+        self.assertEqual((event['type'],event['message']['route']['generation']),('status',1))
+
+    def test_concurrent_duplicate_sends_emit_one_message(self):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            ids=list(pool.map(lambda _:self.send()['id'],range(8)))
+        self.assertEqual(len(set(ids)),1)
+        self.assertEqual(self.server.call('ping')['messages'],1)
+
+    def test_cli_ask_and_reply_roundtrip(self):
+        p=subprocess.Popen([sys.executable,bridge.__file__,'--socket',self.server.path,'ask','--project','demo',
+            '--from-channel','roa','--channel','naru','--key','ask','--file','-','--timeout','3'],
+            stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        try:
+            p.stdin.write('Discuss API');p.stdin.close();p.stdin=None
+            sent=json.loads(p.stdout.readline())
+            self.assertEqual(sent['type'],'sent')
+            self.server.call('reply',id=sent['message']['id'],body='Agreed',key='ask-response')
+            out,err=p.communicate(timeout=5)
+            self.assertEqual(p.returncode,0,err)
+            self.assertEqual(json.loads(out)['replies'][0]['body'],'Agreed')
+        finally:
+            if p.poll() is None:p.kill();p.communicate()
+
+    def test_single_broker_ownership_does_not_disconnect_existing_server(self):
+        p=subprocess.run([sys.executable,bridge.__file__,'--socket',self.server.path,'serve'],capture_output=True,text=True,timeout=5)
+        self.assertEqual(p.returncode,1)
+        self.assertEqual(self.server.call('ping')['instance'],self.server.instance)
+
+    def test_restart_has_no_persistent_messages(self):
+        self.send()
+        self.server.call('shutdown')
+        self.server.process.communicate(timeout=5)
+        with RunningBroker() as other:
+            self.assertNotEqual(other.instance,self.server.instance)
+            self.assertEqual(other.call('ping')['messages'],0)
+        self.assertFalse(list(Path(self.server.temp.name).glob('*.db')))
+
+    def fake(self,transport='codex',result='queued',exit_code=0):
+        exe=Path(self.server.temp.name)/'fake-cli'
+        exe.write_text('#!'+sys.executable+'\nimport sys,json\nfrom pathlib import Path\n'
+            f'Path({str(exe.with_suffix(".args"))!r}).write_text(json.dumps(sys.argv))\n'
+            f'print({result!r})\nraise SystemExit({exit_code})\n')
         exe.chmod(0o700)
-        bridge.register(self.db,'demo','naru',transport,str(uuid.uuid4()),str(self.root),str(exe))
+        self.server.call('register',project='demo',name='naru',transport=transport,session=str(uuid.uuid4()),cwd=self.server.temp.name,executable=str(exe))
+        self.server.call('channel-bind',project='demo',name='naru',owner='naru',description='cli',expect_generation=1)
         return exe
 
-    def test_idempotence_and_conflicting_key(self):
-        first = self.send()
-        self.assertEqual(first['id'], self.send()['id'])
-        with self.assertRaisesRegex(ValueError,'different content'):
-            bridge.post(self.db,'demo','roa','naru','Changed','request-1')
-        self.assertEqual(self.db.execute('SELECT count(*) FROM messages').fetchone()[0],1)
+    def test_external_cli_delivery_remains_explicit_and_exclusive(self):
+        exe=self.fake()
+        m=self.send()
+        self.assertFalse(bridge.deliver(self.server.path,m['id'],dry_run=True)['sent'])
+        self.assertFalse(exe.with_suffix('.args').exists())
+        self.assertEqual(bridge.deliver(self.server.path,m['id'])['state'],'submitted')
+        with self.assertRaisesRegex(ValueError,'pending'):bridge.deliver(self.server.path,m['id'])
 
-    def test_reply_direction_and_atomic_parent_completion(self):
-        first = self.send()
-        with self.assertRaisesRegex(ValueError,'reverse'):
-            bridge.post(self.db,'demo','roa','naru','Wrong','wrong',first['id'])
-        answer = bridge.post(self.db,'demo','naru','roa','Ready','answer',first['id'])
-        self.assertEqual(bridge.message(self.db,first['id'])['state'],'answered')
-        self.assertEqual(answer['reply_to'],first['id'])
-
-    def test_frozen_route_and_shell_literals(self):
-        self.fake()
-        body = "quotes ' \" ; $(touch SHOULD_NOT_EXIST) `touch ALSO_NOT`\nnext line"
-        m = bridge.post(self.db,'demo','roa','naru',body,'literal')
-        session = json.loads(m['route'])['session']
-        bridge.register(self.db,'demo','naru','inbox',None,str(self.root),None)
-        result = bridge.deliver(self.db,m['id'])
-        self.assertEqual(result['state'],'submitted')
-        args = json.loads((self.root / 'argv.json').read_text())
-        self.assertIn(session,args)
-        self.assertTrue(args[-1].endswith(body))
-        self.assertFalse((self.root / 'SHOULD_NOT_EXIST').exists())
-        self.assertFalse((self.root / 'ALSO_NOT').exists())
-        with self.assertRaisesRegex(ValueError,'Only pending'):
-            bridge.deliver(self.db,m['id'])
-
-    def test_dry_run_has_no_side_effect(self):
-        self.fake()
-        m = self.send()
-        self.assertFalse(bridge.deliver(self.db,m['id'],dry_run=True)['sent'])
-        self.assertFalse((self.root/'argv.json').exists())
-        self.assertEqual(bridge.message(self.db,m['id'])['state'],'pending')
-
-    def test_claude_response_returns_to_sender(self):
-        self.fake('claude', json.dumps({'result':'View reviewed','is_error':False}))
-        m = self.send()
-        self.assertEqual(bridge.deliver(self.db,m['id'])['state'],'answered')
-        reply = dict(self.db.execute('SELECT * FROM messages WHERE reply_to=?',(m['id'],)).fetchone())
-        self.assertEqual((reply['sender'],reply['recipient'],reply['body']),('naru','roa','View reviewed'))
-        self.assertEqual(reply['state'],'pending')  # no automatic ping-pong
-
-    def test_invalid_claude_result_does_not_claim_completion(self):
-        for output in ('not JSON', '[]',json.dumps({'result':'Done','is_error':True}),
-                       json.dumps({'result':'Done','permission_denials':[{'tool':'Read'}]})):
-            self.fake('claude',output)
-            m = self.send(str(uuid.uuid4()))
-            self.assertEqual(bridge.deliver(self.db,m['id'])['state'],'uncertain')
-
-    def test_nonzero_exit_is_ambiguous_and_not_retried(self):
+    def test_cli_failure_blocks_retry_and_other_messages_to_same_session(self):
         self.fake(exit_code=2)
-        m = self.send()
-        self.assertEqual(bridge.deliver(self.db,m['id'])['state'],'uncertain')
-        with self.assertRaises(ValueError):
-            bridge.deliver(self.db,m['id'])
+        m=self.send()
+        self.assertEqual(bridge.deliver(self.server.path,m['id'])['state'],'uncertain')
+        with self.assertRaises(ValueError):bridge.deliver(self.server.path,m['id'])
+        second=self.send('second')
+        with self.assertRaisesRegex(ValueError,'active or uncertain'):bridge.deliver(self.server.path,second['id'])
 
-    def test_missing_executable_is_definite_failure(self):
-        bridge.register(self.db,'demo','naru','codex',str(uuid.uuid4()),str(self.root),str(self.root/'absent'))
-        m = self.send()
-        self.assertEqual(bridge.deliver(self.db,m['id'])['state'],'failed')
+    def test_delivery_timeout_and_shell_literals(self):
+        exe=self.fake()
+        body="' \" $(touch SHOULD_NOT_EXIST) `touch ALSO_NOT`\nsecond line"
+        m=self.server.call('send',project='demo',sender_channel='roa',channel='naru',body=body,key='literals')
+        self.assertEqual(bridge.deliver(self.server.path,m['id'])['state'],'submitted')
+        argv=json.loads(exe.with_suffix('.args').read_text())
+        self.assertTrue(argv[-1].endswith(body))
+        self.assertFalse((exe.parent/'SHOULD_NOT_EXIST').exists())
+        self.assertFalse((exe.parent/'ALSO_NOT').exists())
+        exe.write_text('#!'+sys.executable+'\nimport time\ntime.sleep(10)\n')
+        late=self.send('timeout')
+        self.assertEqual(bridge.deliver(self.server.path,late['id'],timeout=0.05)['state'],'uncertain')
 
-    def test_timeout_is_uncertain(self):
-        exe = self.fake()
-        exe.write_text('#!' + sys.executable + '\nimport time\ntime.sleep(10)\n')
-        m = self.send()
-        self.assertEqual(bridge.deliver(self.db,m['id'],timeout=0.05)['state'],'uncertain')
-
-    def test_concurrent_identical_sends_have_one_id(self):
-        def send(_):
-            db = bridge.connect(self.path)
-            try:
-                return bridge.post(db,'demo','roa','naru','same','concurrent')['id']
-            finally:
-                db.close()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            ids = list(pool.map(send,range(8)))
-        self.assertEqual(len(set(ids)),1)
-
-    def test_dispatch_claim_is_exclusive(self):
-        m = self.send()
-        def claim(_):
-            db = bridge.connect(self.path)
-            try:
-                return bridge.transition(db,m['id'],'pending','dispatching')
-            finally:
-                db.close()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            results = list(pool.map(claim,range(8)))
-        self.assertEqual(sum(results),1)
-
-    def test_session_gate_blocks_distinct_messages_after_ambiguous_send(self):
-        self.fake(exit_code=2)
-        first = self.send('first')
-        second = self.send('second')
-        bridge.deliver(self.db,first['id'])
-        with self.assertRaisesRegex(ValueError,'active or uncertain'):
-            bridge.deliver(self.db,second['id'])
-        self.assertEqual(bridge.message(self.db,second['id'])['state'],'pending')
-
-    def setup_channels(self):
-        for name, channel in (('naru','modal-view'), ('roa','game-logic')):
-            bridge.register(self.db,'demo',name,'codex',str(uuid.uuid4()),str(self.root),None)
-            bridge.bind_channel(self.db,'demo',channel,name,channel)
-
-    def channel_send(self, key='channel-request'):
-        return bridge.post(self.db,'demo',None,None,'Review state contract',key,
-                           channel='modal-view',sender_channel='game-logic')
-
-    def test_channel_handoff_preserves_both_addresses(self):
-        self.setup_channels()
-        first = self.channel_send()
-        old_destination = json.loads(first['route'])['session']
-        old_return = json.loads(first['return_route'])['session']
-        for name, channel in (('naru','modal-view'), ('roa','game-logic')):
-            bridge.register(self.db,'demo',name,'codex',str(uuid.uuid4()),str(self.root),None)
-            bridge.bind_channel(self.db,'demo',channel,name,'new commander',expected=1)
-        second = self.channel_send('new-request')
-        self.assertNotEqual(json.loads(second['route'])['session'],old_destination)
-        self.assertNotEqual(json.loads(second['return_route'])['session'],old_return)
-        answer = bridge.reply(self.db,first['id'],'Contract accepted','channel-reply')
-        self.assertEqual(json.loads(answer['route'])['session'],old_return)
-        self.assertEqual(json.loads(answer['return_route'])['session'],old_destination)
-        self.assertEqual((answer['channel'],answer['sender_channel']),('game-logic','modal-view'))
-        self.assertEqual(json.loads(answer['route'])['generation'],1)
-        self.assertEqual(self.channel_send()['id'],first['id'])  # retry cannot reroute
-
-    def test_handoff_requires_current_generation(self):
-        self.setup_channels()
-        with self.assertRaisesRegex(ValueError,'generation changed'):
-            bridge.bind_channel(self.db,'demo','modal-view','naru','overwrite without reading')
-        self.assertEqual(bridge.channel_route(self.db,'demo','modal-view')[1]['generation'],1)
-
-    def test_channel_lookup_is_project_scoped_and_closed_channel_refuses_new_mail(self):
-        self.setup_channels()
-        with self.assertRaisesRegex(ValueError,'missing or closed'):
-            bridge.channel_route(self.db,'another-project','modal-view')
-        original = self.channel_send()
-        self.db.execute("UPDATE channels SET active=0 WHERE name='game-logic'")
-        with self.assertRaisesRegex(ValueError,'missing or closed'):
-            self.channel_send('closed-request')
-        # An existing conversation can still respond to its original session.
-        self.assertEqual(bridge.reply(self.db,original['id'],'Done','closed-reply')['channel'],'game-logic')
-
-    def test_legacy_mailbox_migration_does_not_invent_return_address(self):
-        legacy = self.root / 'legacy.db'
-        db = sqlite3.connect(legacy)
-        db.execute("CREATE TABLE messages (id TEXT PRIMARY KEY, project TEXT, sender TEXT, recipient TEXT, "
-                   "body TEXT, reply_to TEXT, dedupe TEXT UNIQUE, route TEXT, state TEXT, note TEXT, created TEXT)")
-        db.execute("INSERT INTO messages VALUES('old','demo','roa','naru','old request',NULL,'old-key','{}','pending',NULL,'today')")
-        db.commit(); db.close()
-        db = bridge.connect(legacy)
-        try:
-            self.assertIsNone(bridge.message(db,'old')['return_route'])
-            with self.assertRaisesRegex(ValueError,'no frozen return address'):
-                bridge.reply(db,'old','answer','legacy-answer')
-        finally:
-            db.close()
-
-    def test_cli_channel_directory_and_reply(self):
-        self.setup_channels()
-        def run(*args, body=None):
-            result = subprocess.run([sys.executable,bridge.__file__,'--db',str(self.path),*args],
-                                    input=body,text=True,capture_output=True,check=True)
-            return json.loads(result.stdout)
-        channels = run('channels','--project','demo')
-        self.assertEqual([c['name'] for c in channels],['game-logic','modal-view'])
-        request = run('send','--project','demo','--from-channel','game-logic','--channel','modal-view',
-                      '--key','cli-channel','--file','-',body='Question')
-        inbox = run('inbox','--project','demo','--channel','modal-view')
-        self.assertEqual(inbox[0]['generation'],1)
-        self.assertEqual(inbox[0]['id'],request['id'])
-        answer = run('reply',request['id'],'--key','cli-channel-reply','--file','-',body='Answer')
-        self.assertEqual(answer['channel'],'game-logic')
-        run('channel-close','modal-view','--project','demo','--expect-generation','1')
-        closed = next(c for c in run('channels','--project','demo') if c['name']=='modal-view')
-        self.assertEqual((closed['active'],closed['generation']),(0,2))
-
-    def test_cli_roundtrip_inbox(self):
-        cli = Path(bridge.__file__)
-        def run(*args, body=None):
-            result = subprocess.run([sys.executable,str(cli),'--db',str(self.path),*args],
-                                    input=body,text=True,capture_output=True,check=True)
-            return json.loads(result.stdout)
-        m = run('send','--project','demo','--from','roa','--to','naru',
-                '--file','-','--key','cli-request',body='Connect this state to the UI')
-        self.assertEqual(run('inbox','naru','--project','demo')[0]['id'],m['id'])
-        response = run('send','--project','demo','--from','naru','--to','roa',
-                      '--file','-','--key','cli-answer','--reply-to',m['id'],body='Connected and verified')
-        self.assertEqual(run('inbox','roa','--project','demo')[0]['id'],response['id'])
-        self.assertEqual(run('show',m['id'])['state'],'answered')
-        self.assertEqual(run('inbox','naru','--project','demo'),[])
+    def test_claude_response_notifies_waiter_without_auto_pingpong(self):
+        self.fake('claude',json.dumps({'result':'Reviewed','is_error':False}))
+        m=self.send()
+        self.assertEqual(bridge.deliver(self.server.path,m['id'])['state'],'answered')
+        result=self.server.call('wait',id=m['id'],timeout=0.1)
+        self.assertEqual(result['replies'][0]['state'],'pending')
+        self.assertEqual(result['replies'][0]['body'],'Reviewed')
 
 
-if __name__ == '__main__':
+if __name__=='__main__':
     unittest.main()
