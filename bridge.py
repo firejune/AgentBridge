@@ -11,6 +11,8 @@ import subprocess
 import sys
 import uuid
 
+import sessions
+
 DEFAULT_DB = Path.home() / '.local/share/agent-bridge/mail.db'
 
 
@@ -85,7 +87,7 @@ def register(db, project, name, transport, session, cwd, executable):
                'DO UPDATE SET transport=excluded.transport,session=excluded.session,'
                'cwd=excluded.cwd,executable=excluded.executable',
                (project, name, transport, session, cwd, executable))
-    return {'project': project, 'name': name, 'transport': transport, 'session': session}
+    return {'project': project, 'name': name, 'transport': transport, 'session': session, 'cwd': cwd}
 
 
 def endpoint(db, project, name):
@@ -201,7 +203,7 @@ def command(m):
     if route['transport'] == 'codex':
         return [route['executable'] or 'codex', 'queue', '--thread', route['session'], '--message', payload]
     if route['transport'] == 'claude':
-        return [route['executable'] or 'claude', '--resume', route['session'], '--model', 'opus',
+        return [*sessions.cli_prefix(route['executable'] or 'claude'), '--resume', route['session'], '--model', 'opus',
                 '--strict-mcp-config', '--output-format', 'json', '--permission-prompts', 'none',
                 '--permission-mode', 'plan', '--tools', 'Read,Grep,Glob', '-p', payload]
     raise ValueError('Inbox route: recipient reads it with inbox/show; no external dispatch needed')
@@ -261,7 +263,7 @@ def deliver(db, mid, timeout=180, dry_run=False):
         if process.returncode != 0:
             transition(db, mid, 'dispatching', 'uncertain', stderr[-4000:] or stdout[-4000:])
         elif route['transport'] == 'claude':
-            result = json.loads(stdout)
+            result = sessions.cli_json(stdout)
             if not isinstance(result, dict) or result.get('is_error') or result.get('permission_denials') or not isinstance(result.get('result'), str) or not result['result'].strip():
                 raise ValueError('Claude reported an error, permission denial, or no text result')
             # Store the response atomically with the parent's answered state.
@@ -296,7 +298,17 @@ def main(argv=None):
     p = sub.add_parser('register', help='Register or replace a project endpoint')
     p.add_argument('name'); p.add_argument('--project', required=True)
     p.add_argument('--transport', choices=['inbox','codex','claude'], default='inbox')
-    p.add_argument('--session'); p.add_argument('--cwd', required=True); p.add_argument('--executable')
+    p.add_argument('--session'); p.add_argument('--cwd'); p.add_argument('--executable')
+    p.add_argument('--discover', action='store_true', help='Verify session with CLI and infer its cwd')
+    p.add_argument('--codex-mode', choices=['auto','shared','saved'], default='auto')
+    p = sub.add_parser('sessions', help='Discover real CLI sessions without starting a turn')
+    p.add_argument('--provider', choices=['all','codex','claude'], default='all')
+    p.add_argument('--cwd'); p.add_argument('--search'); p.add_argument('--limit', type=int, default=100)
+    p.add_argument('--codex-executable', default='codex'); p.add_argument('--claude-executable', default='claude')
+    p.add_argument('--codex-mode', choices=['auto','shared','saved'], default='auto')
+    p = sub.add_parser('session', help='Read metadata for one exact session UUID')
+    p.add_argument('provider', choices=['codex','claude']); p.add_argument('id'); p.add_argument('--executable')
+    p.add_argument('--codex-mode', choices=['auto','shared','saved'], default='auto')
     p = sub.add_parser('routes'); p.add_argument('--project', required=True)
     p = sub.add_parser('channel-bind', help='Bind a work channel to a registered commander session')
     p.add_argument('name'); p.add_argument('--project', required=True); p.add_argument('--owner', required=True)
@@ -327,9 +339,31 @@ def main(argv=None):
     p.add_argument('--note', required=True)
     args = parser.parse_args(argv)
     try:
+        if args.cmd == 'sessions':
+            result = sessions.discover(args.provider,args.cwd,args.search,args.limit,
+                args.codex_executable,args.claude_executable,args.codex_mode)
+            print(json.dumps(result,ensure_ascii=False,indent=2))
+            return 1 if result['errors'] else 0
+        if args.cmd == 'session':
+            result = sessions.inspect_session(args.provider,args.id,args.executable,args.codex_mode)
+            print(json.dumps(result,ensure_ascii=False,indent=2))
+            return 0
         db = connect(args.db)
         if args.cmd == 'register':
+            observation = None
+            if args.discover:
+                if args.transport == 'inbox' or not args.session:
+                    raise ValueError('--discover requires a CLI transport and exact --session UUID')
+                observation = sessions.inspect_session(args.transport,args.session,args.executable,args.codex_mode)
+                observed = observation['session']
+                if args.cwd and Path(args.cwd).expanduser().resolve() != Path(observed['cwd']).resolve():
+                    raise ValueError('Requested cwd differs from the discovered session cwd')
+                args.cwd = observed['cwd']
+            if not args.cwd:
+                raise ValueError('Provide --cwd or use --discover to infer it')
             result = register(db,args.project,args.name,args.transport,args.session,args.cwd,args.executable)
+            if observation:
+                result['discovery'] = observation
         elif args.cmd == 'routes':
             result = [dict(r) for r in db.execute('SELECT * FROM endpoints WHERE project=? ORDER BY name',(args.project,))]
         elif args.cmd == 'channel-bind':
@@ -389,7 +423,7 @@ def main(argv=None):
         if args.cmd == 'deliver' and result.get('state') in ('failed','uncertain'):
             return 1
         return 0
-    except (ValueError, OSError, sqlite3.Error) as error:
+    except (ValueError, OSError, sqlite3.Error, subprocess.TimeoutExpired, KeyError, TypeError) as error:
         print(json.dumps({'error':str(error)},ensure_ascii=False),file=sys.stderr)
         return 1
 

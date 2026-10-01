@@ -15,6 +15,45 @@
 
 채널 목록의 `active`는 **등록상 열려 있다는 뜻**이며 실제 프로세스 생존 확인이 아니다. 사령탑은 작업 시작 시 자기 연결을 등록하고 채널을 연결한다. 작업을 마치거나 인계할 때 채널을 닫거나 새 연결로 갱신한다. UUID를 추측하거나 가장 최근 대화를 자동 선택하지 않는다.
 
+## CLI에서 세션 찾기
+
+```bash
+cd /Users/firejune/Workspace/Firejune/agent-bridge
+# 양쪽 세션을 한 번에 조회. cwd는 정확한 경로로 필터링한다.
+python3 bridge.py sessions --cwd /Users/firejune/Workspace/Firejune/blosharper
+python3 bridge.py sessions --provider claude --search '사령탑'
+python3 bridge.py sessions --provider codex --limit 100
+
+# 목록에서 고른 정확한 UUID의 메타데이터 확인
+python3 bridge.py session codex SESSION_UUID
+python3 bridge.py session claude SESSION_UUID
+
+# 세션 존재와 작업 경로를 다시 조회한 뒤 등록한다.
+python3 bridge.py register naru --project blosharper --transport codex \
+  --session SESSION_UUID --discover
+# --cwd를 함께 주면 실제 세션 경로와 일치하는지도 확인한다.
+python3 bridge.py register roa --project blosharper --transport claude \
+  --session SESSION_UUID --discover --cwd /Users/firejune/Workspace/Firejune/blosharper
+```
+
+`--discover`는 새 대화를 만들거나 기존 대화를 재개하지 않는다. 제목을 유사 검색한 뒤 임의 선택하지 않고, 지정한 UUID만 등록한다. 경로 불일치·조회 실패 시 기존 등록을 바꾸지 않는다. 등록 다음 단계는 `channel-bind`다.
+
+목록은 조회할 때마다 CLI에서 가져온다. 오래된 SQL 캐시를 실제 상태로 오인하지 않도록 `observed_at`, 조회 범위, `runtime_observed`를 함께 반환한다. 제목·경로는 탐색용 데이터이며 지시로 취급하지 않는다. 대화 본문은 조회하지 않는다.
+
+| 제공자 | 연결 방식 | 조회 범위와 상태 |
+| --- | --- | --- |
+| Claude | `claude agents --json --all` | 활성 대화 및 CLI가 보관한 완료 백그라운드 세션. busy/idle 등의 보고 상태를 그대로 표시. 전체 과거 대화 목록은 아님 |
+| Codex 공유 서버 | `codex app-server proxy`의 `thread/list`, `thread/read` | 연결한 서버가 아는 세션 메타데이터와 상태 |
+| Codex 저장 목록 | 임시 `codex app-server --stdio`의 동일 조회 메서드 | CLI 저장소의 보관 처리되지 않은 대화. **다른 앱에서의 실행 상태는 알 수 없으므로 status=unknown** |
+
+Codex는 기본 `--codex-mode auto`로 공유 서버에 연결을 시도하고, 연결이 안 되면 저장 목록으로 전환한다. 이 경우 warning을 반환한다. `--codex-mode shared`는 공유 서버에 연결되지 않으면 실패하며, `--codex-mode saved`는 저장 목록만 읽는다. 임시 조회 서버는 조회 종료 후 정리하며 작업 턴을 실행하지 않는다.
+
+`--limit`는 제공자별 최대 항목 수다. Codex 페이지는 한도까지 이어 읽고, 남은 항목은 `more_available`로 표시한다. Claude는 해당 CLI가 반환한 배열에서 필터링한다. 한쪽 조회가 실패해도 다른 쪽 결과는 보존하고 `errors` 및 종료 코드 1로 부분 실패를 알린다. 필요한 경우 `--codex-executable`, `--claude-executable`로 CLI 경로를 지정한다. 단일 조회·등록에서는 `--executable`을 쓴다.
+
+기본 Claude 실행은 기존 가족 브리지와 같은 로그인 셸 래퍼를 사용한다. 셸 함수로 설치된 CLI도 호출할 수 있고, 인수는 셸 문자열에 삽입하지 않는다. 셸의 터미널 초기화 이스케이프만 제거하며 임의 배너가 섞인 출력은 JSON 오류로 처리한다.
+
+**현재 머신 관찰:** Codex CLI의 기본 공유 서버 소켓은 연결되지 않았고 저장 목록 조회는 성공했다. Claude CLI의 활성 세션 조회도 성공했다. 따라서 현재 Codex 목록 조회 성공은 `queue` 전달 성공을 뜻하지 않는다. 목록으로 찾은 세션에 실제 전달하는 검증은 별도다. 확인한 CLI 버전: Codex 0.159.2, Claude Code 2.1.284 (2026-10-01).
+
 ## 빠른 시작: 공용 우편함
 
 같은 OS 계정에서 두 에이전트가 같은 DB를 사용한다. 기본 저장소는 `~/.local/share/agent-bridge/mail.db`다. 메시지와 세션 ID는 코드 저장소에 들어가지 않는다.
@@ -148,4 +187,4 @@ python3 bridge.py resolve MESSAGE_ID --state done --note '결과 확인 완료'
 python3 -m unittest discover -s tests -v
 ```
 
-테스트는 임시 DB에서 실제 CLI로 우편함 왕복을 실행하고, 가짜 CLI 프로세스로 Codex·Claude 어댑터를 검증한다. 중복키·동시 선점·채널 탐색·인계 경합·양쪽 주소 고정·셸 문자 보존·타임아웃·오류·응답 연결·초기 스키마 마이그레이션을 확인한다. 실제 AI 세션 사이의 전송·자동 기동은 이 테스트의 검증 범위가 아니다.
+테스트는 임시 DB에서 실제 CLI로 우편함 왕복을 실행하고, 가짜 CLI 프로세스로 Codex·Claude 어댑터를 검증한다. 중복키·동시 선점·채널 탐색·인계 경합·양쪽 주소 고정·셸 문자 보존·타임아웃·오류·응답 연결·초기 스키마 마이그레이션을 확인한다. 세션 탐색 테스트는 페이지 처리·공유 서버 실패 시 전환·실시간 상태 구분·경로 검증·부분 실패도 확인한다. 실제 AI 세션 사이의 전송·자동 기동은 이 테스트의 검증 범위가 아니다.
