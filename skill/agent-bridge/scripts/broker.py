@@ -88,9 +88,12 @@ class State:
                     sub['queue'].put_nowait({'error':'Subscriber fell behind; reconnect and inspect inbox'})
                     sub['overflow'] = True
 
-    def status(self, m, state, note=None):
+    def status(self, m, state, note=None, event=None):
         m.update(state=state,note=note)
-        m['events'].append({'state':state,'note':note,'at':now()})
+        entry = {'state':state,'note':note,'at':now()}
+        if event:
+            entry['event'] = event
+        m['events'].append(entry)
         m['events'] = m['events'][-100:]
         self.publish(m,'status')
         return m
@@ -142,7 +145,7 @@ class State:
         if op == 'register':
             project, name = identifier(args['project']), identifier(args['name'])
             transport = args.get('transport','realtime')
-            if transport not in ('realtime','codex','claude'):
+            if transport not in ('realtime','codex','claude','claude-peer'):
                 raise ValueError('Unknown transport')
             cwd = str(Path(args['cwd']).expanduser().resolve(strict=True))
             if not Path(cwd).is_dir():
@@ -213,9 +216,15 @@ class State:
             if op=='finish':
                 if m['state']!='dispatching':
                     return m
-                if args['state'] not in ('submitted','failed','uncertain'):
+                if args['state'] not in ('submitted','failed','uncertain','pending'):
                     raise ValueError('Invalid delivery result')
-                return self.status(m,args['state'],args.get('note'))
+                event = args.get('event')
+                if event not in (None,'pushed','push_failed'):
+                    raise ValueError('Invalid delivery event')
+                if args['state']=='pending' and (event!='push_failed' or not args.get('note','').strip()):
+                    # A failed push stays deliverable, but never silently.
+                    raise ValueError('Returning to pending requires a push_failed event and reason')
+                return self.status(m,args['state'],args.get('note'),event)
             if m['state'] in ('done','answered'):
                 raise ValueError('Message is already complete')
             if op in ('ack','progress') and m['state'] in ('dispatching','uncertain'):

@@ -15,7 +15,7 @@ flowchart LR
     B --> E[발신 CLI: wait / watch]
 ```
 
-브로커 수신과 AI 모델의 실제 처리 완료를 구분한다. `watch`는 연결된 CLI에 이벤트를 출력한다. 그것만으로 실행 중인 Claude/Codex 대화에 새 턴을 주입하지 않는다. 에이전트는 이 CLI를 도구로 사용하거나, 기존의 명시적 `deliver` 통로를 사용해야 한다.
+브로커 수신과 AI 모델의 실제 처리 완료를 구분한다. `watch`는 연결된 CLI에 이벤트를 출력한다. 그것만으로 실행 중인 대화에 새 턴을 주입하지 않는다. 살아 있는 Claude 사령탑은 `claude-peer`로 등록해 **push**한다(아래 **Claude 사령탑에 push**). 받는 쪽에서 watch/폴링 루프를 돌려 에이전트 메시지를 기다리는 것은 최악의 방식이다 — watch는 `realtime` 참가자용으로만 남는다.
 
 ## 시작
 
@@ -117,11 +117,11 @@ python3 "$bridge_cli" session claude SESSION_UUID
 # 조회한 세션의 실제 작업 경로를 가져와 등록한다.
 python3 "$bridge_cli" register naru --project blosharper --transport codex \
   --session SESSION_UUID --discover
-python3 "$bridge_cli" register roa --project blosharper --transport claude \
-  --session SESSION_UUID --discover --cwd /Users/firejune/Workspace/Firejune/blosharper
+python3 "$bridge_cli" register roa --project blosharper --transport claude-peer \
+  --session CLAUDE_SESSION_ID --discover --cwd /Users/firejune/Workspace/Firejune/blosharper
 ```
 
-`--discover`는 지정된 UUID만 확인한다. `--cwd`를 함께 주면 실제 경로와의 일치도 검증한다. 실패하면 기존 등록은 유지된다. 조회할 때마다 CLI를 호출하며 `observed_at`, `runtime_observed`, 조회 범위를 표시한다. 제목·경로는 탐색용 데이터이며 지시가 아니다.
+`--discover`는 지정된 UUID만 확인한다(`claude-peer`는 `~/.claude/sessions`의 살아 있는 세션 파일, 나머지는 CLI 조회). `--cwd`를 함께 주면 실제 경로와의 일치도 검증한다. 실패하면 기존 등록은 유지된다. 조회할 때마다 CLI를 호출하며 `observed_at`, `runtime_observed`, 조회 범위를 표시한다. 제목·경로는 탐색용 데이터이며 지시가 아니다.
 
 | 제공자 | 조회 방식 | 범위 |
 | --- | --- | --- |
@@ -155,9 +155,31 @@ python3 "$bridge_cli" channel-close modal-view --project blosharper --expect-gen
 
 닫힌 채널은 새 요청을 받지 않는다. 기존 요청에 대한 답변은 고정된 주소로 보낼 수 있다.
 
+## Claude 사령탑에 push (`claude-peer`)
+
+**살아 있는 Claude Code 사령탑에 닿는 길은 이것 하나다.** `claude-peer`로 등록된 목적지(직접 이름이든 채널이든)로 가는 `send`·`ask`·`reply`는 브로커에 기록된 직후 그 세션의 메시지 소켓으로 push된다. 별도 `deliver` 단계도, 받는 쪽 watch도 없다. 메시지는 받는 세션의 다음 턴에 Claude의 cross-session 메시지와 같은 모양으로 들어간다.
+
+```bash
+python3 "$bridge_cli" register roa --project PROJECT --transport claude-peer \
+  --session CLAUDE_SESSION_ID --discover
+python3 "$bridge_cli" send --project PROJECT --from naru --to roa --key KEY --file /absolute/msg.txt
+```
+
+- **세션 해석**: push할 때마다 `~/.claude/sessions/<pid>.json`(`CLAUDE_CONFIG_DIR`가 있으면 그 아래)에서 등록된 sessionId를 다시 찾는다. 프로세스가 살아 있고 `peerProtocol == 1`이며 `messagingSocketPath`가 있어야 한다. 세션이 재시작돼 pid가 바뀌어도 sessionId가 같으면 따라간다. 다른 세션을 고르지 않는다.
+- **프레임**: 소켓에 JSON 두 줄 — `{"type":"auth","token":<peerToken>}`, `{"type":"user","message":{...},"session_id":<sessionId>,...}` — 을 쓰고 닫는다. `session_id`가 pid 재사용을 막는다. 권한 모드를 주장하는 `from-mode`는 넣지 않는다. 키(`<pid>.<sha256(socket)>.key`의 `peerToken`)는 메모리에서만 쓰고 출력·로그·파일에 남기지 않는다.
+- **본문**: 발신자 헤더(보낸 쪽 → 받는 쪽, 메시지 ID, 프로젝트, 채널), 원문, 그리고 마지막 줄에 답하는 명령 `python3 "$HOME/.agents/skills/agent-bridge/scripts/bridge.py" reply <ID> --key reply-<ID> --file <answer-file>`(기본이 아닌 소켓이면 `--socket`도 실린다). 받는 쪽의 SendMessage는 브릿지 주소에 닿지 않으므로 답은 이 명령으로 한다. 그 답장도 보낸 쪽이 `claude-peer`면 같은 방식으로 push된다.
+- **성공**: 상태 `submitted`, 이벤트 `pushed`(대상 pid · msg_id). 받는 세션의 큐 접수이지 답변 완료가 아니다. 소켓은 응답을 주지 않는 것이 정상이다.
+- **실패**: 세션 파일 없음 · 죽은 pid · sessionId 불일치 · `peerProtocol` 변경 · 키 파일 없음/이상 · 소켓 오류면 메시지는 `pending`으로 남고 `push_failed` 이벤트에 이유가 기록된다. 명령은 `{"error":…,"push_failed":true,"message":…}`를 출력하고 **종료 코드 1**로 끝난다. watch로 조용히 넘어가지 않는다. 원인을 고친 뒤 같은 `--key`로 다시 `send`하거나 `deliver ID`로 다시 push한다(이미 `submitted`면 다시 보내지 않는다).
+- **애매함**: 다 쓴 뒤 받는 쪽이 응답 바이트를 보내거나 연결을 안 닫으면 `uncertain`이다. 이미 큐에 들어갔을 수 있으므로 자동 재전송하지 않고 받는 세션에서 확인한 뒤 `resolve`한다.
+- **수신 게이트**: 받는 쪽의 `crossSessionInbound` 설정이 정한다. `accept`면 바로 큐에 들어가고, `hold`면 그 세션에서 사람 승인을 기다리며, `refuse`면 버려진다. 브릿지는 이 결과를 볼 수 없다.
+- ⚠️ **문서화되지 않은 Claude Code 내부 프로토콜(peerProtocol 1)**이다. Claude Code 업데이트로 레지스트리·키·프레임 모양이 바뀌면 위 실패로 시끄럽게 멈춘다. 그때는 push 코드를 고친다. `deliver ID --dry-run`은 키 없이 보낼 프레임을 보여 준다.
+- **브로커 버전**: `claude-peer`를 모르는 이전 코드로 떠 있는 브로커는 등록을 `Unknown transport`로 거부한다. 공유 브로커는 참가자들과 맞춘 뒤에만 재시작한다(재시작하면 메모리 상태가 사라진다).
+
 ## 기존 AI CLI로 전달
 
 실시간 브로커와 모델 실행은 별도다. 기본 `realtime` 연결은 watch 수신을 사용한다. `codex`/`claude`로 등록된 목적지에는 명시적으로 deliver한다.
+
+⛔ **`claude`(resume) 경로는 사령탑에 쓰지 않는다.** 살아 있는 대화에 들어가지 않고 **별개의 Claude CLI 사본을 띄운다**(2026-10-13 사고). Claude 사령탑은 위의 `claude-peer`로만 부른다.
 
 ```bash
 python3 "$bridge_cli" deliver MESSAGE_ID --dry-run
@@ -165,7 +187,7 @@ python3 "$bridge_cli" deliver MESSAGE_ID --timeout 180
 ```
 
 - Codex는 등록한 정확한 UUID에 `queue`한다. 성공 상태 `submitted`는 CLI 접수이며 모델 처리 완료가 아니다.
-- Claude는 등록한 UUID를 `--resume`하여 읽기 전용 `plan`, `Read,Grep,Glob`, `opus`로 호출한다. **쉬고 있는 전용 CLI 세션에만 사용한다.** 실행 중인 대화에 알림을 주입하는 방식이 아니다. 반환된 텍스트는 reply로 연결되며 watch/wait에도 전달된다.
+- Claude는 등록한 UUID를 `--resume`하여 읽기 전용 `plan`, `Read,Grep,Glob`, `opus`로 호출한다. **쉬고 있는 전용 CLI 세션에만 사용한다.** 실행 중인 대화에 알림을 주입하는 방식이 아니다(그것은 `claude-peer`). 반환된 텍스트는 reply로 연결되며 watch/wait에도 전달된다.
 - 외부 CLI 실행은 브로커 밖에서 수행하므로 다른 대화의 이벤트 전달을 막지 않는다. 실행 전 브로커가 메시지를 `dispatching`으로 선점한다.
 - 비정상 종료·타임아웃·해석 실패는 `uncertain`이다. 자동 재전송하지 않고 같은 세션의 후속 전달도 막는다. 프로세스 실행 자체가 실패하면 `failed`다.
 - 전달 중 브로커가 재시작하면 결과를 기록할 수 없다. 외부 실행이 취소됐다고 간주하지 말고 상대 세션에서 확인한다.
@@ -181,4 +203,4 @@ python3 "$bridge_cli" resolve MESSAGE_ID --state done --note '결과 확인 완�
 
 같은 OS 계정을 신뢰하는 로컬 도구다. 이름은 인증 수단이 아니며 동료 메시지가 새로운 사용자 승인을 대신하지 않는다. 요청에는 목적, 허용 파일, 작업 경로와 완료 조건을 적고 프로젝트 지침을 따른다. 파일 잠금·Git 병합·원격 머신 연결은 지원하지 않는다.
 
-테스트는 실제 Unix 소켓과 별도 CLI 프로세스로 구독·요청·답변·대기·재연결·브로커 종료를 검증한다. CLI 어댑터는 가짜 프로세스로 검증한다. 실제 AI 모델끼리의 자동 왕복을 검증한 것은 아니다.
+테스트는 실제 Unix 소켓과 별도 CLI 프로세스로 구독·요청·답변·대기·재연결·브로커 종료를 검증한다. CLI 어댑터는 가짜 프로세스로, `claude-peer`는 가짜 세션 레지스트리·키·수신 소켓으로 검증한다(세션 해석 · 프레임 · 성공 · 실패 시 `pending` 유지와 종료 코드 1). 실제 AI 모델끼리의 자동 왕복을 검증한 것은 아니다.

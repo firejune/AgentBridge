@@ -247,3 +247,63 @@ def inspect_session(provider, sid, executable=None, codex_mode='auto'):
     if len(matches) != 1:
         raise DiscoveryError('Claude session is absent or ambiguous in the agent registry; not selecting another session')
     return {'session':matches[0],'warning':None}
+
+
+# --- Claude Code live-session registry (peerProtocol 1) ---------------------
+# Undocumented internal Claude Code protocol, reverse-read from Claude Code
+# 2.1.295. Each live session writes ~/.claude/sessions/<pid>.json with its
+# sessionId and messagingSocketPath. Anything unexpected is a loud failure:
+# the bridge never guesses another session or another protocol version.
+PEER_PROTOCOL = 1
+
+
+def claude_sessions_dir():
+    base = os.environ.get('CLAUDE_CONFIG_DIR')
+    return Path(base).expanduser() / 'sessions' if base else Path.home() / '.claude' / 'sessions'
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def resolve_claude_peer(sid, sessions_dir=None):
+    """Return the live peer endpoint of one exact Claude sessionId, or raise."""
+    sid = str(uuid.UUID(sid))
+    root = Path(sessions_dir) if sessions_dir else claude_sessions_dir()
+    if not root.is_dir():
+        raise DiscoveryError(f'Claude session registry is missing: {root}')
+    records = []
+    for path in root.iterdir():
+        if not re.fullmatch(r'\d+\.json', path.name):
+            continue
+        try:
+            record = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue  # Files are rewritten while sessions update their status.
+        if isinstance(record, dict) and record.get('sessionId') == sid:
+            records.append((path, record))
+    if not records:
+        raise DiscoveryError(f'No Claude session file has sessionId {sid}; the session is not running')
+    live = [(p, r) for p, r in records if isinstance(r.get('pid'), int)
+            and p.name == f"{r['pid']}.json" and pid_alive(r['pid'])]
+    if not live:
+        raise DiscoveryError(f'Claude session {sid} is not alive (pid {records[0][1].get("pid")!r} is gone)')
+    if len(live) > 1:
+        raise DiscoveryError(f'{len(live)} live Claude processes claim session {sid}; not choosing one')
+    path, record = live[0]
+    if record.get('peerProtocol') != PEER_PROTOCOL:
+        raise DiscoveryError(f'Claude session {sid} speaks peerProtocol {record.get("peerProtocol")!r}; '
+                             f'the bridge supports only {PEER_PROTOCOL}')
+    sock = record.get('messagingSocketPath')
+    if not isinstance(sock, str) or not sock.startswith('/'):
+        raise DiscoveryError(f'Claude session {sid} has no messaging socket (inbox not running)')
+    return {'provider':'claude','id':sid,'name':record.get('name'),'cwd':record.get('cwd'),
+            'status':record.get('status','unknown'),'pid':record['pid'],'socket':sock,
+            'peer_protocol':record['peerProtocol'],'version':record.get('version'),
+            'registry':str(path),'observed_at':observed_now(),'scope':'Claude live-session registry'}
