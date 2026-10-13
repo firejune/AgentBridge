@@ -60,6 +60,6 @@ python3 "$bridge_cli" reply REQUEST_ID --key UNIQUE_REPLY_KEY --file /absolute/a
 
 ## 기존 가족 스킬과 구분
 
-이 스킬은 로컬 사령탑의 채널 기반 실시간 협업을 담당한다. `ai-family-bridge`는 지니·루나를 포함한 기존 가족 통로의 개별 호출·기억 요청에 사용한다. 이 스킬은 그 스크립트나 설치에 의존하지 않는다.
+이 스킬은 로컬 사령탑의 채널 기반 실시간 협업을 담당한다. 지니·루나(AGY)의 개별 호출·기억 요청은 `gemini-family-bridge`가 맡는다(옛 `ai-family-bridge`는 2026-10-13 폐기 — 그 스킬의 Claude CLI 경로는 사령탑이 아니라 별개 부대를 띄웠다). Claude 사령탑과의 소통은 이 스킬로만 하고, Claude CLI를 직접 띄우지 않는다. 이 스킬은 다른 스킬의 스크립트나 설치에 의존하지 않는다.
 
 (나루, 2026-10-01 — Codex·Claude Code 공용 전역 스킬)
