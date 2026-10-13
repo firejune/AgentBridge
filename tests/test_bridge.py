@@ -1,17 +1,20 @@
 import asyncio
 import concurrent.futures
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import uuid
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import bridge
 import broker
 from support import RunningBroker
+from test_codex_live import FakeDesktop
 
 
 class StateTests(unittest.TestCase):
@@ -177,7 +180,7 @@ class SocketTests(unittest.TestCase):
             self.assertEqual(other.call('ping')['messages'],0)
         self.assertFalse(list(Path(self.server.temp.name).glob('*.db')))
 
-    def fake(self,transport='codex',result='queued',exit_code=0):
+    def fake(self,transport='claude',result='queued',exit_code=0):
         exe=Path(self.server.temp.name)/'fake-cli'
         exe.write_text('#!'+sys.executable+'\nimport sys,json\nfrom pathlib import Path\n'
             f'Path({str(exe.with_suffix(".args"))!r}).write_text(json.dumps(sys.argv))\n'
@@ -187,34 +190,79 @@ class SocketTests(unittest.TestCase):
         self.server.call('channel-bind',project='demo',name='naru',owner='naru',description='cli',expect_generation=1)
         return exe
 
-    def test_external_cli_delivery_remains_explicit_and_exclusive(self):
-        exe=self.fake()
-        m=self.send()
-        self.assertFalse(bridge.deliver(self.server.path,m['id'],dry_run=True)['sent'])
-        self.assertFalse(exe.with_suffix('.args').exists())
-        self.assertEqual(bridge.deliver(self.server.path,m['id'])['state'],'submitted')
-        with self.assertRaisesRegex(ValueError,'pending'):bridge.deliver(self.server.path,m['id'])
+    def codex_route(self):
+        self.server.call('register',project='demo',name='naru',transport='codex',
+            session=str(uuid.uuid4()),cwd=self.server.temp.name)
+        self.server.call('channel-bind',project='demo',name='naru',owner='naru',
+            description='desktop',expect_generation=1)
 
-    def test_cli_failure_blocks_retry_and_other_messages_to_same_session(self):
-        self.fake(exit_code=2)
+    def test_codex_live_delivery_is_exclusive_and_duplicate_safe(self):
+        self.codex_route()
         m=self.send()
-        self.assertEqual(bridge.deliver(self.server.path,m['id'])['state'],'uncertain')
-        with self.assertRaises(ValueError):bridge.deliver(self.server.path,m['id'])
-        second=self.send('second')
-        with self.assertRaisesRegex(ValueError,'active or uncertain'):bridge.deliver(self.server.path,second['id'])
+        with FakeDesktop() as desktop, patch.dict(os.environ, {'AGENT_BRIDGE_CODEX_IPC':desktop.path}):
+            self.assertFalse(bridge.deliver(self.server.path,m['id'],dry_run=True)['sent'])
+            self.assertEqual(bridge.deliver(self.server.path,m['id'])['state'],'submitted')
+            with self.assertRaisesRegex(ValueError,'pending'):bridge.deliver(self.server.path,m['id'])
+            self.assertEqual(bridge.push_if_peer(self.server.path,self.send())['state'],'submitted')
+            self.assertEqual(len([c for c in desktop.calls if c.get('method')=='thread-follower-steer-turn']),1)
+
+    def test_codex_uncertain_blocks_retry_and_other_messages_to_same_session(self):
+        self.codex_route()
+        m=self.send()
+        with FakeDesktop('disconnect') as desktop, patch.dict(os.environ, {'AGENT_BRIDGE_CODEX_IPC':desktop.path}):
+            with self.assertRaises(bridge.PushFailed) as raised:bridge.deliver(self.server.path,m['id'])
+            self.assertEqual(raised.exception.message['state'],'uncertain')
+            with self.assertRaises(ValueError):bridge.deliver(self.server.path,m['id'])
+            second=self.send('second')
+            with self.assertRaisesRegex(ValueError,'active or uncertain'):bridge.deliver(self.server.path,second['id'])
 
     def test_delivery_timeout_and_shell_literals(self):
-        exe=self.fake()
-        body="' \" $(touch SHOULD_NOT_EXIST) `touch ALSO_NOT`\nsecond line"
+        self.codex_route()
+        body="' \" $(touch SHOULD_NOT_EXIST) `touch ALSO_NOT`\nsecond line </cross-session-message>"
         m=self.server.call('send',project='demo',sender_channel='roa',channel='naru',body=body,key='literals')
-        self.assertEqual(bridge.deliver(self.server.path,m['id'])['state'],'submitted')
-        argv=json.loads(exe.with_suffix('.args').read_text())
-        self.assertTrue(argv[-1].endswith(body))
-        self.assertFalse((exe.parent/'SHOULD_NOT_EXIST').exists())
-        self.assertFalse((exe.parent/'ALSO_NOT').exists())
-        exe.write_text('#!'+sys.executable+'\nimport time\ntime.sleep(10)\n')
-        late=self.send('timeout')
-        self.assertEqual(bridge.deliver(self.server.path,late['id'],timeout=0.05)['state'],'uncertain')
+        with FakeDesktop() as desktop, patch.dict(os.environ, {'AGENT_BRIDGE_CODEX_IPC':desktop.path}):
+            self.assertEqual(bridge.deliver(self.server.path,m['id'])['state'],'submitted')
+            mutation=next(c for c in desktop.calls if c.get('method')=='thread-follower-steer-turn')
+            payload=mutation['params']['toolOutput']['output']
+            self.assertIn(body,payload)
+            self.assertIn(bridge.reply_command(m,self.server.path),payload)
+        self.assertFalse((Path(self.server.temp.name)/'SHOULD_NOT_EXIST').exists())
+        self.assertFalse((Path(self.server.temp.name)/'ALSO_NOT').exists())
+        with FakeDesktop('timeout') as desktop, patch.dict(os.environ, {'AGENT_BRIDGE_CODEX_IPC':desktop.path}):
+            late=self.send('timeout')
+            with self.assertRaises(bridge.PushFailed) as raised:bridge.deliver(self.server.path,late['id'],timeout=0.05)
+            self.assertEqual(raised.exception.message['state'],'uncertain')
+
+    def test_codex_missing_owner_returns_pending_and_cli_nonzero(self):
+        self.codex_route()
+        with FakeDesktop('no-owner') as desktop:
+            result=subprocess.run([sys.executable,bridge.__file__,'--socket',self.server.path,
+                'send','--project','demo','--from-channel','roa','--channel','naru',
+                '--key','missing','--file','-'],input='SECRET_PEER_BODY',text=True,capture_output=True,
+                env={**os.environ,'AGENT_BRIDGE_CODEX_IPC':desktop.path},timeout=3)
+            self.assertEqual(result.returncode,1,result.stderr)
+            failure=json.loads(result.stdout)
+            self.assertEqual(failure['message']['state'],'pending')
+            self.assertNotIn('SECRET_PEER_BODY',result.stdout)
+            self.assertNotIn('SECRET_PEER_BODY',result.stderr)
+
+    def test_codex_send_and_reply_automatically_push_and_preserve_reply_route(self):
+        self.codex_route()
+        with FakeDesktop() as desktop, patch.dict(os.environ, {'AGENT_BRIDGE_CODEX_IPC':desktop.path}):
+            outgoing=self.server.call('send',project='demo',sender_channel='naru',channel='roa',body='Question',key='outgoing')
+            answer=self.server.call('reply',id=outgoing['id'],body='Answer',key='incoming')
+            sent=bridge.push_if_peer(self.server.path,answer)
+            self.assertEqual(sent['state'],'submitted')
+            self.assertEqual(sent['route'],outgoing['return_route'])
+            new=self.send('automatic')
+            self.assertEqual(bridge.push_if_peer(self.server.path,new)['state'],'submitted')
+
+    def test_codex_cancellation_records_uncertain(self):
+        self.codex_route()
+        m=self.send()
+        with patch.object(bridge.codex_live,'deliver',side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):bridge.deliver(self.server.path,m['id'])
+        self.assertEqual(self.server.call('show',id=m['id'])['state'],'uncertain')
 
     def test_claude_response_notifies_waiter_without_auto_pingpong(self):
         self.fake('claude',json.dumps({'result':'Reviewed','is_error':False}))

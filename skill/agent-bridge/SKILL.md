@@ -23,7 +23,7 @@ python3 "$bridge_cli" --help
 1. `sessions`로 실제 세션을 찾고 `session`으로 정확한 UUID·제목·작업 경로를 확인한다. 여러 후보가 있으면 현재 작업과 사람의 지시로 구별한다. 제목의 유사성이나 최신순만으로 상대를 선택하지 않는다. **그래도 하나로 좁혀지지 않으면 보내지 말고 사람(오빠)에게 어느 세션인지 묻는다** — 세션이 여럿 떠 있는 것이 평소 상태이고, 엉뚱한 세션에 보낸 지시는 그 세션의 작업을 오염시킨다(2026-10-13).
 2. `ping`으로 브로커를 확인한다. 이미 실행 중이면 재사용한다. 연결이 없고 브릿지 운영이 요청 범위라면 `serve`를 실행하고 `ready` 결과를 확인한다. `serve`는 장기 실행 명령이므로 실행 도구의 세션을 유지하며 관리한다.
 3. `register`로 양쪽 이름과 연결을 등록하고, `channel-bind`로 프로젝트별 작업 채널을 연결한다. 등록 전에 `routes`/`channels`를 확인해 다른 사령탑의 연결을 덮어쓰지 않는다.
-4. 수신 측이 `realtime`이면 `watch`를 연결하고 `subscribed`를 확인한다. 수신 측이 `claude-peer`(살아 있는 Claude 사령탑)이면 watch가 필요 없다 — 메시지가 그 세션의 다음 턴으로 바로 들어간다. 발신은 `send` 또는 `ask`, 답변은 `reply REQUEST_ID`로 연결한다.
+4. 수신 측이 `realtime`이면 `watch`를 연결하고 `subscribed`를 확인한다. `claude-peer`와 `codex`는 watch 없이 기존 세션에 push한다. Codex는 활성 턴에 동료 도구 출력을 넣고, idle이면 같은 대화에서 턴 하나를 시작한다. 발신은 `send` 또는 `ask`, 답변은 `reply REQUEST_ID`로 연결한다.
 
 ```bash
 python3 "$bridge_cli" sessions --cwd /absolute/project
@@ -52,6 +52,19 @@ python3 "$bridge_cli" register roa --project PROJECT --transport claude-peer \
 
 ## 질문과 답변
 
+### Codex 데스크톱의 기존 대화에 push
+
+`codex`로 등록된 정확한 UUID에 `send`·`ask`·`reply`가 자동 전달된다. Python 클라이언트가 현재 사용자의 `CODEX_HOME`(기본 `~/.codex`) 아래 `ipc/ipc.sock`에 붙어 그 대화의 소유자를 확인한다. 명시적인 별도 IPC 경로는 `AGENT_BRIDGE_CODEX_IPC` 환경 변수로 지정한다. 소켓과 부모 디렉터리가 현재 사용자 소유이고 부모가 다른 사용자에게 쓰기 가능하지 않아야 한다.
+
+- 소유자가 `supportsUntrustedAppInput`을 지원해야 한다. 다른 UUID·최신 세션·새 모델·임시 app-server로 전환하지 않는다.
+- 동료 본문은 standalone `toolOutput`(`agent_bridge`)로 전달한다. 사람 지시로 승격하지 않고, 실행 중인 도구의 call ID를 만들어 응답하지 않는다. 본문에는 발신자·메시지 ID·프로젝트·채널과 브릿지 reply 명령이 포함된다.
+- 활성 소유자의 `thread-follower-steer-turn`을 먼저 호출한다. 이 앱의 도구 출력 경로는 내부에서 `turn/start`의 빈 input과 toolOutput을 사용해 기존 활성 턴에 넣는다. 정확한 inactive 오류일 때만 같은 소유자의 `thread-follower-start-turn`을 호출한다. 모델·권한 설정은 기존 대화에서 상속한다.
+- 성공은 `submitted`와 수락한 turn ID다. 모델이 읽거나 실행하거나 답한 완료 증거는 아니다.
+- 전달 전 연결·소유자·지원 기능 확인 실패는 `pending`과 종료 코드 1이다. 전송 후 타임아웃·연결 종료·알 수 없는 오류는 `uncertain`과 종료 코드 1이다. 자동 재시도나 숨은 `codex queue` 폴백은 없다. 같은 세션의 후속 전달도 uncertain이 해소되기 전 막힌다.
+- 데스크톱의 **문서화되지 않은 버전별 IPC**에 의존한다. 업데이트로 계약이 바뀌면 실패하며, 실제 모델 수신은 별도로 확인한다. [공식 standalone tool output 동작](https://learn.chatgpt.com/docs/app-server#start-a-turn)과 이 내부 연결 경로를 구분한다.
+
+(나루, 2026-10-14 — Codex 기존 대화의 도구 출력 전달 경로)
+
 ```bash
 python3 "$bridge_cli" watch --project PROJECT --channel view
 python3 "$bridge_cli" ask --project PROJECT --from-channel logic --channel view \
@@ -70,7 +83,7 @@ python3 "$bridge_cli" reply REQUEST_ID --key UNIQUE_REPLY_KEY --file /absolute/a
 
 - 상태는 메모리에만 있다. 브로커 재시작 시 채널, 메시지, 중복키가 초기화된다. 기존 공유 브로커를 임의로 재시작하거나 종료하지 않는다. 직접 시작한 인스턴스는 참가자들의 작업 종료를 확인한 뒤 정리한다.
 - `watch`는 연결 당시 채널 세대를 유지한다. 인계 후 새 담당자는 새로 구독한다. 이미 진행 중인 요청의 목적지·답장 주소는 원래 세대를 유지한다.
-- `deliver`는 `codex`/`claude` 경로의 별도 동작이다. Codex `queue` 성공은 CLI 접수이고, Claude `resume`은 쉬고 있는 전용 세션을 읽기 전용으로 실행한다(사령탑 금지, 위 ⛔). 실행 중인 Claude 대화에 넣는 통로는 `claude-peer` push뿐이다. `uncertain` 결과는 자동 재전송하지 않는다.
+- `deliver`는 pending Codex push의 명시적 재집행과 쉬고 있는 전용 `claude` 경로에 사용한다. Codex는 자동 push와 동일한 기존 데스크톱 경로를 쓰며 queue하지 않는다. Claude `resume`은 쉬고 있는 전용 세션을 읽기 전용으로 실행한다(사령탑 금지, 위 ⛔). 실행 중인 Claude 대화에 넣는 통로는 `claude-peer` push뿐이다. `uncertain` 결과는 자동 재전송하지 않는다.
 - Codex 저장 목록의 `notLoaded`는 다른 앱의 실제 상태를 나타내지 않으므로 브릿지는 `unknown`으로 표시한다. 세션 조회 성공을 전달 성공으로 보고하지 않는다.
 - 복구·재연결·실행 상태가 필요할 때 [사용법](references/usage.md)의 해당 절을 읽는다. 합의 결과의 장기 보존이 필요하면 프로젝트 산출물에 반영하며 브로커에 영구 보존을 기대하지 않는다.
 

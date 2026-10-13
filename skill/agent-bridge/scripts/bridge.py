@@ -14,7 +14,10 @@ import sys
 import os
 import uuid
 
+# Also resolve sibling modules when this entrypoint is imported via its root link.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import broker
+import codex_live
 import sessions
 
 def envelope(m):
@@ -50,12 +53,12 @@ def reply_command(m, path):
     return f"{REPLY_CLI}{sock} reply {m['id']} --key reply-{m['id']} --file <answer-file>"
 
 
-def peer_text(m, path):
+def peer_text(m, path, escape_peer=True):
     body = (envelope(m).rstrip('\n')+'\n\n'
             'Answer through the bridge, not SendMessage (SendMessage cannot reach a bridge address). '
             'Write the answer to a file (or use --file - with stdin) and run:\n'
             + reply_command(m, path))
-    return PEER_CLOSE_TAG.sub('<\\\\', body)
+    return PEER_CLOSE_TAG.sub('<\\\\', body) if escape_peer else body
 
 
 def peer_frame(m, target, path):
@@ -141,16 +144,41 @@ def push(path, m, dry_run=False):
 
 
 def push_if_peer(path, m):
-    if m['route']['transport'] == 'claude-peer' and m['state'] == 'pending':
-        return push(path, m)
+    if m['state'] == 'pending':
+        if m['route']['transport'] == 'claude-peer':
+            return push(path, m)
+        if m['route']['transport'] == 'codex':
+            return push_codex(path, m)
     return m
+
+
+def push_codex(path, m, timeout=10, dry_run=False):
+    def rpc(op, **fields):
+        return broker.request(path, {'op':op, 'id':m['id'], **fields})
+    if dry_run:
+        return dict(state=m['state'], **codex_live.deliver(
+            m['route'], m['id'], peer_text(m, path, escape_peer=False), timeout, dry_run=True))
+    rpc('claim')
+    try:
+        receipt = codex_live.deliver(m['route'], m['id'], peer_text(m, path, escape_peer=False), timeout)
+    except codex_live.DeliveryError as error:
+        state = 'uncertain' if error.uncertain else 'pending'
+        fields = {} if error.uncertain else {'event':'push_failed'}
+        message = rpc('finish', state=state, note=str(error), **fields)
+        raise PushFailed(str(error), message) from None
+    except BaseException:
+        # Cancellation may arrive after the owner accepted the output.
+        rpc('finish', state='uncertain', note='Codex delivery interrupted; check the receiving turn before resolving')
+        raise
+    return rpc('finish', state='submitted', event='pushed',
+               note=f"Codex {receipt['delivery_mode']} tool output accepted by turn {receipt['turn_id']}")
 
 
 def command(m):
     route = m['route']
     payload = envelope(m)
     if route['transport'] == 'codex':
-        return [route['executable'] or 'codex', 'queue', '--thread', route['session'], '--message', payload]
+        raise ValueError('Codex uses the existing desktop IPC owner, not a queued CLI process')
     if route['transport'] == 'claude':
         return [*sessions.cli_prefix(route['executable'] or 'claude'), '--resume', route['session'], '--model', 'opus',
                 '--strict-mcp-config', '--output-format', 'json', '--permission-prompts', 'none',
@@ -166,6 +194,10 @@ def deliver(path, mid, timeout=180, dry_run=False):
     def finish(state, note=None):
         return rpc("finish", state=state, note=note)
     m = rpc("show")
+    if m['route']['transport'] == 'codex':
+        if m['state'] != 'pending' and not dry_run:
+            raise ValueError('Only pending messages may be delivered')
+        return push_codex(path, m, timeout, dry_run)
     if m['route']['transport'] == 'claude-peer':
         if m['state'] != 'pending' and not dry_run:
             raise ValueError('Only pending messages may be delivered')
@@ -334,7 +366,10 @@ def main(argv=None):
     except KeyboardInterrupt:
         return 130
     except PushFailed as error:
-        output({'error':str(error),'push_failed':True,'message':error.message})
+        message = error.message
+        if message['route']['transport'] == 'codex':
+            message = {k:message[k] for k in ('id','state','route')}
+        output({'error':str(error),'push_failed':True,'message':message})
         return 1
     except (ValueError,OSError,subprocess.TimeoutExpired,KeyError,TypeError) as error:
         output({'error':str(error)})

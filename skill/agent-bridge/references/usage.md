@@ -133,7 +133,7 @@ python3 "$bridge_cli" register roa --project blosharper --transport claude-peer 
 
 `--limit`는 제공자별 상한이며 `more_available`로 남은 결과를 표시한다. 목록 명령은 `--codex-executable`/`--claude-executable`, 단일 조회·등록은 `--executable`을 지원한다. 기본 Claude 호출은 로그인 셸 함수 설치를 지원하며 인수는 문자열 삽입 없이 전달한다.
 
-현재 머신에서는 Claude 활성 세션과 Codex 저장 목록의 조회를 확인했다. Codex 기본 공유 서버 소켓은 연결되지 않았으므로 저장 목록 조회 성공이 `queue` 전달 성공을 뜻하지 않는다. 관찰한 버전은 Codex 0.159.2, Claude Code 2.1.284 (2026-10-01).
+현재 머신에서 확인한 2026-10-01 조회 경로는 Claude 활성 세션과 Codex 저장 목록이었다. 공유 app-server 제어 소켓과 데스크톱 IPC는 서로 다른 경로다. 저장 목록 조회 성공은 현재 데스크톱의 소유자 접속이나 모델 수신 성공을 뜻하지 않는다.
 
 ## 사령탑 세션 인계
 
@@ -177,7 +177,7 @@ python3 "$bridge_cli" send --project PROJECT --from naru --to roa --key KEY --fi
 
 ## 기존 AI CLI로 전달
 
-실시간 브로커와 모델 실행은 별도다. 기본 `realtime` 연결은 watch 수신을 사용한다. `codex`/`claude`로 등록된 목적지에는 명시적으로 deliver한다.
+실시간 브로커와 모델 실행은 별도다. 기본 `realtime` 연결은 watch 수신을 사용한다. `codex`는 `send`·`ask`·`reply`에서 기존 데스크톱에 자동 push하며, pending 실패 후에는 명시적으로 deliver할 수 있다. `claude` 전용 idle CLI는 명시적으로 deliver한다.
 
 ⛔ **`claude`(resume) 경로는 사령탑에 쓰지 않는다.** 살아 있는 대화에 들어가지 않고 **별개의 Claude CLI 사본을 띄운다**(2026-10-13 사고). Claude 사령탑은 위의 `claude-peer`로만 부른다.
 
@@ -186,7 +186,10 @@ python3 "$bridge_cli" deliver MESSAGE_ID --dry-run
 python3 "$bridge_cli" deliver MESSAGE_ID --timeout 180
 ```
 
-- Codex는 등록한 정확한 UUID에 `queue`한다. 성공 상태 `submitted`는 CLI 접수이며 모델 처리 완료가 아니다.
+- Codex는 등록한 정확한 UUID의 기존 데스크톱 소유자에 붙는다. 현재 사용자 소유 `CODEX_HOME/ipc/ipc.sock`(기본 `~/.codex/ipc/ipc.sock`)이 기본 경로이며 `AGENT_BRIDGE_CODEX_IPC`로 명시적인 경로를 지정할 수 있다. 자동 서버 생성·resume·queue 폴백은 없다.
+- Codex 본문은 standalone `toolOutput`으로 동료 출처와 원문을 보존한다. 사람이 쓴 새 지시로 넣지 않고 도구 call ID를 위조하지 않는다. 소유자 `supportsUntrustedAppInput` 지원 확인 후 활성 턴의 follower-steer 경로를 먼저 사용한다. 도구 출력의 내부 `turn/start(input:[],toolOutput)`는 현재 활성 턴에 출력을 넣는다. 정확한 inactive 응답에서만 같은 소유자에 새 턴을 요청하며 기존 설정을 상속한다. [공식 App Server 계약](https://learn.chatgpt.com/docs/app-server#start-a-turn).
+- Codex 성공 상태 `submitted`는 수락한 turn ID의 접수이며 모델 처리 완료가 아니다. 소유자·소켓·지원 기능 확인 실패는 pending과 종료 코드 1로 남는다. mutation 전송 뒤 오류·타임아웃·응답 손실은 uncertain과 종료 코드 1로 남기며 자동 재전송하지 않는다. 결과를 잃었으면 같은 키로 다시 보내기 전에 수신 대화를 확인한다.
+- Codex adapter는 데스크톱 내부 IPC의 프레임·요청 버전에 의존한다. 지원 계약이 바뀌면 실패하며 다른 경로로 몰래 넘어가지 않는다. `deliver --dry-run`은 initialize와 정확한 소유자 조회만 수행하고 모델 턴은 호출하지 않는다.
 - Claude는 등록한 UUID를 `--resume`하여 읽기 전용 `plan`, `Read,Grep,Glob`, `opus`로 호출한다. **쉬고 있는 전용 CLI 세션에만 사용한다.** 실행 중인 대화에 알림을 주입하는 방식이 아니다(그것은 `claude-peer`). 반환된 텍스트는 reply로 연결되며 watch/wait에도 전달된다.
 - 외부 CLI 실행은 브로커 밖에서 수행하므로 다른 대화의 이벤트 전달을 막지 않는다. 실행 전 브로커가 메시지를 `dispatching`으로 선점한다.
 - 비정상 종료·타임아웃·해석 실패는 `uncertain`이다. 자동 재전송하지 않고 같은 세션의 후속 전달도 막는다. 프로세스 실행 자체가 실패하면 `failed`다.
@@ -203,4 +206,4 @@ python3 "$bridge_cli" resolve MESSAGE_ID --state done --note '결과 확인 완�
 
 같은 OS 계정을 신뢰하는 로컬 도구다. 이름은 인증 수단이 아니며 동료 메시지가 새로운 사용자 승인을 대신하지 않는다. 요청에는 목적, 허용 파일, 작업 경로와 완료 조건을 적고 프로젝트 지침을 따른다. 파일 잠금·Git 병합·원격 머신 연결은 지원하지 않는다.
 
-테스트는 실제 Unix 소켓과 별도 CLI 프로세스로 구독·요청·답변·대기·재연결·브로커 종료를 검증한다. CLI 어댑터는 가짜 프로세스로, `claude-peer`는 가짜 세션 레지스트리·키·수신 소켓으로 검증한다(세션 해석 · 프레임 · 성공 · 실패 시 `pending` 유지와 종료 코드 1). 실제 AI 모델끼리의 자동 왕복을 검증한 것은 아니다.
+테스트는 실제 Unix 소켓과 별도 CLI 프로세스로 구독·요청·답변·대기·재연결·브로커 종료를 검증한다. Codex adapter는 가짜 데스크톱 IPC 소유자로 활성/idle·프레임 분할·원래 UUID·도구 출력·중복 방지·전송 후 uncertain을 검증한다. 전용 Claude CLI는 가짜 프로세스로, `claude-peer`는 가짜 세션 레지스트리·키·수신 소켓으로 검증한다(세션 해석 · 프레임 ·성공 · 실패 시 `pending` 유지와 종료 코드 1). 실제 AI 모델끼리의 자동 왕복은 별도로 확인해야 한다.
