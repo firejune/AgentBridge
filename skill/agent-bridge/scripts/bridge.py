@@ -16,6 +16,7 @@ import uuid
 
 # Also resolve sibling modules when this entrypoint is imported via its root link.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import agy_live
 import broker
 import codex_live
 import sessions
@@ -149,6 +150,8 @@ def push_if_peer(path, m):
             return push(path, m)
         if m['route']['transport'] == 'codex':
             return push_codex(path, m)
+        if m['route']['transport'] == 'agy':
+            return push_agy(path, m)
     return m
 
 
@@ -174,11 +177,36 @@ def push_codex(path, m, timeout=10, dry_run=False):
                note=f"Codex {receipt['delivery_mode']} tool output accepted by turn {receipt['turn_id']}")
 
 
+def push_agy(path, m, timeout=10, dry_run=False):
+    def rpc(op, **fields):
+        return broker.request(path, {'op':op, 'id':m['id'], **fields})
+    text = peer_text(m, path, escape_peer=False)
+    if dry_run:
+        return dict(state=m['state'], **agy_live.deliver(
+            m['route'], m['id'], text, m['sender'], m['project'], timeout, dry_run=True))
+    rpc('claim')
+    try:
+        receipt = agy_live.deliver(m['route'], m['id'], text, m['sender'], m['project'], timeout)
+    except agy_live.DeliveryError as error:
+        state = 'uncertain' if error.uncertain else 'pending'
+        fields = {} if error.uncertain else {'event':'push_failed'}
+        reason = str(error) if error.uncertain else f'push_failed: {error}'
+        message = rpc('finish', state=state, note=reason, **fields)
+        raise PushFailed(reason, message) from None
+    except BaseException:
+        rpc('finish', state='uncertain', note='Antigravity delivery interrupted; check the receiving session before resolving')
+        raise
+    return rpc('finish', state='submitted', event='pushed',
+               note=f"pushed to Antigravity session {receipt['session']} (pid {receipt['pid']})")
+
+
 def command(m):
     route = m['route']
     payload = envelope(m)
     if route['transport'] == 'codex':
         raise ValueError('Codex uses the existing desktop IPC owner, not a queued CLI process')
+    if route['transport'] == 'agy':
+        raise ValueError('Antigravity uses the live desktop server, not a queued CLI process')
     if route['transport'] == 'claude':
         return [*sessions.cli_prefix(route['executable'] or 'claude'), '--resume', route['session'], '--model', 'opus',
                 '--strict-mcp-config', '--output-format', 'json', '--permission-prompts', 'none',
@@ -202,6 +230,10 @@ def deliver(path, mid, timeout=180, dry_run=False):
         if m['state'] != 'pending' and not dry_run:
             raise ValueError('Only pending messages may be delivered')
         return push(path, m, dry_run)
+    if m['route']['transport'] == 'agy':
+        if m['state'] != 'pending' and not dry_run:
+            raise ValueError('Only pending messages may be delivered')
+        return push_agy(path, m, timeout, dry_run)
     cmd = command(m)
     route = m['route']
     if dry_run:
@@ -278,17 +310,17 @@ def main(argv=None):
     sub.add_parser('ping'); sub.add_parser('stop')
     p = sub.add_parser('register')
     p.add_argument('name');p.add_argument('--project',required=True)
-    p.add_argument('--transport',choices=['realtime','codex','claude','claude-peer'],default='realtime')
+    p.add_argument('--transport',choices=['realtime','codex','claude','claude-peer','agy'],default='realtime')
     p.add_argument('--session');p.add_argument('--cwd');p.add_argument('--executable')
     p.add_argument('--discover',action='store_true')
     p.add_argument('--codex-mode',choices=['auto','shared','saved'],default='auto')
     p = sub.add_parser('sessions',help='Discover real CLI sessions without starting a turn')
-    p.add_argument('--provider',choices=['all','codex','claude'],default='all')
+    p.add_argument('--provider',choices=['all','codex','claude','agy'],default='all')
     p.add_argument('--cwd');p.add_argument('--search');p.add_argument('--limit',type=int,default=100)
     p.add_argument('--codex-executable',default='codex');p.add_argument('--claude-executable',default='claude')
     p.add_argument('--codex-mode',choices=['auto','shared','saved'],default='auto')
     p = sub.add_parser('session')
-    p.add_argument('provider',choices=['codex','claude']);p.add_argument('id');p.add_argument('--executable')
+    p.add_argument('provider',choices=['codex','claude','agy']);p.add_argument('id');p.add_argument('--executable')
     p.add_argument('--codex-mode',choices=['auto','shared','saved'],default='auto')
     for cmd in ('routes','channels'):
         p = sub.add_parser(cmd);p.add_argument('--project',required=True)

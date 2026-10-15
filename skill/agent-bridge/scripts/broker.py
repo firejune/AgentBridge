@@ -145,7 +145,7 @@ class State:
         if op == 'register':
             project, name = identifier(args['project']), identifier(args['name'])
             transport = args.get('transport','realtime')
-            if transport not in ('realtime','codex','claude','claude-peer'):
+            if transport not in ('realtime','codex','claude','claude-peer','agy'):
                 raise ValueError('Unknown transport')
             cwd = str(Path(args['cwd']).expanduser().resolve(strict=True))
             if not Path(cwd).is_dir():

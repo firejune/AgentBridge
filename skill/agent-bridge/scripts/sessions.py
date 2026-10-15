@@ -5,15 +5,30 @@ import os
 import re
 from pathlib import Path
 import selectors
+import shutil
 import signal
 import subprocess
 import tempfile
 import time
 import uuid
 
+import agy_live
+
 
 class DiscoveryError(ValueError):
     pass
+
+
+def resolve_codex_executable(executable):
+    if executable != 'codex' or shutil.which('codex'):
+        return executable
+    for candidate in (
+        '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
+        '/Applications/Codex.app/Contents/Resources/codex',
+    ):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return executable
 
 
 def cli_prefix(executable):
@@ -59,7 +74,7 @@ def stop_process(process):
 
 class CodexClient:
     def __init__(self, executable='codex', mode='auto', timeout=10):
-        self.executable, self.timeout = executable, timeout
+        self.executable, self.timeout = resolve_codex_executable(executable), timeout
         self.warning = None
         try:
             self.open('shared' if mode == 'auto' else mode)
@@ -229,10 +244,16 @@ def discover(provider='all', cwd=None, search=None, limit=100,
     if limit <= 0:
         raise ValueError('Limit must be positive')
     results, errors = {}, {}
-    for name in (('codex','claude') if provider == 'all' else (provider,)):
+    for name in (('codex','claude','agy') if provider == 'all' else (provider,)):
         try:
-            results[name] = (list_codex(codex_executable,cwd,search,limit,codex_mode) if name == 'codex'
-                             else list_claude(claude_executable,cwd,search,limit))
+            if name == 'codex':
+                results[name] = list_codex(codex_executable,cwd,search,limit,codex_mode)
+            elif name == 'claude':
+                results[name] = list_claude(claude_executable,cwd,search,limit)
+            elif name == 'agy':
+                results[name] = agy_live.list_agy(cwd,search,limit)
+            else:
+                raise ValueError(f'Unknown provider: {name}')
         except (ValueError, OSError, subprocess.TimeoutExpired, KeyError, TypeError) as error:
             errors[name] = str(error)
     return {'providers':results,'errors':errors}
@@ -242,6 +263,8 @@ def inspect_session(provider, sid, executable=None, codex_mode='auto'):
     sid = str(uuid.UUID(sid))
     if provider == 'codex':
         return read_codex(sid,executable or 'codex',codex_mode)
+    if provider == 'agy':
+        return agy_live.read_agy(sid)
     listing = list_claude(executable or 'claude',limit=1000000)
     matches = [row for row in listing['sessions'] if row['id'] == sid]
     if len(matches) != 1:

@@ -1,6 +1,6 @@
 # Agent Bridge
 
-Codex·Claude Code 사령탑의 세션을 조회하고 로컬 소켓으로 실시간 질문·답변을 주고받는 도구. Python 표준 라이브러리만 사용하며 상태는 메모리에 유지한다.
+Codex·Claude Code·Antigravity(AGY) 사령탑의 세션을 조회하고 로컬 소켓 및 데스크톱 런타임으로 실시간 질문·답변을 주고받는 도구. Python 표준 라이브러리만 사용하며 상태는 메모리에 유지한다.
 
 - [스킬 진입점](skill/agent-bridge/SKILL.md)
 - [명령·운영 사용법](skill/agent-bridge/references/usage.md)
@@ -10,20 +10,22 @@ Codex·Claude Code 사령탑의 세션을 조회하고 로컬 소켓으로 실�
 
 ## 전역 설치
 
-이 머신에서는 아래 세 경로를 동일한 `skill/agent-bridge` 폴더로 연결했다.
+이 머신에서는 아래 네 경로를 동일한 `skill/agent-bridge` 폴더로 연결했다.
 
 - Codex: `~/.codex/skills/agent-bridge`
 - 공용 탐색·실행 경로: `~/.agents/skills/agent-bridge`
 - Claude Code: `~/.claude/skills/agent-bridge`
+- Antigravity (AGY): `~/.gemini/config/skills/agent-bridge`
 
-Codex에서는 `$agent-bridge`, Claude Code에서는 `/agent-bridge`로 호출할 수 있다. 별도 실행 권한이나 자동 발신 권한을 추가하지 않는다. 스킬만 다른 곳에 설치할 때도 폴더 안의 스크립트와 참조 문서를 함께 유지한다.
+Codex에서는 `$agent-bridge`, Claude Code에서는 `/agent-bridge`로 호출할 수 있고, Antigravity에서는 `agent-bridge` 스킬로 로드된다. 별도 실행 권한이나 자동 발신 권한을 추가하지 않는다. 스킬만 다른 곳에 설치할 때도 폴더 안의 스크립트와 참조 문서를 함께 유지한다.
 
 ```bash
 python3 ~/.agents/skills/agent-bridge/scripts/bridge.py --help
 python3 ~/.agents/skills/agent-bridge/scripts/bridge.py sessions --provider claude
+python3 ~/.agents/skills/agent-bridge/scripts/bridge.py sessions --provider agy
 ```
 
-심볼릭 링크 설치이므로 저장소 위치를 옮기면 세 링크도 갱신해야 한다. 브로커를 재시작하면 메모리 상태가 사라진다. 전역 스킬 설치가 브로커를 자동 기동하거나 AI 대화를 깨우지는 않는다.
+심볼릭 링크 설치이므로 저장소 위치를 옮기면 네 링크도 갱신해야 한다. 브로커를 재시작하면 메모리 상태가 사라진다. 전역 스킬 설치가 브로커를 자동 기동하거나 AI 대화를 깨우지는 않는다.
 
 ## 개발·검증
 

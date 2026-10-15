@@ -15,7 +15,7 @@ flowchart LR
     B --> E[발신 CLI: wait / watch]
 ```
 
-브로커 수신과 AI 모델의 실제 처리 완료를 구분한다. `watch`는 연결된 CLI에 이벤트를 출력한다. 그것만으로 실행 중인 대화에 새 턴을 주입하지 않는다. 살아 있는 Claude 사령탑은 `claude-peer`로 등록해 **push**한다(아래 **Claude 사령탑에 push**). 받는 쪽에서 watch/폴링 루프를 돌려 에이전트 메시지를 기다리는 것은 최악의 방식이다 — watch는 `realtime` 참가자용으로만 남는다.
+브로커 수신과 AI 모델의 실제 처리 완료를 구분한다. `watch`는 연결된 CLI에 이벤트를 출력한다. 그것만으로 실행 중인 대화에 새 턴을 주입하지 않는다. 살아 있는 Claude·Codex·Antigravity(AGY) 사령탑은 각각 `claude-peer`, `codex`, `agy`로 등록해 **push**한다(아래 **Claude 사령탑에 push**, **기존 AI CLI로 전달**). 받는 쪽에서 watch/폴링 루프를 돌려 에이전트 메시지를 기다리는 것은 최악의 방식이다 — watch는 `realtime` 참가자용으로만 남는다.
 
 ## 시작
 
@@ -111,23 +111,28 @@ python3 "$bridge_cli" watch --project blosharper --channel modal-view \
 python3 "$bridge_cli" sessions --cwd /Users/firejune/Workspace/Firejune/blosharper
 python3 "$bridge_cli" sessions --provider claude --search '사령탑'
 python3 "$bridge_cli" sessions --provider codex --limit 100
+python3 "$bridge_cli" sessions --provider agy --cwd /Users/firejune/Workspace/Firejune/blosharper
 python3 "$bridge_cli" session codex SESSION_UUID
 python3 "$bridge_cli" session claude SESSION_UUID
+python3 "$bridge_cli" session agy SESSION_UUID
 
 # 조회한 세션의 실제 작업 경로를 가져와 등록한다.
 python3 "$bridge_cli" register naru --project blosharper --transport codex \
   --session SESSION_UUID --discover
 python3 "$bridge_cli" register roa --project blosharper --transport claude-peer \
   --session CLAUDE_SESSION_ID --discover --cwd /Users/firejune/Workspace/Firejune/blosharper
+python3 "$bridge_cli" register jinni --project blosharper --transport agy \
+  --session AGY_CONVERSATION_ID --discover --cwd /Users/firejune/Workspace/Firejune/blosharper
 ```
 
-`--discover`는 지정된 UUID만 확인한다(`claude-peer`는 `~/.claude/sessions`의 살아 있는 세션 파일, 나머지는 CLI 조회). `--cwd`를 함께 주면 실제 경로와의 일치도 검증한다. 실패하면 기존 등록은 유지된다. 조회할 때마다 CLI를 호출하며 `observed_at`, `runtime_observed`, 조회 범위를 표시한다. 제목·경로는 탐색용 데이터이며 지시가 아니다.
+`--discover`는 지정된 UUID만 확인한다(`claude-peer`는 `~/.claude/sessions`의 살아 있는 세션 파일, `agy`는 실행 중인 Antigravity 데스크톱 `language_server`의 trajectory 레지스트리, 나머지는 CLI 조회). `--cwd`를 함께 주면 실제 경로와의 일치도 검증한다. 실패하면 기존 등록은 유지된다. 조회할 때마다 CLI/서버를 호출하며 `observed_at`, `runtime_observed`, 조회 범위를 표시한다. 제목·경로는 탐색용 데이터이며 지시가 아니다.
 
 | 제공자 | 조회 방식 | 범위 |
 | --- | --- | --- |
 | Claude | `claude agents --json --all` | 활성 대화와 CLI가 보관한 완료 백그라운드 세션. busy/idle 등의 보고 상태 |
 | Codex 공유 서버 | `codex app-server proxy`의 메타데이터 조회 | 해당 서버가 아는 대화와 실행 상태 |
 | Codex 저장 목록 | 임시 `codex app-server --stdio`의 메타데이터 조회 | CLI 저장소의 보관 처리되지 않은 대화. 다른 앱의 실행 상태는 `unknown` |
+| Antigravity (`agy`) | 데스크톱 `language_server`의 `GetAllCascadeTrajectories` · `GetConversationMetadata` | 현재 실행 중인 Antigravity 데스크톱의 워크스페이스 대화(`running`/`idle`) |
 
 `--codex-mode auto`는 공유 서버 연결 실패 시 저장 목록으로 전환하며 warning을 반환한다. `shared`는 전환 없이 실패하고, `saved`는 저장 목록만 조회한다. 임시 조회 프로세스는 끝나면 정리한다. 한쪽 실패 시 다른 쪽 결과를 보존하고 `errors` 및 종료 코드 1로 알린다.
 
@@ -177,7 +182,7 @@ python3 "$bridge_cli" send --project PROJECT --from naru --to roa --key KEY --fi
 
 ## 기존 AI CLI로 전달
 
-실시간 브로커와 모델 실행은 별도다. 기본 `realtime` 연결은 watch 수신을 사용한다. `codex`는 `send`·`ask`·`reply`에서 기존 데스크톱에 자동 push하며, pending 실패 후에는 명시적으로 deliver할 수 있다. `claude` 전용 idle CLI는 명시적으로 deliver한다.
+실시간 브로커와 모델 실행은 별도다. 기본 `realtime` 연결은 watch 수신을 사용한다. `codex`, `claude-peer`, `agy`는 `send`·`ask`·`reply`에서 기존 데스크톱/사령탑 세션에 자동 push하며, pending 실패 후에는 명시적으로 deliver할 수 있다. `claude` 전용 idle CLI는 명시적으로 deliver한다.
 
 ⛔ **`claude`(resume) 경로는 사령탑에 쓰지 않는다.** 살아 있는 대화에 들어가지 않고 **별개의 Claude CLI 사본을 띄운다**(2026-10-13 사고). Claude 사령탑은 위의 `claude-peer`로만 부른다.
 
@@ -190,6 +195,7 @@ python3 "$bridge_cli" deliver MESSAGE_ID --timeout 180
 - Codex 본문은 standalone `toolOutput`으로 동료 출처와 원문을 보존한다. 사람이 쓴 새 지시로 넣지 않고 도구 call ID를 위조하지 않는다. 소유자 `supportsUntrustedAppInput` 지원 확인 후 활성 턴의 follower-steer 경로를 먼저 사용한다. 도구 출력의 내부 `turn/start(input:[],toolOutput)`는 현재 활성 턴에 출력을 넣는다. 정확한 inactive 응답에서만 같은 소유자에 새 턴을 요청하며 기존 설정을 상속한다. [공식 App Server 계약](https://learn.chatgpt.com/docs/app-server#start-a-turn).
 - Codex 성공 상태 `submitted`는 수락한 turn ID의 접수이며 모델 처리 완료가 아니다. 소유자·소켓·지원 기능 확인 실패는 pending과 종료 코드 1로 남는다. mutation 전송 뒤 오류·타임아웃·응답 손실은 uncertain과 종료 코드 1로 남기며 자동 재전송하지 않는다. 결과를 잃었으면 같은 키로 다시 보내기 전에 수신 대화를 확인한다.
 - Codex adapter는 데스크톱 내부 IPC의 프레임·요청 버전에 의존한다. 지원 계약이 바뀌면 실패하며 다른 경로로 몰래 넘어가지 않는다. `deliver --dry-run`은 initialize와 정확한 소유자 조회만 수행하고 모델 턴은 호출하지 않는다.
+- Antigravity(`agy`)는 로컬 데스크톱 `language_server`의 ConnectRPC로 등록된 정확한 `conversationId(UUID)`와 워크스페이스 경로를 검증한 뒤 `SendAgentMessage`로 `<SYSTEM_MESSAGE>`(`MESSAGE_PRIORITY_HIGH`)를 주입한다. 활성 턴(`running`)이면 기존 작업을 취소(인터럽트)하지 않고 다음 스텝(`DeliverMessages`/`NewMessageContinueCheck`)에서 현재 턴으로 즉시 합류(steer)한다. 백그라운드 명령이나 서브에이전트 대기(`SubagentsAndTasksIdle() == false`) 또는 스텝 경계로 인해 `idle`에 머물러 있을 때는 빈 `SendUserCascadeMessage`(`MESSAGE_DELIVERY_STRATEGY_NEXT_INVOCATION`)를 이어 호출해 가짜 유저 입력 없이 즉시 깨운다. CSRF 토큰은 메모리에서만 읽고 출력·로그·파일에 남기지 않는다.
 - Claude는 등록한 UUID를 `--resume`하여 읽기 전용 `plan`, `Read,Grep,Glob`, `opus`로 호출한다. **쉬고 있는 전용 CLI 세션에만 사용한다.** 실행 중인 대화에 알림을 주입하는 방식이 아니다(그것은 `claude-peer`). 반환된 텍스트는 reply로 연결되며 watch/wait에도 전달된다.
 - 외부 CLI 실행은 브로커 밖에서 수행하므로 다른 대화의 이벤트 전달을 막지 않는다. 실행 전 브로커가 메시지를 `dispatching`으로 선점한다.
 - 비정상 종료·타임아웃·해석 실패는 `uncertain`이다. 자동 재전송하지 않고 같은 세션의 후속 전달도 막는다. 프로세스 실행 자체가 실패하면 `failed`다.
@@ -206,4 +212,4 @@ python3 "$bridge_cli" resolve MESSAGE_ID --state done --note '결과 확인 완�
 
 같은 OS 계정을 신뢰하는 로컬 도구다. 이름은 인증 수단이 아니며 동료 메시지가 새로운 사용자 승인을 대신하지 않는다. 요청에는 목적, 허용 파일, 작업 경로와 완료 조건을 적고 프로젝트 지침을 따른다. 파일 잠금·Git 병합·원격 머신 연결은 지원하지 않는다.
 
-테스트는 실제 Unix 소켓과 별도 CLI 프로세스로 구독·요청·답변·대기·재연결·브로커 종료를 검증한다. Codex adapter는 가짜 데스크톱 IPC 소유자로 활성/idle·프레임 분할·원래 UUID·도구 출력·중복 방지·전송 후 uncertain을 검증한다. 전용 Claude CLI는 가짜 프로세스로, `claude-peer`는 가짜 세션 레지스트리·키·수신 소켓으로 검증한다(세션 해석 · 프레임 ·성공 · 실패 시 `pending` 유지와 종료 코드 1). 실제 AI 모델끼리의 자동 왕복은 별도로 확인해야 한다.
+테스트는 실제 Unix 소켓과 별도 CLI 프로세스로 구독·요청·답변·대기·재연결·브로커 종료를 검증한다. Codex adapter는 가짜 데스크톱 IPC 소유자로 활성/idle·프레임 분할·원래 UUID·도구 출력·중복 방지·전송 후 uncertain을 검증한다. Antigravity(`agy`) adapter는 가짜 ConnectRPC 서버로 정확한 UUID·워크스페이스 검증·`SendAgentMessage` 주입·`SendUserCascadeMessage`(`NEXT_INVOCATION`) 즉시 깨움·CSRF 비노출·전송 후 uncertain을 검증한다. 전용 Claude CLI는 가짜 프로세스로, `claude-peer`는 가짜 세션 레지스트리·키·수신 소켓으로 검증한다(세션 해석 · 프레임 · 성공 · 실패 시 `pending` 유지와 종료 코드 1). 실제 AI 모델끼리의 자동 왕복은 별도로 확인해야 한다.
