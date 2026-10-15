@@ -48,6 +48,6 @@ class RunningBroker:
         return broker.request(self.path,{'op':op,**args})
 
     def register_pair(self):
-        for name in ('naru','roa'):
+        for name in ('alpha','beta'):
             self.call('register',project='demo',name=name,cwd=self.temp.name,transport='realtime')
             self.call('channel-bind',project='demo',name=name,owner=name,description=name)

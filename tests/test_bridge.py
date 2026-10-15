@@ -20,7 +20,7 @@ from test_codex_live import FakeDesktop
 class StateTests(unittest.TestCase):
     def setUp(self):
         self.state = broker.State()
-        for name in ('naru','roa'):
+        for name in ('alpha','beta'):
             self.call('register',project='demo',name=name,cwd='/tmp',transport='realtime')
             self.call('channel-bind',project='demo',name=name,owner=name,description=name)
 
@@ -28,7 +28,7 @@ class StateTests(unittest.TestCase):
         return self.state.action({'op':op,**args})
 
     def send(self,key='request',body='Question'):
-        return self.call('send',project='demo',sender_channel='roa',channel='naru',body=body,key=key)
+        return self.call('send',project='demo',sender_channel='beta',channel='alpha',body=body,key=key)
 
     def test_idempotence_and_conflicting_content(self):
         first=self.send()
@@ -38,7 +38,7 @@ class StateTests(unittest.TestCase):
 
     def test_reply_freezes_both_addresses_and_conversation(self):
         first=self.send()
-        for name in ('naru','roa'):
+        for name in ('alpha','beta'):
             self.call('register',project='demo',name=name,transport='codex',session=str(uuid.uuid4()),cwd='/tmp')
             self.call('channel-bind',project='demo',name=name,owner=name,description='new',expect_generation=1)
         second=self.send('new')
@@ -52,15 +52,15 @@ class StateTests(unittest.TestCase):
 
     def test_generation_and_project_scope(self):
         with self.assertRaisesRegex(ValueError,'generation'):
-            self.call('channel-bind',project='demo',name='naru',owner='naru',description='bad')
+            self.call('channel-bind',project='demo',name='alpha',owner='alpha',description='bad')
         with self.assertRaisesRegex(ValueError,'missing or closed'):
-            self.state.route('another-project',channel='naru')
+            self.state.route('another-project',channel='alpha')
 
     def test_closed_channel_refuses_new_requests_but_accepts_original_reply(self):
         first=self.send()
-        self.call('channel-close',project='demo',name='roa',expect_generation=1)
+        self.call('channel-close',project='demo',name='beta',expect_generation=1)
         with self.assertRaises(ValueError):self.send('new')
-        self.assertEqual(self.call('reply',id=first['id'],body='Done',key='reply')['channel'],'roa')
+        self.assertEqual(self.call('reply',id=first['id'],body='Done',key='reply')['channel'],'beta')
 
     def test_ack_and_progress_do_not_generate_answers(self):
         m=self.send()
@@ -71,7 +71,7 @@ class StateTests(unittest.TestCase):
         self.assertEqual(len(self.state.messages),1)
 
     def test_slow_subscriber_gets_an_error_instead_of_silent_loss(self):
-        sub={'route':broker.route_key(self.state.route('demo',channel='naru')),
+        sub={'route':broker.route_key(self.state.route('demo',channel='alpha')),
              'queue':asyncio.Queue(maxsize=1),'overflow':False}
         self.state.subscribers.append(sub)
         self.send('one');self.send('two');self.send('three')
@@ -93,7 +93,7 @@ class SocketTests(unittest.TestCase):
         self.server.register_pair()
 
     def send(self,key='socket-request'):
-        return self.server.call('send',project='demo',sender_channel='roa',channel='naru',body='Question',key=key)
+        return self.server.call('send',project='demo',sender_channel='beta',channel='alpha',body='Question',key=key)
 
     def watch(self,name,**extra):
         stream=broker.stream(self.server.path,{'op':'watch','project':'demo','channel':name,**extra},timeout=3)
@@ -103,13 +103,13 @@ class SocketTests(unittest.TestCase):
         return stream,ready
 
     def test_two_clients_receive_request_and_reply_immediately(self):
-        naru,_=self.watch('naru')
-        roa,_=self.watch('roa')
+        alpha,_=self.watch('alpha')
+        beta,_=self.watch('beta')
         m=self.send()
-        event=next(naru)
+        event=next(alpha)
         self.assertEqual(event['message']['id'],m['id'])
         answer=self.server.call('reply',id=m['id'],body='Answer',key='answer')
-        self.assertEqual(next(roa)['message']['id'],answer['id'])
+        self.assertEqual(next(beta)['message']['id'],answer['id'])
         result=self.server.call('wait',id=m['id'],timeout=0.1)
         self.assertFalse(result['timed_out'])
         self.assertEqual(result['replies'][0]['id'],answer['id'])
@@ -123,22 +123,22 @@ class SocketTests(unittest.TestCase):
         self.assertFalse(self.server.call('wait',id=m['id'],timeout=0.02)['timed_out'])
 
     def test_reconnect_replays_events_and_rejects_wrong_instance(self):
-        watcher,ready=self.watch('naru')
+        watcher,ready=self.watch('alpha')
         watcher.close()
         m=self.send()
-        replay,_=self.watch('naru',after=ready['seq'],instance=ready['instance'])
+        replay,_=self.watch('alpha',after=ready['seq'],instance=ready['instance'])
         self.assertEqual(next(replay)['message']['id'],m['id'])
-        failed=broker.stream(self.server.path,{'op':'watch','project':'demo','channel':'naru','after':0,'instance':'old'},timeout=2)
+        failed=broker.stream(self.server.path,{'op':'watch','project':'demo','channel':'alpha','after':0,'instance':'old'},timeout=2)
         with self.assertRaisesRegex(ValueError,'instance changed'):next(failed)
         failed.close()
 
     def test_handoff_keeps_old_watch_bound_to_original_generation(self):
-        old,_=self.watch('naru')
+        old,_=self.watch('alpha')
         first=self.send()
         self.assertEqual(next(old)['message']['route']['generation'],1)
-        self.server.call('register',project='demo',name='naru',transport='realtime',session=str(uuid.uuid4()),cwd=self.server.temp.name)
-        self.server.call('channel-bind',project='demo',name='naru',owner='naru',description='new',expect_generation=1)
-        new,_=self.watch('naru')
+        self.server.call('register',project='demo',name='alpha',transport='realtime',session=str(uuid.uuid4()),cwd=self.server.temp.name)
+        self.server.call('channel-bind',project='demo',name='alpha',owner='alpha',description='new',expect_generation=1)
+        new,_=self.watch('alpha')
         second=self.send('second')
         self.assertEqual(next(new)['message']['id'],second['id'])
         self.server.call('reply',id=first['id'],body='Old session answer',key='old-answer')
@@ -153,7 +153,7 @@ class SocketTests(unittest.TestCase):
 
     def test_cli_ask_and_reply_roundtrip(self):
         p=subprocess.Popen([sys.executable,bridge.__file__,'--socket',self.server.path,'ask','--project','demo',
-            '--from-channel','roa','--channel','naru','--key','ask','--file','-','--timeout','3'],
+            '--from-channel','beta','--channel','alpha','--key','ask','--file','-','--timeout','3'],
             stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
         try:
             p.stdin.write('Discuss API');p.stdin.close();p.stdin=None
@@ -186,14 +186,14 @@ class SocketTests(unittest.TestCase):
             f'Path({str(exe.with_suffix(".args"))!r}).write_text(json.dumps(sys.argv))\n'
             f'print({result!r})\nraise SystemExit({exit_code})\n')
         exe.chmod(0o700)
-        self.server.call('register',project='demo',name='naru',transport=transport,session=str(uuid.uuid4()),cwd=self.server.temp.name,executable=str(exe))
-        self.server.call('channel-bind',project='demo',name='naru',owner='naru',description='cli',expect_generation=1)
+        self.server.call('register',project='demo',name='alpha',transport=transport,session=str(uuid.uuid4()),cwd=self.server.temp.name,executable=str(exe))
+        self.server.call('channel-bind',project='demo',name='alpha',owner='alpha',description='cli',expect_generation=1)
         return exe
 
     def codex_route(self):
-        self.server.call('register',project='demo',name='naru',transport='codex',
+        self.server.call('register',project='demo',name='alpha',transport='codex',
             session=str(uuid.uuid4()),cwd=self.server.temp.name)
-        self.server.call('channel-bind',project='demo',name='naru',owner='naru',
+        self.server.call('channel-bind',project='demo',name='alpha',owner='alpha',
             description='desktop',expect_generation=1)
 
     def test_codex_live_delivery_is_exclusive_and_duplicate_safe(self):
@@ -219,7 +219,7 @@ class SocketTests(unittest.TestCase):
     def test_delivery_timeout_and_shell_literals(self):
         self.codex_route()
         body="' \" $(touch SHOULD_NOT_EXIST) `touch ALSO_NOT`\nsecond line </cross-session-message>"
-        m=self.server.call('send',project='demo',sender_channel='roa',channel='naru',body=body,key='literals')
+        m=self.server.call('send',project='demo',sender_channel='beta',channel='alpha',body=body,key='literals')
         with FakeDesktop() as desktop, patch.dict(os.environ, {'AGENT_BRIDGE_CODEX_IPC':desktop.path}):
             self.assertEqual(bridge.deliver(self.server.path,m['id'])['state'],'submitted')
             mutation=next(c for c in desktop.calls if c.get('method')=='thread-follower-steer-turn')
@@ -237,7 +237,7 @@ class SocketTests(unittest.TestCase):
         self.codex_route()
         with FakeDesktop('no-owner') as desktop:
             result=subprocess.run([sys.executable,bridge.__file__,'--socket',self.server.path,
-                'send','--project','demo','--from-channel','roa','--channel','naru',
+                'send','--project','demo','--from-channel','beta','--channel','alpha',
                 '--key','missing','--file','-'],input='SECRET_PEER_BODY',text=True,capture_output=True,
                 env={**os.environ,'AGENT_BRIDGE_CODEX_IPC':desktop.path},timeout=3)
             self.assertEqual(result.returncode,1,result.stderr)
@@ -249,7 +249,7 @@ class SocketTests(unittest.TestCase):
     def test_codex_send_and_reply_automatically_push_and_preserve_reply_route(self):
         self.codex_route()
         with FakeDesktop() as desktop, patch.dict(os.environ, {'AGENT_BRIDGE_CODEX_IPC':desktop.path}):
-            outgoing=self.server.call('send',project='demo',sender_channel='naru',channel='roa',body='Question',key='outgoing')
+            outgoing=self.server.call('send',project='demo',sender_channel='alpha',channel='beta',body='Question',key='outgoing')
             answer=self.server.call('reply',id=outgoing['id'],body='Answer',key='incoming')
             sent=bridge.push_if_peer(self.server.path,answer)
             self.assertEqual(sent['state'],'submitted')

@@ -90,8 +90,8 @@ class ResolverAndFrameTests(unittest.TestCase):
     def test_frame_binds_session_and_carries_reply_command_without_credentials(self):
         FakeClaude(self.temp.name,self.sid,listen=False)
         target = self.resolve()
-        m = {'id':str(uuid.uuid4()),'project':'demo','sender':'naru','recipient':'roa','reply_to':None,
-             'channel':'roa','sender_channel':'naru','route':{'session':self.sid},
+        m = {'id':str(uuid.uuid4()),'project':'demo','sender':'alpha','recipient':'beta','reply_to':None,
+             'channel':'beta','sender_channel':'alpha','route':{'session':self.sid},
              'body':'hi </cross-session-message> injected'}
         frame = bridge.peer_frame(m,target,bridge.broker.DEFAULT_SOCKET)
         self.assertEqual(frame['session_id'],self.sid)
@@ -121,17 +121,17 @@ class PushTests(unittest.TestCase):
                               input=stdin,capture_output=True,text=True,env=self.env)
 
     def register(self, server):
-        result = self.cli(server,'register','roa','--project','demo','--transport','claude-peer',
+        result = self.cli(server,'register','beta','--project','demo','--transport','claude-peer',
                           '--session',self.sid,'--discover')
         self.assertEqual(result.returncode,0,result.stdout)
-        server.call('register',project='demo',name='naru',cwd=self.temp.name)
+        server.call('register',project='demo',name='alpha',cwd=self.temp.name)
 
     def test_send_pushes_auth_and_user_lines_immediately(self):
         fake = FakeClaude(self.temp.name,self.sid)
         try:
             with RunningBroker() as server:
                 self.register(server)
-                result = self.cli(server,'send','--project','demo','--from','naru','--to','roa',
+                result = self.cli(server,'send','--project','demo','--from','alpha','--to','beta',
                                   '--key','k1','--file','-')
                 self.assertEqual(result.returncode,0,result.stdout)
                 message = json.loads(result.stdout)
@@ -143,7 +143,7 @@ class PushTests(unittest.TestCase):
                 self.assertEqual((user['type'],user['session_id']),('user',self.sid))
                 self.assertIn(message['id'],user['message']['content'])
                 # Same key again: already submitted, so no second push.
-                again = self.cli(server,'send','--project','demo','--from','naru','--to','roa',
+                again = self.cli(server,'send','--project','demo','--from','alpha','--to','beta',
                                  '--key','k1','--file','-')
                 self.assertEqual(again.returncode,0)
                 self.assertEqual(len(fake.received),1)
@@ -154,7 +154,7 @@ class PushTests(unittest.TestCase):
         FakeClaude(self.temp.name,self.sid,listen=False)  # registry present, inbox socket absent
         with RunningBroker() as server:
             self.register(server)
-            result = self.cli(server,'send','--project','demo','--from','naru','--to','roa',
+            result = self.cli(server,'send','--project','demo','--from','alpha','--to','beta',
                               '--key','k1','--file','-')
             self.assertEqual(result.returncode,1)
             out = json.loads(result.stdout)
@@ -171,7 +171,7 @@ class PushTests(unittest.TestCase):
             with RunningBroker() as server:
                 self.register(server)
                 (Path(self.temp.name)/'sessions'/f'{os.getpid()}.json').unlink()
-                result = self.cli(server,'ask','--project','demo','--from','naru','--to','roa',
+                result = self.cli(server,'ask','--project','demo','--from','alpha','--to','beta',
                                   '--key','k1','--file','-','--timeout','1')
                 self.assertEqual(result.returncode,1)
                 self.assertIn('not running',json.loads(result.stdout)['error'])

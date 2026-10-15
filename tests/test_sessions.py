@@ -121,7 +121,7 @@ for line in sys.stdin:
     def test_discovered_registration_infers_path_and_rejects_mismatch(self):
         with RunningBroker() as server:
             exe=self.fake_codex()
-            args=[sys.executable,bridge.__file__,'--socket',server.path,'register','naru',
+            args=[sys.executable,bridge.__file__,'--socket',server.path,'register','alpha',
                   '--project','demo','--transport','codex','--session',self.sid,
                   '--discover','--executable',exe,'--codex-mode','saved']
             result=subprocess.run(args,capture_output=True,text=True,check=True)
