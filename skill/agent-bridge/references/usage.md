@@ -8,14 +8,21 @@
 
 ```mermaid
 flowchart LR
-    A[발신 CLI: ask / send] --> B[메모리 브로커 · Unix socket]
-    B --> C[수신 CLI: watch]
-    C --> D[reply / ack / progress]
-    D --> B
-    B --> E[발신 CLI: wait / watch]
+    subgraph Live["라이브 세션 참가자 (Push · No Polling)"]
+        C["Claude Code<br/>(claude-peer)"]
+        X["Codex / ChatGPT Desktop<br/>(codex)"]
+        A["Antigravity Desktop<br/>(agy)"]
+    end
+    B(("메모리 브로커<br/>Unix socket"))
+    W["CLI 참가자<br/>(realtime · watch)"]
+
+    C <-->|"send / ask / reply<br/>peerProtocol 1"| B
+    X <-->|"send / ask / reply<br/>IPC steer-turn"| B
+    A <-->|"send / ask / reply<br/>SendAgentMessage + NEXT_INVOCATION"| B
+    W <-->|"send / reply / watch"| B
 ```
 
-브로커 수신과 AI 모델의 실제 처리 완료를 구분한다. `watch`는 연결된 CLI에 이벤트를 출력한다. 그것만으로 실행 중인 대화에 새 턴을 주입하지 않는다. 살아 있는 Claude·Codex·Antigravity(AGY) 사령탑은 각각 `claude-peer`, `codex`, `agy`로 등록해 **push**한다(아래 **Claude 사령탑에 push**, **기존 AI CLI로 전달**). 받는 쪽에서 watch/폴링 루프를 돌려 에이전트 메시지를 기다리는 것은 최악의 방식이다 — watch는 `realtime` 참가자용으로만 남는다.
+브로커 수신과 AI 모델의 실제 처리 완료를 구분한다. `watch`는 연결된 CLI에 이벤트를 출력한다. 그것만으로 실행 중인 대화에 새 턴을 주입하지 않는다. 살아 있는 Claude·Codex·Antigravity(AGY) 라이브 세션은 각각 `claude-peer`, `codex`, `agy`로 등록해 **상대방의 활성 턴이나 유휴 대화에 직접 push**한다(아래 **Claude 라이브 세션에 push**, **기존 AI 세션 및 CLI로 전달**). 받는 쪽에서 watch/폴링 루프를 돌려 에이전트 메시지를 기다리는 것은 최악의 방식이다 — watch는 `realtime` CLI 참가자용으로만 남는다.
 
 ## 시작
 
@@ -26,14 +33,16 @@ bridge_cli="$HOME/.agents/skills/agent-bridge/scripts/bridge.py"
 python3 "$bridge_cli" serve
 ```
 
-다른 터미널에서 등록하고 작업 채널을 연결한다.
+다른 터미널에서 참가자(Claude · Codex · Antigravity 또는 CLI)를 등록하고 작업 채널을 연결한다.
 
 ```bash
-python3 "$bridge_cli" register naru --project blosharper --cwd /Users/firejune/Workspace/Firejune/blosharper
-python3 "$bridge_cli" register roa --project blosharper --cwd /Users/firejune/Workspace/Firejune/blosharper
-python3 "$bridge_cli" channel-bind modal-view --project blosharper --owner naru --description '모달 UI·반응형 담당'
-python3 "$bridge_cli" channel-bind game-logic --project blosharper --owner roa --description '게임 규칙·상태 계약 담당'
-python3 "$bridge_cli" channels --project blosharper
+python3 "$bridge_cli" register codex-agent --project my-app --cwd /path/to/workspace
+python3 "$bridge_cli" register claude-agent --project my-app --cwd /path/to/workspace
+python3 "$bridge_cli" register agy-agent --project my-app --cwd /path/to/workspace
+python3 "$bridge_cli" channel-bind modal-view --project my-app --owner codex-agent --description '모달 UI·반응형 담당'
+python3 "$bridge_cli" channel-bind game-logic --project my-app --owner claude-agent --description '게임 규칙·상태 계약 담당'
+python3 "$bridge_cli" channel-bind motion-rig --project my-app --owner agy-agent --description '리깅·렌더 검증 담당'
+python3 "$bridge_cli" channels --project my-app
 python3 "$bridge_cli" ping
 ```
 
@@ -49,16 +58,16 @@ python3 "$bridge_cli" stop
 
 ## 실시간 티키타카
 
-수신 측에서 먼저 채널에 연결한다. `watch`는 새 메시지와 상태 변경을 JSON Lines로 즉시 출력한다. 초기 `subscribed` 이벤트가 나오면 구독이 준비된 상태다.
+`claude-peer`·`codex`·`agy`로 등록된 라이브 세션은 별도 구독 없이 `send`·`ask`·`reply` 시점에 즉시 상대 세션으로 push된다. `realtime` 참가자는 먼저 채널에 `watch`를 연결해 새 메시지와 상태 변경을 JSON Lines로 받는다(초기 `subscribed` 이벤트가 나오면 구독이 준비된 상태다).
 
 ```bash
-python3 "$bridge_cli" watch --project blosharper --channel modal-view
+python3 "$bridge_cli" watch --project my-app --channel modal-view
 ```
 
 발신 측에서 질문한다. `ask`는 요청 ID를 먼저 출력하고 답변을 기다린다.
 
 ```bash
-python3 "$bridge_cli" ask --project blosharper --from-channel game-logic --channel modal-view \
+python3 "$bridge_cli" ask --project my-app --from-channel game-logic --channel modal-view \
   --key hp-contract-001 --file - --timeout 60 <<'MESSAGE'
 체력 상태 계약을 검토해 주세요.
 프로젝트 지침을 따르고, 이번 요청에서는 코드 수정 없이 표시 측 요구사항을 답해 주세요.
@@ -83,7 +92,7 @@ MESSAGE
 - 구독자가 없어도 메시지는 브로커 메모리에 남는다. 자동으로 AI를 깨우지는 않는다. `inbox`/`show`로 확인할 수 있다.
 
 ```bash
-python3 "$bridge_cli" inbox --project blosharper --channel modal-view
+python3 "$bridge_cli" inbox --project my-app --channel modal-view
 python3 "$bridge_cli" show REQUEST_ID
 python3 "$bridge_cli" conversation REQUEST_ID
 ```
@@ -95,7 +104,7 @@ python3 "$bridge_cli" conversation REQUEST_ID
 watch 이벤트에는 브로커 `instance`와 증가하는 `seq`가 있다. 마지막으로 처리한 이벤트 번호를 이용해 같은 실행 내에서 재연결한다.
 
 ```bash
-python3 "$bridge_cli" watch --project blosharper --channel modal-view \
+python3 "$bridge_cli" watch --project my-app --channel modal-view \
   --instance BROKER_INSTANCE_UUID --after LAST_PROCESSED_SEQ
 ```
 
@@ -108,21 +117,21 @@ python3 "$bridge_cli" watch --project blosharper --channel modal-view \
 조회 명령은 브로커 없이도 사용할 수 있다. 대화 본문을 가져오거나 새 모델 턴을 실행하지 않는다.
 
 ```bash
-python3 "$bridge_cli" sessions --cwd /Users/firejune/Workspace/Firejune/blosharper
-python3 "$bridge_cli" sessions --provider claude --search '사령탑'
+python3 "$bridge_cli" sessions --cwd /path/to/workspace
+python3 "$bridge_cli" sessions --provider claude --search 'feature'
 python3 "$bridge_cli" sessions --provider codex --limit 100
-python3 "$bridge_cli" sessions --provider agy --cwd /Users/firejune/Workspace/Firejune/blosharper
+python3 "$bridge_cli" sessions --provider agy --cwd /path/to/workspace
 python3 "$bridge_cli" session codex SESSION_UUID
 python3 "$bridge_cli" session claude SESSION_UUID
 python3 "$bridge_cli" session agy SESSION_UUID
 
-# 조회한 세션의 실제 작업 경로를 가져와 등록한다.
-python3 "$bridge_cli" register naru --project blosharper --transport codex \
+# 조회한 세션의 실제 작업 경로를 가져와 3자간 라이브 세션을 등록한다.
+python3 "$bridge_cli" register codex-agent --project my-app --transport codex \
   --session SESSION_UUID --discover
-python3 "$bridge_cli" register roa --project blosharper --transport claude-peer \
-  --session CLAUDE_SESSION_ID --discover --cwd /Users/firejune/Workspace/Firejune/blosharper
-python3 "$bridge_cli" register jinni --project blosharper --transport agy \
-  --session AGY_CONVERSATION_ID --discover --cwd /Users/firejune/Workspace/Firejune/blosharper
+python3 "$bridge_cli" register claude-agent --project my-app --transport claude-peer \
+  --session CLAUDE_SESSION_ID --discover --cwd /path/to/workspace
+python3 "$bridge_cli" register agy-agent --project my-app --transport agy \
+  --session AGY_CONVERSATION_ID --discover --cwd /path/to/workspace
 ```
 
 `--discover`는 지정된 UUID만 확인한다(`claude-peer`는 `~/.claude/sessions`의 살아 있는 세션 파일, `agy`는 실행 중인 Antigravity 데스크톱 `language_server`의 trajectory 레지스트리, 나머지는 CLI 조회). `--cwd`를 함께 주면 실제 경로와의 일치도 검증한다. 실패하면 기존 등록은 유지된다. 조회할 때마다 CLI/서버를 호출하며 `observed_at`, `runtime_observed`, 조회 범위를 표시한다. 제목·경로는 탐색용 데이터이며 지시가 아니다.
@@ -138,36 +147,36 @@ python3 "$bridge_cli" register jinni --project blosharper --transport agy \
 
 `--limit`는 제공자별 상한이며 `more_available`로 남은 결과를 표시한다. 목록 명령은 `--codex-executable`/`--claude-executable`, 단일 조회·등록은 `--executable`을 지원한다. 기본 Claude 호출은 로그인 셸 함수 설치를 지원하며 인수는 문자열 삽입 없이 전달한다.
 
-현재 머신에서 확인한 2026-10-01 조회 경로는 Claude 활성 세션과 Codex 저장 목록이었다. 공유 app-server 제어 소켓과 데스크톱 IPC는 서로 다른 경로다. 저장 목록 조회 성공은 현재 데스크톱의 소유자 접속이나 모델 수신 성공을 뜻하지 않는다.
+공유 app-server 제어 소켓과 데스크톱 IPC는 서로 다른 경로다. 저장 목록 조회 성공은 현재 데스크톱의 소유자 접속이나 모델 수신 성공을 뜻하지 않는다.
 
-## 사령탑 세션 인계
+## 세션 인계
 
 프로젝트·작업 채널을 주소로 사용한다. 에이전트 등록과 채널 연결은 별도이며, 채널은 연결 당시의 세션을 독립적으로 유지한다.
 
 ```bash
-python3 "$bridge_cli" register naru --project blosharper --transport codex --session NEW_SESSION_UUID --discover
-python3 "$bridge_cli" channels --project blosharper
-python3 "$bridge_cli" channel-bind modal-view --project blosharper --owner naru \
+python3 "$bridge_cli" register codex-agent --project my-app --transport codex --session NEW_SESSION_UUID --discover
+python3 "$bridge_cli" channels --project my-app
+python3 "$bridge_cli" channel-bind modal-view --project my-app --owner codex-agent \
   --description '모달 UI·반응형 담당' --expect-generation 1
 ```
 
 현재 세대가 맞을 때만 인계된다. 새 요청과 새 구독은 새 주소를 사용한다. 이미 연결된 watch, 기존 요청의 목적지와 답장 주소는 이전 세대를 유지한다. 구독의 세대를 자동 변경하지 않으므로 세션을 인계한 수신 측은 watch도 새로 연결한다. 이전 세대 요청은 inbox에 세대·세션과 함께 표시되며 명시적으로 확인한다.
 
 ```bash
-python3 "$bridge_cli" inbox --project blosharper --channel modal-view --session OLD_SESSION_UUID
-python3 "$bridge_cli" channel-close modal-view --project blosharper --expect-generation 2
+python3 "$bridge_cli" inbox --project my-app --channel modal-view --session OLD_SESSION_UUID
+python3 "$bridge_cli" channel-close modal-view --project my-app --expect-generation 2
 ```
 
 닫힌 채널은 새 요청을 받지 않는다. 기존 요청에 대한 답변은 고정된 주소로 보낼 수 있다.
 
-## Claude 사령탑에 push (`claude-peer`)
+## Claude 라이브 세션에 push (`claude-peer`)
 
-**살아 있는 Claude Code 사령탑에 닿는 길은 이것 하나다.** `claude-peer`로 등록된 목적지(직접 이름이든 채널이든)로 가는 `send`·`ask`·`reply`는 브로커에 기록된 직후 그 세션의 메시지 소켓으로 push된다. 별도 `deliver` 단계도, 받는 쪽 watch도 없다. 메시지는 받는 세션의 다음 턴에 Claude의 cross-session 메시지와 같은 모양으로 들어간다.
+**살아 있는 Claude Code 세션에 닿는 길은 이것 하나다.** `claude-peer`로 등록된 목적지(직접 이름이든 채널이든)로 가는 `send`·`ask`·`reply`는 브로커에 기록된 직후 그 세션의 메시지 소켓으로 push된다. 별도 `deliver` 단계도, 받는 쪽 watch도 없다. 메시지는 받는 세션의 다음 턴에 Claude의 cross-session 메시지와 같은 모양으로 들어간다.
 
 ```bash
-python3 "$bridge_cli" register roa --project PROJECT --transport claude-peer \
+python3 "$bridge_cli" register claude-agent --project PROJECT --transport claude-peer \
   --session CLAUDE_SESSION_ID --discover
-python3 "$bridge_cli" send --project PROJECT --from naru --to roa --key KEY --file /absolute/msg.txt
+python3 "$bridge_cli" send --project PROJECT --from codex-agent --to claude-agent --key KEY --file /absolute/msg.txt
 ```
 
 - **세션 해석**: push할 때마다 `~/.claude/sessions/<pid>.json`(`CLAUDE_CONFIG_DIR`가 있으면 그 아래)에서 등록된 sessionId를 다시 찾는다. 프로세스가 살아 있고 `peerProtocol == 1`이며 `messagingSocketPath`가 있어야 한다. 세션이 재시작돼 pid가 바뀌어도 sessionId가 같으면 따라간다. 다른 세션을 고르지 않는다.

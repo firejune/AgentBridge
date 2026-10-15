@@ -32,8 +32,8 @@ def resolve_codex_executable(executable):
 
 
 def cli_prefix(executable):
-    # The user's Claude installation may be a login-shell function (as in the
-    # existing family bridge). Arguments remain separate argv entries.
+    # Support Claude installations defined as a login-shell function while
+    # keeping all arguments as separate argv entries.
     if executable == 'claude':
         return ['/bin/bash','-lc','claude "$@"','agent-bridge']
     return [executable]

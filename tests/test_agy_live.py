@@ -125,7 +125,7 @@ class AgyLiveTests(unittest.TestCase):
             'AGENT_BRIDGE_AGY_CSRF': CSRF,
         }
 
-    def cli(self, server_path, env, *args, stdin='Question for Jinni'):
+    def cli(self, server_path, env, *args, stdin='Question for peer'):
         return subprocess.run(
             [sys.executable, bridge.__file__, '--socket', str(server_path), *args],
             input=stdin, capture_output=True, text=True, env=env,
@@ -153,14 +153,14 @@ class AgyLiveTests(unittest.TestCase):
     def test_send_pushes_immediately_to_live_agy_session_and_deduplicates(self):
         with FakeAgyServer(self.root, self.sid) as fake, RunningBroker() as server:
             env = self.env(fake)
-            reg = self.cli(server.path, env, 'register', 'jinni', '--project', 'demo',
+            reg = self.cli(server.path, env, 'register', 'agy-agent', '--project', 'demo',
                            '--transport', 'agy', '--session', self.sid, '--discover')
             self.assertEqual(reg.returncode, 0, reg.stdout)
             self.assertEqual(json.loads(reg.stdout)['cwd'], str(self.root))
-            server.call('register', project='demo', name='naru', cwd=str(self.root))
+            server.call('register', project='demo', name='codex-agent', cwd=str(self.root))
 
             sent = self.cli(server.path, env, 'send', '--project', 'demo',
-                            '--from', 'naru', '--to', 'jinni', '--key', 'k1', '--file', '-')
+                            '--from', 'codex-agent', '--to', 'agy-agent', '--key', 'k1', '--file', '-')
             self.assertEqual(sent.returncode, 0, sent.stdout)
             msg = json.loads(sent.stdout)
             self.assertEqual(msg['state'], 'submitted')
@@ -170,7 +170,7 @@ class AgyLiveTests(unittest.TestCase):
             send_calls = [body for path, _, body in fake.requests if path.endswith('/SendAgentMessage')]
             self.assertEqual(len(send_calls), 1)
             self.assertEqual(send_calls[0]['recipient'], self.sid)
-            self.assertEqual(send_calls[0]['senderId'], 'agent-bridge:demo/naru')
+            self.assertEqual(send_calls[0]['senderId'], 'agent-bridge:demo/codex-agent')
             self.assertIn(msg['id'], send_calls[0]['content'])
 
             wake_calls = [body for path, _, body in fake.requests if path.endswith('/SendUserCascadeMessage')]
@@ -181,7 +181,7 @@ class AgyLiveTests(unittest.TestCase):
             })
 
             again = self.cli(server.path, env, 'send', '--project', 'demo',
-                             '--from', 'naru', '--to', 'jinni', '--key', 'k1', '--file', '-')
+                             '--from', 'codex-agent', '--to', 'agy-agent', '--key', 'k1', '--file', '-')
             self.assertEqual(again.returncode, 0)
             send_calls_after = [body for path, _, body in fake.requests if path.endswith('/SendAgentMessage')]
             self.assertEqual(len(send_calls_after), 1)
@@ -189,12 +189,12 @@ class AgyLiveTests(unittest.TestCase):
     def test_send_wakes_session_that_yields_to_idle_with_background_task(self):
         with FakeAgyServer(self.root, self.sid, send_behavior='finish-after-first-wake') as fake, RunningBroker() as server:
             env = self.env(fake)
-            self.cli(server.path, env, 'register', 'jinni', '--project', 'demo',
+            self.cli(server.path, env, 'register', 'agy-agent', '--project', 'demo',
                      '--transport', 'agy', '--session', self.sid, '--discover')
-            server.call('register', project='demo', name='naru', cwd=str(self.root))
+            server.call('register', project='demo', name='codex-agent', cwd=str(self.root))
 
             sent = self.cli(server.path, env, 'send', '--project', 'demo',
-                            '--from', 'naru', '--to', 'jinni', '--key', 'k-wake', '--file', '-')
+                            '--from', 'codex-agent', '--to', 'agy-agent', '--key', 'k-wake', '--file', '-')
             self.assertEqual(sent.returncode, 0, sent.stdout)
             self.assertEqual(fake.trajectories[self.sid]['status'], 'CASCADE_RUN_STATUS_RUNNING')
             wake_calls = [body for path, _, body in fake.requests if path.endswith('/SendUserCascadeMessage')]
@@ -203,13 +203,13 @@ class AgyLiveTests(unittest.TestCase):
     def test_pre_send_missing_session_stays_pending_and_exits_nonzero(self):
         with FakeAgyServer(self.root, self.sid) as fake, RunningBroker() as server:
             env = self.env(fake)
-            self.cli(server.path, env, 'register', 'jinni', '--project', 'demo',
+            self.cli(server.path, env, 'register', 'agy-agent', '--project', 'demo',
                      '--transport', 'agy', '--session', self.sid, '--discover')
-            server.call('register', project='demo', name='naru', cwd=str(self.root))
+            server.call('register', project='demo', name='codex-agent', cwd=str(self.root))
             # Remove session before send so pre-verification fails.
             fake.trajectories.pop(self.sid)
             res = self.cli(server.path, env, 'send', '--project', 'demo',
-                           '--from', 'naru', '--to', 'jinni', '--key', 'k-miss', '--file', '-')
+                           '--from', 'codex-agent', '--to', 'agy-agent', '--key', 'k-miss', '--file', '-')
             self.assertEqual(res.returncode, 1)
             out = json.loads(res.stdout)
             self.assertTrue(out['push_failed'])
@@ -232,11 +232,11 @@ class AgyLiveTests(unittest.TestCase):
     def test_post_send_error_marks_message_uncertain_and_blocks_followup(self):
         with FakeAgyServer(self.root, self.sid, send_behavior='error') as fake, RunningBroker() as server:
             env = self.env(fake)
-            self.cli(server.path, env, 'register', 'jinni', '--project', 'demo',
+            self.cli(server.path, env, 'register', 'agy-agent', '--project', 'demo',
                      '--transport', 'agy', '--session', self.sid, '--discover')
-            server.call('register', project='demo', name='naru', cwd=str(self.root))
+            server.call('register', project='demo', name='codex-agent', cwd=str(self.root))
             res = self.cli(server.path, env, 'send', '--project', 'demo',
-                           '--from', 'naru', '--to', 'jinni', '--key', 'k-err', '--file', '-')
+                           '--from', 'codex-agent', '--to', 'agy-agent', '--key', 'k-err', '--file', '-')
             self.assertEqual(res.returncode, 1)
             out = json.loads(res.stdout)
             self.assertEqual(server.call('show', id=out['message']['id'])['state'], 'uncertain')
