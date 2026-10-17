@@ -139,7 +139,26 @@ python3 "$bridge_cli" register agy-agent --project my-app --transport agy \
 | Claude | `claude agents --json --all` | Active conversations and completed background sessions tracked by the CLI |
 | Codex shared server | `codex app-server proxy` metadata query | Conversations and runtime state known to the shared app-server |
 | Codex saved list | Temporary `codex app-server --stdio` metadata query | Unarchived CLI conversations (`unknown` runtime status for other apps) |
-| Antigravity (`agy`) | Local `language_server` `GetAllCascadeTrajectories` & `GetConversationMetadata` | Live workspace conversations (`running`/`idle`) across Antigravity IDE and Desktop |
+| Antigravity (`agy`) | Local `language_server` (`--app_data_dir antigravity` & `antigravity-ide`, skipping `--enable_lsp`) `GetAllCascadeTrajectories` & `GetConversationMetadata` | Live workspace conversations (`running`/`idle`) across both Antigravity IDE (`Antigravity IDE live trajectory registry`) and Desktop (`Antigravity desktop live trajectory registry`) |
+
+### Finding & Addressing an Antigravity IDE or Desktop Channel from Another Session
+
+1. **Check existing registrations first**:
+   ```bash
+   python3 "$bridge_cli" routes --project my-app
+   python3 "$bridge_cli" channels --project my-app
+   ```
+2. **Discover live Antigravity IDE & Desktop sessions** (if not yet registered):
+   ```bash
+   python3 "$bridge_cli" sessions --provider agy
+   python3 "$bridge_cli" sessions --provider agy --cwd /path/to/workspace
+   ```
+   Each row reports `scope: "Antigravity IDE live trajectory registry"` or `"Antigravity desktop live trajectory registry"`, along with `id` (conversation UUID), `name` (title), `cwd`, and `status`.
+3. **Register with `--transport agy` (never `realtime`)** so outbound `send`, `ask`, and `reply` calls push directly into the open IDE or Desktop conversation instead of staying `pending`:
+   ```bash
+   python3 "$bridge_cli" register agy-ide-agent --project my-app --transport agy \
+     --session AGY_CONVERSATION_UUID --discover
+   ```
 
 ## Session Handoff
 

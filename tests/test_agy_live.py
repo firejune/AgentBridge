@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bridge
 from support import RunningBroker
 
-CSRF = 'csrf-' + 'ab' * 16
+CSRF = 'ca5f-' + 'ab' * 16
 
 
 class FakeAgyServer:
@@ -240,6 +240,46 @@ class AgyLiveTests(unittest.TestCase):
             self.assertEqual(res.returncode, 1)
             out = json.loads(res.stdout)
             self.assertEqual(server.call('show', id=out['message']['id'])['state'], 'uncertain')
+
+    def test_discovers_both_desktop_and_ide_servers_while_skipping_lsp_workers(self):
+        from unittest import mock
+        import agy_live
+
+        desktop_sid = str(uuid.uuid4())
+        ide_sid = str(uuid.uuid4())
+        with FakeAgyServer(self.root, desktop_sid) as desktop_srv, FakeAgyServer(self.root, ide_sid) as ide_srv:
+            uid = os.getuid()
+            ps_text = (
+                f"1001 {uid} /Applications/Antigravity.app/Contents/Resources/bin/language_server --csrf_token {CSRF} --app_data_dir antigravity\n"
+                f"1002 {uid} /Applications/Antigravity IDE.app/Contents/Resources/app/extensions/antigravity/bin/language_server_macos_arm --csrf_token {CSRF} --app_data_dir antigravity-ide --subclient_type ide\n"
+                f"1003 {uid} /Applications/Antigravity IDE.app/Contents/Resources/app/extensions/antigravity/bin/language_server_macos_arm --enable_lsp --csrf_token {CSRF} --app_data_dir antigravity-ide\n"
+            )
+            desktop_port = desktop_srv.httpd.server_port
+            ide_port = ide_srv.httpd.server_port
+
+            def fake_check_output(cmd, *args, **kwargs):
+                if cmd[0] == 'ps':
+                    return ps_text
+                if cmd[0] == 'lsof':
+                    pid = cmd[cmd.index('-p') + 1]
+                    port = desktop_port if pid == '1001' else ide_port
+                    return f"language_ {pid} user 10u IPv4 0x0 0t0 TCP 127.0.0.1:{port} (LISTEN)\n"
+                raise AssertionError(f"Unexpected command: {cmd}")
+
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop('AGENT_BRIDGE_AGY_URL', None)
+                os.environ.pop('AGENT_BRIDGE_AGY_CSRF', None)
+                with mock.patch('subprocess.check_output', side_effect=fake_check_output):
+                    listed = agy_live.list_agy(cwd=str(self.root))
+                    by_id = {row['id']: row for row in listed['sessions']}
+                    self.assertIn(desktop_sid, by_id)
+                    self.assertIn(ide_sid, by_id)
+                    self.assertIn('desktop', by_id[desktop_sid]['scope'])
+                    self.assertIn('IDE', by_id[ide_sid]['scope'])
+
+                    srv_ide, row_ide = agy_live.resolve_agy(ide_sid)
+                    self.assertEqual(srv_ide['app_dir'], 'antigravity-ide')
+                    self.assertEqual(row_ide['id'], ide_sid)
 
 
 if __name__ == '__main__':

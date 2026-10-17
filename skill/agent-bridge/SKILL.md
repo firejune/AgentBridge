@@ -76,11 +76,16 @@ python3 "$bridge_cli" register codex-agent --project PROJECT --transport codex \
 ### 3. Push into a Live Antigravity IDE or Desktop Session (`agy`)
 
 ```bash
+python3 "$bridge_cli" sessions --provider agy
 python3 "$bridge_cli" register agy-agent --project PROJECT --transport agy \
   --session AGY_CONVERSATION_ID --discover
 ```
 
-- `send`, `ask`, and `reply` automatically push to the exact `conversationId` (UUID) registered with `agy`. Connects to the local Antigravity `language_server` (`--app_data_dir antigravity`) over ConnectRPC (`GetAllCascadeTrajectories`, `GetConversationMetadata`, `SendAgentMessage`, `SendUserCascadeMessage`), covering **both Antigravity IDE side-panel sessions and Agent Manager (Desktop) sessions** without any VS Code extension.
+- `send`, `ask`, and `reply` automatically push to the exact `conversationId` (UUID) registered with `agy`. Connects to local Antigravity `language_server` instances (`--app_data_dir antigravity` for Agent Manager / Desktop and `--app_data_dir antigravity-ide` for Antigravity IDE, automatically skipping `--enable_lsp` LSP worker processes) over ConnectRPC (`GetAllCascadeTrajectories`, `GetConversationMetadata`, `SendAgentMessage`, `SendUserCascadeMessage`), covering **both Antigravity IDE side-panel sessions and Agent Manager (Desktop) sessions simultaneously** without any VS Code extension.
+- **How other sessions find and address an Antigravity IDE or Desktop channel**:
+  1. Run `python3 "$bridge_cli" routes --project PROJECT` and `python3 "$bridge_cli" channels --project PROJECT` to see if the session is already registered under a participant name or channel.
+  2. If not yet registered, run `python3 "$bridge_cli" sessions --provider agy` (or add `--cwd /path/to/workspace`) to list all live Antigravity IDE (`scope: "Antigravity IDE live trajectory registry"`) and Desktop (`scope: "Antigravity desktop live trajectory registry"`) conversations with their UUID (`id`), title (`name`), and `cwd`.
+  3. Register the target UUID with `--transport agy --session UUID --discover` (not `realtime`, which leaves replies `pending` until polled), and optionally bind a project channel via `channel-bind`.
 - Injects directly into the open conversation's message hub (`MESSAGE_PRIORITY_HIGH`) without spawning `agy -p`. When the target session is `running`, it joins the active turn on the very next step (`DeliverMessages`/`NewMessageContinueCheck`) as `<SYSTEM_MESSAGE>[Message] ...` without cancelling in-flight work. When the session is `idle` (or waiting on background commands/subagents where `SubagentsAndTasksIdle() == false`), it immediately follows up with an empty `SendUserCascadeMessage` (`MESSAGE_DELIVERY_STRATEGY_NEXT_INVOCATION`) to wake the session without creating a synthetic `<USER_REQUEST>`.
 - The final line of the message includes the bridge reply command (`bridge.py reply <ID> --key … --file …`). Because Antigravity's internal `send_message` tool only addresses subagents, the receiver must reply via `bridge.py reply` in the shell.
 - Pre-delivery process, UUID, or workspace mismatches leave the message `pending` (`push_failed` event) and exit with code 1. Errors after `SendAgentMessage` is sent mark the message `uncertain` and exit with code 1. The CSRF token is read in memory only and never logged.

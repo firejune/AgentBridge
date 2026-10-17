@@ -74,11 +74,16 @@ python3 "$bridge_cli" register codex-agent --project PROJECT --transport codex \
 ### 3. Antigravity(AGY) IDE 및 데스크톱의 라이브 세션에 push (`agy`)
 
 ```bash
+python3 "$bridge_cli" sessions --provider agy
 python3 "$bridge_cli" register agy-agent --project PROJECT --transport agy \
   --session AGY_CONVERSATION_ID --discover
 ```
 
-- `agy`로 등록된 정확한 `conversationId(UUID)`에 `send`·`ask`·`reply`가 자동 push된다. 로컬 Antigravity `language_server`(`--app_data_dir antigravity`)의 ConnectRPC(`GetAllCascadeTrajectories`·`GetConversationMetadata`·`SendAgentMessage`·`SendUserCascadeMessage`)를 사용하므로 VS Code 익스텐션 없이 **Antigravity IDE 창과 Agent Manager(Desktop) 창의 모든 라이브 세션**을 동일하게 커버한다.
+- `agy`로 등록된 정확한 `conversationId(UUID)`에 `send`·`ask`·`reply`가 자동 push된다. 로컬 Antigravity `language_server`(데스크톱 앱은 `--app_data_dir antigravity`, IDE는 `--app_data_dir antigravity-ide`, `--enable_lsp` LSP 전용 워커는 자동 제외)의 ConnectRPC(`GetAllCascadeTrajectories`·`GetConversationMetadata`·`SendAgentMessage`·`SendUserCascadeMessage`)를 동시에 탐색하므로 VS Code 익스텐션 없이 **Antigravity IDE 창과 Agent Manager(Desktop) 창의 모든 라이브 세션**을 함께 커버한다.
+- **다른 세션(HQ·Claude·Codex 등)에서 이 채널을 찾고 연결하는 방법**:
+  1. `python3 "$bridge_cli" routes --project PROJECT` 및 `python3 "$bridge_cli" channels --project PROJECT`로 이미 등록된 참가자 이름이나 바인딩된 채널이 있는지 확인한다.
+  2. 아직 등록되지 않았다면 `python3 "$bridge_cli" sessions --provider agy`(또는 `--cwd /path/to/workspace` 추가)를 실행해 현재 열려 있는 Antigravity IDE(`scope: "Antigravity IDE live trajectory registry"`)와 데스크톱(`scope: "Antigravity desktop live trajectory registry"`) 대화의 UUID(`id`), 제목(`name`), 작업 경로(`cwd`)를 조회한다.
+  3. 찾은 UUID를 반드시 `--transport agy --session UUID --discover`로 등록하고(소켓 전용 `realtime`으로 등록하면 상대방의 `reply`가 자동 push되지 않고 `pending`에 머문다), 필요 시 `channel-bind`로 역할 채널에 연결한다.
 - 별도의 `agy -p` 프로세스를 띄우지 않고 열려 있는 대화의 메시지 허브(`MESSAGE_PRIORITY_HIGH`)로 직접 주입한다. 활성 턴(`running`)이면 기존 작업을 취소(인터럽트)하지 않고 바로 다음 스텝(`DeliverMessages`/`NewMessageContinueCheck`)에 `<SYSTEM_MESSAGE>[Message] ...`로 합류(steer)하고, 백그라운드 명령(`run_command`)·서브에이전트 대기(`SubagentsAndTasksIdle() == false`)나 스텝 경계로 인해 `idle`에 머물러 있을 때는 빈 `SendUserCascadeMessage`(`MESSAGE_DELIVERY_STRATEGY_NEXT_INVOCATION`)로 가짜 유저 입력 없이 즉시 깨워 같은 대화에서 턴을 이어간다.
 - 본문 마지막 줄에는 브릿지 답장 명령(`bridge.py reply <ID> --key … --file …`)이 포함된다. AGY 내부의 `send_message` 도구는 서브에이전트 전용이라 브릿지 주소에 닿지 않으므로 반드시 셸에서 `bridge.py reply`로 답한다.
 - 전달 전 프로세스·세션 UUID·작업 경로 불일치 실패는 `pending`(`push_failed` 이벤트)과 종료 코드 1로 남는다. `SendAgentMessage` 요청 전송 후 오류는 `uncertain`과 종료 코드 1이다. CSRF 토큰은 메모리에서만 읽고 출력·로그·파일에 남기지 않는다.
