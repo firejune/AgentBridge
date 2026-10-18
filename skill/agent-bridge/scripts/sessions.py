@@ -10,6 +10,7 @@ import signal
 import subprocess
 import tempfile
 import time
+from urllib.parse import urlencode
 import uuid
 
 import agy_live
@@ -272,9 +273,13 @@ def inspect_session(provider, sid, executable=None, codex_mode='auto'):
     return {'session':matches[0],'warning':None}
 
 
-def open_session(provider='agy', cwd=None, title=None, model=None):
+def open_session(provider='agy', cwd=None, title=None, model=None, timeout=180):
+    if provider == 'claude':
+        if not cwd:
+            raise DiscoveryError('Provide --cwd when opening a new Claude Code desktop session')
+        return open_claude(cwd=cwd, title=title, model=model, timeout=timeout)
     if provider != 'agy':
-        raise DiscoveryError(f'Opening a new session is currently supported only for Antigravity Desktop (agy), not {provider!r}')
+        raise DiscoveryError(f'Opening a new session is supported only for Antigravity Desktop (agy) and Claude Code desktop (claude), not {provider!r}')
     if not cwd:
         raise DiscoveryError('Provide --cwd when opening a new Antigravity Desktop session')
     return agy_live.open_agy(cwd=cwd, title=title, model=model)
@@ -339,3 +344,105 @@ def resolve_claude_peer(sid, sessions_dir=None):
             'status':record.get('status','unknown'),'pid':record['pid'],'socket':sock,
             'peer_protocol':record['peerProtocol'],'version':record.get('version'),
             'registry':str(path),'observed_at':observed_now(),'scope':'Claude live-session registry'}
+
+
+# --- Opening a new Claude Code desktop session ------------------------------
+# The desktop app registers the claude:// scheme. Its own Finder service
+# ("New Claude Code Session Here") opens claude://code/new?folder=PATH, and the
+# handler also accepts q= (or prompt=) to prefill the composer. The link only
+# opens the new-session composer: the session starts when the owner presses
+# Enter. The bridge never presses it and never launches a standalone CLI;
+# it opens the composer and waits for the new live registry record.
+# Trusting a folder also starts a short-lived probe CLI there (the app logs it
+# as a "temporary query"); its record has no hostSessionId. Only a record whose
+# hostSessionId names a desktop session (local_...) is the new session.
+CLAUDE_DESKTOP_ENTRYPOINT = 'claude-desktop'
+
+
+def claude_new_session_url(cwd, prompt):
+    query = [('folder', cwd)]
+    if prompt:
+        query.append(('q', prompt))
+    query.append(('source', 'url_external'))
+    return 'claude://code/new?' + urlencode(query)
+
+
+def open_url(url):
+    if not shutil.which('open'):
+        raise DiscoveryError('Opening a Claude Code desktop session needs the macOS `open` command')
+    result = subprocess.run(['open', url], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            stdin=subprocess.DEVNULL, text=True, timeout=10)
+    if result.returncode:
+        raise DiscoveryError('The claude:// link was not opened: ' + result.stderr.strip()[-500:])
+
+
+def claude_live_records(root):
+    rows = []
+    if not root.is_dir():
+        return rows
+    for path in root.iterdir():
+        if not re.fullmatch(r'\d+\.json', path.name):
+            continue
+        try:
+            record = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue
+        if (isinstance(record, dict) and isinstance(record.get('sessionId'), str)
+                and isinstance(record.get('pid'), int) and path.name == f"{record['pid']}.json"
+                and pid_alive(record['pid'])):
+            rows.append(record)
+    return rows
+
+
+def same_or_inside(path, folder):
+    try:
+        resolved = Path(path).expanduser().resolve()
+    except (OSError, TypeError, ValueError):
+        return False
+    return resolved == folder or folder in resolved.parents
+
+
+def open_claude(cwd, title=None, model=None, timeout=180, sessions_dir=None, opener=None, poll=0.5):
+    if model:
+        raise DiscoveryError('The Claude desktop new-session link carries no model; choose it in the composer instead of --model')
+    if not cwd or not str(cwd).strip():
+        raise DiscoveryError('Workspace --cwd is required to open a Claude Code desktop session')
+    if not 0 < timeout <= 3600:
+        raise DiscoveryError('Timeout must be between 0 and 3600 seconds')
+    folder = Path(cwd).expanduser().resolve()
+    if not folder.is_dir():
+        raise DiscoveryError(f'Workspace directory does not exist: {folder}')
+    root = Path(sessions_dir) if sessions_dir else claude_sessions_dir()
+    clean_title = str(title).strip() if isinstance(title, str) and title.strip() else None
+    prompt = clean_title or 'agent-bridge: this session was opened to receive peer messages. Wait for them.'
+    before = {r['sessionId'] for r in claude_live_records(root)}
+    opened_at = time.time() * 1000
+    url = claude_new_session_url(str(folder), prompt)
+    (opener or open_url)(url)
+    deadline = time.monotonic() + timeout
+    while True:
+        fresh = [r for r in claude_live_records(root)
+                 if r['sessionId'] not in before
+                 and r.get('entrypoint') == CLAUDE_DESKTOP_ENTRYPOINT
+                 and isinstance(r.get('hostSessionId'), str) and r['hostSessionId'].startswith('local_')
+                 and not (isinstance(r.get('startedAt'), (int, float)) and r['startedAt'] < opened_at - 5000)
+                 and same_or_inside(r.get('cwd'), folder)]
+        ids = {r['sessionId'] for r in fresh}
+        if len(ids) > 1:
+            raise DiscoveryError(f'{len(ids)} new Claude sessions appeared under {folder}; not choosing one '
+                                 '(bind the right one with register --discover --session ID)')
+        if ids:
+            sid = ids.pop()
+            try:
+                row = resolve_claude_peer(sid, root)
+            except DiscoveryError:
+                row = None  # The record exists before the inbox socket is announced.
+            if row:
+                host = next(r['hostSessionId'] for r in fresh if r['sessionId'] == sid)
+                return {'created': True, 'session': row, 'desktop_session': host,
+                        'url': url, 'prompt': prompt, 'warning': None}
+        if time.monotonic() >= deadline:
+            raise DiscoveryError(f'No new live Claude Code session appeared under {folder} within {timeout:g}s. '
+                                 'The composer opens with the first message prefilled; the session starts only '
+                                 'when someone presses Enter in the app. Then bind it with register --discover --session ID.')
+        time.sleep(poll)

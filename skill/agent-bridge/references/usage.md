@@ -204,6 +204,31 @@ python3 "$bridge_cli" send --project PROJECT --from codex-agent --to claude-agen
 - **Envelope**: Includes the bridge header, body, and exact reply command (`bridge.py reply <ID> --key reply-<ID> --file <answer-file>`).
 - **Outcomes**: `submitted` (`pushed` event) on clean write; `pending` (`push_failed` event, exit code 1) on pre-write validation or socket error; `uncertain` if unexpected response bytes arrive or the socket fails to close cleanly.
 
+### Opening a New Claude Code Desktop Session
+
+```bash
+python3 "$bridge_cli" open --provider claude --cwd /path/to/workspace --title "First message"
+python3 "$bridge_cli" register claude-worker --project PROJECT --transport claude-peer \
+  --new --cwd /path/to/workspace --title "First message" --timeout 300
+```
+
+`open` / `register --new` open `claude://code/new?folder=<cwd>&q=<title>&source=url_external`, then wait for the new session's live record and (for `register`) bind it. Output carries `created`, `session` (the resolved peer endpoint), `desktop_session` (`local_…`), the `url`, and the prefilled `prompt`. Exit 0 on success, 1 with `{"error": …}` otherwise; nothing is registered on failure.
+
+The new session exists only after someone presses Enter in the prefilled composer. For a folder the app has not seen, it first asks to trust the workspace. Both stay human steps.
+
+How the path was chosen (measured against Claude desktop with Claude Code 2.1.299; internal and unversioned, so it may change):
+
+| Candidate | What it does | Used? |
+| --- | --- | --- |
+| `claude://` URL scheme | `CFBundleURLSchemes = ["claude"]` in the app's `Info.plist`. The app's own Finder service "New Claude Code Session Here" runs `open "claude://code/new?folder=$u&source=services"`. The `code/new` handler reads `q`/`prompt`, `folder`, `file`, `environment`, `runner_pool` and `ssh_*`, and navigates to the new-session page. Observed: the composer opens at the folder with the text prefilled, not submitted. No record appears in `~/.claude/sessions` until Enter | **Yes** — the only external entry point that opens a desktop session at a folder |
+| `claude://resume?session=UUID` | Imports an existing CLI transcript into the app | No — needs a transcript that a CLI run already wrote |
+| Peer messaging socket | Belongs to one running CLI process and accepts `auth` + `user` frames for that session | No — reaches an existing session only |
+| Bundled `claude` CLI | Starts a standalone process | No — a separate CLI process, not a desktop session |
+| Local app servers | The main bundle listens only for OAuth loopback, the browser bridge, and SSH askpass | No session API |
+| Pressing Enter by keystroke automation | Would type into whichever window has focus | Rejected |
+
+Detection: after trusting a folder the app logs `LocalSessions.saveTrust` and starts a short-lived "temporary query" CLI there. Its `~/.claude/sessions/<pid>.json` has `entrypoint: "claude-desktop"` but no `hostSessionId`, and it exits within seconds. The real session's record also has `hostSessionId: "local_…"`. `--new` waits for exactly one record that is new since the link opened, alive, under `--cwd`, `entrypoint == "claude-desktop"`, `hostSessionId` starting with `local_`, and announcing a messaging socket.
+
 ## Pushing & Delivering to Codex, Antigravity, and Idle CLI Sessions
 
 `codex`, `claude-peer`, and `agy` push automatically during `send`, `ask`, and `reply`, and can be retried explicitly with `deliver` if left `pending`. Idle dedicated `claude` CLI sessions are dispatched explicitly via `deliver`.

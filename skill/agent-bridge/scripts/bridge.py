@@ -288,11 +288,12 @@ def registration(args):
     if getattr(args, 'new', False):
         if args.discover or args.session:
             raise ValueError('--new cannot be combined with --session or --discover')
-        if args.transport != 'agy':
-            raise ValueError('--new is currently supported only with --transport agy (Antigravity Desktop)')
+        if args.transport not in ('agy','claude-peer'):
+            raise ValueError('--new is supported only with --transport agy (Antigravity Desktop) or claude-peer (Claude Code desktop)')
         if not args.cwd:
             raise ValueError('--new requires --cwd')
-        observation = sessions.open_session('agy', cwd=args.cwd, title=args.title, model=args.model)
+        provider = 'claude' if args.transport == 'claude-peer' else 'agy'
+        observation = sessions.open_session(provider, cwd=args.cwd, title=args.title, model=args.model, timeout=args.timeout)
         args.session = observation['session']['id']
         args.cwd = observation['session']['cwd']
         return observation
@@ -324,12 +325,14 @@ def main(argv=None):
     p.add_argument('--transport',choices=['realtime','codex','claude','claude-peer','agy'],default='realtime')
     p.add_argument('--session');p.add_argument('--cwd');p.add_argument('--executable')
     p.add_argument('--discover',action='store_true')
-    p.add_argument('--new',action='store_true',help='Open a new Antigravity Desktop session and register it')
+    p.add_argument('--new',action='store_true',help='Open a new Antigravity Desktop or Claude Code desktop session and register it')
     p.add_argument('--title');p.add_argument('--model')
+    p.add_argument('--timeout',type=float,default=180,help='Seconds to wait for a new claude-peer session to start')
     p.add_argument('--codex-mode',choices=['auto','shared','saved'],default='auto')
-    p = sub.add_parser('open',help='Open a new live session (currently Antigravity Desktop)')
-    p.add_argument('--provider',choices=['agy'],default='agy')
+    p = sub.add_parser('open',help='Open a new live session (Antigravity Desktop or Claude Code desktop)')
+    p.add_argument('--provider',choices=['agy','claude'],default='agy')
     p.add_argument('--cwd',required=True);p.add_argument('--title');p.add_argument('--model')
+    p.add_argument('--timeout',type=float,default=180)
     p = sub.add_parser('sessions',help='Discover real CLI sessions without starting a turn')
     p.add_argument('--provider',choices=['all','codex','claude','agy'],default='all')
     p.add_argument('--cwd');p.add_argument('--search');p.add_argument('--limit',type=int,default=100)
@@ -376,7 +379,7 @@ def main(argv=None):
             asyncio.run(broker.serve(args.socket,args.max_messages))
             return 0
         if args.cmd=='open':
-            output(sessions.open_session(args.provider,args.cwd,args.title,args.model))
+            output(sessions.open_session(args.provider,args.cwd,args.title,args.model,args.timeout))
             return 0
         if args.cmd=='sessions':
             result = sessions.discover(args.provider,args.cwd,args.search,args.limit,args.codex_executable,args.claude_executable,args.codex_mode)
@@ -392,7 +395,7 @@ def main(argv=None):
             result = deliver(args.socket,args.id,args.timeout,args.dry_run)
             output(result)
             return 1 if result['state'] in ('failed','uncertain') else 0
-        fields = {k:v for k,v in vars(args).items() if k not in ('cmd','socket','file','discover','new','title','model','codex_mode')}
+        fields = {k:v for k,v in vars(args).items() if k not in ('cmd','socket','file','discover','new','title','model','codex_mode') and not (k=='timeout' and args.cmd=='register')}
         fields['op'] = {'stop':'shutdown','ask':'send'}.get(args.cmd,args.cmd)
         if args.cmd in ('send','ask','reply'):
             fields['body'] = sys.stdin.read() if args.file=='-' else Path(args.file).read_text(encoding='utf-8')

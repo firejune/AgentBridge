@@ -217,6 +217,31 @@ python3 "$bridge_cli" send --project PROJECT --from codex-agent --to claude-agen
 - **성공**: 상태 `submitted`, 이벤트 `pushed`(대상 pid · msg_id). 받는 세션의 큐 접수이지 답변 완료가 아니다. 소켓은 응답을 주지 않는 것이 정상이다.
 - **실패**: 세션 파일 없음 · 죽은 pid · sessionId 불일치 · `peerProtocol` 변경 · 키 파일 없음/이상 · 소켓 오류면 메시지는 `pending`으로 남고 `push_failed` 이벤트에 이유가 기록된다. 명령은 `{"error":…,"push_failed":true,"message":…}`를 출력하고 **종료 코드 1**로 끝난다. watch로 조용히 넘어가지 않는다. 원인을 고친 뒤 같은 `--key`로 다시 `send`하거나 `deliver ID`로 다시 push한다(이미 `submitted`면 다시 보내지 않는다).
 - **애매함**: 다 쓴 뒤 받는 쪽이 응답 바이트를 보내거나 연결을 안 닫으면 `uncertain`이다. 이미 큐에 들어갔을 수 있으므로 자동 재전송하지 않고 받는 세션에서 확인한 뒤 `resolve`한다.
+
+### Claude Code 데스크톱 신규 세션 열기
+
+```bash
+python3 "$bridge_cli" open --provider claude --cwd /path/to/workspace --title "첫 메시지"
+python3 "$bridge_cli" register claude-worker --project PROJECT --transport claude-peer \
+  --new --cwd /path/to/workspace --title "첫 메시지" --timeout 300
+```
+
+`claude://code/new?folder=<cwd>&q=<title>&source=url_external`을 열고 새 세션의 라이브 레코드를 기다렸다가(`register`면) 등록한다. 출력에는 `created`, `session`(해석된 peer 엔드포인트), `desktop_session`(`local_…`), `url`, 미리 채운 `prompt`가 실린다. 성공은 종료 코드 0, 실패는 `{"error": …}`와 1이며 실패하면 아무것도 등록하지 않는다.
+
+새 세션은 미리 채워진 입력창에서 사람이 Enter를 눌러야 생긴다. 앱이 처음 보는 폴더면 먼저 작업 공간 신뢰를 묻는다. 둘 다 사람 몫으로 둔다.
+
+경로 선택 근거(Claude 데스크톱 + Claude Code 2.1.299에서 측정, 비공식이라 바뀔 수 있다):
+
+| 후보 | 하는 일 | 사용 |
+| --- | --- | --- |
+| `claude://` URL 스킴 | 앱 `Info.plist`의 `CFBundleURLSchemes = ["claude"]`. 앱 자체 Finder 서비스 「New Claude Code Session Here」가 `open "claude://code/new?folder=$u&source=services"`를 실행한다. `code/new` 핸들러는 `q`/`prompt`·`folder`·`file`·`environment`·`runner_pool`·`ssh_*`를 읽어 새 세션 화면으로 간다. 관찰: 입력창이 그 폴더로 열리고 글이 채워지지만 전송되지 않는다. Enter 전에는 `~/.claude/sessions`에 레코드가 없다 | **사용** — 폴더를 지정해 데스크톱 세션을 여는 유일한 외부 진입점 |
+| `claude://resume?session=UUID` | 이미 있는 CLI 대화 기록을 앱으로 가져온다 | 미사용 — CLI가 먼저 기록을 써야 한다 |
+| peer 메시징 소켓 | 실행 중인 CLI 프로세스 하나의 것이며 그 세션용 `auth` + `user` 프레임을 받는다 | 미사용 — 기존 세션에만 닿는다 |
+| 번들 `claude` CLI | 별도 프로세스를 띄운다 | 미사용 — 데스크톱 세션이 아닌 별개 CLI |
+| 앱 로컬 서버 | 메인 번들은 OAuth 루프백·브라우저 브릿지·SSH askpass만 연다 | 세션 API 없음 |
+| 키 입력 자동화로 Enter | 포커스가 있는 아무 창에 입력된다 | 기각 |
+
+탐지: 폴더를 신뢰하면 앱이 `LocalSessions.saveTrust`를 기록하고 그 폴더에 잠깐짜리 「temporary query」 CLI를 띄운다. 그 `~/.claude/sessions/<pid>.json`은 `entrypoint: "claude-desktop"`이지만 `hostSessionId`가 없고 몇 초 안에 끝난다. 진짜 세션 레코드에는 `hostSessionId: "local_…"`가 있다. `--new`는 링크를 연 뒤 새로 생겼고, 살아 있고, `--cwd` 아래이며, `entrypoint == "claude-desktop"`, `hostSessionId`가 `local_`로 시작하고, 메시징 소켓을 알린 레코드 정확히 하나를 기다린다.
 - **수신 게이트**: 받는 쪽의 `crossSessionInbound` 설정이 정한다. `accept`면 바로 큐에 들어가고, `hold`면 그 세션에서 사람 승인을 기다리며, `refuse`면 버려진다. 브릿지는 이 결과를 볼 수 없다.
 - ⚠️ **문서화되지 않은 Claude Code 내부 프로토콜(peerProtocol 1)**이다. Claude Code 업데이트로 레지스트리·키·프레임 모양이 바뀌면 위 실패로 시끄럽게 멈춘다. 그때는 push 코드를 고친다. `deliver ID --dry-run`은 키 없이 보낼 프레임을 보여 준다.
 - **브로커 버전**: `claude-peer`를 모르는 이전 코드로 떠 있는 브로커는 등록을 `Unknown transport`로 거부한다. 공유 브로커는 참가자들과 맞춘 뒤에만 재시작한다(재시작하면 메모리 상태가 사라진다).

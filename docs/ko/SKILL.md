@@ -55,6 +55,16 @@ python3 "$bridge_cli" register claude-agent --project PROJECT --transport claude
 - ⚠️ Claude Code의 **문서화되지 않은 내부 프로토콜(peerProtocol 1)**에 기댄다. CLI 업데이트로 모양이 바뀌면 조용히 틀리지 않고 실패한다 — 그때는 push 코드를 고쳐야 한다. 받는 쪽 설정 `crossSessionInbound`가 `accept`가 아니면 그 세션에서 사용자 승인을 기다린다.
 - 키(`peerToken`)는 메모리에서만 읽는다. 출력·로그·파일에 남기지 않는다.
 - ⛔ **`--transport claude`(resume)는 라이브 세션에 쓰지 않는다.** 그것은 살아 있는 대화에 들어가는 길이 아니라 **별개의 Claude CLI 사본을 띄운다**. 쉬고 있는 전용 CLI 세션에만 남겨 둔 경로다. 자세한 등록·인계 명령은 [사용법](usage.md)을 읽는다.
+- **Claude Code 데스크톱 신규 세션 열기 (`open --provider claude` / `register --new`)**:
+
+  ```bash
+  python3 "$bridge_cli" register claude-worker --project PROJECT --transport claude-peer \
+    --new --cwd /path/to/workspace --title "새 세션의 첫 메시지" --timeout 300
+  ```
+
+  - 앱의 Finder 서비스 「New Claude Code Session Here」가 쓰는 링크 `claude://code/new?folder=…&q=…`를 연다. 앱은 그 폴더의 새 세션 입력창을 첫 메시지가 채워진 채로 띄운다. **세션은 사람이 Enter를 눌러야 시작된다**(새 폴더면 앱이 묻는 작업 공간 신뢰도). 브릿지는 대신 누르지 않고 별도 CLI도 띄우지 않는다.
+  - `--timeout`초(기본 180) 동안 `~/.claude/sessions`에 그 폴더 아래 `entrypoint == "claude-desktop"`이고 데스크톱 `hostSessionId`(`local_…`)가 있는 새 라이브 레코드 하나를 기다렸다가 등록하고 `sessionId`와 `desktop_session`을 출력한다. 폴더를 신뢰한 직후 앱이 띄우는 잠깐짜리 조회 CLI는 `hostSessionId`가 없어 무시한다. 새 세션이 둘이면 고르지 않고 실패하고, 시간이 지나면 등록 없이 종료 코드 1이다.
+  - `--title`은 미리 채울 첫 메시지다(앱이 그것으로 세션 제목을 짓는다). `--model`은 거부한다 — 링크에 모델이 없으니 입력창에서 고른다.
 
 ### 2. Codex / ChatGPT 데스크톱의 라이브 세션에 push (`codex`)
 

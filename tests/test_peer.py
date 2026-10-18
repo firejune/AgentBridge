@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,8 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
+from urllib.parse import parse_qs, urlsplit
 import uuid
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
@@ -26,14 +29,14 @@ def dead_pid():
 
 class FakeClaude:
     """A fake live Claude session: registry file, key file and inbox socket."""
-    def __init__(self, root, sid, pid=None, protocol=1, listen=True):
+    def __init__(self, root, sid, pid=None, protocol=1, listen=True, extra=None):
         self.root, self.sid = Path(root), sid
         self.pid = os.getpid() if pid is None else pid
         self.registry = self.root/'sessions'
         self.registry.mkdir(exist_ok=True)
         self.sock = str(self.root/f'{self.pid}.sock')
         record = {'pid':self.pid,'sessionId':sid,'cwd':str(self.root),'peerProtocol':protocol,
-                  'messagingSocketPath':self.sock,'name':'fake commander','status':'idle'}
+                  'messagingSocketPath':self.sock,'name':'fake commander','status':'idle',**(extra or {})}
         (self.registry/f'{self.pid}.json').write_text(json.dumps(record))
         digest = hashlib.sha256(os.path.abspath(self.sock).encode()).hexdigest()
         (self.registry/f'{self.pid}.{digest}.key').write_text(json.dumps({'peerToken':TOKEN}))
@@ -178,6 +181,102 @@ class PushTests(unittest.TestCase):
                 self.assertEqual(fake.received,[])
         finally:
             fake.close()
+
+
+class OpenClaudeTests(unittest.TestCase):
+    """register --transport claude-peer --new: open the composer link, bind the new live record."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='abn-',dir='/tmp')
+        self.root = Path(self.temp.name)
+        self.sid = str(uuid.uuid4())
+        self.fakes, self.urls = [], []
+
+    def tearDown(self):
+        for fake in self.fakes:
+            fake.close()
+        self.temp.cleanup()
+
+    DESKTOP = {'entrypoint':'claude-desktop','hostSessionId':'local_fake'}
+
+    def opener(self, sid=None, extra=DESKTOP):
+        def open_link(url):
+            self.urls.append(url)
+            self.fakes.append(FakeClaude(self.temp.name,sid or self.sid,extra=extra))
+        return open_link
+
+    def open(self, **kwargs):
+        kwargs.setdefault('opener',self.opener())
+        return sessions.open_claude(str(self.root),sessions_dir=self.root/'sessions',poll=0.01,**kwargs)
+
+    def test_link_opens_composer_at_folder_and_binds_new_record(self):
+        opened = self.open(title='Fresh worker')
+        self.assertTrue(opened['created'])
+        self.assertEqual(opened['session']['id'],self.sid)
+        self.assertEqual(opened['desktop_session'],'local_fake')
+        self.assertEqual(opened['session']['cwd'],str(self.root))
+        url = self.urls[0]
+        self.assertTrue(url.startswith('claude://code/new?'),url)
+        query = parse_qs(urlsplit(url).query)
+        self.assertEqual(query['folder'],[str(self.root.resolve())])
+        self.assertEqual(query['q'],['Fresh worker'])
+
+    def test_trust_probe_without_desktop_host_is_not_taken(self):
+        probe = {'entrypoint':'claude-desktop'}  # the app's temporary query process
+        with self.assertRaisesRegex(ValueError,'No new live Claude Code session'):
+            self.open(opener=self.opener(extra=probe),timeout=0.05)
+
+    def test_preexisting_session_in_same_folder_is_not_taken(self):
+        self.fakes.append(FakeClaude(self.temp.name,str(uuid.uuid4()),extra=self.DESKTOP))
+        with self.assertRaisesRegex(ValueError,'No new live Claude Code session'):
+            self.open(opener=self.urls.append,timeout=0.05)
+        self.assertEqual(len(self.urls),1)
+
+    def test_rejects_model_missing_folder_and_bad_timeout_before_opening(self):
+        with self.assertRaisesRegex(ValueError,'carries no model'):
+            self.open(model='opus')
+        with self.assertRaisesRegex(ValueError,'does not exist'):
+            sessions.open_claude(str(self.root/'missing'),opener=self.urls.append)
+        with self.assertRaisesRegex(ValueError,'Timeout'):
+            self.open(timeout=0)
+        self.assertEqual(self.urls,[])
+
+    def test_register_new_parsing_rejects_conflicts(self):
+        for extra in (['--session',self.sid],['--discover']):
+            with self.assertRaisesRegex(ValueError,'cannot be combined'):
+                bridge.registration(self.args(*extra))
+        with self.assertRaisesRegex(ValueError,'supported only with'):
+            bridge.registration(self.args(transport='codex'))
+        args = self.args()
+        args.cwd = None
+        with self.assertRaisesRegex(ValueError,'requires --cwd'):
+            bridge.registration(args)
+
+    def args(self, *extra, transport='claude-peer'):
+        import argparse
+        ns = argparse.Namespace(new=True,discover='--discover' in extra,
+                                session=extra[1] if extra[:1]==('--session',) else None,
+                                transport=transport,cwd=str(self.root),title=None,model=None,timeout=1)
+        return ns
+
+    def test_register_new_binds_route_and_send_lands(self):
+        out = io.StringIO()
+        with RunningBroker() as server, mock.patch.dict(os.environ,{'CLAUDE_CONFIG_DIR':self.temp.name}), \
+                mock.patch.object(sessions,'open_url',self.opener()), mock.patch('sys.stdout',out):
+            code = bridge.main(['--socket',server.path,'register','fresh','--project','demo',
+                                '--transport','claude-peer','--new','--cwd',str(self.root),'--timeout','5'])
+            self.assertEqual(code,0,out.getvalue())
+            reg = json.loads(out.getvalue().splitlines()[-1])
+            self.assertEqual((reg['session'],reg['transport']),(self.sid,'claude-peer'))
+            self.assertTrue(reg['discovery']['created'])
+            server.call('register',project='demo',name='alpha',cwd=self.temp.name)
+            with mock.patch('sys.stdin',io.StringIO('hello')):
+                code = bridge.main(['--socket',server.path,'send','--project','demo','--from','alpha',
+                                    '--to','fresh','--key','k1','--file','-'])
+            self.assertEqual(code,0,out.getvalue())
+            self.assertEqual(json.loads(out.getvalue().splitlines()[-1])['state'],'submitted')
+            _,user = self.fakes[0].received[0]
+            self.assertEqual(user['session_id'],self.sid)
+            self.assertIn('hello',user['message']['content'])
 
 
 if __name__=='__main__':
