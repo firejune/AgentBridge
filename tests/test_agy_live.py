@@ -64,6 +64,48 @@ class FakeAgyServer:
                         self.respond(200, {'code': 'unknown', 'message': f'trajectory not found: {cid}'})
                     else:
                         self.respond(200, {'metadata': {'workspaces': traj['workspaces']}})
+                elif self.path.endswith('/GetCascadeModelConfigData'):
+                    self.respond(200, {
+                        'clientModelConfigs': [
+                            {
+                                'label': 'Gemini 3.1 Pro (High)',
+                                'modelOrAlias': {'model': 'MODEL_PLACEHOLDER_M418'},
+                                'modelId': 'gemini-3.1-pro-high',
+                            },
+                            {
+                                'label': 'Claude Opus 4.6 (Thinking)',
+                                'modelOrAlias': {'model': 'MODEL_PLACEHOLDER_M26'},
+                                'modelId': 'claude-opus-4-6-thinking',
+                            },
+                        ],
+                        'defaultOverrideModelConfig': {
+                            'modelOrAlias': {'model': 'MODEL_PLACEHOLDER_M418'},
+                        },
+                    })
+                elif self.path.endswith('/StartCascade'):
+                    new_id = str(uuid.uuid4())
+                    uris = body.get('workspaceUris') or []
+                    proj_env = body.get('projectEnvConfig') or {}
+                    proj_id = proj_env.get('projectId')
+                    if proj_id and not uris:
+                        uris = [parent.root.as_uri()]
+                    parent.trajectories[new_id] = {
+                        'summary': '',
+                        'status': 'CASCADE_RUN_STATUS_IDLE',
+                        'workspaces': [{'workspaceFolderAbsoluteUri': u} for u in uris],
+                        'lastModifiedTime': '2026-10-18T12:00:00Z',
+                    }
+                    if proj_id:
+                        parent.trajectories[new_id]['annotations'] = {'projectId': proj_id}
+                    self.respond(200, {'cascadeId': new_id})
+                elif self.path.endswith('/UpdateConversationAnnotations'):
+                    cid = body.get('cascadeId')
+                    traj = parent.trajectories.get(cid)
+                    if traj is not None:
+                        ann = body.get('annotations') or {}
+                        if 'title' in ann:
+                            traj['summary'] = ann['title']
+                    self.respond(200, {})
                 elif self.path.endswith('/SendAgentMessage'):
                     if parent.send_behavior == 'error':
                         self.respond(500, {'code': 'internal', 'message': 'message hub failure'})
@@ -241,6 +283,67 @@ class AgyLiveTests(unittest.TestCase):
             out = json.loads(res.stdout)
             self.assertEqual(server.call('show', id=out['message']['id'])['state'], 'uncertain')
 
+    def test_open_and_register_new_create_desktop_session_with_default_agent_spec(self):
+        with FakeAgyServer(self.root, self.sid) as fake, RunningBroker() as server:
+            config_dir = self.root / 'gemini-config'
+            projects_dir = config_dir / 'projects'
+            projects_dir.mkdir(parents=True)
+            proj_id = str(uuid.uuid4())
+            (projects_dir / f'{proj_id}.json').write_text(
+                json.dumps({'id': proj_id, 'name': 'demo-proj', 'workspacePaths': [str(self.root)]}),
+                encoding='utf-8',
+            )
+            env = {**self.env(fake), 'GEMINI_CONFIG_DIR': str(config_dir)}
+            sock = self.root / 'unused.sock'
+
+            # 1) Standalone open with project matching, custom title, and model alias.
+            opened = self.cli(sock, env, 'open', '--provider', 'agy', '--cwd', str(self.root),
+                              '--title', 'Fresh Session', '--model', 'claude-opus-4-6-thinking')
+            self.assertEqual(opened.returncode, 0, opened.stdout)
+            opened_json = json.loads(opened.stdout)
+            new_sid = opened_json['session']['id']
+            self.assertTrue(opened_json['created'])
+            self.assertEqual(opened_json['session']['name'], 'Fresh Session')
+            self.assertEqual(opened_json['session']['cwd'], str(self.root))
+            self.assertEqual(opened_json['model'], 'claude-opus-4-6-thinking')
+            self.assertEqual(opened_json['model_enum'], 'MODEL_PLACEHOLDER_M26')
+            self.assertEqual(opened_json['project_id'], proj_id)
+
+            start_calls = [body for path, _, body in fake.requests if path.endswith('/StartCascade')]
+            self.assertEqual(len(start_calls), 1)
+            self.assertEqual(start_calls[0]['projectEnvConfig']['projectId'], proj_id)
+            self.assertEqual(
+                start_calls[0]['customAgentSpec']['cascadeConfig']['plannerConfig']['planModel'],
+                'MODEL_PLACEHOLDER_M26',
+            )
+            self.assertTrue(
+                start_calls[0]['customAgentSpec']['builtinAgent']['defaultAgent']['isInteractive']
+            )
+
+            # 2) register --new opens and immediately binds the new session for messaging.
+            unregistered_dir = self.root / 'subworkspace'
+            unregistered_dir.mkdir()
+            reg = self.cli(server.path, env, 'register', 'agy-fresh', '--project', 'demo',
+                           '--transport', 'agy', '--new', '--cwd', str(unregistered_dir),
+                           '--title', 'Subworkspace Worker')
+            self.assertEqual(reg.returncode, 0, reg.stdout)
+            reg_json = json.loads(reg.stdout)
+            fresh_sid = reg_json['session']
+            self.assertEqual(reg_json['cwd'], str(unregistered_dir))
+            self.assertEqual(reg_json['discovery']['session']['name'], 'Subworkspace Worker')
+
+            server.call('register', project='demo', name='codex-agent', cwd=str(self.root))
+            sent = self.cli(server.path, env, 'send', '--project', 'demo',
+                            '--from', 'codex-agent', '--to', 'agy-fresh', '--key', 'k-fresh', '--file', '-')
+            self.assertEqual(sent.returncode, 0, sent.stdout)
+            self.assertEqual(json.loads(sent.stdout)['state'], 'submitted')
+            self.assertEqual(fake.trajectories[fresh_sid]['status'], 'CASCADE_RUN_STATUS_RUNNING')
+
+            # 3) Unknown model or missing directory fails loudly.
+            bad_model = self.cli(sock, env, 'open', '--cwd', str(self.root), '--model', 'nonexistent-model')
+            self.assertEqual(bad_model.returncode, 1)
+            self.assertIn('Unknown Antigravity model', json.loads(bad_model.stdout)['error'])
+
     def test_discovers_both_desktop_and_ide_servers_while_skipping_lsp_workers(self):
         from unittest import mock
         import agy_live
@@ -284,4 +387,5 @@ class AgyLiveTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
 

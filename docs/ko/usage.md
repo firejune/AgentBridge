@@ -145,7 +145,7 @@ python3 "$bridge_cli" register agy-agent --project my-app --transport agy \
 | Codex 저장 목록 | 임시 `codex app-server --stdio`의 메타데이터 조회 | CLI 저장소의 보관 처리되지 않은 대화. 다른 앱의 실행 상태는 `unknown` |
 | Antigravity (`agy`) | 로컬 `language_server`(`--app_data_dir antigravity` 및 `antigravity-ide`, `--enable_lsp` 제외)의 `GetAllCascadeTrajectories` · `GetConversationMetadata` | 현재 실행 중인 Antigravity IDE(`Antigravity IDE live trajectory registry`) 및 Desktop(`Antigravity desktop live trajectory registry`)의 워크스페이스 대화(`running`/`idle`) |
 
-### 다른 세션에서 Antigravity IDE · Desktop 채널을 찾고 연결하는 법
+### 다른 세션에서 Antigravity IDE · Desktop 채널을 찾거나 새로 여는 법
 
 1. **이미 등록된 라우트와 채널을 먼저 확인한다**:
    ```bash
@@ -158,11 +158,22 @@ python3 "$bridge_cli" register agy-agent --project my-app --transport agy \
    python3 "$bridge_cli" sessions --provider agy --cwd /path/to/workspace
    ```
    각 항목의 `scope`로 IDE 세션(`Antigravity IDE live trajectory registry`)과 데스크톱 세션(`Antigravity desktop live trajectory registry`)을 구별할 수 있으며, `id`(대화 UUID)·`name`(제목)·`cwd`·`status`가 함께 표시된다.
-3. **반드시 `--transport agy`로 등록한다**(`realtime`으로 등록하면 상대방의 `reply`가 자동 push되지 않고 `pending`에 머문다):
+3. **기존 세션은 반드시 `--transport agy`로 등록한다**(`realtime`으로 등록하면 상대방의 `reply`가 자동 push되지 않고 `pending`에 머문다):
    ```bash
    python3 "$bridge_cli" register agy-ide-agent --project my-app --transport agy \
      --session AGY_CONVERSATION_UUID --discover
    ```
+4. **또는 새 Antigravity 데스크톱 세션을 즉시 생성·등록한다**:
+   ```bash
+   # 단독 생성 (생성된 세션 UUID, cwd, model, project_id 반환):
+   python3 "$bridge_cli" open --provider agy --cwd /path/to/workspace \
+     --title "Motion Worker" --model claude-opus-4-6-thinking
+
+   # 새 데스크톱 세션을 열자마자 브로커에 등록:
+   python3 "$bridge_cli" register agy-worker --project my-app --transport agy \
+     --new --cwd /path/to/workspace --title "Motion Worker"
+   ```
+   `open` 및 `register --new`는 실행 중인 Antigravity 데스크톱 `language_server`(`--app_data_dir antigravity`)에 새 대화를 만들고, 데스크톱 프로젝트(`~/.gemini/config/projects/*.json`)가 있으면 자동으로 매칭하며, 기본 대화형 에이전트 사양(`customAgentSpec`)을 초기화해 0-step 신규 세션도 브릿지 메시지가 도착하는 즉시 깨어나 첫 턴을 시작하도록 준비한다.
 
 `--codex-mode auto`는 공유 서버 연결 실패 시 저장 목록으로 전환하며 warning을 반환한다. `shared`는 전환 없이 실패하고, `saved`는 저장 목록만 조회한다. 임시 조회 프로세스는 끝나면 정리한다. 한쪽 실패 시 다른 쪽 결과를 보존하고 `errors` 및 종료 코드 1로 알린다.
 

@@ -223,15 +223,167 @@ def discover_server(timeout=5):
     return discover_servers(timeout=timeout)[0]
 
 
+def discover_desktop_server(timeout=5):
+    servers = discover_servers(timeout=timeout)
+    for server in servers:
+        if server.get('app_dir') == 'antigravity':
+            return server
+    raise DeliveryError('Antigravity desktop language_server is not running')
+
+
+def gemini_projects_dir():
+    base = os.environ.get('GEMINI_CONFIG_DIR')
+    if base:
+        candidate = Path(base).expanduser()
+        if (candidate / 'projects').is_dir():
+            return candidate / 'projects'
+        return candidate / 'config' / 'projects'
+    return Path.home() / '.gemini' / 'config' / 'projects'
+
+
+def find_desktop_project_id(server, target_cwd, projects_dir=None):
+    resolved_target = str(Path(target_cwd).expanduser().resolve())
+    summaries = server.get('summaries') if isinstance(server, dict) else None
+    if isinstance(summaries, dict):
+        for item in summaries.values():
+            if not isinstance(item, dict):
+                continue
+            meta = item.get('trajectoryMetadata')
+            project_id = meta.get('projectId') if isinstance(meta, dict) else None
+            if not isinstance(project_id, str) or not project_id:
+                continue
+            cwd = extract_cwd(item.get('workspaces')) or extract_cwd(meta.get('workspaces'))
+            if cwd and str(Path(cwd).resolve()) == resolved_target:
+                return project_id
+
+    root = Path(projects_dir) if projects_dir else gemini_projects_dir()
+    if not root.is_dir():
+        return None
+    for path in sorted(root.glob('*.json')):
+        try:
+            record = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        project_id = record.get('id')
+        if not isinstance(project_id, str) or not project_id:
+            continue
+        for raw_path in record.get('workspacePaths') or ():
+            if isinstance(raw_path, str) and raw_path.strip():
+                folder_path = uri_to_path(raw_path) if raw_path.startswith('file://') else str(Path(raw_path).expanduser().resolve())
+                if folder_path == resolved_target:
+                    return project_id
+        resources = record.get('projectResources', {}).get('resources')
+        if not isinstance(resources, list):
+            continue
+        for res in resources:
+            if not isinstance(res, dict):
+                continue
+            uri = res.get('folderUri')
+            if not uri and isinstance(res.get('gitFolder'), dict):
+                uri = res['gitFolder'].get('folderUri')
+            folder_path = uri_to_path(uri)
+            if folder_path and folder_path == resolved_target:
+                return project_id
+    return None
+
+
+def build_default_agent_spec(model_enum):
+    cascade_config = {
+        'plannerConfig': {
+            'planModel': model_enum,
+            'conversational': {},
+            'supportsLatexRendering': True,
+        },
+        'executorConfig': {
+            'useCoreDirect': True,
+        },
+    }
+    return {
+        'builtinAgent': {
+            'defaultAgent': {
+                'isInteractive': True,
+                'surface': 'AGENT_SURFACE_HUB',
+            },
+            'model': model_enum,
+            'cascadeConfig': cascade_config,
+        },
+        'cascadeConfig': cascade_config,
+    }
+
+
+def resolve_model(server, requested_model=None, timeout=5):
+    default_enum = 'MODEL_PLACEHOLDER_M418'
+    configs = []
+    try:
+        data = rpc_call(server['url'], server['csrf'], 'GetCascadeModelConfigData', {}, timeout=timeout)
+        if isinstance(data.get('clientModelConfigs'), list):
+            configs = [c for c in data['clientModelConfigs'] if isinstance(c, dict)]
+        override_enum = (
+            data.get('defaultOverrideModelConfig', {})
+            .get('modelOrAlias', {})
+            .get('model')
+        )
+        if isinstance(override_enum, str) and override_enum:
+            default_enum = override_enum
+        elif configs:
+            first_enum = configs[0].get('modelOrAlias', {}).get('model')
+            if isinstance(first_enum, str) and first_enum:
+                default_enum = first_enum
+    except DeliveryError as error:
+        text = str(error).lower()
+        if 'unimplemented' not in text and 'http 404' not in text:
+            raise
+
+    if not requested_model:
+        for cfg in configs:
+            if cfg.get('modelOrAlias', {}).get('model') == default_enum:
+                return {
+                    'model_enum': default_enum,
+                    'model_id': cfg.get('modelId') or default_enum,
+                    'label': cfg.get('label'),
+                }
+        return {'model_enum': default_enum, 'model_id': default_enum, 'label': None}
+
+    needle = str(requested_model).strip()
+    folded = needle.casefold()
+    for cfg in configs:
+        model_enum = cfg.get('modelOrAlias', {}).get('model')
+        model_id = cfg.get('modelId')
+        label = cfg.get('label')
+        if not isinstance(model_enum, str) or not model_enum:
+            continue
+        if (
+            model_enum.casefold() == folded
+            or (isinstance(model_id, str) and model_id.casefold() == folded)
+            or (isinstance(label, str) and label.casefold() == folded)
+        ):
+            return {
+                'model_enum': model_enum,
+                'model_id': model_id or model_enum,
+                'label': label,
+            }
+
+    if needle.startswith('MODEL_'):
+        return {'model_enum': needle, 'model_id': needle, 'label': None}
+
+    available = [c.get('modelId') for c in configs if isinstance(c.get('modelId'), str)]
+    suffix = f" (available: {', '.join(available)})" if available else ''
+    raise DeliveryError(f'Unknown Antigravity model {needle!r}{suffix}')
+
+
 def agy_row(sid, item, pid, fallback_cwd=None, app_dir='antigravity'):
     sid = str(uuid.UUID(sid))
     raw_status = item.get('status', 'unknown') if isinstance(item, dict) else 'unknown'
     cwd = extract_cwd(item.get('workspaces') if isinstance(item, dict) else None) or fallback_cwd
     surface = 'IDE' if app_dir == 'antigravity-ide' else 'desktop'
+    annotations = item.get('annotations') if isinstance(item, dict) and isinstance(item.get('annotations'), dict) else {}
+    title = (item.get('summary') if isinstance(item, dict) else None) or annotations.get('title') or None
     return {
         'provider': 'agy',
         'id': sid,
-        'name': (item.get('summary') if isinstance(item, dict) else None) or None,
+        'name': title,
         'cwd': cwd,
         'status': normalize_status(raw_status),
         'reported_status': raw_status,
@@ -329,6 +481,90 @@ def resolve_agy(sid, timeout=5):
 def read_agy(sid, timeout=5):
     _, row = resolve_agy(sid, timeout=timeout)
     return {'session': row, 'warning': None}
+
+
+def open_agy(cwd, title=None, model=None, timeout=5):
+    if not cwd or not str(cwd).strip():
+        raise DeliveryError('Workspace --cwd is required to open an Antigravity desktop session')
+    target_path = Path(cwd).expanduser().resolve()
+    if not target_path.is_dir():
+        raise DeliveryError(f'Workspace directory does not exist: {target_path}')
+
+    server = discover_desktop_server(timeout=timeout)
+    model_info = resolve_model(server, model, timeout=timeout)
+    project_id = find_desktop_project_id(server, str(target_path))
+    cid = str(uuid.uuid4())
+    base_payload = {
+        'cascadeId': cid,
+        'source': 'CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT',
+        'requestedModel': model_info['model_enum'],
+        'customAgentSpec': build_default_agent_spec(model_info['model_enum']),
+    }
+
+    start_resp = None
+    if project_id:
+        try:
+            start_resp = rpc_call(
+                server['url'],
+                server['csrf'],
+                'StartCascade',
+                {
+                    **base_payload,
+                    'projectEnvConfig': {
+                        'projectId': project_id,
+                        'defaultProjectEnvironment': {},
+                    },
+                },
+                timeout=timeout,
+            )
+        except DeliveryError:
+            project_id = None
+
+    if start_resp is None:
+        start_resp = rpc_call(
+            server['url'],
+            server['csrf'],
+            'StartCascade',
+            {
+                **base_payload,
+                'workspaceUris': [target_path.as_uri()],
+            },
+            timeout=timeout,
+        )
+
+    actual_cid = str(uuid.UUID(start_resp.get('cascadeId') or cid))
+    clean_title = str(title).strip() if isinstance(title, str) and title.strip() else None
+    annotations = {'lastUserViewTime': observed_now()}
+    if clean_title:
+        annotations['title'] = clean_title
+    try:
+        rpc_call(
+            server['url'],
+            server['csrf'],
+            'UpdateConversationAnnotations',
+            {
+                'cascadeId': actual_cid,
+                'annotations': annotations,
+                'mergeAnnotations': True,
+            },
+            timeout=timeout,
+        )
+    except DeliveryError as error:
+        text = str(error).lower()
+        if 'unimplemented' not in text and 'http 404' not in text:
+            raise
+
+    _, row = resolve_agy(actual_cid, timeout=timeout)
+    if clean_title and not row.get('name'):
+        row['name'] = clean_title
+    return {
+        'created': True,
+        'session': row,
+        'model': model_info['model_id'],
+        'model_enum': model_info['model_enum'],
+        'project_id': project_id,
+        'warning': None,
+    }
 
 
 def build_frame(route, sender, project, text):

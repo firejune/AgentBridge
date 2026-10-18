@@ -272,6 +272,15 @@ def inspect_session(provider, sid, executable=None, codex_mode='auto'):
     return {'session':matches[0],'warning':None}
 
 
+def open_session(provider='agy', cwd=None, title=None, model=None):
+    if provider != 'agy':
+        raise DiscoveryError(f'Opening a new session is currently supported only for Antigravity Desktop (agy), not {provider!r}')
+    if not cwd:
+        raise DiscoveryError('Provide --cwd when opening a new Antigravity Desktop session')
+    return agy_live.open_agy(cwd=cwd, title=title, model=model)
+
+
+
 # --- Claude Code live-session registry (peerProtocol 1) ---------------------
 # Undocumented internal Claude Code protocol, reverse-read from Claude Code
 # 2.1.295. Each live session writes ~/.claude/sessions/<pid>.json with its

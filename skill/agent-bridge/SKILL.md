@@ -73,19 +73,29 @@ python3 "$bridge_cli" register codex-agent --project PROJECT --transport codex \
 - Pre-delivery validation failures leave the message `pending` and exit with code 1. Post-send timeouts, disconnects, or unknown errors mark the message `uncertain` and exit with code 1, blocking subsequent deliveries to that session until resolved. There is no automatic retry or hidden `codex queue` fallback.
 - Relies on Desktop's **undocumented versioned IPC** alongside [official standalone tool output behavior](https://learn.chatgpt.com/docs/app-server#start-a-turn).
 
-### 3. Push into a Live Antigravity IDE or Desktop Session (`agy`)
+### 3. Push into (or Open) a Live Antigravity IDE or Desktop Session (`agy`)
 
 ```bash
 python3 "$bridge_cli" sessions --provider agy
 python3 "$bridge_cli" register agy-agent --project PROJECT --transport agy \
   --session AGY_CONVERSATION_ID --discover
+
+# Or open a brand-new Antigravity Desktop session and register it immediately:
+python3 "$bridge_cli" open --provider agy --cwd /path/to/workspace --title "Worker"
+python3 "$bridge_cli" register agy-worker --project PROJECT --transport agy \
+  --new --cwd /path/to/workspace --title "Worker"
 ```
 
 - `send`, `ask`, and `reply` automatically push to the exact `conversationId` (UUID) registered with `agy`. Connects to local Antigravity `language_server` instances (`--app_data_dir antigravity` for Agent Manager / Desktop and `--app_data_dir antigravity-ide` for Antigravity IDE, automatically skipping `--enable_lsp` LSP worker processes) over ConnectRPC (`GetAllCascadeTrajectories`, `GetConversationMetadata`, `SendAgentMessage`, `SendUserCascadeMessage`), covering **both Antigravity IDE side-panel sessions and Agent Manager (Desktop) sessions simultaneously** without any VS Code extension.
+- **Opening a new Antigravity Desktop session (`open` / `register --new`)**:
+  - `bridge.py open [--provider agy] --cwd /path/to/workspace [--title TITLE] [--model MODEL]` creates a new live conversation in the running Antigravity Desktop server (`--app_data_dir antigravity`) via `StartCascade` and `UpdateConversationAnnotations`.
+  - Automatically matches the workspace to an existing Antigravity Desktop project (`~/.gemini/config/projects/*.json` or live trajectories) when available so the conversation appears under the project in the Desktop sidebar, or falls back to `workspaceUris`.
+  - Configures `customAgentSpec` (`builtinAgent.defaultAgent` + `planModel`) so a 0-step newly created session wakes and runs its first turn with all built-in tools as soon as a bridge `send` or `ask` arrives.
+  - `bridge.py register NAME --project PROJECT --transport agy --new --cwd /path/to/workspace [--title TITLE] [--model MODEL]` opens the Desktop session and binds its UUID to `NAME` in one step.
 - **How other sessions find and address an Antigravity IDE or Desktop channel**:
   1. Run `python3 "$bridge_cli" routes --project PROJECT` and `python3 "$bridge_cli" channels --project PROJECT` to see if the session is already registered under a participant name or channel.
   2. If not yet registered, run `python3 "$bridge_cli" sessions --provider agy` (or add `--cwd /path/to/workspace`) to list all live Antigravity IDE (`scope: "Antigravity IDE live trajectory registry"`) and Desktop (`scope: "Antigravity desktop live trajectory registry"`) conversations with their UUID (`id`), title (`name`), and `cwd`.
-  3. Register the target UUID with `--transport agy --session UUID --discover` (not `realtime`, which leaves replies `pending` until polled), and optionally bind a project channel via `channel-bind`.
+  3. Register an existing target UUID with `--transport agy --session UUID --discover` (or create one with `--transport agy --new --cwd /path/to/workspace`), and optionally bind a project channel via `channel-bind`.
 - Injects directly into the open conversation's message hub (`MESSAGE_PRIORITY_HIGH`) without spawning `agy -p`. When the target session is `running`, it joins the active turn on the very next step (`DeliverMessages`/`NewMessageContinueCheck`) as `<SYSTEM_MESSAGE>[Message] ...` without cancelling in-flight work. When the session is `idle` (or waiting on background commands/subagents where `SubagentsAndTasksIdle() == false`), it immediately follows up with an empty `SendUserCascadeMessage` (`MESSAGE_DELIVERY_STRATEGY_NEXT_INVOCATION`) to wake the session without creating a synthetic `<USER_REQUEST>`.
 - The final line of the message includes the bridge reply command (`bridge.py reply <ID> --key … --file …`). Because Antigravity's internal `send_message` tool only addresses subagents, the receiver must reply via `bridge.py reply` in the shell.
 - Pre-delivery process, UUID, or workspace mismatches leave the message `pending` (`push_failed` event) and exit with code 1. Errors after `SendAgentMessage` is sent mark the message `uncertain` and exit with code 1. The CSRF token is read in memory only and never logged.

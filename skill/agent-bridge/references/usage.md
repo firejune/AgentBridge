@@ -141,7 +141,7 @@ python3 "$bridge_cli" register agy-agent --project my-app --transport agy \
 | Codex saved list | Temporary `codex app-server --stdio` metadata query | Unarchived CLI conversations (`unknown` runtime status for other apps) |
 | Antigravity (`agy`) | Local `language_server` (`--app_data_dir antigravity` & `antigravity-ide`, skipping `--enable_lsp`) `GetAllCascadeTrajectories` & `GetConversationMetadata` | Live workspace conversations (`running`/`idle`) across both Antigravity IDE (`Antigravity IDE live trajectory registry`) and Desktop (`Antigravity desktop live trajectory registry`) |
 
-### Finding & Addressing an Antigravity IDE or Desktop Channel from Another Session
+### Finding, Addressing, or Opening an Antigravity IDE or Desktop Channel
 
 1. **Check existing registrations first**:
    ```bash
@@ -154,11 +154,22 @@ python3 "$bridge_cli" register agy-agent --project my-app --transport agy \
    python3 "$bridge_cli" sessions --provider agy --cwd /path/to/workspace
    ```
    Each row reports `scope: "Antigravity IDE live trajectory registry"` or `"Antigravity desktop live trajectory registry"`, along with `id` (conversation UUID), `name` (title), `cwd`, and `status`.
-3. **Register with `--transport agy` (never `realtime`)** so outbound `send`, `ask`, and `reply` calls push directly into the open IDE or Desktop conversation instead of staying `pending`:
+3. **Register an existing session with `--transport agy` (never `realtime`)** so outbound `send`, `ask`, and `reply` calls push directly into the open IDE or Desktop conversation instead of staying `pending`:
    ```bash
    python3 "$bridge_cli" register agy-ide-agent --project my-app --transport agy \
      --session AGY_CONVERSATION_UUID --discover
    ```
+4. **Or open a new Antigravity Desktop session on demand**:
+   ```bash
+   # Standalone creation (returns new session UUID, cwd, model, and project_id):
+   python3 "$bridge_cli" open --provider agy --cwd /path/to/workspace \
+     --title "Motion Worker" --model claude-opus-4-6-thinking
+
+   # Create and register in one step:
+   python3 "$bridge_cli" register agy-worker --project my-app --transport agy \
+     --new --cwd /path/to/workspace --title "Motion Worker"
+   ```
+   `open` and `register --new` target the running Antigravity Desktop `language_server` (`--app_data_dir antigravity`), bind the workspace to its matching Desktop project (`~/.gemini/config/projects/*.json`) when present, and initialize the default interactive agent specification so the fresh 0-step session immediately wakes and executes its first turn when a bridge message is pushed.
 
 ## Session Handoff
 
