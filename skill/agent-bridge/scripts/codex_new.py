@@ -180,8 +180,7 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
     except BaseException as error:
         # Preserve recovery identity even when title, adoption, model update or
         # registration cannot be confirmed. No automatic second thread/start.
-        if not isinstance(error, (CreationError, ValueError, OSError, KeyError, TypeError,
-                                  subprocess.TimeoutExpired, KeyboardInterrupt)):
+        if not isinstance(error, (Exception, KeyboardInterrupt)):
             raise
         message = str(error) if isinstance(error, CreationError) else 'Codex creation/adoption failed; do not create another thread automatically'
         failure = CreationError(message, attempted, sid, adopted, stage)

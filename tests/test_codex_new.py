@@ -182,6 +182,18 @@ class NewCodexTests(unittest.TestCase):
         self.assertTrue(caught.exception.uncertain)
         self.assertFalse(caught.exception.adopted)
 
+    def test_unexpected_post_create_error_preserves_recovery_identity(self):
+        def fail(url):raise RuntimeError('unexpected launcher adapter failure')
+        with ModelDesktop() as desktop, self.assertRaises(codex_new.CreationError) as caught:
+            self.open(desktop,opener=fail)
+        self.assertEqual(caught.exception.session,self.sid)
+        self.assertTrue(caught.exception.created)
+        self.assertTrue(caught.exception.uncertain)
+        self.assertFalse(caught.exception.adopted)
+        self.assertEqual(caught.exception.stage,'adoption')
+        self.assertEqual(sum(method=='thread/start' for method,_,_ in self.calls),1)
+        self.assertTrue(all(c.closed for c in self.instances))
+
     def test_model_update_refusal_and_readback_substitution_fail(self):
         for options in ({'reject_update':True},{'keep_model':True}):
             with self.subTest(options=options), ModelDesktop(**options) as desktop, self.assertRaises(codex_new.CreationError) as caught:
