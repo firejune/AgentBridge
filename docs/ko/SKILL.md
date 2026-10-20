@@ -131,3 +131,19 @@ python3 "$bridge_cli" reply REQUEST_ID --key UNIQUE_REPLY_KEY --file /absolute/a
 - `deliver`는 pending `codex`·`claude-peer`·`agy` push의 명시적 재집행과 쉬고 있는 전용 `claude` 경로에 사용한다. Codex·AGY는 자동 push와 동일한 기존 데스크톱 경로를 쓰며 queue하지 않는다. Claude `resume`은 쉬고 있는 전용 세션을 읽기 전용으로 실행한다(라이브 세션 금지, 위 ⛔). 실행 중인 Claude 대화에 넣는 통로는 `claude-peer` push뿐이다. `uncertain` 결과는 자동 재전송하지 않는다.
 - Codex 저장 목록의 `notLoaded`는 다른 앱의 실제 상태를 나타내지 않으므로 브릿지는 `unknown`으로 표시한다. 세션 조회 성공을 전달 성공으로 보고하지 않는다.
 - 복구·재연결·실행 상태가 필요할 때 [사용법](usage.md)의 해당 절을 읽는다. 합의 결과의 장기 보존이 필요하면 프로젝트 산출물에 반영하며 브로커에 영구 보존을 기대하지 않는다.
+
+### 새 Codex Desktop 세션 열기
+
+```bash
+python3 "$bridge_cli" open --provider codex --cwd /path/to/workspace --title "첫 메시지"
+python3 "$bridge_cli" register codex-worker --project PROJECT --transport codex \
+  --new --cwd /path/to/workspace --title "첫 메시지" --timeout 300
+```
+
+설치된 앱의 `codex://threads/new?path=…&prompt=…&mode=codex` 링크로 새 작성기를 연다. `--title`은 첫 메시지 초안이며 앱이 대화 제목을 정한다. 생략하면 사용자나 브리지의 작업을 기다리라는 메시지만 채운다. **앱에서 사람이 Enter를 눌러야 세션이 시작된다.** 작업 폴더 확인이 나오면 직접 처리한다. 브리지는 Enter를 누르거나 작업을 발신하거나 독립 CLI 세션을 만들지 않는다. 링크에는 모델 필드가 없어 `--model`은 거부한다. 작성기에서 모델을 고르면 된다. 앱은 해당 폴더의 로컬 프로젝트를 선택하거나 추가할 수 있으며, 상속된 MCP 호출 문맥은 필요 없다.
+
+링크를 열기 전에 기존 루트 대화 UUID를 기록한다. 이후 턴을 시작하지 않는 저장 메타데이터 조회로 정확한 `--cwd`에 새로 생긴 UUID 하나를 찾고, 그 UUID의 Desktop IPC 소유자가 `supportsUntrustedAppInput`을 제공하는지 확인한다. 저장 메타데이터와 원본 라벨만으로 실행 중이라고 판정하지 않으며 정확한 IPC 소유자가 판정 근거다. 하위 에이전트·`exec`·다른 폴더·기존 세션은 제외하며 새 후보가 둘이면 선택하지 않는다. 목록이 잘렸으면 명시적으로 실패한다. 기본 대기 시간은 180초다.
+
+열기·탐지 실패는 종료 1이며, 링크 실행 후에는 `uncertain: true`와 확인된 `session` UUID를 반환한다. 작성기나 세션이 남아 있을 수 있으므로 `--new`를 자동 재실행하지 않는다. 앱을 확인하고 `register --transport codex --session ID --discover`로 정확한 세션을 등록한다. 세션 생성 뒤 브로커 등록만 실패하면 `created: true`, `registered: false`와 UUID를 보존하며 대체 세션을 만들지 않는다. `created`는 소유자 탐지 성공이며 모델의 작업 완료가 아니다.
+
+딥 링크와 IPC는 업데이트로 바뀔 수 있는 내부 계약이다. 프로토콜 테스트는 격리된 대역을 사용하며, 실제 작성기 열기·세션 시작은 별도 라이브 검증이 필요하다. 호출자 권한 검사를 우회하지 않도록 native app-tools MCP 파이프는 사용하지 않는다.

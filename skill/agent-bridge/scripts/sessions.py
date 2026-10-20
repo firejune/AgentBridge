@@ -1,4 +1,4 @@
-"""Read session metadata through installed CLIs; never resume or start a turn."""
+"""Read session metadata or open supported desktop new-session entrypoints."""
 from datetime import datetime, timezone
 import json
 import os
@@ -14,6 +14,7 @@ from urllib.parse import urlencode
 import uuid
 
 import agy_live
+import codex_new
 
 
 class DiscoveryError(ValueError):
@@ -274,12 +275,14 @@ def inspect_session(provider, sid, executable=None, codex_mode='auto'):
 
 
 def open_session(provider='agy', cwd=None, title=None, model=None, timeout=180):
+    if provider == 'codex':
+        return codex_new.open_codex(cwd=cwd, title=title, model=model, timeout=timeout)
     if provider == 'claude':
         if not cwd:
             raise DiscoveryError('Provide --cwd when opening a new Claude Code desktop session')
         return open_claude(cwd=cwd, title=title, model=model, timeout=timeout)
     if provider != 'agy':
-        raise DiscoveryError(f'Opening a new session is supported only for Antigravity Desktop (agy) and Claude Code desktop (claude), not {provider!r}')
+        raise DiscoveryError(f'Opening a new session is supported only for Antigravity Desktop (agy), Claude Code desktop (claude), and Codex desktop (codex), not {provider!r}')
     if not cwd:
         raise DiscoveryError('Provide --cwd when opening a new Antigravity Desktop session')
     return agy_live.open_agy(cwd=cwd, title=title, model=model)

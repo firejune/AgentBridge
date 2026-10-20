@@ -279,3 +279,19 @@ python3 "$bridge_cli" resolve MESSAGE_ID --state done --note '결과 확인 완�
 같은 OS 계정을 신뢰하는 로컬 도구다. 이름은 인증 수단이 아니며 동료 메시지가 새로운 사용자 승인을 대신하지 않는다. 요청에는 목적, 허용 파일, 작업 경로와 완료 조건을 적고 프로젝트 지침을 따른다. 파일 잠금·Git 병합·원격 머신 연결은 지원하지 않는다.
 
 테스트는 실제 Unix 소켓과 별도 CLI 프로세스로 구독·요청·답변·대기·재연결·브로커 종료를 검증한다. Codex adapter는 가짜 데스크톱 IPC 소유자로 활성/idle·프레임 분할·원래 UUID·도구 출력·중복 방지·전송 후 uncertain을 검증한다. Antigravity(`agy`) adapter는 가짜 ConnectRPC 서버로 정확한 UUID·워크스페이스 검증·`SendAgentMessage` 주입·`SendUserCascadeMessage`(`NEXT_INVOCATION`) 즉시 깨움·CSRF 비노출·전송 후 uncertain을 검증한다. 전용 Claude CLI는 가짜 프로세스로, `claude-peer`는 가짜 세션 레지스트리·키·수신 소켓으로 검증한다(세션 해석 · 프레임 · 성공 · 실패 시 `pending` 유지와 종료 코드 1). 실제 AI 모델끼리의 자동 왕복은 별도로 확인해야 한다.
+
+### 새 Codex Desktop 세션 열기
+
+```bash
+python3 "$bridge_cli" open --provider codex --cwd /path/to/workspace --title "첫 메시지"
+python3 "$bridge_cli" register codex-worker --project PROJECT --transport codex \
+  --new --cwd /path/to/workspace --title "첫 메시지" --timeout 300
+```
+
+설치된 앱의 `codex://threads/new?path=…&prompt=…&mode=codex` 링크로 새 작성기를 연다. `--title`은 첫 메시지 초안이며 앱이 대화 제목을 정한다. 생략하면 사용자나 브리지의 작업을 기다리라는 메시지만 채운다. **앱에서 사람이 Enter를 눌러야 세션이 시작된다.** 작업 폴더 확인이 나오면 직접 처리한다. 브리지는 Enter를 누르거나 작업을 발신하거나 독립 CLI 세션을 만들지 않는다. 링크에는 모델 필드가 없어 `--model`은 거부한다. 작성기에서 모델을 고르면 된다. 앱은 해당 폴더의 로컬 프로젝트를 선택하거나 추가할 수 있으며, 상속된 MCP 호출 문맥은 필요 없다.
+
+링크를 열기 전에 기존 루트 대화 UUID를 기록한다. 이후 턴을 시작하지 않는 저장 메타데이터 조회로 정확한 `--cwd`에 새로 생긴 UUID 하나를 찾고, 그 UUID의 Desktop IPC 소유자가 `supportsUntrustedAppInput`을 제공하는지 확인한다. 저장 메타데이터와 원본 라벨만으로 실행 중이라고 판정하지 않으며 정확한 IPC 소유자가 판정 근거다. 하위 에이전트·`exec`·다른 폴더·기존 세션은 제외하며 새 후보가 둘이면 선택하지 않는다. 목록이 잘렸으면 명시적으로 실패한다. 기본 대기 시간은 180초다.
+
+열기·탐지 실패는 종료 1이며, 링크 실행 후에는 `uncertain: true`와 확인된 `session` UUID를 반환한다. 작성기나 세션이 남아 있을 수 있으므로 `--new`를 자동 재실행하지 않는다. 앱을 확인하고 `register --transport codex --session ID --discover`로 정확한 세션을 등록한다. 세션 생성 뒤 브로커 등록만 실패하면 `created: true`, `registered: false`와 UUID를 보존하며 대체 세션을 만들지 않는다. `created`는 소유자 탐지 성공이며 모델의 작업 완료가 아니다.
+
+딥 링크와 IPC는 업데이트로 바뀔 수 있는 내부 계약이다. 프로토콜 테스트는 격리된 대역을 사용하며, 실제 작성기 열기·세션 시작은 별도 라이브 검증이 필요하다. 호출자 권한 검사를 우회하지 않도록 native app-tools MCP 파이프는 사용하지 않는다.

@@ -245,7 +245,7 @@ class OpenClaudeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'cannot be combined'):
                 bridge.registration(self.args(*extra))
         with self.assertRaisesRegex(ValueError,'supported only with'):
-            bridge.registration(self.args(transport='codex'))
+            bridge.registration(self.args(transport='realtime'))
         args = self.args()
         args.cwd = None
         with self.assertRaisesRegex(ValueError,'requires --cwd'):

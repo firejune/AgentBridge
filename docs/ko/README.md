@@ -66,3 +66,5 @@ python3 -m unittest discover -s tests -v
 ```
 
 테스트는 실제 Unix 소켓, 별도 CLI 프로세스, 그리고 Claude·Codex·Antigravity 프로토콜 스텁 서버로 협업 및 비파괴 전달 흐름을 검증한다. 코드 수정은 `skill/agent-bridge/` 폴더의 정본에서 하며 스크립트를 따로 복제하지 않는다.
+
+Codex도 `open --provider codex --cwd PATH` 또는 `register --transport codex --new --cwd PATH`로 새 작성기를 열 수 있다. `--title`은 첫 메시지 초안이며 사람이 Enter를 눌러야 시작된다. 모델은 작성기에서 선택한다(`--model` 거부). 정확한 폴더에 새로 생긴 UUID 하나와 Desktop 소유자를 확인한 뒤 등록하며, 시간 초과·모호성에 자동 재생성하지 않는다. [자세한 계약](usage.md#새-codex-desktop-세션-열기)을 참고한다.

@@ -260,3 +260,19 @@ Run the test suite with:
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+### Opening a New Codex Desktop Session
+
+```bash
+python3 "$bridge_cli" open --provider codex --cwd /path/to/workspace --title "First message"
+python3 "$bridge_cli" register codex-worker --project PROJECT --transport codex \
+  --new --cwd /path/to/workspace --title "First message" --timeout 300
+```
+
+Opens `codex://threads/new?path=…&prompt=…&mode=codex`, the installed app's new-thread composer. `--title` prefills the first message; the app derives the conversation title from it. Without it, the prompt only asks the session to wait for a user or bridge task. **Someone must press Enter in the app** (and complete any workspace confirmation). The bridge never submits the composer, sends a task, or starts a standalone CLI session. `--model` is refused because the link has no model field; choose the model in the composer. The app can select or add the local project for the folder; no inherited MCP caller context is required.
+
+Before opening, records existing root-thread UUIDs. It then reads saved metadata without starting turns, requiring exactly one new UUID at the exact resolved `--cwd` and an IPC owner advertising `supportsUntrustedAppInput`. Saved metadata and source labels alone never prove a live session; the exact IPC owner is decisive. Subagents, `exec` threads, other folders, old sessions, and two new candidates are refused. Listing truncation fails explicitly. Default timeout is 180 seconds.
+
+Opening/discovery failures exit 1; after launching the link, output includes `uncertain: true` and the observed `session` UUID when known. The composer or thread may still exist: do not rerun `--new` automatically. Inspect the app and bind the exact UUID with `register --transport codex --session ID --discover`. If creation succeeds but broker registration fails, output preserves `created: true`, `registered: false`, and the UUID. It never creates a replacement thread. `created` proves the owner accepted discovery, not that a model completed work.
+
+The deep link and Desktop IPC are internal, update-sensitive contracts. Protocol tests use isolated fixtures; opening a real composer and starting the resulting session requires separate live verification. The native app-tools MCP pipe is not used: its caller authorization must remain intact.
