@@ -126,6 +126,59 @@ class Client:
                     raise DeliveryError('Codex desktop IPC returned a different method or owner')
             return response
 
+    def snapshot(self, thread, owner):
+        """Read one exact owner's versioned snapshot; never claim ownership."""
+        thread = str(uuid.UUID(thread))
+        def following(value):
+            self.write(dict(type='broadcast', method='thread-stream-following-changed',
+                sourceClientId=self.client_id, version=1, targetClientIds=[owner],
+                params=dict(hostId='local', conversationId=thread, following=value)))
+        complete = False
+        try:
+            following(True)
+            deadline = time.monotonic() + self.timeout
+            while True:
+                size = struct.unpack('<I', self.exact(4, deadline))[0]
+                if not 0 < size <= MAX_FRAME:
+                    raise DeliveryError('Codex desktop snapshot exceeds the adapter limit')
+                try:
+                    response = json.loads(self.exact(size, deadline))
+                except (ValueError, UnicodeError):
+                    raise DeliveryError('Codex desktop snapshot returned invalid JSON') from None
+                if not isinstance(response, dict):
+                    raise DeliveryError('Codex desktop snapshot returned an invalid frame')
+                if response.get('type') == 'client-discovery-request':
+                    self.write(dict(type='client-discovery-response',
+                        requestId=response.get('requestId'), response={'canHandle':False}))
+                    continue
+                if response.get('type') != 'broadcast' or response.get('method') != 'thread-stream-state-changed':
+                    continue
+                params = response.get('params')
+                if not isinstance(params, dict) or params.get('conversationId') != thread:
+                    continue
+                if (response.get('sourceClientId') != owner or response.get('version') != 11
+                        or params.get('hostId') != 'local'
+                        or not isinstance(response.get('targetClientIds'), list)
+                        or self.client_id not in response['targetClientIds']):
+                    raise DeliveryError('Codex desktop snapshot owner, version, or destination differs')
+                change = params.get('change')
+                if not isinstance(change, dict) or change.get('type') != 'snapshot':
+                    continue  # Patches are not a complete permission reading.
+                state = change.get('conversationState')
+                if not isinstance(state, dict) or state.get('id') != thread:
+                    raise DeliveryError('Codex desktop snapshot returned a different thread')
+                complete = True
+                return state
+        except OSError:
+            raise DeliveryError('Codex desktop snapshot transport failed or timed out') from None
+        finally:
+            try:
+                following(False)
+            except (OSError, DeliveryError):
+                # A secondary cleanup error must not replace the primary error.
+                if complete:
+                    raise DeliveryError('Codex desktop snapshot unsubscribe failed') from None
+
     def owner(self, thread):
         response = self.call('thread-owner-discovery',
                              {'hostId': 'local', 'conversationId': thread}, 1)
