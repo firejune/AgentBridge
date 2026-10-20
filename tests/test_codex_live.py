@@ -248,5 +248,84 @@ class CodexLiveTests(unittest.TestCase):
                     self.deliver(desktop)
 
 
+class SnapshotDesktop(FakeDesktop):
+    def __init__(self, behavior='snapshot', fragmented=False):
+        super().__init__('active', fragmented)
+        self.snapshot_behavior = behavior
+        self.unsubscribed = threading.Event()
+
+    def handle(self, sock, request):
+        if request.get('method') != 'thread-stream-following-changed':
+            return super().handle(sock, request)
+        self.calls.append(request)
+        if not request['params']['following']:
+            self.unsubscribed.set()
+            return True
+        sid = request['params']['conversationId']
+        response = {'type':'broadcast','method':'thread-stream-state-changed','version':11,
+                    'sourceClientId':self.owner,'targetClientIds':[request['sourceClientId']],
+                    'params':{'hostId':'local','conversationId':sid,'change':{'type':'snapshot',
+                        'revision':1,'conversationState':{'id':sid,'latestThreadSettings':{'approvalPolicy':'never'}}}}}
+        mode = self.snapshot_behavior
+        if mode == 'wrong-owner':response['sourceClientId']='different-owner'
+        elif mode == 'wrong-version':response['version']=12
+        elif mode == 'wrong-destination':response['targetClientIds']=['other-client']
+        elif mode == 'wrong-host':response['params']['hostId']='other-host'
+        elif mode == 'wrong-state-id':response['params']['change']['conversationState']['id']=str(uuid.uuid4())
+        elif mode == 'oversized':
+            sock.sendall(struct.pack('<I',codex_live.MAX_FRAME+1));return True
+        elif mode == 'malformed':
+            sock.sendall(struct.pack('<I',3)+b'bad');return True
+        elif mode == 'unrelated-only':
+            response['params']['conversationId']=str(uuid.uuid4())
+        elif mode == 'patches-only':response['params']['change']={'type':'patches','patches':[]}
+        elif mode == 'unrelated-then-snapshot':
+            unrelated=json.loads(json.dumps(response));unrelated['params']['conversationId']=str(uuid.uuid4())
+            self.write(sock,unrelated)
+        self.write(sock,response)
+        return True
+
+
+class CodexSnapshotTests(unittest.TestCase):
+    def test_exact_snapshot_and_unsubscribe_use_assigned_client_identity(self):
+        sid=str(uuid.uuid4())
+        with SnapshotDesktop('unrelated-then-snapshot',fragmented=True) as desktop:
+            with codex_live.Client(desktop.path,timeout=.2) as client:
+                owner=client.owner(sid)
+                state=client.snapshot(sid,owner)
+                self.assertEqual(state['id'],sid)
+                self.assertFalse(client.mutation_sent)
+                self.assertTrue(desktop.unsubscribed.wait(.2))
+                frames=[q for q in desktop.calls if q.get('method')=='thread-stream-following-changed']
+                self.assertEqual([q['params']['following'] for q in frames],[True,False])
+                self.assertTrue(all(q['sourceClientId']==client.client_id and q['targetClientIds']==[owner]
+                                    and q['params']['conversationId']==sid for q in frames))
+
+    def test_wrong_identity_version_or_invalid_frames_are_refused_and_unsubscribed(self):
+        sid=str(uuid.uuid4())
+        for behavior in ('wrong-owner','wrong-version','wrong-destination','wrong-host','wrong-state-id',
+                         'oversized','malformed','unrelated-only','patches-only'):
+            with self.subTest(behavior=behavior), SnapshotDesktop(behavior) as desktop:
+                with codex_live.Client(desktop.path,timeout=.04) as client:
+                    owner=client.owner(sid)
+                    with self.assertRaises(codex_live.DeliveryError):client.snapshot(sid,owner)
+                    self.assertTrue(desktop.unsubscribed.wait(.2))
+                    self.assertFalse(client.mutation_sent)
+
+    def test_cleanup_error_does_not_replace_primary_snapshot_failure(self):
+        sid=str(uuid.uuid4())
+        with SnapshotDesktop() as desktop, codex_live.Client(desktop.path,timeout=.2) as client:
+            owner=client.owner(sid)
+            original=client.write
+            def write(value,mutation=False):
+                if value.get('method')=='thread-stream-following-changed' and not value['params']['following']:
+                    raise OSError('secondary cleanup error')
+                return original(value,mutation)
+            with patch.object(client,'write',side_effect=write), \
+                    patch.object(client,'exact',side_effect=codex_live.DeliveryError('primary snapshot failure')):
+                with self.assertRaisesRegex(codex_live.DeliveryError,'primary snapshot failure'):
+                    client.snapshot(sid,owner)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -19,13 +19,33 @@ from support import RunningBroker
 from test_codex_live import FakeDesktop
 
 
+def full_permissions():
+    return {'activePermissionProfile':{'id':codex_new.FULL_ACCESS_PROFILE,'extends':None},
+            'approvalPolicy':'never','sandboxPolicy':{'type':'dangerFullAccess'}}
+
+
 class ModelDesktop(FakeDesktop):
-    def __init__(self, model='app-default', reject_update=False, keep_model=False, behavior='active'):
+    def __init__(self, model='app-default', reject_update=False, keep_model=False, behavior='active',
+                 permissions=None, refuse_permissions=False, stale_current=False):
         super().__init__(behavior)
         self.model, self.reject_update, self.keep_model = model, reject_update, keep_model
+        self.permissions = permissions or {'activePermissionProfile':{'id':':workspace'},
+            'approvalPolicy':'on-request','sandboxPolicy':{'type':'workspaceWrite'}}
+        self.refuse_permissions, self.stale_current = refuse_permissions, stale_current
 
     def handle(self, sock, request):
         method = request['method']
+        if request.get('type') == 'broadcast' and method == 'thread-stream-following-changed':
+            self.calls.append(request)
+            if request['params']['following']:
+                state = {'id':request['params']['conversationId'],
+                         'latestThreadSettings':self.permissions,
+                         'currentPermissions':getattr(self,'current_permissions',{} if self.stale_current else self.permissions)}
+                self.write(sock, {'type':'broadcast','method':'thread-stream-state-changed','version':11,
+                    'sourceClientId':self.owner,'targetClientIds':[request['sourceClientId']],
+                    'params':{'hostId':'local','conversationId':state['id'],
+                              'change':{'type':'snapshot','revision':1,'conversationState':state}}})
+            return True
         if method not in ('thread-follower-read-model-settings','thread-follower-update-thread-settings'):
             return super().handle(sock, request)
         self.calls.append(request)
@@ -34,8 +54,11 @@ class ModelDesktop(FakeDesktop):
         if method == 'thread-follower-read-model-settings':
             response['result'] = {'settings':{'model':self.model,'resumeState':'resumed'}}
         else:
-            if not self.keep_model:
-                self.model = request['params']['threadSettings']['model']
+            values = request['params']['threadSettings']
+            if not self.keep_model and 'model' in values:
+                self.model = values['model']
+            if not self.refuse_permissions and 'permissions' in values:
+                self.permissions = full_permissions()
             response['result'] = {'applied':not self.reject_update}
         self.write(sock, response)
         return True
@@ -52,6 +75,8 @@ class NewCodexTests(unittest.TestCase):
         self.fail_method = None
         self.reader_wrong_cwd = False
         self.substitute_model = False
+        self.profiles = [{'id':codex_new.FULL_ACCESS_PROFILE,'allowed':True}]
+        self.creator_full_access = True
 
     def tearDown(self):
         self.temp.cleanup()
@@ -70,11 +95,15 @@ class NewCodexTests(unittest.TestCase):
                 test.calls.append((method,params,self))
                 if test.fail_method == method:
                     raise sessions.DiscoveryError('ambiguous disconnect')
+                if method == 'permissionProfile/list':
+                    return {'data':test.profiles,'nextCursor':None}
                 if method == 'model/list':
                     return {'data':[{'model':'requested-model'}],'nextCursor':None}
                 if method == 'thread/start':
                     return {'thread':dict(test.thread),'model':'substituted' if test.substitute_model else params.get('model','creator-default'),
-                            'cwd':test.root,'approvalPolicy':'on-request','sandbox':{'type':'workspaceWrite','networkAccess':False}}
+                            'cwd':test.root, 'approvalPolicy':'never' if test.creator_full_access else 'on-request',
+                            'activePermissionProfile':{'id':codex_new.FULL_ACCESS_PROFILE},
+                            'sandbox':{'type':'dangerFullAccess' if test.creator_full_access else 'workspaceWrite'}}
                 if method == 'thread/name/set':
                     test.thread['name'] = params['name'];return {}
                 if method == 'thread/read':
@@ -104,22 +133,26 @@ class NewCodexTests(unittest.TestCase):
             self.assertEqual(result['model'],'requested-model')
             self.assertEqual(self.urls,['codex://threads/'+self.sid])
             create = next(params for method,params,_ in self.calls if method=='thread/start')
-            self.assertEqual(create,{'cwd':self.root,'model':'requested-model','ephemeral':False,'allowProviderModelFallback':False})
+            self.assertEqual(create,{'cwd':self.root,'model':'requested-model','ephemeral':False,'allowProviderModelFallback':False,
+                                     'permissions':codex_new.FULL_ACCESS_PROFILE,'approvalPolicy':'never'})
             self.assertTrue(all(c.closed for c in self.instances))
             self.assertTrue(all(method not in ('turn/start','turn/steer') for method,_,_ in self.calls))
             update = next(x for x in desktop.calls if x['method']=='thread-follower-update-thread-settings')
-            self.assertEqual(update['params'],{'conversationId':self.sid,'threadSettings':{'model':'requested-model'}})
+            self.assertEqual(update['params'],{'conversationId':self.sid,'threadSettings':{
+                'model':'requested-model','permissions':codex_new.FULL_ACCESS_PROFILE,'approvalPolicy':'never'}})
+            self.assertEqual(result['permission_settings'],full_permissions())
             self.assertEqual(update['version'],2)
 
-    def test_omitted_model_uses_app_default_and_never_overrides_permissions(self):
-        with ModelDesktop(model='app-default') as desktop:
+    def test_omitted_model_keeps_app_default_and_always_requests_full_access(self):
+        with ModelDesktop(model='app-default',permissions=full_permissions()) as desktop:
             result = self.open(desktop)
         create = next(params for method,params,_ in self.calls if method=='thread/start')
         self.assertNotIn('model',create)
         self.assertNotIn('sandbox',create)
-        self.assertNotIn('approvalPolicy',create)
+        self.assertEqual(create['permissions'],codex_new.FULL_ACCESS_PROFILE)
+        self.assertEqual(create['approvalPolicy'],'never')
         self.assertEqual(result['model'],'app-default')
-        self.assertEqual(result['creator_settings']['approvalPolicy'],'on-request')
+        self.assertEqual(result['creator_settings']['approvalPolicy'],'never')
         self.assertFalse(any(x['method']=='thread-follower-update-thread-settings' for x in desktop.calls))
         self.assertNotIn('prompt',result)
 
@@ -131,6 +164,36 @@ class NewCodexTests(unittest.TestCase):
         self.assertFalse(any(method=='thread/start' for method,_,_ in self.calls))
         self.assertEqual(self.urls,[])
         self.assertTrue(all(c.closed for c in self.instances))
+
+    def test_missing_or_disallowed_full_access_profile_refused_before_creation(self):
+        for profiles in ([],[{'id':codex_new.FULL_ACCESS_PROFILE,'allowed':False}]):
+            self.profiles=profiles
+            with self.subTest(profiles=profiles), ModelDesktop() as desktop, self.assertRaises(codex_new.CreationError) as caught:
+                self.open(desktop)
+            self.assertFalse(caught.exception.created)
+            self.assertFalse(caught.exception.uncertain)
+        self.assertFalse(any(method=='thread/start' for method,_,_ in self.calls))
+
+    def test_creator_must_confirm_full_access_and_never(self):
+        self.creator_full_access=False
+        with ModelDesktop() as desktop, self.assertRaisesRegex(codex_new.CreationError,'creator did not confirm') as caught:
+            self.open(desktop)
+        self.assertTrue(caught.exception.created)
+        self.assertEqual(self.urls,[])
+
+    def test_latest_settings_override_stale_current_permissions_for_next_turn(self):
+        with ModelDesktop(permissions=full_permissions(),stale_current=True) as desktop:
+            result=self.open(desktop)
+        self.assertEqual(result['permission_settings'],full_permissions())
+        self.assertFalse(any(x['method']=='thread-follower-update-thread-settings' for x in desktop.calls))
+
+    def test_latest_permissions_mismatch_is_not_masked_by_update_ack(self):
+        with ModelDesktop(refuse_permissions=True) as desktop, self.assertRaisesRegex(codex_new.CreationError,'did not confirm Full Access') as caught:
+            desktop.current_permissions=full_permissions()
+            self.open(desktop)
+        self.assertTrue(caught.exception.adopted)
+        self.assertEqual(caught.exception.stage,'permissions')
+        self.assertEqual(sum(x['method']=='thread-follower-update-thread-settings' for x in desktop.calls),1)
 
     def test_creator_substitution_is_not_accepted(self):
         self.substitute_model = True
@@ -269,10 +332,11 @@ for line in sys.stdin:
  if 'id' not in q:continue
  m=q['method'];p=q['params']
  if m=='initialize':r={{'userAgent':'fixture'}}
+ elif m=='permissionProfile/list':r={{'data':[{{'id':':danger-full-access','allowed':True}}]}}
  elif m=='model/list':r={{'data':[{{'model':'requested-model'}}]}}
  elif m=='thread/start':
   t={{'id':{self.sid!r},'cwd':{self.root!r},'ephemeral':False,'source':'vscode','status':{{'type':'idle'}},'name':None}}
-  state.write_text(json.dumps(t));r={{'thread':t,'model':p['model'],'approvalPolicy':'on-request','sandbox':{{'type':'workspaceWrite'}}}}
+  state.write_text(json.dumps(t));r={{'thread':t,'model':p['model'],'approvalPolicy':'never','activePermissionProfile':{{'id':':danger-full-access'}},'sandbox':{{'type':'dangerFullAccess'}}}}
  elif m=='thread/name/set':
   t=json.loads(state.read_text());t['name']=p['name'];state.write_text(json.dumps(t));r={{}}
  elif m=='thread/read':r={{'thread':json.loads(state.read_text())}}

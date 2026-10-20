@@ -13,6 +13,8 @@ import uuid
 
 import codex_live
 
+FULL_ACCESS_PROFILE = ':danger-full-access'
+
 
 class CreationError(ValueError):
     def __init__(self, reason, uncertain=False, session=None, adopted=False, stage=None):
@@ -71,6 +73,50 @@ def require_model(client, model, remaining=None):
         seen.add(cursor)
 
 
+def require_full_access_profile(client, cwd, remaining):
+    cursor, seen = None, set()
+    while True:
+        client.timeout = remaining()
+        params = {'cwd':str(cwd),'limit':100}
+        if cursor is not None:
+            params['cursor'] = cursor
+        page = client.call('permissionProfile/list', params)
+        rows = page.get('data')
+        if not isinstance(rows, list):
+            raise CreationError('Codex permissionProfile/list returned no profile catalog')
+        for row in rows:
+            if isinstance(row, dict) and row.get('id') == FULL_ACCESS_PROFILE:
+                if row.get('allowed') is True:
+                    return
+                raise CreationError('Installed Codex requirements refuse the Full Access profile')
+        cursor = page.get('nextCursor')
+        if not cursor:
+            raise CreationError('Installed Codex does not advertise the Full Access profile')
+        if not isinstance(cursor, str) or cursor in seen or len(seen) >= 100:
+            raise CreationError('Codex permissionProfile/list returned an invalid or repeated cursor')
+        seen.add(cursor)
+
+
+def has_full_access(settings, sandbox_key='sandboxPolicy'):
+    if not isinstance(settings, dict):
+        return False
+    profile, sandbox = settings.get('activePermissionProfile'), settings.get(sandbox_key)
+    return (isinstance(profile, dict) and profile.get('id') == FULL_ACCESS_PROFILE
+            and settings.get('approvalPolicy') == 'never'
+            and isinstance(sandbox, dict) and sandbox.get('type') == 'dangerFullAccess')
+
+
+def permission_settings(client, sid, owner):
+    # latestThreadSettings are the app's confirmed subsequent-turn inputs;
+    # currentPermissions may still describe the last completed turn.
+    state = client.snapshot(sid, owner)
+    values = state.get('latestThreadSettings')
+    if not isinstance(values, dict):
+        raise CreationError('Exact Codex Desktop owner returned no next-turn permission settings')
+    return {key:values.get(key) for key in
+            ('activePermissionProfile','approvalPolicy','sandboxPolicy')}
+
+
 def owner_settings(client, sid, owner):
     response = client.call('thread-follower-read-model-settings', {'conversationId':sid}, 1, owner)
     result = response.get('result')
@@ -110,9 +156,11 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
 
     try:
         with factory(mode='saved',timeout=remaining(),experimental=True) as creator:
+            require_full_access_profile(creator, folder, remaining)
             if model is not None:
                 require_model(creator, model, remaining)
-            params = {'cwd':str(folder),'ephemeral':False,'allowProviderModelFallback':False}
+            params = {'cwd':str(folder),'ephemeral':False,'allowProviderModelFallback':False,
+                      'permissions':FULL_ACCESS_PROFILE,'approvalPolicy':'never'}
             if model is not None:
                 params['model'] = model
             stage, attempted = 'create', True
@@ -125,6 +173,8 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
             require_thread(thread, sid, folder)
             if model is not None and created.get('model') != model:
                 raise CreationError('Codex creator substituted the requested --model')
+            if not has_full_access(created, 'sandbox'):
+                raise CreationError('Codex creator did not confirm Full Access with approvalPolicy never')
             effective = {key:created.get(key) for key in
                          ('approvalPolicy','approvalsReviewer','sandbox','activePermissionProfile')}
             if title is not None:
@@ -153,18 +203,28 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                     adopted = True
                     stage = 'model'
                     settings = owner_settings(client, sid, owner)
+                    stage = 'permissions'
+                    permissions = permission_settings(client, sid, owner)
+                    updates = {}
+                    if not has_full_access(permissions):
+                        updates.update(permissions=FULL_ACCESS_PROFILE, approvalPolicy='never')
                     if model is not None and settings['model'] != model:
-                        # Empty stored threads can adopt the app's default.
-                        # Change only model, never the app's permissions.
+                        updates['model'] = model
+                    if updates:
+                        # Change only this newly created thread, never global
+                        # config or the permissions of an existing session.
                         response = client.call('thread-follower-update-thread-settings',
-                            {'conversationId':sid,'threadSettings':{'model':model}}, 2, owner, mutation=True)
+                            {'conversationId':sid,'threadSettings':updates}, 2, owner, mutation=True)
                         result = response.get('result')
                         if (response.get('resultType') != 'success' or not isinstance(result, dict)
                                 or result.get('applied') is not True):
-                            raise CreationError('Exact Codex Desktop owner did not confirm the requested model update')
+                            raise CreationError('Exact Codex Desktop owner did not confirm new-thread settings update')
                         settings = owner_settings(client, sid, owner)
+                        permissions = permission_settings(client, sid, owner)
                     if model is not None and settings['model'] != model:
                         raise CreationError('Exact Codex Desktop owner substituted the requested --model')
+                    if not has_full_access(permissions):
+                        raise CreationError('Exact Codex Desktop owner did not confirm Full Access with approvalPolicy never')
                     break
             except (codex_live.DeliveryError, OSError):
                 if adopted:
@@ -176,7 +236,9 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                                     sid, folder, title)
         row = sessions.codex_row(stored, 'saved')
         return {'created':True,'adopted':True,'session':row,'owner':owner,'url':url,
-                'model':settings['model'],'creator_settings':effective,'warning':None}
+                'model':settings['model'],'creator_settings':effective,
+                'permission_settings':permissions,'permission_settings_source':'Desktop owner latestThreadSettings',
+                'warning':None}
     except BaseException as error:
         # Preserve recovery identity even when title, adoption, model update or
         # registration cannot be confirmed. No automatic second thread/start.
