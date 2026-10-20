@@ -75,9 +75,10 @@ def stop_process(process):
 
 
 class CodexClient:
-    def __init__(self, executable='codex', mode='auto', timeout=10):
+    def __init__(self, executable='codex', mode='auto', timeout=10, experimental=False):
         self.executable, self.timeout = resolve_codex_executable(executable), timeout
         self.warning = None
+        self.experimental = experimental
         try:
             self.open('shared' if mode == 'auto' else mode)
         except (OSError, DiscoveryError):
@@ -96,7 +97,10 @@ class CodexClient:
             self.process = subprocess.Popen([self.executable,*args],stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,stderr=self.errors,start_new_session=True)
             self.selector.register(self.process.stdout, selectors.EVENT_READ)
-            self.call('initialize',{'clientInfo':{'name':'agent_bridge','version':'0.2'}})
+            params = {'clientInfo':{'name':'agent_bridge','version':'0.2'}}
+            if self.experimental:
+                params['capabilities'] = {'experimentalApi':True}
+            self.call('initialize',params)
             self.write({'method':'initialized'})
         except BaseException:
             self.close()

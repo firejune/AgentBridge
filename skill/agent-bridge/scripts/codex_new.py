@@ -1,107 +1,189 @@
-"""Open the app's new-thread composer and identify its exact Desktop owner.
+"""Create a persistent thread with the public app-server API, then adopt it in Desktop.
 
-The internal deep-link contract was read from the installed Desktop app. This
-opens a composer; it never presses Enter or creates a standalone CLI thread.
+The creator is an ordinary, short-lived app-server client. Only exact Desktop
+ownership and model readback admit a session to the bridge; no composer, native
+pipe authorization workaround, synthetic user prompt, or creation replay.
 """
 import math
 from pathlib import Path
+import shutil
 import subprocess
 import time
-from urllib.parse import urlencode
+import uuid
 
 import codex_live
 
-PROMPT = 'This session was opened by agent-bridge. Wait for a task from the user or agent-bridge.'
-
 
 class CreationError(ValueError):
-    def __init__(self, reason, uncertain=False, session=None):
+    def __init__(self, reason, uncertain=False, session=None, adopted=False, stage=None):
         super().__init__(reason)
         self.uncertain = uncertain
         self.session = session
+        self.created = session is not None
+        self.adopted = adopted
+        self.stage = stage
+        self.cancelled = False
 
 
-def new_session_url(cwd, prompt):
-    return 'codex://threads/new?' + urlencode({'path':cwd, 'prompt':prompt, 'mode':'codex'})
+def adoption_url(sid):
+    return 'codex://threads/' + str(uuid.UUID(sid))
 
 
-def desktop_rows(cwd):
-    # The app has no shared app-server socket on some installations. Saved
-    # metadata is discovery only; the independent exact owner check below is
-    # required to call the session live. No turn is started by this reader.
-    import sessions
-    listing = sessions.list_codex(cwd=cwd, limit=10000, mode='saved')
-    if listing['more_available']:
-        raise CreationError('Codex desktop session listing was truncated; not identifying a new session')
-    return [row for row in listing['sessions'] if interactive_row(row, Path(cwd))]
-
-
-def interactive_row(row, folder):
-    # SourceKind is owned by app-server and may change. A root source string
-    # is only a candidate; the exact Desktop owner is the decisive check.
-    source = row.get('source')
-    return (isinstance(source, str) and source != 'exec'
-            and isinstance(row.get('cwd'), str) and Path(row['cwd']).resolve() == folder)
-
-
-def open_link(url):
-    import shutil
-    import subprocess
+def open_link(url, timeout=10):
     if not shutil.which('open'):
-        raise CreationError('Opening a Codex desktop session needs the macOS `open` command')
+        raise CreationError('Adopting a Codex thread in Desktop needs the macOS `open` command')
     result = subprocess.run(['open', url], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, timeout=10)
+                            stderr=subprocess.PIPE, text=True, timeout=timeout)
     if result.returncode:
-        raise CreationError('The codex:// new-thread link was not opened')
+        raise CreationError('The exact Codex thread link was not opened')
 
 
-def open_codex(cwd, title=None, model=None, timeout=180, opener=None, listing=None,
-               owner_factory=codex_live.Client, poll=0.5):
-    if model is not None:
-        raise CreationError('The Codex desktop new-thread link carries no model; choose it in the composer instead of --model')
+def require_thread(value, sid, cwd, title=None):
+    if not isinstance(value, dict) or value.get('id') != sid or value.get('ephemeral') is not False:
+        raise CreationError('Codex returned a different, missing, or ephemeral thread')
+    actual = value.get('cwd')
+    if not isinstance(actual, str) or Path(actual).resolve() != cwd:
+        raise CreationError('Codex thread cwd differs from the requested workspace')
+    if title is not None and value.get('name') != title:
+        raise CreationError('Codex thread title differs from the requested --title')
+    return value
+
+
+def require_model(client, model, remaining=None):
+    cursor, seen = None, set()
+    while True:
+        if remaining is not None:
+            client.timeout = remaining()
+        params = {'limit':100,'includeHidden':True}
+        if cursor is not None:
+            params['cursor'] = cursor
+        page = client.call('model/list', params)
+        rows = page.get('data')
+        if not isinstance(rows, list):
+            raise CreationError('Codex model/list returned no model catalog')
+        if any(isinstance(row, dict) and row.get('model') == model for row in rows):
+            return
+        cursor = page.get('nextCursor')
+        if not cursor:
+            raise CreationError('Requested --model is not advertised by the installed Codex provider')
+        if not isinstance(cursor, str) or cursor in seen or len(seen) >= 100:
+            raise CreationError('Codex model/list returned an invalid or repeated cursor')
+        seen.add(cursor)
+
+
+def owner_settings(client, sid, owner):
+    response = client.call('thread-follower-read-model-settings', {'conversationId':sid}, 1, owner)
+    result = response.get('result')
+    settings = result.get('settings') if isinstance(result, dict) else None
+    if (response.get('resultType') != 'success' or not isinstance(settings, dict)
+            or not isinstance(settings.get('model'), str) or not settings['model']
+            or settings.get('resumeState') != 'resumed'):
+        raise CreationError('Exact Codex Desktop owner did not confirm resumed model settings')
+    return settings
+
+
+def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_factory=None,
+               owner_factory=None, poll=0.5):
+    import sessions
     if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not 0 < timeout <= 3600:
         raise CreationError('Timeout must be between 0 and 3600 seconds')
     if not cwd or not str(cwd).strip():
-        raise CreationError('Workspace --cwd is required to open a Codex desktop session')
+        raise CreationError('Workspace --cwd is required to create a Codex desktop session')
     folder = Path(cwd).expanduser().resolve()
     if not folder.is_dir():
         raise CreationError(f'Workspace directory does not exist: {folder}')
-    if title is not None and (not isinstance(title, str) or not title.strip()):
-        raise CreationError('--title must be a nonempty first message')
-    prompt = title.strip() if title is not None else PROMPT
-    read = listing or desktop_rows
-    before = {row['id'] for row in read(str(folder))}
-    url = new_session_url(str(folder), prompt)
-    opened, sid = False, None
+    for label, value in (('--title',title),('--model',model)):
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise CreationError(f'{label} must be a nonempty string')
+    if opener is None and not shutil.which('open'):
+        raise CreationError('Adopting a Codex thread in Desktop needs the macOS `open` command')
+    factory = client_factory or sessions.CodexClient
+    owners = owner_factory or codex_live.Client
+    deadline = time.monotonic() + timeout
+    sid, adopted, attempted, stage = None, False, False, 'preflight'
+
+    def remaining():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise CreationError('Codex session creation/adoption timed out; use the returned UUID to recover')
+        return min(left, 10)
+
     try:
-        # A partial/ambiguous launcher outcome must not trigger a second link.
-        opened = True
-        (opener or open_link)(url)
-        deadline = time.monotonic() + timeout
+        with factory(mode='saved',timeout=remaining(),experimental=True) as creator:
+            if model is not None:
+                require_model(creator, model, remaining)
+            params = {'cwd':str(folder),'ephemeral':False,'allowProviderModelFallback':False}
+            if model is not None:
+                params['model'] = model
+            stage, attempted = 'create', True
+            creator.timeout = remaining()
+            created = creator.call('thread/start', params)
+            thread = created.get('thread')
+            if not isinstance(thread, dict):
+                raise CreationError('Codex thread/start returned no thread')
+            sid = str(uuid.UUID(thread['id']))
+            require_thread(thread, sid, folder)
+            if model is not None and created.get('model') != model:
+                raise CreationError('Codex creator substituted the requested --model')
+            effective = {key:created.get(key) for key in
+                         ('approvalPolicy','approvalsReviewer','sandbox','activePermissionProfile')}
+            if title is not None:
+                stage = 'title'
+                creator.timeout = remaining()
+                creator.call('thread/name/set', {'threadId':sid,'name':title})
+        # Closing the creator is required before Desktop takes over. A fresh,
+        # metadata-only client proves this is a persisted thread, not that
+        # short-lived server's in-memory session.
+        stage = 'persistence'
+        with factory(mode='saved',timeout=remaining()) as reader:
+            require_thread(reader.call('thread/read', {'threadId':sid,'includeTurns':False}).get('thread'),
+                           sid, folder, title)
+        stage = 'adoption'
+        url = adoption_url(sid)
+        if opener is None:
+            open_link(url, remaining())
+        else:
+            opener(url)
         while True:
-            rows = [row for row in read(str(folder)) if row['id'] not in before
-                    and interactive_row(row, folder)]
-            ids = {row['id'] for row in rows}
-            if len(ids) > 1:
-                raise CreationError('Multiple new Codex sessions appeared in --cwd; not choosing one. Bind the exact session with register --discover --session ID.')
-            if ids:
-                sid = next(iter(ids))
-                try:
-                    with owner_factory(timeout=min(max(deadline-time.monotonic(), 0.01), 2)) as client:
-                        owner = client.owner(sid)
-                except (codex_live.DeliveryError, OSError):
-                    owner = None  # A saved row can precede the Desktop owner.
-                if owner:
-                    row = next(row for row in rows if row['id'] == sid)
-                    return {'created':True, 'session':row, 'owner':owner, 'url':url,
-                            'prompt':prompt, 'warning':None}
-            if time.monotonic() >= deadline:
-                raise CreationError('No new owned Codex desktop session appeared in --cwd before timeout. The composer is prefilled; press Enter in the app, then bind the exact session with register --discover --session ID.')
-            time.sleep(min(poll, max(0, deadline-time.monotonic())))
-    except CreationError as error:
-        error.uncertain = opened
-        error.session = sid
-        raise
-    except (OSError, ValueError, TypeError, KeyError, subprocess.TimeoutExpired):
-        raise CreationError('Codex desktop opening or discovery failed; do not reopen automatically',
-                            uncertain=opened, session=sid) from None
+            remaining()
+            try:
+                client = owners(timeout=min(remaining(), 2))
+                with client:
+                    owner = client.owner(sid)
+                    adopted = True
+                    stage = 'model'
+                    settings = owner_settings(client, sid, owner)
+                    if model is not None and settings['model'] != model:
+                        # Empty stored threads can adopt the app's default.
+                        # Change only model, never the app's permissions.
+                        response = client.call('thread-follower-update-thread-settings',
+                            {'conversationId':sid,'threadSettings':{'model':model}}, 2, owner, mutation=True)
+                        result = response.get('result')
+                        if (response.get('resultType') != 'success' or not isinstance(result, dict)
+                                or result.get('applied') is not True):
+                            raise CreationError('Exact Codex Desktop owner did not confirm the requested model update')
+                        settings = owner_settings(client, sid, owner)
+                    if model is not None and settings['model'] != model:
+                        raise CreationError('Exact Codex Desktop owner substituted the requested --model')
+                    break
+            except (codex_live.DeliveryError, OSError):
+                if adopted:
+                    raise  # Never replay a possibly sent settings mutation.
+                time.sleep(min(poll, max(0, deadline-time.monotonic())))
+        stage = 'verification'
+        with factory(mode='saved',timeout=remaining()) as reader:
+            stored = require_thread(reader.call('thread/read', {'threadId':sid,'includeTurns':False}).get('thread'),
+                                    sid, folder, title)
+        row = sessions.codex_row(stored, 'saved')
+        return {'created':True,'adopted':True,'session':row,'owner':owner,'url':url,
+                'model':settings['model'],'creator_settings':effective,'warning':None}
+    except BaseException as error:
+        # Preserve recovery identity even when title, adoption, model update or
+        # registration cannot be confirmed. No automatic second thread/start.
+        if not isinstance(error, (CreationError, ValueError, OSError, KeyError, TypeError,
+                                  subprocess.TimeoutExpired, KeyboardInterrupt)):
+            raise
+        message = str(error) if isinstance(error, CreationError) else 'Codex creation/adoption failed; do not create another thread automatically'
+        failure = CreationError(message, attempted, sid, adopted, stage)
+        failure.cancelled = isinstance(error, KeyboardInterrupt)
+        raise failure from None

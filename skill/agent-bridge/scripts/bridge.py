@@ -417,6 +417,8 @@ def main(argv=None):
         result = broker.request(args.socket,fields,timeout=args.timeout+5 if args.cmd in ('ask','wait') else 10)
         if observation:
             result['discovery'] = observation
+            if args.cmd == 'register' and args.transport == 'codex' and args.new:
+                result['registered'] = True
         output(result)
         return 2 if args.cmd in ('ask','wait') and result['timed_out'] else 0
     except KeyboardInterrupt:
@@ -428,12 +430,13 @@ def main(argv=None):
         output({'error':str(error),'push_failed':True,'message':message})
         return 1
     except codex_new.CreationError as error:
-        output({'error':str(error),'uncertain':error.uncertain,'session':error.session})
-        return 1
+        output({'error':str(error),'uncertain':error.uncertain,'session':error.session,
+                'created':error.created,'adopted':error.adopted,'registered':False,'stage':error.stage})
+        return 130 if error.cancelled else 1
     except (ValueError,OSError,subprocess.TimeoutExpired,KeyError,TypeError) as error:
         result = {'error':str(error)}
         if observation and args.cmd == 'register' and args.transport == 'codex' and args.new:
-            result.update(created=True, session=observation['session']['id'],
+            result.update(created=True, adopted=observation.get('adopted',False), session=observation['session']['id'],
                           registered=False, discovery=observation)
         output(result)
         return 1
