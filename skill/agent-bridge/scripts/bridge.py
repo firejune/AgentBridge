@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import agy_live
 import broker
 import codex_live
+import codex_new
 import sessions
 
 def envelope(m):
@@ -288,11 +289,11 @@ def registration(args):
     if getattr(args, 'new', False):
         if args.discover or args.session:
             raise ValueError('--new cannot be combined with --session or --discover')
-        if args.transport not in ('agy','claude-peer'):
-            raise ValueError('--new is supported only with --transport agy (Antigravity Desktop) or claude-peer (Claude Code desktop)')
+        if args.transport not in ('agy','claude-peer','codex'):
+            raise ValueError('--new is supported only with --transport agy (Antigravity Desktop), claude-peer (Claude Code desktop), or codex (Codex desktop)')
         if not args.cwd:
             raise ValueError('--new requires --cwd')
-        provider = 'claude' if args.transport == 'claude-peer' else 'agy'
+        provider = 'claude' if args.transport == 'claude-peer' else args.transport
         observation = sessions.open_session(provider, cwd=args.cwd, title=args.title, model=args.model, timeout=args.timeout)
         args.session = observation['session']['id']
         args.cwd = observation['session']['cwd']
@@ -325,12 +326,12 @@ def main(argv=None):
     p.add_argument('--transport',choices=['realtime','codex','claude','claude-peer','agy'],default='realtime')
     p.add_argument('--session');p.add_argument('--cwd');p.add_argument('--executable')
     p.add_argument('--discover',action='store_true')
-    p.add_argument('--new',action='store_true',help='Open a new Antigravity Desktop or Claude Code desktop session and register it')
+    p.add_argument('--new',action='store_true',help='Open a new Antigravity, Claude Code, or Codex desktop session and register it')
     p.add_argument('--title');p.add_argument('--model')
-    p.add_argument('--timeout',type=float,default=180,help='Seconds to wait for a new claude-peer session to start')
+    p.add_argument('--timeout',type=float,default=180,help='Seconds to wait for desktop session creation')
     p.add_argument('--codex-mode',choices=['auto','shared','saved'],default='auto')
-    p = sub.add_parser('open',help='Open a new live session (Antigravity Desktop or Claude Code desktop)')
-    p.add_argument('--provider',choices=['agy','claude'],default='agy')
+    p = sub.add_parser('open',help='Open a new live desktop session')
+    p.add_argument('--provider',choices=['agy','claude','codex'],default='agy')
     p.add_argument('--cwd',required=True);p.add_argument('--title');p.add_argument('--model')
     p.add_argument('--timeout',type=float,default=180)
     p = sub.add_parser('sessions',help='Discover real CLI sessions without starting a turn')
@@ -372,6 +373,7 @@ def main(argv=None):
     p = sub.add_parser('deliver');p.add_argument('id');p.add_argument('--dry-run',action='store_true');p.add_argument('--timeout',type=float,default=180)
     p = sub.add_parser('resolve');p.add_argument('id');p.add_argument('--state',choices=['pending','submitted','done'],required=True);p.add_argument('--note',required=True)
     args = parser.parse_args(argv)
+    observation = None
     try:
         if args.cmd=='serve':
             if args.max_messages<1:
@@ -415,6 +417,8 @@ def main(argv=None):
         result = broker.request(args.socket,fields,timeout=args.timeout+5 if args.cmd in ('ask','wait') else 10)
         if observation:
             result['discovery'] = observation
+            if args.cmd == 'register' and args.transport == 'codex' and args.new:
+                result['registered'] = True
         output(result)
         return 2 if args.cmd in ('ask','wait') and result['timed_out'] else 0
     except KeyboardInterrupt:
@@ -425,8 +429,16 @@ def main(argv=None):
             message = {k:message[k] for k in ('id','state','route')}
         output({'error':str(error),'push_failed':True,'message':message})
         return 1
+    except codex_new.CreationError as error:
+        output({'error':str(error),'uncertain':error.uncertain,'session':error.session,
+                'created':error.created,'adopted':error.adopted,'registered':False,'stage':error.stage})
+        return 130 if error.cancelled else 1
     except (ValueError,OSError,subprocess.TimeoutExpired,KeyError,TypeError) as error:
-        output({'error':str(error)})
+        result = {'error':str(error)}
+        if observation and args.cmd == 'register' and args.transport == 'codex' and args.new:
+            result.update(created=True, adopted=observation.get('adopted',False), session=observation['session']['id'],
+                          registered=False, discovery=observation)
+        output(result)
         return 1
 
 

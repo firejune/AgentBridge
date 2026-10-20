@@ -131,3 +131,19 @@ python3 "$bridge_cli" reply REQUEST_ID --key UNIQUE_REPLY_KEY --file /absolute/a
 - `deliver`는 pending `codex`·`claude-peer`·`agy` push의 명시적 재집행과 쉬고 있는 전용 `claude` 경로에 사용한다. Codex·AGY는 자동 push와 동일한 기존 데스크톱 경로를 쓰며 queue하지 않는다. Claude `resume`은 쉬고 있는 전용 세션을 읽기 전용으로 실행한다(라이브 세션 금지, 위 ⛔). 실행 중인 Claude 대화에 넣는 통로는 `claude-peer` push뿐이다. `uncertain` 결과는 자동 재전송하지 않는다.
 - Codex 저장 목록의 `notLoaded`는 다른 앱의 실제 상태를 나타내지 않으므로 브릿지는 `unknown`으로 표시한다. 세션 조회 성공을 전달 성공으로 보고하지 않는다.
 - 복구·재연결·실행 상태가 필요할 때 [사용법](usage.md)의 해당 절을 읽는다. 합의 결과의 장기 보존이 필요하면 프로젝트 산출물에 반영하며 브로커에 영구 보존을 기대하지 않는다.
+
+### Codex Desktop 세션 자동 생성
+
+```bash
+python3 "$bridge_cli" open --provider codex --cwd /path/to/workspace --title "작업 세션" --model MODEL
+python3 "$bridge_cli" register codex-worker --project PROJECT --transport codex \
+  --new --cwd /path/to/workspace --title "작업 세션" --model MODEL --timeout 180
+```
+
+설치된 CLI의 공식 `app-server --stdio` JSON-RPC로 영속 대화를 하나 만들고, `thread/name/set`으로 실제 이름을 저장한 뒤 생성 프로세스를 종료한다. 별도 메타데이터 조회에서 동일 UUID·정확한 `--cwd`·요청한 제목을 다시 확인하고 `codex://threads/UUID`로 앱이 그 대화를 인계받게 한다. 해당 UUID의 정확한 IPC 소유자가 `supportsUntrustedAppInput`을 제공하고 대화를 재개했는지 확인한 뒤 등록한다. **Enter·작성기 제출·가짜 사용자 프롬프트·모델 턴·상속된 MCP 문맥·UI 자동화는 필요 없다.** macOS 앱과 CLI가 설치되어 있어야 하며, 실제 Desktop 소유자 확인이 등록 조건이다.
+
+`--title`은 실제 대화 제목이다. 명시한 `--model`은 설치된 제공자 목록에 있어야 하며 알 수 없는 모델은 생성 전에 거부한다. 제공자의 모델 자동 대체도 금지한다. 빈 영속 대화는 `thread/start`의 모델과 달리 앱 기본 모델로 인계될 수 있으므로 정확한 소유자의 모델을 읽고, 필요하면 요청한 모델만 설정한 뒤 다시 읽어 일치를 확인한다. `--model` 생략 시 앱 기본값을 유지한다. 승인·샌드박스·네트워크·권한 설정을 덮어쓰지 않는다. 출력의 `creator_settings`는 생성 프로세스의 실제 기본 설정이며 인계 후 앱 권한까지 확인했다는 뜻은 아니다.
+
+생성 요청은 한 번만 보낸다. `--timeout`은 전체 흐름의 기한이며 마지막 IPC 호출·프로세스 정리에 짧고 제한된 초과 시간이 생길 수 있다. 생성 뒤 실패하면 `session`, `created`, `adopted`, `registered: false`, `stage`, `uncertain`을 보존한다. 생성 요청 전송 뒤 UUID가 없으면 결과 미확인이다. `--new`를 자동 재실행하지 않는다. 정확한 UUID를 확인하고 남은 인계·모델 검증을 마친 뒤 등록한다. 브로커 등록만 실패하면 생성 결과와 UUID가 남으므로 `register --transport codex --session ID --discover`로 기존 대화를 등록할 수 있다. 성공한 `register --new`는 `registered: true`를, `discovery` 안에 `created`, `adopted`, 검증한 모델을 반환한다. 이 값은 작업 완료가 아니다.
+
+앱 서버 스키마는 설치된 CLI에서 생성하며 생성 필드에 필요한 실험 API 기능을 명시적으로 협상한다. 정확한 UUID 딥 링크와 소유자·설정 IPC는 업데이트로 바뀔 수 있는 내부 계약이다. native app-tools 파이프를 사용하거나 권한을 우회하지 않는다. 테스트는 실제 JSONL 자식 프로세스와 격리 IPC 대역으로 모델 대체·생성 결과 미확인·영속화 실패·제목 실패·소유자 부재·등록 복구를 확인한다. CLI 생성만 성공한 상태를 Desktop 세션 성공으로 부르지 않는다.

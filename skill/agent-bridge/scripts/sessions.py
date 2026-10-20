@@ -1,4 +1,4 @@
-"""Read session metadata through installed CLIs; never resume or start a turn."""
+"""Read session metadata or open supported desktop new-session entrypoints."""
 from datetime import datetime, timezone
 import json
 import os
@@ -14,6 +14,7 @@ from urllib.parse import urlencode
 import uuid
 
 import agy_live
+import codex_new
 
 
 class DiscoveryError(ValueError):
@@ -74,9 +75,10 @@ def stop_process(process):
 
 
 class CodexClient:
-    def __init__(self, executable='codex', mode='auto', timeout=10):
+    def __init__(self, executable='codex', mode='auto', timeout=10, experimental=False):
         self.executable, self.timeout = resolve_codex_executable(executable), timeout
         self.warning = None
+        self.experimental = experimental
         try:
             self.open('shared' if mode == 'auto' else mode)
         except (OSError, DiscoveryError):
@@ -95,7 +97,10 @@ class CodexClient:
             self.process = subprocess.Popen([self.executable,*args],stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,stderr=self.errors,start_new_session=True)
             self.selector.register(self.process.stdout, selectors.EVENT_READ)
-            self.call('initialize',{'clientInfo':{'name':'agent_bridge','version':'0.2'}})
+            params = {'clientInfo':{'name':'agent_bridge','version':'0.2'}}
+            if self.experimental:
+                params['capabilities'] = {'experimentalApi':True}
+            self.call('initialize',params)
             self.write({'method':'initialized'})
         except BaseException:
             self.close()
@@ -274,12 +279,14 @@ def inspect_session(provider, sid, executable=None, codex_mode='auto'):
 
 
 def open_session(provider='agy', cwd=None, title=None, model=None, timeout=180):
+    if provider == 'codex':
+        return codex_new.open_codex(cwd=cwd, title=title, model=model, timeout=timeout)
     if provider == 'claude':
         if not cwd:
             raise DiscoveryError('Provide --cwd when opening a new Claude Code desktop session')
         return open_claude(cwd=cwd, title=title, model=model, timeout=timeout)
     if provider != 'agy':
-        raise DiscoveryError(f'Opening a new session is supported only for Antigravity Desktop (agy) and Claude Code desktop (claude), not {provider!r}')
+        raise DiscoveryError(f'Opening a new session is supported only for Antigravity Desktop (agy), Claude Code desktop (claude), and Codex desktop (codex), not {provider!r}')
     if not cwd:
         raise DiscoveryError('Provide --cwd when opening a new Antigravity Desktop session')
     return agy_live.open_agy(cwd=cwd, title=title, model=model)
