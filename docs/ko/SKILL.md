@@ -126,11 +126,13 @@ python3 "$bridge_cli" reply REQUEST_ID --key UNIQUE_REPLY_KEY --file /absolute/a
 
 ## 실행 경계
 
-- 상태는 메모리에만 있다. 브로커 재시작 시 채널, 메시지, 중복키가 초기화된다. 기존 공유 브로커를 임의로 재시작하거나 종료하지 않는다. 직접 시작한 인스턴스는 참가자들의 작업 종료를 확인한 뒤 정리한다.
+- endpoint·채널 바인딩만 소유자 전용 파일에 저장한다. 재시작 시 정확한 라이브 세션과 채널의 고정 주소를 재검증하고, 사용할 수 없는 바인딩은 제거한다. 메시지·중복키·이벤트는 초기화된다. 기존 공유 브로커를 임의로 재시작하거나 종료하지 않는다. 직접 시작한 인스턴스는 참가자들의 작업 종료를 확인한 뒤 정리한다.
 - `watch`는 연결 당시 채널 세대를 유지한다. 인계 후 새 담당자는 새로 구독한다. 이미 진행 중인 요청의 목적지·답장 주소는 원래 세대를 유지한다.
 - `deliver`는 pending `codex`·`claude-peer`·`agy` push의 명시적 재집행과 쉬고 있는 전용 `claude` 경로에 사용한다. Codex·AGY는 자동 push와 동일한 기존 데스크톱 경로를 쓰며 queue하지 않는다. Claude `resume`은 쉬고 있는 전용 세션을 읽기 전용으로 실행한다(라이브 세션 금지, 위 ⛔). 실행 중인 Claude 대화에 넣는 통로는 `claude-peer` push뿐이다. `uncertain` 결과는 자동 재전송하지 않는다.
 - Codex 저장 목록의 `notLoaded`는 다른 앱의 실제 상태를 나타내지 않으므로 브릿지는 `unknown`으로 표시한다. 세션 조회 성공을 전달 성공으로 보고하지 않는다.
 - 복구·재연결·실행 상태가 필요할 때 [사용법](usage.md)의 해당 절을 읽는다. 합의 결과의 장기 보존이 필요하면 프로젝트 산출물에 반영하며 브로커에 영구 보존을 기대하지 않는다.
+
+- 보존 상한에서는 보호되지 않은 `done`·`answered`·`failed`만 제거한다. `submitted`·`uncertain`은 완료가 아니다. 제거 시 메시지 ID와 중복키도 만료된다. 서비스는 `install-service`로 명시 설치하며, `--generate-only --plist PATH`는 로드 없이 파일만 만든다. KeepAlive는 `stop` 후에도 재기동하므로 계속 중지하려면 `uninstall-service`로 제거한다.
 
 ### Codex Desktop 세션 자동 생성
 

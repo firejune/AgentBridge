@@ -128,11 +128,11 @@ python3 "$bridge_cli" reply REQUEST_ID --key UNIQUE_REPLY_KEY --file /absolute/a
 
 ## Operational Boundaries
 
-- State lives in memory only. Broker restarts clear channels, messages, and idempotency keys. Do not restart or stop a shared broker without coordinating with active participants.
+- Only routes and channel bindings persist in an owner-private routing snapshot. Restart re-verifies exact live sessions and pinned channel routes, dropping unavailable bindings; messages, idempotency keys, and events are volatile. Do not restart or stop a shared broker without coordinating with active participants.
 - `watch` stays bound to the channel generation active when subscribed; after a handoff, the new owner subscribes anew while in-flight requests keep their original return routes.
 - `deliver` explicitly retries pending `codex`, `claude-peer`, or `agy` pushes and dispatches idle dedicated `claude` sessions. Never automatically retry `uncertain` deliveries.
 - In Codex saved listings, `notLoaded` does not reflect another app's live runtime state, so the bridge reports `unknown`. Never report session discovery success as message delivery success.
-- See [usage.md](references/usage.md) for recovery, reconnection, and resolution workflows. Persist durable decisions in project artifacts rather than relying on broker memory.
+- See [usage.md](references/usage.md) for recovery, reconnection, and resolution workflows. At the retention limit, only unprotected `done`/`answered`/`failed` messages can be evicted; `submitted` and `uncertain` are unfinished. Eviction also expires the message ID and key. Persist durable decisions in project artifacts. Supervision is opt-in via `install-service`; `--generate-only --plist PATH` writes without loading. KeepAlive restarts after `stop`; `uninstall-service` keeps it down.
 
 ### Creating a New Codex Desktop Session Autonomously
 
