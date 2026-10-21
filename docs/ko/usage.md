@@ -4,7 +4,7 @@
 
 에이전트끼리 실시간으로 질문과 답변을 주고받는 로컬 CLI. Python 3.10 이상, 표준 라이브러리만 사용한다. macOS/Linux의 Unix 도메인 소켓으로 연결하며 외부 패키지, API 키, 네트워크 포트가 필요 없다.
 
-**SQLite와 파일 우편함을 제거했다.** 브로커가 채널·메시지·이벤트를 메모리에만 유지하고 구독 중인 클라이언트에 즉시 전달한다. 브로커를 재시작하면 등록, 대화, 중복 방지 키와 이벤트 이력이 모두 사라진다. 기존 버전의 DB는 자동으로 읽거나 삭제하지 않는다.
+**SQLite와 파일 우편함을 제거했다.** endpoint·채널 바인딩만 소유자 전용 라우팅 파일에 저장한다. 메시지·전달 상태·대화·중복 방지 키·이벤트는 메모리에 유지하고 재시작 시 사라진다. 라우팅은 재검증해 복원하며 메시지를 재생하지 않는다. 기존 DB는 자동으로 읽거나 삭제하지 않는다.
 
 ## 연결 구조
 
@@ -56,7 +56,7 @@ python3 "$bridge_cli" ping
 python3 "$bridge_cli" stop
 ```
 
-별도 인스턴스가 필요하면 모든 명령에 동일한 `--socket /tmp/my-bridge.sock`을 지정한다. 소켓 주소는 OS 길이 제한에 맞게 짧게 둔다. 자동 시작·자동 재시작 서비스는 설치하지 않는다.
+격리 인스턴스는 모든 명령에 명시적 임시 `--socket`을 주고, 서버에는 `serve --state-dir /absolute/private/state`도 지정한다. 소켓 주소는 OS 길이 제한에 맞게 짧게 둔다. 테스트를 위해 공유 브로커를 멈추지 않는다. 서비스는 아래 절의 명시적 설치 전까지 꺼져 있다.
 
 ## 실시간 티키타카
 
@@ -90,7 +90,7 @@ MESSAGE
 - `reply`는 질문에 고정된 답장 주소를 사용한다. 답장 ID에 다시 reply하면 같은 `conversation` 안에서 협의를 이어간다.
 - `send`는 ask와 같은 인수를 받되 기다리지 않는다. 전송 후 `wait REQUEST_ID --timeout 60`으로 답변을 기다릴 수 있다.
 - `ask`/`wait`의 시간 초과는 종료 코드 2, `timed_out: true`다. 질문 취소나 상대 작업 실패를 뜻하지 않는다. 같은 ID로 다시 wait하면 늦은 답변을 받을 수 있다.
-- 같은 메시지를 다시 보내야 할 때는 같은 `--key`를 사용한다. 같은 키에 다른 내용을 넣으면 거부한다. 중복 방지는 **현재 브로커 실행 동안만** 유효하다.
+- 같은 메시지를 다시 보내야 할 때는 같은 `--key`를 사용한다. 같은 키에 다른 내용을 넣으면 거부한다. 중복 방지는 **현재 브로커 실행에서 해당 메시지가 보존되는 동안만** 유효하다. 제거된 메시지의 키를 다시 쓰면 새 메시지가 되므로 자동 재전송하지 않는다.
 - 구독자가 없어도 메시지는 브로커 메모리에 남는다. 자동으로 AI를 깨우지는 않는다. `inbox`/`show`로 확인할 수 있다.
 
 ```bash
@@ -112,7 +112,39 @@ python3 "$bridge_cli" watch --project my-app --channel modal-view \
 
 최근 1,024개 이벤트를 메모리에 유지한다. 범위를 벗어난 커서나 브로커 재시작 전의 instance는 거부한다. 이때 채널과 inbox를 다시 확인한다. 자동 재연결·자동 재전송은 하지 않는다. 느린 구독자의 버퍼가 차면 오류를 알리고 연결을 닫아 누락을 숨기지 않는다.
 
-기본 메시지 상한은 2,048개이며 `serve --max-messages`로 설정한다. 한 메시지는 UTF-8 32 KiB까지다. 상한에 도달하면 새 메시지와 답변을 거부한다. 여유가 있을 때 필요한 합의 내용을 프로젝트 산출물에 정리하고 브로커를 재시작한다. 이 도구는 장기 기록 저장소가 아니다.
+한 메시지는 UTF-8 32 KiB까지다. `serve --max-messages 2048`은 메시지 보존 개수이며, 상한에서 보호되지 않은 종료 항목 중 가장 오래된 것을 제거한다.
+
+- `done`: `resolve --state done --note ...`로 명시적으로 완료했다.
+- `answered`: 브릿지 답변을 기록했다. 답변 메시지 자체는 미처리일 수 있다.
+- `failed`: 불확실한 결과가 아닌 확정된 디스패치 실패다.
+
+`pending`·`dispatching`·`submitted`·`received`·`in_progress`·`uncertain`은 미완료라 제거하지 않는다. 전달 접수·수신 확인·진행 보고·wait 시간 초과는 완료가 아니다. 자동 만료는 없으며 `delivered`·`replied`·`expired`는 프로토콜 상태가 아니다. 자동 재시도도 추가하지 않는다.
+
+현재 답변의 부모, 실행 중인 wait, 미완료 또는 wait 중인 부모에게 필요한 종료 답변은 보호한다. 후보가 없으면 `In-memory message limit reached: no evictable terminal messages`로 새 전송·답변을 거부한다. 전부 미처리인 경우와 완료 항목도 보호 중인 경우를 포함한다. 답변도 빈 슬롯이나 다른 제거 후보가 필요하다. 잘못된 주소·본문·키·답변 ID는 제거 전에 거부한다. 제거된 ID의 `show`는 실패하고 `conversation`은 일부 이력만 표시할 수 있다. 답변 이벤트와 중복키도 함께 제거한다. 이벤트 재생은 별도의 최근 1,024개 창이라 이미 제거된 메시지의 복사본을 포함할 수 있다. 합의는 프로젝트 산출물에 보관한다.
+
+## 라우팅 저장과 선택적 launchd
+
+`serve --state-dir PATH`는 소유자 전용 디렉터리(0700)의 `routes.json`(0600)에 endpoint·채널을 저장한다. 기본은 소켓 경로의 확장자를 `.state`로 바꾼 디렉터리이며, 기본 소켓에서는 `~/.local/share/agent-bridge/bridge.state/`다. 등록·채널 연결·닫기마다 허용 필드만 새 임시 파일에 쓰고 flush·fsync한 뒤 원자 교체한다. 교체가 성공한 뒤에만 메모리 변경을 수락하므로 저장 실패는 이전 파일과 메모리를 유지한다. 별도 디렉터리 잠금이 서로 다른 소켓의 동시 쓰기도 막는다. 최상위 형식이 손상되거나 지원하지 않는 버전이면 덮어쓰지 않고 기동을 거부한다. 디렉터리 항목 자체는 fsync하지 않으므로 갑작스러운 전원 손실까지 보장하지 않는다.
+
+저장 대상은 프로젝트·이름·전송 방식·세션 UUID·작업 경로·선택 실행 파일과 채널 소유자·설명·세대·활성 여부·고정 주소다. 메시지·전달 상태·중복키·이벤트·토큰·발견한 상대 소켓·PID·discovery 원문은 저장하지 않는다. 이 파일은 비공개 로컬 라우팅이며 버전 관리에 넣지 않는다.
+
+시작 시 endpoint와 **채널의 고정 주소**를 각각 검증한다. 채널이 현재 endpoint보다 이전 세션을 가리켜도 그 세션·세대를 보존하며 새 endpoint로 바꾸지 않는다. 닫힌 채널은 세대와 닫힘을 보존한다. `claude-peer`는 정확한 라이브 레지스트리 UUID·PID·프로토콜·소유 소켓·작업 경로를, Codex는 `auto` 메타데이터 조회(shared 서버가 없으면 저장 메타데이터)로 정확한 UUID·작업 경로를 확인한 뒤 untrusted-input을 지원하는 정확한 기존 Desktop IPC 소유자를 요구한다. 저장 메타데이터의 `unknown`·`notLoaded`는 생존 판정이 아니며 독립된 owner가 UUID를 확인하면 복원한다. `agy`는 정확한 라이브 trajectory·작업 경로를 확인한다. 없거나 불일치·무효·확인 불가인 라우트는 제거하고 정리된 파일을 저장한다. 제거 진단은 discovery 예외·크리덴셜·상대 소켓 정보를 출력하지 않는다. 일시적인 provider 장애도 보수적으로 제거하므로 나중에 명시적 재등록이 필요할 수 있다. `realtime`과 전용 `claude`는 라이브 peer 계약이 없으므로 UUID·작업 경로의 형식과 존재만 검증한다. 복원하면서 Claude CLI를 실행하지 않는다. 시작 이후 상태는 바뀔 수 있어 기존 전달 adapter가 다시 확인한다.
+
+재시작하면 메시지와 진행 중 ID는 사라지고 구독자는 0명이다. 새 instance로 재연결하고 라우트·채널·inbox를 확인해 미완료 작업을 조율한다. 사라진 ID를 안전한 재전송 근거로 삼지 않는다. 기존 `stop`(shutdown RPC)·SIGINT·SIGTERM은 watch·wait·부분 요청·정체된 클라이언트의 연결을 닫은 뒤 서버 종료를 기다린다. `stop` 성공 응답은 종료 접수이며 프로세스 종료 자체와 구분한다.
+
+macOS 서비스는 **기본 꺼짐**이다. 소유자가 설치 전에 로드 없이 plist를 검토할 수 있다.
+
+```bash
+python3 "$bridge_cli" --socket /absolute/private/bridge.sock install-service \
+  --state-dir /absolute/private/state --plist /absolute/review/agent.plist --generate-only
+plutil -lint /absolute/review/agent.plist
+```
+
+이 모드는 plist와 상위 디렉터리만 만들며 launchctl·브로커를 실행하지 않는다. 테스트는 생성·검증만 한다. `uninstall-service --generate-only --plist PATH`는 일치하는 plist 파일만 지우므로 로드하지 않은 검토 파일에만 쓴다. 검토 파일이 다음 로그인 때 실행되지 않도록 생성 전용 모드는 `~/Library/LaunchAgents` 밖의 명시적 `--plist`를 요구한다. 실제 설치 기본 경로는 `~/Library/LaunchAgents/com.agent-bridge.broker.SOCKET_HASH.plist`다. label은 절대 소켓 경로의 안정적인 해시를 포함해 인스턴스를 구분한다. 기존 파일을 덮어쓰지 않으므로 실제 설치 전 로드하지 않은 검토 사본은 제거한다.
+
+승인된 실제 설치에서 `install-service`는 plist를 쓰고 `launchctl bootstrap gui/UID PLIST`를 호출한다. 절대 Python·스크립트·소켓·저장 경로, 저장 디렉터리의 비공개 로그, `RunAtLoad`, `KeepAlive: true`, 10초 throttle, umask 0077을 사용한다. 기존 브로커를 멈추거나 셸 시작 파일을 바꾸지 않는다. 수동 브로커에서 전환할 때 참가자와 먼저 조율한다. 소켓 잠금이 중복 실행을 거부한다. 설치 실패는 plist를 남기며 불확실한 launchctl 결과는 자동 재시도하지 않는다. 구버전 메모리의 등록은 자동 이관하지 않는다. 이 버전이 등록을 받아 저장한 뒤부터 복원할 수 있다.
+
+**KeepAlive는 `stop`·Ctrl-C·SIGTERM·정상 종료 후에도 재기동한다.** 계속 중지하려면 일치하는 `--socket`·`--state-dir`·선택 `--plist`로 `uninstall-service`를 실행한다. `launchctl bootout gui/UID/com.agent-bridge.broker.SOCKET_HASH` 성공 뒤에만 일치하는 plist를 지운다. 실패하면 plist를 남긴다. 이미 내려간 서비스는 소유자 확인 후 `--generate-only`로 파일만 제거해야 할 수 있다. 라우팅 파일은 유지한다. 스킬 설치나 foreground 실행만으로 launchctl을 실행하지 않는다. 실제 서비스 로드·크래시 재기동 검증은 소유자가 승인한 macOS 설치가 필요하며 plist lint와 구분한다.
 
 ## 세션 조회와 확인
 

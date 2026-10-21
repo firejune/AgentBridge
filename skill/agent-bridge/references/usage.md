@@ -4,7 +4,7 @@
 
 A local CLI for real-time peer-to-peer correspondence across AI coding agents. Requires Python 3.10+ and uses only the Python standard library over Unix domain sockets on macOS and Linux — no third-party packages, API keys, or network ports required.
 
-**No SQLite or file mailboxes.** The broker keeps channels, messages, and events strictly in memory and streams updates to connected clients immediately. Restarting the broker clears all registrations, conversations, idempotency keys, and event history.
+**No SQLite or file mailboxes.** Only endpoints and channel bindings persist in an owner-private routing snapshot. Messages, delivery state, conversations, idempotency keys, and events stay in memory. Restarting clears that correspondence and re-verifies routing; it never replays messages.
 
 ## Architecture
 
@@ -56,7 +56,7 @@ A process lock prevents two brokers from sharing the same socket. Stop the broke
 python3 "$bridge_cli" stop
 ```
 
-To run an isolated broker instance, pass `--socket /tmp/my-bridge.sock` to all commands.
+To run an isolated broker instance, pass an explicit temporary `--socket` to every command and `serve --state-dir /absolute/private/state` to the server. Never stop a shared broker for testing.
 
 ## Real-Time Correspondence
 
@@ -90,7 +90,7 @@ MESSAGE
 - `reply` uses the return route captured on the original request. Replying to a reply ID continues the same `conversation`.
 - `send` takes the same arguments as `ask` without waiting. You can wait later with `wait REQUEST_ID --timeout 60`.
 - When `ask` or `wait` times out, it exits with code 2 (`timed_out: true`). It does not cancel the request; run `wait` again on the same ID to collect a late reply.
-- Reuse the same `--key` when retrying a send. Reusing a key with different payload parameters is rejected. Idempotency keys last for the current broker run only.
+- Reuse the same `--key` when retrying a send. Reusing a key with different payload parameters is rejected. Idempotency keys last only while their messages are retained in the current broker run. Eviction removes the key; reusing it then creates a new message. Never automatically repeat an evicted request.
 - Inspect queued or historical in-memory messages with `inbox`, `show`, and `conversation`:
 
 ```bash
@@ -108,7 +108,39 @@ python3 "$bridge_cli" watch --project my-app --channel modal-view \
   --instance BROKER_INSTANCE_UUID --after LAST_PROCESSED_SEQ
 ```
 
-The broker keeps the most recent 1,024 events in memory. Out-of-range cursors or stale broker instances are rejected; re-check `channels` and `inbox` when that happens. The broker also caps total messages at 2,048 by default (`serve --max-messages`) and individual message bodies at 32 KiB UTF-8.
+The broker keeps the most recent 1,024 events in memory. Out-of-range cursors or stale broker instances are rejected; re-check `channels` and `inbox` when that happens. Individual message bodies are limited to 32 KiB UTF-8. `serve --max-messages 2048` is the message retention size. At capacity, the oldest eligible terminal message is evicted before accepting a new send or reply:
+
+- `done`: explicitly completed with `resolve --state done --note ...`.
+- `answered`: a bridge reply has been recorded. A reply can itself remain pending.
+- `failed`: a definite dispatch failure, not an uncertain outcome.
+
+`pending`, `dispatching`, `submitted`, `received`, `in_progress`, and `uncertain` are unfinished and never evicted. Delivery acceptance, acknowledgment, progress, or a wait timeout cannot make a message terminal. There is no automatic expiry; `delivered`, `replied`, and `expired` are not protocol states. No delivery retries are introduced.
+
+The current reply parent, active waits, and terminal replies needed by an unfinished or actively waited parent are protected. If no eligible message remains, sends/replies fail with `In-memory message limit reached: no evictable terminal messages`; this includes all-pending traffic and protected completed history. A reply requires a free slot or another eviction candidate, even if it will complete its parent. Invalid addresses, bodies, keys, and reply IDs are rejected before eviction. `show` on an evicted ID fails; `conversation` may show partial history. The message's answer event and idempotency entry are removed with it. Event replay has its independent 1,024-event window and can contain copies of already evicted messages.
+
+## Routing Storage and Opt-In launchd
+
+`serve --state-dir PATH` stores `routes.json` beneath an owner-private directory (0700, file 0600). Without this option, the socket path's suffix is replaced by `.state`; for the default socket this is `~/.local/share/agent-bridge/bridge.state/`. Every registration, channel bind, and channel close writes an allowlisted complete snapshot to a temporary file, flushes and fsyncs it, then atomically replaces the previous snapshot. Memory changes only after replacement succeeds. A separate state-directory lock also prevents two sockets from writing the same routing store. Corrupt or unsupported top-level snapshots refuse startup without overwriting the file.
+
+Only project/name, transport, session UUID, workspace, optional executable, and channel ownership/description/generation/active flag and pinned route are stored. No message bodies, idempotency keys, delivery state, event history, provider tokens, discovered peer socket paths, PIDs, or discovery payloads are stored. This is a private local routing file; keep it out of version control. Atomic replacement protects complete snapshots, but directory entries are not fsynced: sudden power loss is outside the durability guarantee.
+
+On startup, each endpoint and each channel's **pinned** route is independently validated. A channel may still target an older session than its current endpoint; restoration preserves that session and generation rather than silently rebinding it. Closed channels retain their generation and closed flag. `claude-peer` uses the exact live registry UUID/PID/protocol, owned socket and matching workspace; Codex uses `auto` metadata discovery (shared-server when available, otherwise saved metadata) to verify the exact UUID/workspace, then requires its exact existing Desktop IPC owner with untrusted-input support. Saved `unknown`/`notLoaded` metadata is not a liveness verdict and is accepted when the independent owner confirms the UUID; `agy` uses the exact live trajectory and workspace. Missing, mismatched, invalid, or unverified routes are dropped and the cleaned snapshot is saved. Diagnostics identify dropped records without printing discovery exceptions, credentials, or peer socket metadata. Transient provider unavailability is fail-closed and can require explicit re-registration later. `realtime` and dedicated `claude` routes validate UUID/workspace syntax/existence only, since neither promises an attached live peer; restoring them never launches a Claude CLI. Liveness can still change after startup and is checked again by existing delivery adapters.
+
+Messages and in-flight IDs remain volatile after a restart. Channels are restored with no subscribers; clients must reconnect using the new broker instance, inspect routes/channels and inbox, and coordinate unfinished work explicitly. Never infer that lost IDs are safe to resend. Existing `stop` (shutdown RPC), SIGINT and SIGTERM close open watch, wait, partial-request and stalled client transports before waiting for the server to close. A successful `stop` response acknowledges shutdown; process exit is separate.
+
+Supervision is **off by default**. On macOS the owner can inspect a generated per-user launchd plist before installing anything:
+
+```bash
+python3 "$bridge_cli" --socket /absolute/private/bridge.sock install-service \
+  --state-dir /absolute/private/state --plist /absolute/review/agent.plist --generate-only
+plutil -lint /absolute/review/agent.plist
+```
+
+This mode only writes the plist (and its parent directory); it never calls launchctl or starts the broker. Generation and validation are sufficient for tests. `uninstall-service --generate-only --plist PATH` only removes a matching generated plist; use it only for an unloaded review file. Generation requires an explicit `--plist` outside `~/Library/LaunchAgents`, so a review file cannot activate at the next login. The installation default is `~/Library/LaunchAgents/com.agent-bridge.broker.SOCKET_HASH.plist`; the label includes a stable hash of the absolute broker socket path to separate instances. Generation refuses to overwrite an existing file, so remove the unloaded review copy before actual installation.
+
+For owner-approved installation, `install-service` without `--generate-only` writes that plist and calls `launchctl bootstrap gui/UID PLIST`. It uses absolute Python/script/socket/state paths, private log files in the state directory, `RunAtLoad`, `KeepAlive: true`, a 10-second throttle and umask 0077. It does not modify shell startup files or stop any existing broker. Coordinate migration from a manually started broker first; the socket lock refuses a second instance. Installation failures leave the plist for inspection, and ambiguous launchctl results are never automatically retried. Existing registrations enter the routing snapshot only after a broker running this version accepts them; there is no automatic migration from an older broker's memory.
+
+**KeepAlive restarts even after `stop`, Ctrl-C, SIGTERM, or a clean exit.** To keep a supervised broker down, use `uninstall-service` with matching `--socket`, `--state-dir`, and optional `--plist`. It calls `launchctl bootout gui/UID/com.agent-bridge.broker.SOCKET_HASH` before removing the matching plist. Failure retains the plist; an already-unloaded service may need owner inspection and explicit `--generate-only` removal. Routing files are retained. No launchctl actions run merely from installing the shared skill or starting the foreground broker. Actual service load/restart behavior requires an owner-approved macOS installation and is separate from plist lint validation.
 
 ## Session Discovery & Verification
 

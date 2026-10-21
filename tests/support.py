@@ -10,11 +10,20 @@ import broker
 
 
 class RunningBroker:
+    def __init__(self, max_messages=2048):
+        self.max_messages = max_messages
+
     def __enter__(self):
         self.temp = tempfile.TemporaryDirectory(prefix='ab-',dir='/tmp')
         self.path = str(Path(self.temp.name)/'b.sock')
+        self.state_dir = str(Path(self.temp.name)/'state')
+        self.start()
+        return self
+
+    def start(self):
         cli = str(Path(broker.__file__).with_name('bridge.py'))
-        self.process = subprocess.Popen([sys.executable,cli,'--socket',self.path,'serve'],
+        self.process = subprocess.Popen([sys.executable,cli,'--socket',self.path,'serve',
+            '--state-dir',self.state_dir,'--max-messages',str(self.max_messages)],
             stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
         ready = selectors.DefaultSelector()
         try:
@@ -30,7 +39,11 @@ class RunningBroker:
             raise
         finally:
             ready.close()
-        return self
+
+    def restart(self):
+        self.call('shutdown')
+        self.process.communicate(timeout=2)
+        self.start()
 
     def __exit__(self,*_):
         if self.process.poll() is None:

@@ -167,7 +167,7 @@ class SocketTests(unittest.TestCase):
             if p.poll() is None:p.kill();p.communicate()
 
     def test_single_broker_ownership_does_not_disconnect_existing_server(self):
-        p=subprocess.run([sys.executable,bridge.__file__,'--socket',self.server.path,'serve'],capture_output=True,text=True,timeout=5)
+        p=subprocess.run([sys.executable,bridge.__file__,'--socket',self.server.path,'serve','--state-dir',self.server.state_dir],capture_output=True,text=True,timeout=5)
         self.assertEqual(p.returncode,1)
         self.assertEqual(self.server.call('ping')['instance'],self.server.instance)
 

@@ -2,7 +2,7 @@
 
 [English](../../README.md) | **한국어**
 
-같은 머신에서 실행 중인 **Claude Code / Desktop (`claude-peer`) ↔ Codex / ChatGPT Desktop (`codex`) ↔ Antigravity IDE / Desktop (`agy`)** 및 로컬 CLI 에이전트(`realtime`/`claude`)의 세션을 조회하고, 프로젝트 채널을 통해 **기존 대화를 중단하지 않으면서 3자간(다자간) 실시간 질문·답변·진행 상황**을 주고받는 로컬 브릿지 도구다. Python 표준 라이브러리만 사용하며 상태는 브로커 메모리에만 유지한다.
+같은 머신에서 실행 중인 **Claude Code / Desktop (`claude-peer`) ↔ Codex / ChatGPT Desktop (`codex`) ↔ Antigravity IDE / Desktop (`agy`)** 및 로컬 CLI 에이전트(`realtime`/`claude`)의 세션을 조회하고, 프로젝트 채널을 통해 **기존 대화를 중단하지 않으면서 3자간(다자간) 실시간 질문·답변·진행 상황**을 주고받는 로컬 브릿지 도구다. Python 표준 라이브러리만 사용하며 메시지·전달 상태는 메모리에 유지하고, endpoint·채널 바인딩만 소유자 전용 파일에 저장한다.
 
 - [스킬 진입점 (한국어)](SKILL.md) · [English](../../skill/agent-bridge/SKILL.md)
 - [명령·운영 사용법 (한국어)](usage.md) · [English](../../skill/agent-bridge/references/usage.md)
@@ -57,7 +57,15 @@ python3 ~/.agents/skills/agent-bridge/scripts/bridge.py sessions --provider all
 python3 ~/.agents/skills/agent-bridge/scripts/bridge.py sessions --provider agy
 ```
 
-심볼릭 링크 설치이므로 저장소 위치를 옮기면 네 링크도 갱신해야 한다. 브로커를 재시작하면 메모리 상태가 사라진다. 전역 스킬 설치가 브로커를 자동 기동하거나 AI 대화를 깨우지는 않는다.
+심볼릭 링크 설치이므로 저장소 위치를 옮기면 네 링크도 갱신해야 한다. 재시작하면 메시지·중복 방지 키·이벤트는 사라지고, endpoint·채널은 정확한 세션·작업 경로를 재검증해 복원한다. 사용할 수 없는 라이브 바인딩은 제거한다. 전역 스킬 설치가 브로커를 자동 기동하거나 AI 대화를 깨우지는 않는다.
+
+## 보존 상한·재시작·선택적 서비스
+
+`serve --max-messages 2048`은 메시지 보존 개수다. 상한에서는 보호되지 않은 `done`·`answered`·`failed` 중 가장 오래된 항목을 제거한다. `submitted`·`uncertain`은 완료가 아니며, 미처리·보호 항목만 남으면 새 전송·답변을 거부한다. 제거 시 중복 방지 키도 사라지므로 자동 재전송하지 않는다.
+
+`serve --state-dir PATH`는 endpoint·채널만 저장한다(기본: 소켓 확장자를 `.state`로 바꾼 디렉터리). `stop`·Ctrl-C·SIGTERM은 열린 클라이언트도 닫는다. 재시작 시 진행 중 메시지 ID는 복원하지 않고 재시도도 없다.
+
+서비스는 명시적 `install-service`로 설치한다. `install-service --generate-only --plist /absolute/review/agent.plist`와 `plutil -lint /absolute/review/agent.plist`는 서비스 로드 없이 검토한다. KeepAlive는 `stop` 뒤에도 다시 기동하므로 계속 중지하려면 `uninstall-service`로 제거한다. 자세한 경로·복원·운영 계약은 [사용법](usage.md#라우팅-저장과-선택적-launchd)을 읽는다.
 
 ## 개발·검증
 

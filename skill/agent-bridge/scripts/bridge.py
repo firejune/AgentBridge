@@ -21,6 +21,7 @@ import broker
 import codex_live
 import codex_new
 import sessions
+import service
 
 def envelope(m):
     return (f"[agent-bridge peer message | {m['sender']} -> {m['recipient']}]\n"
@@ -318,9 +319,17 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--socket',default=str(broker.DEFAULT_SOCKET))
     sub = parser.add_subparsers(dest='cmd',required=True)
-    p = sub.add_parser('serve',help='Run the volatile local broker in the foreground')
-    p.add_argument('--max-messages',type=int,default=2048)
+    p = sub.add_parser('serve',help='Run the local broker in the foreground')
+    p.add_argument('--max-messages',type=int,default=2048,help='Retained messages; evict oldest unprotected done/answered/failed first')
+    p.add_argument('--state-dir',help='Private routing snapshot directory (default: socket path with .state suffix)')
     sub.add_parser('ping'); sub.add_parser('stop')
+    for cmd in ('install-service','uninstall-service'):
+        p = sub.add_parser(cmd,help='Opt-in per-user launchd service management')
+        p.add_argument('--state-dir')
+        p.add_argument('--plist',help='Plist path (default: ~/Library/LaunchAgents/com.agent-bridge.broker.SOCKET_HASH.plist)')
+        p.add_argument('--generate-only',action='store_true',help='Write/remove the plist only; never call launchctl')
+        if cmd == 'install-service':
+            p.add_argument('--max-messages',type=int,default=2048)
     p = sub.add_parser('register')
     p.add_argument('name');p.add_argument('--project',required=True)
     p.add_argument('--transport',choices=['realtime','codex','claude','claude-peer','agy'],default='realtime')
@@ -378,7 +387,14 @@ def main(argv=None):
         if args.cmd=='serve':
             if args.max_messages<1:
                 raise ValueError('Message limit must be positive')
-            asyncio.run(broker.serve(args.socket,args.max_messages))
+            asyncio.run(broker.serve(args.socket,args.max_messages,args.state_dir))
+            return 0
+        if args.cmd in ('install-service','uninstall-service'):
+            fields = dict(socket=args.socket, state_dir=args.state_dir, plist=args.plist,
+                          generate_only=args.generate_only)
+            if args.cmd == 'install-service':
+                fields['max_messages'] = args.max_messages
+            output((service.install if args.cmd == 'install-service' else service.uninstall)(**fields))
             return 0
         if args.cmd=='open':
             output(sessions.open_session(args.provider,args.cwd,args.title,args.model,args.timeout))

@@ -344,7 +344,7 @@ for line in sys.stdin:
  print(json.dumps({{'id':q['id'],'result':r}}),flush=True)
 ''');exe.chmod(0o700)
         with ModelDesktop() as desktop:
-            result=self.open(desktop,title='Actual title',model='requested-model',
+            result=self.open(desktop,title='Actual title',model='requested-model',timeout=2,
                              client_factory=functools.partial(sessions.CodexClient,executable=str(exe)))
         calls=[json.loads(line) for line in log.read_text().splitlines()]
         self.assertEqual(sum(x.get('method')=='thread/start' for x in calls),1)

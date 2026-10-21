@@ -1,4 +1,4 @@
-"""Volatile single-process broker, Unix socket RPC and event subscriptions."""
+"""Single-process broker: durable routing, volatile correspondence."""
 import asyncio
 from collections import deque
 from copy import deepcopy
@@ -11,7 +11,11 @@ import re
 import signal
 import socket
 import stat
+import sys
 import uuid
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import route_store
 
 DEFAULT_SOCKET = Path.home() / '.local/share/agent-bridge/bridge.sock'
 MAX_FRAME = 1024 * 1024
@@ -38,8 +42,13 @@ def route_key(route):
     return tuple(route.get(k) for k in ('project','name','transport','session','cwd','channel','generation'))
 
 
+TERMINAL_STATES = frozenset(('done', 'answered', 'failed'))
+
+
 class State:
-    def __init__(self, max_messages=2048):
+    def __init__(self, max_messages=2048, store=None):
+        if max_messages < 1:
+            raise ValueError('Message retention size must be positive')
         self.instance = str(uuid.uuid4())
         self.max_messages = max_messages
         self.endpoints, self.channels, self.messages, self.keys = {}, {}, {}, {}
@@ -47,6 +56,39 @@ class State:
         self.sequence = 0
         self.subscribers = []
         self.answers = {}
+        self.waiters = {}
+        self.store = store
+        if store is not None:
+            self.endpoints, self.channels = store.load()
+
+    def routing_change(self, collection, key, item):
+        endpoints, channels = self.endpoints.copy(), self.channels.copy()
+        (endpoints if collection == 'endpoints' else channels)[key] = item
+        # Commit to disk before accepting the action in memory. Save failures
+        # leave both maps and the previous complete file untouched.
+        if self.store is not None:
+            self.store.save(endpoints, channels)
+        self.endpoints, self.channels = endpoints, channels
+        return item
+
+    def make_room(self, parent=None):
+        if len(self.messages) < self.max_messages:
+            return
+        # Insertion order defines oldest. Keep a reply's parent, active waits,
+        # and replies whose unfinished parent may still need their answer.
+        for mid, message in self.messages.items():
+            ancestor = self.messages.get(message['reply_to'])
+            if (mid == parent or self.waiters.get(mid)
+                    or message['state'] not in TERMINAL_STATES
+                    or (ancestor and (ancestor['state'] not in TERMINAL_STATES
+                                      or self.waiters.get(ancestor['id'])))):
+                continue
+            del self.messages[mid]
+            self.answers.pop(mid, None)
+            self.keys = {key: value for key, value in self.keys.items() if value[1] != mid}
+            return
+        raise ValueError('In-memory message limit reached: no evictable terminal messages; '
+                         'pending or protected work is retained')
 
     def get(self, mid):
         if mid not in self.messages:
@@ -111,8 +153,6 @@ class State:
             if original_intent != intent:
                 raise ValueError('Idempotency key already used with different content')
             return self.get(mid)
-        if len(self.messages) >= self.max_messages:
-            raise ValueError('In-memory message limit reached; finish work and restart broker')
         if reply_to:
             parent = self.get(reply_to)
             destination, origin = deepcopy(parent['return_route']), deepcopy(parent['route'])
@@ -123,6 +163,8 @@ class State:
             if route_key(destination)==route_key(origin):
                 raise ValueError('Sender and recipient addresses must differ')
             conversation = str(uuid.uuid4())
+        # Validate both addresses and the reply parent before removing history.
+        self.make_room(reply_to)
         mid = str(uuid.uuid4())
         m = {'id':mid,'conversation':conversation,'project':destination['project'],
              'sender':origin['name'],'recipient':destination['name'],'route':destination,
@@ -155,8 +197,7 @@ class State:
                 sid = str(uuid.UUID(sid or ''))
             item = dict(project=project,name=name,transport=transport,cwd=cwd,
                         session=sid,executable=args.get('executable'))
-            self.endpoints[project,name] = item
-            return item
+            return self.routing_change('endpoints', (project,name), item)
         if op == 'routes':
             return [x for (p,_),x in self.endpoints.items() if p==args['project']]
         if op == 'channel-bind':
@@ -171,8 +212,7 @@ class State:
             route.update(channel=name,generation=generation+1)
             item = dict(project=project,name=name,owner=args['owner'],description=args['description'],
                         route=route,generation=generation+1,active=True)
-            self.channels[project,name] = item
-            return item
+            return self.routing_change('channels', (project,name), item)
         if op == 'channels':
             result = []
             for (project,_),item in self.channels.items():
@@ -183,8 +223,8 @@ class State:
             item = self.channels.get((args['project'],args['name']))
             if not item or item['generation']!=args['expect_generation']:
                 raise ValueError('Channel missing or generation changed')
-            item.update(active=False,generation=item['generation']+1)
-            return item
+            item = dict(item, active=False, generation=item['generation']+1)
+            return self.routing_change('channels', (args['project'],args['name']), item)
         if op in ('send','reply'):
             return self.post(args,args.get('id') if op=='reply' else None)
         if op == 'show':
@@ -247,6 +287,7 @@ async def wait_answer(state, args, reader):
     timeout = args.get('timeout',60)
     if not 0 < timeout <= 3600:
         raise ValueError('Timeout must be between 0 and 3600 seconds')
+    state.waiters[mid] = state.waiters.get(mid, 0) + 1
     pending = [asyncio.create_task(state.answers[mid].wait()),asyncio.create_task(reader.read(1))]
     try:
         done,_ = await asyncio.wait(pending,timeout=timeout,return_when=asyncio.FIRST_COMPLETED)
@@ -258,6 +299,9 @@ async def wait_answer(state, args, reader):
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending,return_exceptions=True)
+        state.waiters[mid] -= 1
+        if not state.waiters[mid]:
+            del state.waiters[mid]
 
 
 async def watch(state, args, reader, writer):
@@ -297,7 +341,7 @@ async def watch(state, args, reader, writer):
         await asyncio.gather(disconnected,return_exceptions=True)
 
 
-async def serve(path, max_messages=2048):
+async def serve(path, max_messages=2048, state_dir=None):
     path = Path(path).expanduser().absolute()
     path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
     lock = path.with_suffix('.lock').open('a')
@@ -307,16 +351,23 @@ async def serve(path, max_messages=2048):
         lock.close()
         raise ValueError('Broker is already running for this socket') from error
     server = None
+    store = None
     try:
         if path.exists():
             if not stat.S_ISSOCK(path.stat().st_mode):
                 raise ValueError('Refusing to replace a non-socket file')
             path.unlink()
-        state = State(max_messages)
+        store = route_store.RouteStore(state_dir or path.with_suffix('.state'))
+        state = State(max_messages, store)
         stopping = asyncio.Event()
         handlers = set()
+        writers = set()
         async def handle(reader,writer):
+            if stopping.is_set():
+                writer.transport.abort()
+                return
             handlers.add(asyncio.current_task())
+            writers.add(writer)
             try:
                 raw = await asyncio.wait_for(reader.readline(),10)
                 args = json.loads(raw)
@@ -347,6 +398,7 @@ async def serve(path, max_messages=2048):
                 except OSError:
                     pass
                 handlers.discard(asyncio.current_task())
+                writers.discard(writer)
         server = await asyncio.start_unix_server(handle,path=str(path),limit=MAX_FRAME)
         os.chmod(path,0o600)
         loop = asyncio.get_running_loop()
@@ -355,14 +407,21 @@ async def serve(path, max_messages=2048):
         print(json.dumps({'ready':True,'socket':str(path),'instance':state.instance}),flush=True)
         await stopping.wait()
         server.close()
-        await server.wait_closed()
-        for task in list(handlers):
+        # Python 3.12.1+ waits for active clients in wait_closed(). Cancel
+        # handlers and abort transports first, including stalled readers/writers.
+        active = list(handlers)
+        for writer in list(writers):
+            writer.transport.abort()
+        for task in active:
             task.cancel()
-        await asyncio.gather(*handlers,return_exceptions=True)
+        await asyncio.gather(*active,return_exceptions=True)
+        await server.wait_closed()
     finally:
         if server is not None:
             server.close()
             path.unlink(missing_ok=True)
+        if store is not None:
+            store.close()
         lock.close()
 
 
