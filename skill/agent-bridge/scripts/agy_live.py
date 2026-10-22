@@ -118,6 +118,8 @@ def trajectory_summaries(data):
     ProtoJSON omits an empty map, so a server with no conversations yet (a
     fresh Desktop hub) answers {}: that is an empty registry, not a failure.
     """
+    if 'code' in data and 'message' in data:
+        return None  # an error envelope; rpc_call lets this method's through
     if 'trajectorySummaries' not in data:
         return {}
     summaries = data['trajectorySummaries']

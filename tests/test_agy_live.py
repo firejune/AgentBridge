@@ -415,6 +415,7 @@ class AgyLiveTests(unittest.TestCase):
         import agy_live
         self.assertEqual(agy_live.trajectory_summaries({}), {})
         self.assertIsNone(agy_live.trajectory_summaries({'trajectorySummaries': []}))
+        self.assertIsNone(agy_live.trajectory_summaries({'code': 'internal', 'message': 'registry unavailable'}))
 
 if __name__ == '__main__':
     unittest.main()
