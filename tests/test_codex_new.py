@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+import os
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skill/agent-bridge/scripts'))
@@ -26,8 +27,9 @@ def full_permissions():
 
 class ModelDesktop(FakeDesktop):
     def __init__(self, model='app-default', reject_update=False, keep_model=False, behavior='active',
-                 permissions=None, refuse_permissions=False, stale_current=False):
+                 permissions=None, refuse_permissions=False, stale_current=False, drop_update=False):
         super().__init__(behavior)
+        self.drop_update = drop_update
         self.model, self.reject_update, self.keep_model = model, reject_update, keep_model
         self.permissions = permissions or {'activePermissionProfile':{'id':':workspace'},
             'approvalPolicy':'on-request','sandboxPolicy':{'type':'workspaceWrite'}}
@@ -49,6 +51,8 @@ class ModelDesktop(FakeDesktop):
         if method not in ('thread-follower-read-model-settings','thread-follower-update-thread-settings'):
             return super().handle(sock, request)
         self.calls.append(request)
+        if self.drop_update and method == 'thread-follower-update-thread-settings':
+            return False  # Possibly applied, never answered.
         response = {'type':'response','requestId':request['requestId'],'resultType':'success',
                     'method':method,'handledByClientId':self.owner}
         if method == 'thread-follower-read-model-settings':
@@ -77,6 +81,11 @@ class NewCodexTests(unittest.TestCase):
         self.substitute_model = False
         self.profiles = [{'id':codex_new.FULL_ACCESS_PROFILE,'allowed':True}]
         self.creator_full_access = True
+        self.catalog = [{'model':'requested-model'},{'model':codex_new.DEFAULT_MODEL}]
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop(codex_new.MODEL_ENV, None)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -98,7 +107,7 @@ class NewCodexTests(unittest.TestCase):
                 if method == 'permissionProfile/list':
                     return {'data':test.profiles,'nextCursor':None}
                 if method == 'model/list':
-                    return {'data':[{'model':'requested-model'}],'nextCursor':None}
+                    return {'data':test.catalog,'nextCursor':None}
                 if method == 'thread/start':
                     return {'thread':dict(test.thread),'model':'substituted' if test.substitute_model else params.get('model','creator-default'),
                             'cwd':test.root, 'approvalPolicy':'never' if test.creator_full_access else 'on-request',
@@ -143,18 +152,42 @@ class NewCodexTests(unittest.TestCase):
             self.assertEqual(result['permission_settings'],full_permissions())
             self.assertEqual(update['version'],2)
 
-    def test_omitted_model_keeps_app_default_and_always_requests_full_access(self):
+    def test_omitted_model_requests_default_not_app_default_and_full_access(self):
         with ModelDesktop(model='app-default',permissions=full_permissions()) as desktop:
             result = self.open(desktop)
+        self.assertEqual(codex_new.DEFAULT_MODEL,'gpt-6.1-sol')
+        self.assertTrue(any(method=='model/list' for method,_,_ in self.calls))
         create = next(params for method,params,_ in self.calls if method=='thread/start')
-        self.assertNotIn('model',create)
+        self.assertEqual(create['model'],codex_new.DEFAULT_MODEL)
         self.assertNotIn('sandbox',create)
         self.assertEqual(create['permissions'],codex_new.FULL_ACCESS_PROFILE)
         self.assertEqual(create['approvalPolicy'],'never')
-        self.assertEqual(result['model'],'app-default')
+        self.assertEqual(result['model'],codex_new.DEFAULT_MODEL)
+        self.assertEqual(result['model_source'],'default')
         self.assertEqual(result['creator_settings']['approvalPolicy'],'never')
-        self.assertFalse(any(x['method']=='thread-follower-update-thread-settings' for x in desktop.calls))
+        update = [x for x in desktop.calls if x['method']=='thread-follower-update-thread-settings']
+        self.assertEqual([x['params']['threadSettings'] for x in update],[{'model':codex_new.DEFAULT_MODEL}])
         self.assertNotIn('prompt',result)
+
+    def test_env_overrides_default_and_flag_overrides_env(self):
+        os.environ[codex_new.MODEL_ENV] = 'requested-model'
+        with ModelDesktop(permissions=full_permissions()) as desktop:
+            result = self.open(desktop)
+        self.assertEqual(result['model'],'requested-model')
+        self.assertEqual(result['model_source'],codex_new.MODEL_ENV)
+        self.assertEqual(codex_new.resolve_model('explicit',{codex_new.MODEL_ENV:'requested-model'}),('explicit','--model'))
+        with self.assertRaisesRegex(codex_new.CreationError,codex_new.MODEL_ENV):
+            codex_new.resolve_model(None,{codex_new.MODEL_ENV:' '})
+
+    def test_unadvertised_default_fails_by_name_and_never_falls_back(self):
+        self.catalog = [{'model':'app-default'}]
+        with ModelDesktop(model='app-default') as desktop, self.assertRaises(codex_new.CreationError) as caught:
+            self.open(desktop)
+        self.assertIn(repr(codex_new.DEFAULT_MODEL),str(caught.exception))
+        self.assertIn('pass --model',str(caught.exception))
+        self.assertFalse(caught.exception.created)
+        self.assertFalse(any(method=='thread/start' for method,_,_ in self.calls))
+        self.assertEqual(self.urls,[])
 
     def test_unsupported_model_refused_before_creation(self):
         with ModelDesktop() as desktop, self.assertRaisesRegex(codex_new.CreationError,'not advertised') as caught:
@@ -182,7 +215,7 @@ class NewCodexTests(unittest.TestCase):
         self.assertEqual(self.urls,[])
 
     def test_latest_settings_override_stale_current_permissions_for_next_turn(self):
-        with ModelDesktop(permissions=full_permissions(),stale_current=True) as desktop:
+        with ModelDesktop(model=codex_new.DEFAULT_MODEL,permissions=full_permissions(),stale_current=True) as desktop:
             result=self.open(desktop)
         self.assertEqual(result['permission_settings'],full_permissions())
         self.assertFalse(any(x['method']=='thread-follower-update-thread-settings' for x in desktop.calls))
@@ -363,6 +396,60 @@ for line in sys.stdin:
         self.assertEqual(c.calls[-1]['cursor'],'again')
         with self.assertRaisesRegex(codex_new.CreationError,'repeated'):
             codex_new.require_model(Catalog(True),'requested-model')
+
+    def switch(self, desktop, model='requested-model', **kwargs):
+        return codex_new.set_model(self.sid, model, timeout=1, client_factory=self.factory,
+            owner_factory=lambda **kw:codex_live.Client(desktop.path,**kw), **kwargs)
+
+    def test_codex_model_sends_only_model_and_reads_back(self):
+        with ModelDesktop(model='gpt-6-astra') as desktop:
+            result = self.switch(desktop)
+        updates = [x for x in desktop.calls if x['method']=='thread-follower-update-thread-settings']
+        self.assertEqual(len(updates),1)
+        self.assertEqual(updates[0]['params'],{'conversationId':self.sid,'threadSettings':{'model':'requested-model'}})
+        self.assertEqual(updates[0]['targetClientId'],desktop.owner)
+        self.assertEqual(sum(x['method']=='thread-follower-read-model-settings' for x in desktop.calls),2)
+        self.assertFalse(any(x['method'].startswith(('thread-follower-steer','thread-follower-start'))
+                             or x['method']=='thread-stream-following-changed' for x in desktop.calls))
+        self.assertEqual((result['model'],result['previous_model'],result['changed']),('requested-model','gpt-6-astra',True))
+        self.assertTrue(any(method=='model/list' for method,_,_ in self.calls))
+
+    def test_codex_model_refuses_unadvertised_before_any_owner_call(self):
+        with ModelDesktop() as desktop, self.assertRaisesRegex(codex_new.ModelSwitchError,'not advertised') as caught:
+            self.switch(desktop,'missing')
+        self.assertFalse(caught.exception.uncertain)
+        self.assertEqual(desktop.calls,[])
+
+    def test_codex_model_readback_mismatch_fails(self):
+        for options in ({'keep_model':True},{'reject_update':True}):
+            with self.subTest(options=options), ModelDesktop(model='gpt-6-astra',**options) as desktop, \
+                    self.assertRaises(codex_new.ModelSwitchError) as caught:
+                self.switch(desktop)
+            self.assertTrue(caught.exception.uncertain)
+            self.assertEqual(sum(x['method']=='thread-follower-update-thread-settings' for x in desktop.calls),1)
+
+    def test_codex_model_never_retries_a_possibly_sent_mutation(self):
+        with ModelDesktop(model='gpt-6-astra',drop_update=True) as desktop, \
+                self.assertRaises(codex_new.ModelSwitchError) as caught:
+            self.switch(desktop)
+        self.assertTrue(caught.exception.uncertain)
+        self.assertEqual(sum(x['method']=='thread-follower-update-thread-settings' for x in desktop.calls),1)
+        self.assertEqual(sum(x['method']=='initialize' for x in desktop.calls),1)
+
+    def test_codex_model_cli_reports_result_and_failure(self):
+        ok={'session':self.sid,'model':'requested-model','changed':True}
+        with patch.object(codex_new,'set_model',return_value=ok) as switch:
+            out=io.StringIO()
+            with patch('sys.stdout',out):
+                code=bridge.main(['codex-model',self.sid,'--model','requested-model'])
+        self.assertEqual((code,json.loads(out.getvalue())),(0,ok))
+        self.assertEqual(switch.call_args.args,(self.sid,'requested-model',10))
+        with patch.object(codex_new,'set_model',side_effect=codex_new.ModelSwitchError('lost',True)):
+            out=io.StringIO()
+            with patch('sys.stdout',out):
+                code=bridge.main(['codex-model',self.sid,'--model','requested-model'])
+        self.assertEqual(code,1)
+        self.assertEqual(json.loads(out.getvalue()),{'error':'lost','uncertain':True,'session':self.sid,'model':'requested-model'})
 
     def test_register_conflicts_are_refused(self):
         for key in ('session','discover'):
