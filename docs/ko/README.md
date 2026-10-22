@@ -71,14 +71,42 @@ python3 ~/.agents/skills/agent-bridge/scripts/bridge.py sessions --provider agy
 
 브로커는 같은 프로세스의 데몬 스레드에서 Codex 구독 한도를 표본으로 읽는다. 서비스를 따로 설치하지 않는다. `serve --usage-interval 15`분마다(최소 5, `0`은 끔) 전용 `codex app-server --stdio`를 띄워 `initialize`·`initialized`·`account/rateLimits/read`만 보내고 프로세스를 끝낸다. 이 읽기는 스레드·턴을 시작하지 않고, 어느 세션에도 전달하지 않으며, 모델 토큰을 쓰지 않는다.
 
-표본은 `<state-dir>/usage/codex.jsonl`에 버킷·창마다 한 줄로 남는다: UTC의 `observed_at`·`resets_at`, `limit_id`, `slot`(`primary`/`secondary`), `used_percent`, `window_mins`, `allowed`, `reset_credits`, `source`, `status`(`ok`·`failed`, 보고된 리셋 시각이 이미 지났으면 `stale`). 계정 식별자와 플랜 이름은 쓰기 전에 버린다. 읽기 실패는 null로 저장되고 0%가 아니라 「알 수 없음」으로 표시된다. 값이 같으면 한 시간까지 건너뛰고, 실패는 최대 4시간까지 간격을 늘리며, 파일은 30일·5 MB 안에서 매번 원자적으로 교체된다.
+표본은 `<state-dir>/usage/codex.jsonl`에 버킷·창마다 한 줄로 남는다: UTC의 `observed_at`·`resets_at`, `limit_id`, `slot`(`primary`/`secondary`), `used_percent`, `window_mins`, `allowed`, `reset_credits`, `source`, `status`(`ok`·`failed`, 보고된 리셋 시각이 이미 지났으면 `stale`). 계정 식별자와 플랜 이름은 쓰기 전에 버린다. 읽기 실패는 null로 저장되고 0%가 아니라 「알 수 없음」으로 표시된다. 값이 같으면(서버의 `resets_at`은 읽을 때마다 1초쯤 흔들리므로 60초 안의 차이는 같은 값으로 본다) 한 시간까지 건너뛰고, 실패는 최대 4시간까지 간격을 늘리며, 파일은 30일·5 MB 안에서 매번 원자적으로 교체된다.
 
 ```bash
 python3 bridge.py usage            # 버킷마다 한 줄
 python3 bridge.py usage --since 2d --json
 ```
 
-한 줄에는 남은 %, 현지 시각의 리셋, 마지막 관측과 신선도(90분 이내이고 그 뒤 실패한 읽기가 없으면 fresh), 그리고 `--since` 창 안 한 리셋 주기에 표본이 둘 이상이면 %p/h 소모율이 나온다. `used_percent`가 줄거나 `resets_at`이 움직이면 리셋 경계다 — `RESET between …`으로 표시하고 그 경계를 가로질러 소모율을 계산하지 않는다.
+한 줄에는 남은 %, 현지 시각의 리셋, 마지막 관측과 신선도(90분 이내이고 그 뒤 실패한 읽기가 없으면 fresh), 그리고 `--since` 창 안 한 리셋 주기에 표본이 둘 이상이면 %p/h 소모율이 나온다. `used_percent`가 줄거나 `resets_at`이 움직이면 리셋 경계다 — `RESET between …`으로 표시하고 그 경계를 가로질러 소모율을 계산하지 않는다. 조기 리셋 추정치(아래)가 있으면 줄 끝에 ` · next early reset ~<시각> [est, n=…, <출처>]`가 붙는다.
+
+### 리셋 이벤트와 두 개의 기준 시각
+
+Codex 리셋은 누적되지 않는다 — `used_percent`가 0으로 돌아갈 뿐이다. 프로모션 기간에는 공식 `resets_at` 전에 추가 리셋이 대략 2.5일마다 왔지만 보장은 없다. 그래서 공식 만료만 보고 아끼면 조기 리셋이 올 때 아낀 몫이 사라지고, 반대로 조기 리셋을 믿고 바닥나지 않으리라 보는 것은 위험하다. 브릿지는 두 질문을 나눈다.
+
+- **spend horizon**(지금 쓰는 게 이득인가, 남는 용량이 버려지나?): 공식 `resets_at`과 추정한 다음 조기 리셋 중 이른 쪽.
+- **stop risk horizon**(작업이 멈추나?): 공식 `resets_at`만.
+
+한 버킷의 연속된 두 성공 표본 사이의 리셋 경계는 모두 이벤트가 된다. 이벤트는 시점이 아니라 창(앞 표본의 `observed_at` → 뒤 표본의 것)이고, 전후의 사용 %와 `resets_at`을 함께 남긴다. 창이 앞 표본의 `resets_at`보다 기본 표본 간격(15분) 이내로 앞서거나 그 뒤에 닫히면 `scheduled`, 그보다 일찍 닫히면 `early`, `resets_at`이 보고되지 않았으면 `unknown`이다. 중간의 실패한 읽기는 창을 끊지 않고 앞뒤 성공 표본까지 넓힌다. 브로커는 표본을 쓸 때마다 이력에서 이벤트를 도출해 `<state-dir>/usage/codex-events.jsonl`(365일·최대 1 MB·원자적 교체·버킷과 창으로 중복 제거)에 보관하므로 표본의 30일보다 오래 남는다. 조회도 현재 표본에서 이벤트를 도출하지만 아무것도 쓰지 않는다. 이벤트를 위해 추가로 읽지 않는다.
+
+외부 공지로 통계를 시드할 수 있다. `usage --seed-announcements FILE`은 JSONL 파일(공지마다 한 줄: UTC 오프셋이 있는 ISO 8601 `at`, `source: "announcement"`, `note`)을 `<state-dir>/usage/codex-announcements.jsonl`에 병합한다. 여러 번 돌려도 같고, 오프셋 없는 시각은 거부하며, 그 파일을 쓰는 것은 이 명령뿐이다. 공지 시각은 게시 시각이지 계정이 실제로 리셋된 시각이 아니다.
+
+추정은 **한** 출처의 연속된 조기 이벤트 간격만 쓴다 — 버킷에 관측된 조기 간격이 3개 이상이면 관측, 아니면 공지. 두 출처를 섞지 않는다. 창이 3시간보다 넓은 이벤트(브로커 중단, 긴 백오프)는 목록에는 나오지만 간격을 재지 않고 추정의 기준점도 되지 못한다. 다음 조기 리셋 = 두 출처 중 가장 최근 조기 이벤트 + 간격 중앙값, 범위는 최근 + 최소 … 최근 + 최대다. 중심을 지나면 `overdue`로 표시하고 계속 쓰며, 범위를 지나면 `lapsed`로 버린다. 간격이 3개 미만이면 `too few`를 출력하고 시각을 내지 않으며 spend horizon은 공식 리셋이다.
+
+```bash
+python3 bridge.py usage --events          # 이벤트, 간격 통계, 추정, 두 기준 시각
+python3 bridge.py usage --events --json
+python3 bridge.py usage --seed-announcements announcements.jsonl
+```
+
+2026-10-07 12:35, 10-11 07:16, 10-13 10:03, 10-15 13:55, 10-18 01:20, 10-20 15:33(KST)의 공지 여섯 건을 시드하고 관측된 조기 리셋이 없으면 `--events`는 이렇게 출력한다.
+
+```text
+early-reset intervals [announcement, n=5]: mean 63.0h · median 59.4h · range 50.8h–90.7h
+next early reset ~10-23 02:58 KST [est, n=5, announcement] window 10-22 18:20 KST … 10-24 10:14 KST, from announcement reset 10-20 15:33 KST
+spend horizon: 10-23 02:58 KST (estimate)
+stop risk horizon: 10-27 15:46 KST (official resets_at)
+```
 
 ## 개발·검증
 

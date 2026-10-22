@@ -130,7 +130,7 @@ python3 "$bridge_cli" reply REQUEST_ID --key UNIQUE_REPLY_KEY --file /absolute/a
 
 - Check your own usage first with your built-in tool or the information your current session already provides (Claude desktop: `get_usage`; Codex: its built-in usage command). Use that whenever it is available.
 - Query the bridge only when that information is missing or stale, or when you need another account's or provider's limits, or the consumption trend.
-- `bridge.py usage [--provider codex] [--since 6h] [--json]` prints one line per Codex limit bucket (remaining %, local reset time, freshness, %p/h burn within one reset period) from the broker's recorded samples; it reads a file and starts nothing.
+- `bridge.py usage [--provider codex] [--since 6h] [--json]` prints one line per Codex limit bucket (remaining %, local reset time, freshness, %p/h burn within one reset period, and `next early reset ~… [est, n=…]` when an estimate exists) from the broker's recorded samples; it reads files and starts nothing. `--events` lists reset events (scheduled/early) and prints two horizons: plan spending to the **spend horizon** (earlier of the official reset and the estimated early reset), and judge the risk of stopping only by the **stop risk horizon** (official `resets_at`), because early resets are not guaranteed.
 - Do not read session token usage as remaining subscription limit. Context window, session tokens and API cost are different metrics.
 
 ## Operational Boundaries

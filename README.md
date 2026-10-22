@@ -80,14 +80,42 @@ Supervision is opt-in: `install-service` installs a per-user launchd agent; `uni
 
 The broker samples Codex subscription limits in a daemon thread of the same process, so no extra service is installed. Every `serve --usage-interval 15` minutes (minimum 5, `0` turns it off) it starts a private `codex app-server --stdio`, sends `initialize`, `initialized` and `account/rateLimits/read`, and stops the process. That read starts no thread or turn, delivers nothing to any session, and costs no model tokens.
 
-Samples go to `<state-dir>/usage/codex.jsonl`, one record per bucket and window: `observed_at` and `resets_at` in UTC, `limit_id`, `slot` (`primary`/`secondary`), `used_percent`, `window_mins`, `allowed`, `reset_credits`, `source`, `status` (`ok`, `failed`, or `stale` when the reported reset time has already passed). Account identifiers and plan names are dropped before writing. A failed read is stored with null values and is shown as unknown, never as 0%. Unchanged samples are skipped for up to an hour, failures back off up to 4 hours, and the file keeps 30 days and at most 5 MB, replaced atomically on each write.
+Samples go to `<state-dir>/usage/codex.jsonl`, one record per bucket and window: `observed_at` and `resets_at` in UTC, `limit_id`, `slot` (`primary`/`secondary`), `used_percent`, `window_mins`, `allowed`, `reset_credits`, `source`, `status` (`ok`, `failed`, or `stale` when the reported reset time has already passed). Account identifiers and plan names are dropped before writing. A failed read is stored with null values and is shown as unknown, never as 0%. Unchanged samples (a `resets_at` within 60 s counts as unchanged, since the server's value drifts by a second between reads) are skipped for up to an hour, failures back off up to 4 hours, and the file keeps 30 days and at most 5 MB, replaced atomically on each write.
 
 ```bash
 python3 bridge.py usage            # one line per bucket
 python3 bridge.py usage --since 2d --json
 ```
 
-The compact line shows remaining %, the reset in local time, when it was last observed and whether that is fresh (within 90 minutes, and no failed read since), and the burn in %p/h when at least two samples fall inside one reset period of the `--since` window. A drop in `used_percent` or a moved `resets_at` is a reset boundary: it is printed as `RESET between …`, and no rate is computed across it.
+The compact line shows remaining %, the reset in local time, when it was last observed and whether that is fresh (within 90 minutes, and no failed read since), and the burn in %p/h when at least two samples fall inside one reset period of the `--since` window. A drop in `used_percent` or a moved `resets_at` is a reset boundary: it is printed as `RESET between …`, and no rate is computed across it. When an early-reset estimate exists (below), the line ends with ` · next early reset ~<when> [est, n=…, <source>]`.
+
+### Reset events and the two horizons
+
+Codex resets do not accumulate: `used_percent` returns to 0. During a promotion, extra resets have arrived before the official `resets_at`, roughly every 2.5 days, with no guarantee. Planning only by the official expiry therefore wastes what is saved when an early reset lands, while counting on an early reset to avoid running out is unsafe. The bridge keeps the two questions apart:
+
+- **spend horizon** (is it worth spending now, will capacity go unused?): the earlier of the official `resets_at` and the estimated next early reset;
+- **stop risk horizon** (will work stop?): the official `resets_at` only.
+
+Every reset boundary between two consecutive successful samples of a bucket becomes an event. It is a window (the earlier sample's `observed_at` → the later one's), with used % and `resets_at` before and after. It is `scheduled` when the window closes no more than one default sampling interval (15 minutes) before the earlier sample's `resets_at` (or after it), `early` when it closes before that, and `unknown` when no `resets_at` was reported. Failed reads in between do not end a window; they widen it to the surrounding successful samples. The broker derives events from the sample history after each write and keeps them in `<state-dir>/usage/codex-events.jsonl` (365 days, at most 1 MB, atomic, de-duplicated by bucket and window), so they outlive the samples' 30 days; a query also derives events from the current samples without writing anything. No extra read is made for events.
+
+External announcements can seed the statistics. `usage --seed-announcements FILE` merges a JSONL file (one line per announcement: `at` as ISO 8601 with a UTC offset, `source: "announcement"`, `note`) into `<state-dir>/usage/codex-announcements.jsonl`; it is idempotent, refuses a time without an offset, and is the only writer of that file. Announcement times are publication times, not the moment an account was reset.
+
+The estimate uses the intervals between consecutive early events of **one** source: observed events once a bucket has at least 3 early intervals, otherwise the announcements; the two are never pooled. An event whose window is wider than 3 hours (broker down, long backoff) is listed but measures no interval and cannot anchor an estimate. The next early reset is the latest early event of either source + the median interval, with the window latest + min … latest + max. Past its centre it is marked `overdue` and still used; past its window it is `lapsed` and not used. With fewer than 3 intervals the output says `too few`, prints no time, and the spend horizon is the official reset.
+
+```bash
+python3 bridge.py usage --events          # events, interval stats, estimate, both horizons
+python3 bridge.py usage --events --json
+python3 bridge.py usage --seed-announcements announcements.jsonl
+```
+
+With the six announcement posts of 2026-10-07 12:35, 10-11 07:16, 10-13 10:03, 10-15 13:55, 10-18 01:20 and 10-20 15:33 (KST) seeded and no observed early resets, `--events` prints:
+
+```text
+early-reset intervals [announcement, n=5]: mean 63.0h · median 59.4h · range 50.8h–90.7h
+next early reset ~10-23 02:58 KST [est, n=5, announcement] window 10-22 18:20 KST … 10-24 10:14 KST, from announcement reset 10-20 15:33 KST
+spend horizon: 10-23 02:58 KST (estimate)
+stop risk horizon: 10-27 15:46 KST (official resets_at)
+```
 
 ## License
 

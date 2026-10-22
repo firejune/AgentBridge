@@ -331,6 +331,8 @@ def main(argv=None):
     p.add_argument('--state-dir',help='Broker state directory (default: socket path with .state suffix)')
     p.add_argument('--since',default='6h',help='Burn-rate and reset window, e.g. 90m, 6h, 2d')
     p.add_argument('--json',action='store_true',help='Full records and summary')
+    p.add_argument('--events',action='store_true',help='Reset events, early-reset intervals, the next-reset estimate and the spend/stop-risk horizons')
+    p.add_argument('--seed-announcements',metavar='FILE',help='Merge promo-reset announcements (JSONL: at with UTC offset, note) into the state dir, then exit')
     sub.add_parser('ping'); sub.add_parser('stop')
     for cmd in ('install-service','uninstall-service'):
         p = sub.add_parser(cmd,help='Opt-in per-user launchd service management')
@@ -403,8 +405,19 @@ def main(argv=None):
             return 0
         if args.cmd=='usage':
             state_dir = args.state_dir or Path(args.socket).expanduser().absolute().with_suffix('.state')
+            if args.seed_announcements:
+                output(usage.seed_announcements(state_dir, args.seed_announcements))
+                return 0
             records, summary, moment = usage.query(state_dir, args.since, args.provider)
-            if args.json:
+            if args.events:
+                if args.json:
+                    output(dict(announcements=summary['announcements'],
+                                buckets=[{key: row[key] for key in ('limit_id','slot','resets_at','events','early_reset',
+                                                                    'spend_horizon','spend_basis','stop_risk_horizon')}
+                                         for row in summary['buckets']]))
+                else:
+                    print(usage.format_events(summary, summary['announcements']), flush=True)
+            elif args.json:
                 cutoff = moment-usage.parse_since(args.since)
                 output(dict(records=[r for r in records if usage.parse_time(r['observed_at'])>=cutoff],
                             **summary))
