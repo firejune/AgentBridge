@@ -112,6 +112,20 @@ def rpc_call(url, csrf, method, payload, timeout=5):
     return data
 
 
+def trajectory_summaries(data):
+    """The conversation map, or None when the reply is not one.
+
+    ProtoJSON omits an empty map, so a server with no conversations yet (a
+    fresh Desktop hub) answers {}: that is an empty registry, not a failure.
+    """
+    if 'code' in data and 'message' in data:
+        return None  # an error envelope; rpc_call lets this method's through
+    if 'trajectorySummaries' not in data:
+        return {}
+    summaries = data['trajectorySummaries']
+    return summaries if isinstance(summaries, dict) else None
+
+
 def validate_override_url(url):
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ('http', 'https') or parsed.hostname not in ('127.0.0.1', 'localhost', '::1') or not parsed.port:
@@ -145,8 +159,8 @@ def _connect_candidate(pid, app_dir, csrf, timeout=5):
             url = f'{scheme}://127.0.0.1:{port}'
             try:
                 data = rpc_call(url, csrf, 'GetAllCascadeTrajectories', {}, timeout=timeout)
-                summaries = data.get('trajectorySummaries')
-                if isinstance(summaries, dict):
+                summaries = trajectory_summaries(data)
+                if summaries is not None:
                     return {
                         'pid': pid,
                         'app_dir': app_dir,
@@ -167,8 +181,8 @@ def discover_servers(timeout=5):
             raise DeliveryError('AGENT_BRIDGE_AGY_CSRF is required when AGENT_BRIDGE_AGY_URL is set')
         url = validate_override_url(override_url)
         data = rpc_call(url, override_csrf, 'GetAllCascadeTrajectories', {}, timeout=timeout)
-        summaries = data.get('trajectorySummaries')
-        if not isinstance(summaries, dict):
+        summaries = trajectory_summaries(data)
+        if summaries is None:
             raise DeliveryError('Antigravity server did not return trajectorySummaries')
         return [{'pid': os.getpid(), 'app_dir': 'antigravity', 'url': url, 'csrf': override_csrf, 'summaries': summaries}]
 

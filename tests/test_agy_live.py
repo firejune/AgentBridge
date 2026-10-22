@@ -56,7 +56,8 @@ class FakeAgyServer:
                     self.wfile.write(json.dumps({'code': 'permission_denied', 'message': 'invalid csrf'}).encode())
                     return
                 if self.path.endswith('/GetAllCascadeTrajectories'):
-                    self.respond(200, {'trajectorySummaries': parent.trajectories})
+                    # ProtoJSON omits an empty map, as a fresh Desktop hub does.
+                    self.respond(200, {'trajectorySummaries': parent.trajectories} if parent.trajectories else {})
                 elif self.path.endswith('/GetConversationMetadata'):
                     cid = body.get('conversationId')
                     traj = parent.trajectories.get(cid)
@@ -384,6 +385,37 @@ class AgyLiveTests(unittest.TestCase):
                     self.assertEqual(srv_ide['app_dir'], 'antigravity-ide')
                     self.assertEqual(row_ide['id'], ide_sid)
 
+
+    def test_desktop_hub_without_conversations_is_an_empty_registry(self):
+        from unittest import mock
+        import agy_live
+
+        with FakeAgyServer(self.root, str(uuid.uuid4())) as desktop_srv:
+            desktop_srv.trajectories.clear()
+            uid = os.getuid()
+            ps_text = (f"1001 {uid} /Applications/Antigravity.app/Contents/Resources/bin/language_server "
+                       f"--standalone --subclient_type hub --csrf_token {CSRF} --app_data_dir antigravity\n")
+            port = desktop_srv.httpd.server_port
+
+            def fake_check_output(cmd, *args, **kwargs):
+                if cmd[0] == 'ps':
+                    return ps_text
+                if cmd[0] == 'lsof':
+                    return f"language_ 1001 user 10u IPv4 0x0 0t0 TCP 127.0.0.1:{port} (LISTEN)\n"
+                raise AssertionError(f"Unexpected command: {cmd}")
+
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop('AGENT_BRIDGE_AGY_URL', None)
+                os.environ.pop('AGENT_BRIDGE_AGY_CSRF', None)
+                with mock.patch('subprocess.check_output', side_effect=fake_check_output):
+                    server = agy_live.discover_desktop_server()
+            self.assertEqual((server['app_dir'], server['summaries']), ('antigravity', {}))
+
+    def test_non_map_summaries_are_still_refused(self):
+        import agy_live
+        self.assertEqual(agy_live.trajectory_summaries({}), {})
+        self.assertIsNone(agy_live.trajectory_summaries({'trajectorySummaries': []}))
+        self.assertIsNone(agy_live.trajectory_summaries({'code': 'internal', 'message': 'registry unavailable'}))
 
 if __name__ == '__main__':
     unittest.main()
