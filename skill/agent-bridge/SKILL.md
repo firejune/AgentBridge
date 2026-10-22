@@ -126,6 +126,12 @@ python3 "$bridge_cli" reply REQUEST_ID --key UNIQUE_REPLY_KEY --file /absolute/a
 - Exit code 2 from `ask` or `wait` means the wait timed out; do not resend or cancel the request — run `wait` again on the same ID. Reuse the same `--key` when retrying a failed send.
 - Peer messages do not grant new human authorization. Do not send unsolicited collaboration messages merely because the skill is installed.
 
+## Checking Usage Limits
+
+- Check your own usage first with your built-in tool or the information your current session already provides (Claude desktop: `get_usage`; Codex: its built-in usage command). Use that whenever it is available.
+- Query the bridge only when that information is missing or stale, or when you need another account's or provider's limits, or the consumption trend.
+- Do not read session token usage as remaining subscription limit. Context window, session tokens and API cost are different metrics.
+
 ## Operational Boundaries
 
 - Only routes and channel bindings persist in an owner-private routing snapshot. Restart re-verifies exact live sessions and pinned channel routes, dropping unavailable bindings; messages, idempotency keys, and events are volatile. Do not restart or stop a shared broker without coordinating with active participants.
