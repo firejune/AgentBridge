@@ -5,6 +5,7 @@ ownership and model readback admit a session to the bridge; no composer, native
 pipe authorization workaround, synthetic user prompt, or creation replay.
 """
 import math
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -14,6 +15,10 @@ import uuid
 import codex_live
 
 FULL_ACCESS_PROFILE = ':danger-full-access'
+# New threads request this model when --model is omitted, so they never
+# inherit the Desktop's own default. Override per machine with MODEL_ENV.
+DEFAULT_MODEL = 'gpt-6.1-sol'
+MODEL_ENV = 'AGENT_BRIDGE_CODEX_MODEL'
 
 
 class CreationError(ValueError):
@@ -51,7 +56,19 @@ def require_thread(value, sid, cwd, title=None):
     return value
 
 
-def require_model(client, model, remaining=None):
+def resolve_model(model=None, environ=None):
+    """--model, then MODEL_ENV, then DEFAULT_MODEL; returns (model, source)."""
+    if model is not None:
+        return model, '--model'
+    value = (os.environ if environ is None else environ).get(MODEL_ENV)
+    if value is not None:
+        if not value.strip():
+            raise CreationError(f'{MODEL_ENV} is set but empty; unset it or pass --model')
+        return value, MODEL_ENV
+    return DEFAULT_MODEL, 'default'
+
+
+def require_model(client, model, remaining=None, missing=None):
     cursor, seen = None, set()
     while True:
         if remaining is not None:
@@ -67,7 +84,7 @@ def require_model(client, model, remaining=None):
             return
         cursor = page.get('nextCursor')
         if not cursor:
-            raise CreationError('Requested --model is not advertised by the installed Codex provider')
+            raise CreationError(missing or 'Requested --model is not advertised by the installed Codex provider')
         if not isinstance(cursor, str) or cursor in seen or len(seen) >= 100:
             raise CreationError('Codex model/list returned an invalid or repeated cursor')
         seen.add(cursor)
@@ -141,6 +158,10 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
     for label, value in (('--title',title),('--model',model)):
         if value is not None and (not isinstance(value, str) or not value.strip()):
             raise CreationError(f'{label} must be a nonempty string')
+    model, source = resolve_model(model)
+    missing = None if source == '--model' else (
+        f'Default Codex model {model!r} (from {source}) is not advertised by the installed '
+        'Codex provider; pass --model with an advertised model')
     if opener is None and not shutil.which('open'):
         raise CreationError('Adopting a Codex thread in Desktop needs the macOS `open` command')
     factory = client_factory or sessions.CodexClient
@@ -157,12 +178,9 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
     try:
         with factory(mode='saved',timeout=remaining(),experimental=True) as creator:
             require_full_access_profile(creator, folder, remaining)
-            if model is not None:
-                require_model(creator, model, remaining)
+            require_model(creator, model, remaining, missing)
             params = {'cwd':str(folder),'ephemeral':False,'allowProviderModelFallback':False,
-                      'permissions':FULL_ACCESS_PROFILE,'approvalPolicy':'never'}
-            if model is not None:
-                params['model'] = model
+                      'permissions':FULL_ACCESS_PROFILE,'approvalPolicy':'never','model':model}
             stage, attempted = 'create', True
             creator.timeout = remaining()
             created = creator.call('thread/start', params)
@@ -171,7 +189,7 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                 raise CreationError('Codex thread/start returned no thread')
             sid = str(uuid.UUID(thread['id']))
             require_thread(thread, sid, folder)
-            if model is not None and created.get('model') != model:
+            if created.get('model') != model:
                 raise CreationError('Codex creator substituted the requested --model')
             if not has_full_access(created, 'sandbox'):
                 raise CreationError('Codex creator did not confirm Full Access with approvalPolicy never')
@@ -208,7 +226,7 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                     updates = {}
                     if not has_full_access(permissions):
                         updates.update(permissions=FULL_ACCESS_PROFILE, approvalPolicy='never')
-                    if model is not None and settings['model'] != model:
+                    if settings['model'] != model:
                         updates['model'] = model
                     if updates:
                         # Change only this newly created thread, never global
@@ -221,7 +239,7 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                             raise CreationError('Exact Codex Desktop owner did not confirm new-thread settings update')
                         settings = owner_settings(client, sid, owner)
                         permissions = permission_settings(client, sid, owner)
-                    if model is not None and settings['model'] != model:
+                    if settings['model'] != model:
                         raise CreationError('Exact Codex Desktop owner substituted the requested --model')
                     if not has_full_access(permissions):
                         raise CreationError('Exact Codex Desktop owner did not confirm Full Access with approvalPolicy never')
@@ -236,7 +254,7 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                                     sid, folder, title)
         row = sessions.codex_row(stored, 'saved')
         return {'created':True,'adopted':True,'session':row,'owner':owner,'url':url,
-                'model':settings['model'],'creator_settings':effective,
+                'model':settings['model'],'model_source':source,'creator_settings':effective,
                 'permission_settings':permissions,'permission_settings_source':'Desktop owner latestThreadSettings',
                 'warning':None}
     except BaseException as error:
@@ -248,3 +266,57 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
         failure = CreationError(message, attempted, sid, adopted, stage)
         failure.cancelled = isinstance(error, KeyboardInterrupt)
         raise failure from None
+
+
+class ModelSwitchError(ValueError):
+    def __init__(self, reason, uncertain=False):
+        super().__init__(reason)
+        self.uncertain = uncertain
+
+
+def set_model(sid, model, timeout=10, client_factory=None, owner_factory=None):
+    """Change one existing thread's model for its next turns.
+
+    Sends only {model} through the exact Desktop owner, never permissions or
+    any other field, and never interrupts an active turn. One attempt: a
+    possibly sent mutation is never replayed.
+    """
+    import sessions
+    try:
+        sid = str(uuid.UUID(str(sid)))
+    except ValueError:
+        raise ModelSwitchError('SESSION_ID must be an exact Codex thread UUID') from None
+    if not isinstance(model, str) or not model.strip():
+        raise ModelSwitchError('--model must be a nonempty string')
+    if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not 0 < timeout <= 3600:
+        raise ModelSwitchError('Timeout must be between 0 and 3600 seconds')
+    factory = client_factory or sessions.CodexClient
+    owners = owner_factory or codex_live.Client
+    client = None
+    try:
+        with factory(mode='saved',timeout=timeout,experimental=True) as catalog:
+            require_model(catalog, model)
+        client = owners(timeout=timeout)
+        with client:
+            owner = client.owner(sid)
+            previous = owner_settings(client, sid, owner)['model']
+            if previous != model:
+                response = client.call('thread-follower-update-thread-settings',
+                    {'conversationId':sid,'threadSettings':{'model':model}}, 2, owner, mutation=True)
+                result = response.get('result')
+                if (response.get('resultType') != 'success' or not isinstance(result, dict)
+                        or result.get('applied') is not True):
+                    raise ModelSwitchError('Exact Codex Desktop owner did not confirm the model update', True)
+            current = owner_settings(client, sid, owner)['model']
+            if current != model:
+                raise ModelSwitchError(f'Exact Codex Desktop owner reads back model {current!r}, not {model!r}',
+                                       client.mutation_sent)
+        return {'session':sid,'owner':owner,'model':current,'previous_model':previous,
+                'changed':previous != model,'applies':'next turn; an active turn is not interrupted'}
+    except ModelSwitchError:
+        raise
+    except (CreationError, codex_live.DeliveryError, sessions.DiscoveryError, OSError) as error:
+        # Never replay: a possibly sent mutation is reported uncertain instead.
+        sent = client is not None and client.mutation_sent
+        raise ModelSwitchError(str(error) if isinstance(error, (CreationError, codex_live.DeliveryError))
+                               else 'Codex model switch transport failed', sent) from None

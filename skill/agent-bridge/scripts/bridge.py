@@ -354,6 +354,9 @@ def main(argv=None):
     p.add_argument('--provider',choices=['agy','claude','codex'],default='agy')
     p.add_argument('--cwd',required=True);p.add_argument('--title');p.add_argument('--model')
     p.add_argument('--timeout',type=float,default=180)
+    p = sub.add_parser('codex-model',help="Switch an existing Codex thread's model from its next turn")
+    p.add_argument('id',metavar='SESSION_ID');p.add_argument('--model',required=True)
+    p.add_argument('--timeout',type=float,default=10)
     p = sub.add_parser('sessions',help='Discover real CLI sessions without starting a turn')
     p.add_argument('--provider',choices=['all','codex','claude','agy'],default='all')
     p.add_argument('--cwd');p.add_argument('--search');p.add_argument('--limit',type=int,default=100)
@@ -434,6 +437,9 @@ def main(argv=None):
         if args.cmd=='open':
             output(sessions.open_session(args.provider,args.cwd,args.title,args.model,args.timeout))
             return 0
+        if args.cmd=='codex-model':
+            output(codex_new.set_model(args.id,args.model,args.timeout))
+            return 0
         if args.cmd=='sessions':
             result = sessions.discover(args.provider,args.cwd,args.search,args.limit,args.codex_executable,args.claude_executable,args.codex_mode)
             output(result)
@@ -479,6 +485,9 @@ def main(argv=None):
         if message['route']['transport'] == 'codex':
             message = {k:message[k] for k in ('id','state','route')}
         output({'error':str(error),'push_failed':True,'message':message})
+        return 1
+    except codex_new.ModelSwitchError as error:
+        output({'error':str(error),'uncertain':error.uncertain,'session':args.id,'model':args.model})
         return 1
     except codex_new.CreationError as error:
         output({'error':str(error),'uncertain':error.uncertain,'session':error.session,
