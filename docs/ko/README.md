@@ -63,9 +63,22 @@ python3 ~/.agents/skills/agent-bridge/scripts/bridge.py sessions --provider agy
 
 `serve --max-messages 2048`은 메시지 보존 개수다. 상한에서는 보호되지 않은 `done`·`answered`·`failed` 중 가장 오래된 항목을 제거한다. `submitted`·`uncertain`은 완료가 아니며, 미처리·보호 항목만 남으면 새 전송·답변을 거부한다. 제거 시 중복 방지 키도 사라지므로 자동 재전송하지 않는다.
 
-`serve --state-dir PATH`는 endpoint·채널만 저장한다(기본: 소켓 확장자를 `.state`로 바꾼 디렉터리). `stop`·Ctrl-C·SIGTERM은 열린 클라이언트도 닫는다. 재시작 시 진행 중 메시지 ID는 복원하지 않고 재시도도 없다.
+`serve --state-dir PATH`는 소통 상태 중 endpoint·채널만 저장한다(기본: 소켓 확장자를 `.state`로 바꾼 디렉터리). 아래 한도 기록은 같은 디렉터리의 별도 파일이다. `stop`·Ctrl-C·SIGTERM은 열린 클라이언트도 닫는다. 재시작 시 진행 중 메시지 ID는 복원하지 않고 재시도도 없다.
 
 서비스는 명시적 `install-service`로 설치한다. `install-service --generate-only --plist /absolute/review/agent.plist`와 `plutil -lint /absolute/review/agent.plist`는 서비스 로드 없이 검토한다. KeepAlive는 `stop` 뒤에도 다시 기동하므로 계속 중지하려면 `uninstall-service`로 제거한다. 자세한 경로·복원·운영 계약은 [사용법](usage.md#라우팅-저장과-선택적-launchd)을 읽는다.
+
+## 구독 한도 (Codex)
+
+브로커는 같은 프로세스의 데몬 스레드에서 Codex 구독 한도를 표본으로 읽는다. 서비스를 따로 설치하지 않는다. `serve --usage-interval 15`분마다(최소 5, `0`은 끔) 전용 `codex app-server --stdio`를 띄워 `initialize`·`initialized`·`account/rateLimits/read`만 보내고 프로세스를 끝낸다. 이 읽기는 스레드·턴을 시작하지 않고, 어느 세션에도 전달하지 않으며, 모델 토큰을 쓰지 않는다.
+
+표본은 `<state-dir>/usage/codex.jsonl`에 버킷·창마다 한 줄로 남는다: UTC의 `observed_at`·`resets_at`, `limit_id`, `slot`(`primary`/`secondary`), `used_percent`, `window_mins`, `allowed`, `reset_credits`, `source`, `status`(`ok`·`failed`, 보고된 리셋 시각이 이미 지났으면 `stale`). 계정 식별자와 플랜 이름은 쓰기 전에 버린다. 읽기 실패는 null로 저장되고 0%가 아니라 「알 수 없음」으로 표시된다. 값이 같으면 한 시간까지 건너뛰고, 실패는 최대 4시간까지 간격을 늘리며, 파일은 30일·5 MB 안에서 매번 원자적으로 교체된다.
+
+```bash
+python3 bridge.py usage            # 버킷마다 한 줄
+python3 bridge.py usage --since 2d --json
+```
+
+한 줄에는 남은 %, 현지 시각의 리셋, 마지막 관측과 신선도(90분 이내이고 그 뒤 실패한 읽기가 없으면 fresh), 그리고 `--since` 창 안 한 리셋 주기에 표본이 둘 이상이면 %p/h 소모율이 나온다. `used_percent`가 줄거나 `resets_at`이 움직이면 리셋 경계다 — `RESET between …`으로 표시하고 그 경계를 가로질러 소모율을 계산하지 않는다.
 
 ## 개발·검증
 
