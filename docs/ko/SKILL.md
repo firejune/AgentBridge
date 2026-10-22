@@ -128,7 +128,7 @@ python3 "$bridge_cli" reply REQUEST_ID --key UNIQUE_REPLY_KEY --file /absolute/a
 
 - 자신의 사용량은 내장 도구나 현재 세션에 제공된 정보로 확인할 수 있으면 그것을 우선 사용한다(Claude 데스크톱: `get_usage`, Codex: 내장 사용량 명령).
 - 해당 정보가 없거나 오래됐거나, 다른 계정·공급자의 한도 또는 사용 추이가 필요할 때만 브릿지를 조회한다.
-- `bridge.py usage [--provider codex] [--since 6h] [--json]`은 브로커가 기록한 표본에서 Codex 한도 버킷마다 한 줄(남은 %, 현지 시각 리셋, 신선도, 한 리셋 주기 안의 %p/h 소모율)을 보여 준다. 파일만 읽고 아무것도 띄우지 않는다.
+- `bridge.py usage [--provider codex] [--since 6h] [--json]`은 브로커가 기록한 표본에서 Codex 한도 버킷마다 한 줄(남은 %, 현지 시각 리셋, 신선도, 한 리셋 주기 안의 %p/h 소모율, 추정치가 있으면 `next early reset ~… [est, n=…]`)을 보여 준다. 파일만 읽고 아무것도 띄우지 않는다. `--events`는 리셋 이벤트(scheduled/early)와 두 기준 시각을 보여 준다 — 사용 계획은 **spend horizon**(공식 리셋과 추정 조기 리셋 중 이른 쪽)에 맞추고, 멈출 위험은 **stop risk horizon**(공식 `resets_at`)으로만 판단한다. 조기 리셋은 보장되지 않기 때문이다.
 - 세션 토큰 사용량을 구독 잔여 한도로 해석하지 않는다. 컨텍스트 잔량·세션 토큰·API 비용은 구독 한도와 다른 지표다.
 
 ## 실행 경계

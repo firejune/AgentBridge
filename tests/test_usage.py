@@ -137,6 +137,17 @@ class CollectionTests(Base):
         self.add(T0 + timedelta(minutes=50 + 61), used=41)
         self.assertEqual(len(self.store.load()), 3)
 
+    def test_resets_at_drift_within_tolerance_is_deduplicated(self):
+        self.add(T0)
+        self.add(T0 + timedelta(minutes=15), resets=RESET + 1)  # measured live: 1 s drift
+        self.add(T0 + timedelta(minutes=30), resets=RESET - 1)
+        self.assertEqual(len(self.store.load()), 1)
+        self.add(T0 + timedelta(minutes=45), resets=RESET + 2 * 3600)  # a real move
+        self.assertEqual([r['resets_at'] for r in self.store.load()],
+                         [usage.utc(datetime.fromtimestamp(t, timezone.utc)) for t in (RESET, RESET + 7200)])
+        self.add(T0 + timedelta(minutes=50), resets=None)
+        self.assertEqual(len(self.store.load()), 3)
+
     def test_retention_and_size_caps(self):
         self.add(T0 - timedelta(days=31), used=1)
         self.add(T0 - timedelta(days=29), used=2)
@@ -334,6 +345,309 @@ class BrokerTests(unittest.TestCase):
         self.assertIn('at least 5 minutes', out.getvalue())
         self.assertFalse(Path('/tmp/ab-never.sock').exists())
 
+
+
+KST = timezone(timedelta(hours=9))
+# The six promo-reset announcement posts (publication times, KST).
+ANNOUNCED = ['2026-10-07 12:35', '2026-10-11 07:16', '2026-10-13 10:03',
+             '2026-10-15 13:55', '2026-10-18 01:20', '2026-10-20 15:33']
+
+
+def kst(text):
+    return datetime.strptime(text, '%Y-%m-%d %H:%M').replace(tzinfo=KST)
+
+
+def ts(moment):
+    return int(moment.timestamp())
+
+
+class EventBase(Base):
+    def setUp(self):
+        super().setUp()
+        self.events = usage.EventStore(self.store.directory)
+        self.announcements = usage.AnnouncementStore(self.store.directory)
+
+    def add(self, moment, used=40, resets=RESET, **fields):
+        return usage.sample(self.store, lambda: response(used, resets, **fields), lambda: moment, self.events)
+
+    def seed(self, times=ANNOUNCED):
+        path = self.root / 'announcements.jsonl'
+        path.write_text(''.join(json.dumps(dict(at=kst(t).isoformat(), source='announcement', note='post')) + '\n'
+                                for t in times))
+        return self.announcements.seed(path, T0)
+
+    def query(self, now):
+        return usage.query(self.root / 'state', '6h', now=now)[1]
+
+    def early_resets(self, start, count, every_hours, resets_after_days=7):
+        """`count` early resets, each 15 minutes wide, with the due time a week out."""
+        moment, due = start, start + timedelta(days=resets_after_days)
+        self.add(moment, used=80, resets=ts(due))
+        for _ in range(count):
+            moment += timedelta(hours=every_hours)
+            self.add(moment - timedelta(minutes=15), used=90, resets=ts(due))
+            due = moment + timedelta(days=resets_after_days)
+            self.add(moment, used=0, resets=ts(due))
+        return moment
+
+
+class ResetEventTests(EventBase):
+    def test_scheduled_when_the_window_contains_the_due_time(self):
+        due = T0 + timedelta(hours=1)
+        self.add(T0 + timedelta(minutes=50), used=70, resets=ts(due))
+        self.add(T0 + timedelta(minutes=65), used=0, resets=ts(due + timedelta(days=7)))
+        [event] = self.events.load()
+        self.assertEqual(event['kind'], 'scheduled')
+        self.assertEqual(event['source'], 'observed')
+        self.assertEqual((event['window_start'], event['window_end']),
+                         (usage.utc(T0 + timedelta(minutes=50)), usage.utc(T0 + timedelta(minutes=65))))
+        self.assertEqual((event['used_before'], event['used_after']), (70, 0))
+        self.assertEqual((event['resets_at_before'], event['resets_at_after']),
+                         (usage.utc(due), usage.utc(due + timedelta(days=7))))
+
+    def test_late_reset_and_one_inside_the_tolerance_are_scheduled(self):
+        due = T0 + timedelta(hours=1)
+        self.add(T0 + timedelta(minutes=70), used=70, resets=ts(due))  # stale: due passed
+        self.add(T0 + timedelta(minutes=85), used=0, resets=ts(due + timedelta(days=7)))
+        self.assertEqual(self.events.load()[0]['kind'], 'scheduled')
+        due2 = T0 + timedelta(days=7, hours=1)
+        self.add(due2 - timedelta(minutes=30), used=5, resets=ts(due + timedelta(days=7)))
+        self.add(due2 - timedelta(minutes=10), used=0, resets=ts(due2 + timedelta(days=7)))
+        self.assertEqual([e['kind'] for e in self.events.load()], ['scheduled', 'scheduled'])
+
+    def test_early_when_the_window_closes_before_the_due_time(self):
+        due = T0 + timedelta(days=4)
+        self.add(T0, used=100, resets=ts(due))
+        self.add(T0 + timedelta(minutes=15), used=0, resets=ts(due + timedelta(days=1)))
+        [event] = self.events.load()
+        self.assertEqual(event['kind'], 'early')
+        # A promo reset that leaves used at 0 is still seen through the moved resets_at.
+        self.add(T0 + timedelta(hours=60), used=0, resets=ts(due + timedelta(days=3)))
+        self.assertEqual([e['kind'] for e in self.events.load()], ['early', 'early'])
+
+    def test_failed_reads_between_widen_the_window_to_the_ok_samples(self):
+        due = T0 + timedelta(days=4)
+        self.add(T0, used=60, resets=ts(due))
+        for minutes in (15, 30, 45):
+            usage.sample(self.store, lambda: (_ for _ in ()).throw(OSError('down')),
+                         lambda m=minutes: T0 + timedelta(minutes=m), self.events)
+        self.add(T0 + timedelta(minutes=60), used=1, resets=ts(due + timedelta(days=2)))
+        [event] = self.events.load()
+        self.assertEqual((event['window_start'], event['window_end'], event['kind']),
+                         (usage.utc(T0), usage.utc(T0 + timedelta(hours=1)), 'early'))
+
+    def test_unknown_due_time_is_not_classified(self):
+        self.add(T0, used=60, resets=None)
+        self.add(T0 + timedelta(minutes=15), used=0, resets=RESET)
+        self.assertEqual(self.events.load()[0]['kind'], 'unknown')
+
+    def test_events_are_deduplicated_and_survive_sample_retention(self):
+        self.add(T0 - timedelta(days=29), used=100, resets=ts(T0))
+        self.add(T0 - timedelta(days=29) + timedelta(minutes=15), used=0, resets=ts(T0 + timedelta(days=2)))
+        for hour in range(1, 4):  # every later cycle re-derives the same event
+            self.add(T0 - timedelta(days=29) + timedelta(hours=hour), used=hour, resets=ts(T0 + timedelta(days=2)))
+        self.assertEqual(len(self.events.load()), 1)
+        self.assertEqual(len(self.events.merge(usage.detect(self.store.load()), T0)), 0)
+        self.add(T0 + timedelta(days=2), used=9, resets=ts(T0 + timedelta(days=2)))
+        self.assertTrue(all(usage.parse_time(r['observed_at']) >= T0 for r in self.store.load()))
+        self.assertEqual(len(self.events.load()), 1)
+        self.assertEqual(len(self.query(T0 + timedelta(days=2))['buckets'][0]['events']), 1)
+
+    def test_query_derives_events_not_yet_persisted(self):
+        usage.sample(self.store, lambda: response(90, ts(T0 + timedelta(days=3))), lambda: T0)
+        usage.sample(self.store, lambda: response(0, ts(T0 + timedelta(days=9))), lambda: T0 + timedelta(minutes=15))
+        self.assertFalse(self.events.path.exists())
+        self.assertEqual([e['kind'] for e in self.query(T0 + timedelta(minutes=16))['buckets'][0]['events']],
+                         ['early'])
+        self.assertFalse(self.events.path.exists())  # a query never writes
+
+    def test_the_broker_collector_persists_events(self):
+        values = iter([response(100, ts(T0 + timedelta(days=4))), response(0, ts(T0 + timedelta(days=9)))])
+        clock = iter([T0, T0 + timedelta(minutes=15)])
+        collector = usage.Collector(self.store, 15, reader=lambda: next(values), clock=lambda: next(clock))
+        collector.cycle(); collector.cycle()
+        self.assertEqual([e['kind'] for e in self.events.load()], ['early'])
+
+    def test_events_file_is_private_and_atomic(self):
+        self.early_resets(T0, 1, 60)
+        self.assertEqual(stat.S_IMODE(self.events.path.stat().st_mode), 0o600)
+        self.assertEqual(sorted(p.name for p in self.store.directory.iterdir()),
+                         ['codex-events.jsonl', 'codex.jsonl'])
+
+
+class EstimateTests(EventBase):
+    def test_six_announcements_give_the_published_statistics(self):
+        self.assertEqual(len(self.seed()), 6)
+        now = kst('2026-10-21 00:00')
+        self.add(now)
+        guess = self.query(now)['buckets'][0]['early_reset']
+        self.assertEqual((guess['source'], guess['n']), ('announcement', 5))
+        self.assertAlmostEqual(guess['mean_hours'], 62.9933, places=3)
+        self.assertAlmostEqual(guess['median_hours'], 59.4167, places=3)
+        self.assertAlmostEqual(guess['min_hours'], 50.7833, places=3)
+        self.assertAlmostEqual(guess['max_hours'], 90.6833, places=3)
+        self.assertEqual(usage.parse_time(guess['centre']), kst('2026-10-23 02:58'))
+        self.assertEqual(usage.parse_time(guess['low']), kst('2026-10-22 18:20'))
+        self.assertEqual(usage.parse_time(guess['high']), kst('2026-10-24 10:14'))
+        self.assertEqual(guess['state'], 'ahead')
+
+    def test_observed_intervals_win_once_there_are_three(self):
+        self.seed()
+        last = self.early_resets(T0, 4, 48)
+        guess = self.query(last + timedelta(hours=1))['buckets'][0]['early_reset']
+        self.assertEqual((guess['source'], guess['n'], guess['counts']['announcement']), ('observed', 3, 5))
+        self.assertAlmostEqual(guess['median_hours'], 48)
+        self.assertEqual(usage.parse_time(guess['centre']), last - timedelta(minutes=7.5) + timedelta(hours=48))
+
+    def test_fewer_observed_intervals_fall_back_to_announcements_unpooled(self):
+        self.seed()
+        last = self.early_resets(kst('2026-10-21 00:00'), 3, 30)
+        guess = self.query(last + timedelta(hours=1))['buckets'][0]['early_reset']
+        self.assertEqual(guess['counts'], dict(observed=2, announcement=5))
+        self.assertEqual((guess['source'], guess['n']), ('announcement', 5))
+        self.assertAlmostEqual(guess['median_hours'], 59.4167, places=3)
+        self.assertAlmostEqual(guess['min_hours'], 50.7833, places=3)
+        # The anchor is the latest early reset of either source: here the observed one.
+        self.assertEqual(guess['anchor_source'], 'observed')
+        self.assertEqual(usage.parse_time(guess['anchor']), last - timedelta(minutes=7.5))
+
+    def test_too_few_prints_no_time_and_spends_to_the_official_reset(self):
+        self.seed(ANNOUNCED[:3])
+        last = self.early_resets(T0, 2, 50)
+        now = last + timedelta(hours=1)
+        row = self.query(now)['buckets'][0]
+        self.assertEqual(row['early_reset'], dict(state='too_few', counts=dict(observed=1, announcement=2)))
+        self.assertEqual((row['spend_horizon'], row['spend_basis']), (row['resets_at'], 'official'))
+        self.assertEqual(row['stop_risk_horizon'], row['resets_at'])
+        text = usage.format_events(self.query(now), self.query(now)['announcements'])
+        self.assertIn('too few', text)
+        self.assertNotIn('next early reset', text)
+        self.assertNotIn('next early reset', usage.format_summary(self.query(now), now))
+
+    def test_spend_horizon_is_the_estimate_when_it_comes_first(self):
+        self.seed()
+        now = kst('2026-10-21 00:00')
+        self.add(now, used=70, resets=ts(kst('2026-10-27 15:46')))
+        row = self.query(now)['buckets'][0]
+        self.assertEqual(usage.parse_time(row['spend_horizon']), kst('2026-10-23 02:58'))
+        self.assertEqual(row['spend_basis'], 'estimate')
+        self.assertEqual(usage.parse_time(row['stop_risk_horizon']), kst('2026-10-27 15:46'))
+
+    def test_spend_horizon_is_official_when_it_comes_first(self):
+        self.seed()
+        now = kst('2026-10-21 00:00')
+        self.add(now, used=70, resets=ts(kst('2026-10-22 09:00')))
+        row = self.query(now)['buckets'][0]
+        self.assertEqual(row['early_reset']['state'], 'ahead')
+        self.assertEqual((usage.parse_time(row['spend_horizon']), row['spend_basis']),
+                         (kst('2026-10-22 09:00'), 'official'))
+        self.assertEqual(usage.parse_time(row['stop_risk_horizon']), kst('2026-10-22 09:00'))
+
+    def test_overdue_is_kept_and_a_lapsed_estimate_is_dropped(self):
+        self.seed()
+        official = ts(kst('2026-10-27 15:46'))
+        self.add(kst('2026-10-23 05:00'), used=70, resets=official)
+        row = self.query(kst('2026-10-23 05:00'))['buckets'][0]
+        self.assertEqual(row['early_reset']['state'], 'overdue')
+        self.assertEqual(row['spend_basis'], 'estimate')
+        self.add(kst('2026-10-24 11:00'), used=75, resets=official)
+        row = self.query(kst('2026-10-24 11:00'))['buckets'][0]
+        self.assertEqual(row['early_reset']['state'], 'lapsed')
+        self.assertEqual((row['spend_basis'], row['spend_horizon']), ('official', row['resets_at']))
+        self.assertNotIn('next early reset', usage.format_summary(self.query(kst('2026-10-24 11:00')),
+                                                                 kst('2026-10-24 11:00')))
+
+    def test_a_wide_window_breaks_the_interval_chain_and_cannot_anchor(self):
+        last = self.early_resets(T0, 4, 48)
+        self.assertEqual(self.query(last)['buckets'][0]['early_reset']['n'], 3)
+        due = last + timedelta(days=7)
+        # Broker down for four hours across the next early reset.
+        self.add(last + timedelta(hours=44), used=50, resets=ts(due))
+        self.add(last + timedelta(hours=48), used=0, resets=ts(due + timedelta(days=2)))
+        row = self.query(last + timedelta(hours=49))['buckets'][0]
+        wide = row['events'][-1]
+        self.assertEqual(usage.width(wide), 4 * 3600)
+        self.assertGreater(usage.width(wide), usage.MAX_EVENT_WINDOW_SECONDS)
+        self.assertEqual(wide['kind'], 'early')  # still listed and classified
+        self.assertEqual(row['early_reset']['n'], 3)  # but no interval to it
+        self.assertEqual(row['early_reset']['state'], 'no_anchor')
+        self.assertEqual(row['spend_basis'], 'official')
+        text = usage.format_events(self.query(last + timedelta(hours=49)), [])
+        self.assertIn('too wide', text)
+
+    def test_announcements_need_an_offset_and_are_stored_in_utc(self):
+        path = self.root / 'bad.jsonl'
+        path.write_text('{"at": "2026-10-07T12:35:00", "note": "x"}\n')
+        with self.assertRaisesRegex(ValueError, 'no UTC offset'):
+            self.announcements.seed(path, T0)
+        path.write_text('{"at": "2026-10-07T12:35:00+09:00", "source": "observed"}\n')
+        with self.assertRaisesRegex(ValueError, 'source must be'):
+            self.announcements.seed(path, T0)
+        self.assertFalse(self.announcements.path.exists())
+        self.seed()
+        self.assertEqual(self.announcements.load()[0]['at'], '2026-10-07T03:35:00+00:00')
+        self.assertEqual(self.seed(), [])  # idempotent
+        self.assertEqual(len(self.announcements.load()), 6)
+
+    def test_local_time_in_event_output(self):
+        self.seed()
+        self.add(kst('2026-10-21 00:00'), used=70, resets=ts(kst('2026-10-27 15:46')))
+        summary = self.query(kst('2026-10-21 00:00'))
+        previous = os.environ.get('TZ')
+        try:
+            os.environ['TZ'] = 'Asia/Seoul'; time.tzset()
+            text = usage.format_events(summary, summary['announcements'])
+            self.assertIn('spend horizon: 10-23 02:58 KST (estimate)', text)
+            self.assertIn('stop risk horizon: 10-27 15:46 KST (official resets_at)', text)
+            self.assertIn('mean 63.0h · median 59.4h · range 50.8h–90.7h', text)
+            self.assertIn('[est, n=5, announcement]', usage.format_summary(summary, kst('2026-10-21 00:00')))
+            os.environ['TZ'] = 'UTC'; time.tzset()
+            text = usage.format_events(summary, summary['announcements'])
+            self.assertIn('spend horizon: 10-22 17:58 UTC (estimate)', text)
+            self.assertIn('window 10-22 09:20 UTC … 10-24 01:14 UTC', text)
+        finally:
+            if previous is None:
+                os.environ.pop('TZ', None)
+            else:
+                os.environ['TZ'] = previous
+            time.tzset()
+
+
+class EventCliTests(EventBase):
+    def test_events_and_seeding_never_collect_or_call(self):
+        self.add(T0, used=90, resets=ts(T0 + timedelta(days=3)))
+        self.add(T0 + timedelta(minutes=15), used=0, resets=ts(T0 + timedelta(days=9)))
+        path = self.root / 'announcements.jsonl'
+        path.write_text(''.join(json.dumps(dict(at=kst(t).isoformat(), note='post')) + '\n' for t in ANNOUNCED))
+        forbidden = AssertionError('a query must not collect or call anything')
+        state = str(self.root / 'state')
+        import sessions
+        with patch.object(usage, 'read_codex', side_effect=forbidden), \
+                patch.object(usage, 'sample', side_effect=forbidden), \
+                patch.object(sessions, 'CodexClient', side_effect=forbidden), \
+                patch('subprocess.Popen', side_effect=forbidden), \
+                patch('socket.socket', side_effect=forbidden):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(bridge.main(['--socket', '/tmp/ab-never.sock', 'usage', '--state-dir', state,
+                                              '--seed-announcements', str(path)]), 0)
+                self.assertEqual(bridge.main(['--socket', '/tmp/ab-never.sock', 'usage', '--state-dir', state,
+                                              '--events']), 0)
+                self.assertEqual(bridge.main(['--socket', '/tmp/ab-never.sock', 'usage', '--state-dir', state,
+                                              '--events', '--json']), 0)
+                self.assertEqual(bridge.main(['--socket', '/tmp/ab-never.sock', 'usage', '--state-dir', state]), 0)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(json.loads(lines[0])['added'], 6)
+        text = out.getvalue()
+        self.assertIn('announcements (6):', text)
+        self.assertIn('early-reset intervals [announcement, n=5]', text)
+        self.assertIn('spend horizon:', text)
+        self.assertIn('stop risk horizon:', text)
+        self.assertIn('[observed]', text)
+        data = json.loads(next(line for line in lines if line.startswith('{"announcements"')))
+        self.assertEqual(data['buckets'][0]['early_reset']['source'], 'announcement')
+        self.assertIn('next early reset ~', [line for line in lines if line.startswith('codex/codex 7d:')][-1])
+        self.assertEqual(len(self.store.load()), 2)  # nothing was sampled
 
 if __name__ == '__main__':
     unittest.main()
