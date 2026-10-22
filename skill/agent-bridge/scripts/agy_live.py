@@ -567,6 +567,140 @@ def open_agy(cwd, title=None, model=None, timeout=5):
     }
 
 
+# --- Model read/switch (issue #13) ------------------------------------------
+# The Antigravity panel labels a conversation's model from its last generator's
+# plannerConfig, and its model picker sends cascadeConfig.plannerConfig.
+# requestedModel with the next SendUserCascadeMessage. The bridge reads and
+# writes the same two places; it never invents a separate setting.
+PLANNER_ONLY_FIELDS = ('modelName', 'planModel', 'requestedModel')
+
+
+class ModelSwitchError(DeliveryError):
+    pass
+
+
+def model_catalog(server, timeout=5):
+    data = rpc_call(server['url'], server['csrf'], 'GetCascadeModelConfigData', {}, timeout=timeout)
+    rows = data.get('clientModelConfigs')
+    return [c for c in rows if isinstance(c, dict)] if isinstance(rows, list) else []
+
+
+def describe_model(catalog, model_enum):
+    for cfg in catalog:
+        if cfg.get('modelOrAlias', {}).get('model') == model_enum:
+            return {'model': cfg.get('modelId') or model_enum, 'model_enum': model_enum, 'label': cfg.get('label')}
+    return {'model': model_enum, 'model_enum': model_enum, 'label': None}
+
+
+def last_generator(server, sid, steps, timeout=5):
+    """The newest generator entry without fetching the whole history.
+
+    generatorMetadataOffset skips that many entries, and there are never more
+    generators than steps, so probe downward from stepCount with a doubling gap.
+    Returns (entry or None, count).
+    """
+    gap, offset = 1, 0
+    while True:
+        offset = max(0, steps - gap)
+        rows = rpc_call(server['url'], server['csrf'], 'GetCascadeTrajectoryGeneratorMetadata',
+                        {'cascadeId': sid, 'generatorMetadataOffset': offset},
+                        timeout=timeout).get('generatorMetadata') or []
+        if rows or offset == 0:
+            return (rows[-1] if rows else None), offset + len(rows)
+        gap *= 2
+
+
+def generator_model(entry):
+    if not isinstance(entry, dict):
+        return None
+    planner = entry.get('plannerConfig') if isinstance(entry.get('plannerConfig'), dict) else {}
+    requested = planner.get('requestedModel') if isinstance(planner.get('requestedModel'), dict) else {}
+    for value in (planner.get('planModel'), requested.get('model'),
+                  (entry.get('chatModel') or {}).get('model') if isinstance(entry.get('chatModel'), dict) else None):
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def read_model_at(server, sid, summary, timeout=5):
+    steps = int(summary.get('stepCount') or 0) if isinstance(summary, dict) else 0
+    entry, count = last_generator(server, sid, steps, timeout) if steps else (None, 0)
+    model_enum = generator_model(entry)
+    if not model_enum:
+        return {'model': 'unknown', 'reason': 'no generator has run in this conversation yet', 'generators': count}
+    return {**describe_model(model_catalog(server, timeout), model_enum),
+            'source': 'last generator plannerConfig (the panel model label)', 'generators': count}
+
+
+def read_model(sid, timeout=5):
+    sid = str(uuid.UUID(sid))
+    server, row = resolve_agy(sid, timeout=timeout)
+    summary = server['summaries'].get(sid) or {}
+    return {'session': sid, 'status': row['status'], **read_model_at(server, sid, summary, timeout)}
+
+
+def switch_config(entry, model_enum):
+    """The conversation's own last plannerConfig with only the model changed.
+
+    Sending a bare config resets the rest of the planner (measured: knowledge
+    on -> off), so start from what the conversation last ran with.
+    """
+    planner = entry.get('plannerConfig') if isinstance(entry, dict) else None
+    if not isinstance(planner, dict) or not planner:
+        raise ModelSwitchError('Antigravity conversation has no planner configuration to preserve; '
+                               'let it run one turn before switching its model')
+    planner = {k: v for k, v in planner.items() if k not in PLANNER_ONLY_FIELDS}
+    planner['requestedModel'] = {'model': model_enum}
+    return {'plannerConfig': planner}
+
+
+def set_model(sid, model, timeout=30, poll=1.0):
+    """Switch an idle conversation's model; the switch runs one invocation.
+
+    One attempt. A rejected request changes nothing; a request whose outcome is
+    unknown is reported uncertain and never resent.
+    """
+    if not isinstance(model, str) or not model.strip():
+        raise ModelSwitchError('--set must be a nonempty model name')
+    sid = str(uuid.UUID(sid))
+    server, row = resolve_agy(sid, timeout=min(timeout, 10))
+    if row['status'] != 'idle':
+        raise ModelSwitchError(f"Antigravity conversation is {row['status']}; a model switch is accepted only while it is idle")
+    catalog = model_catalog(server, timeout=min(timeout, 10))
+    target = resolve_model(server, model, timeout=min(timeout, 10))
+    summary = server['summaries'].get(sid) or {}
+    entry, count = last_generator(server, sid, int(summary.get('stepCount') or 0), min(timeout, 10))
+    previous = generator_model(entry)
+    before = describe_model(catalog, previous) if previous else {'model': 'unknown'}
+    if previous == target['model_enum']:
+        return {'session': sid, **describe_model(catalog, previous), 'previous_model': before['model'],
+                'changed': False, 'applies': 'already current; nothing was sent'}
+    frame = {'cascadeId': sid, 'cascadeConfig': switch_config(entry, target['model_enum']),
+             'deliveryStrategy': NEXT_INVOCATION}
+    try:
+        rpc_call(server['url'], server['csrf'], 'SendUserCascadeMessage', frame, timeout=min(timeout, 10))
+    except DeliveryError as error:
+        # An HTTP status means the server answered and refused; anything else may have landed.
+        raise ModelSwitchError(f'Antigravity did not accept the model switch: {error}',
+                               uncertain=' HTTP ' not in str(error)) from None
+    deadline = time.monotonic() + timeout
+    while True:
+        steps = int((rpc_call(server['url'], server['csrf'], 'GetAllCascadeTrajectories', {}, timeout=10)
+                     .get('trajectorySummaries') or {}).get(sid, {}).get('stepCount') or 0)
+        latest, latest_count = last_generator(server, sid, steps, 10)
+        if latest_count > count and generator_model(latest):
+            current = generator_model(latest)
+            if current != target['model_enum']:
+                raise ModelSwitchError(f"Antigravity reads back model {describe_model(catalog, current)['model']!r}, "
+                                       f"not {target['model_id']!r}", uncertain=True)
+            return {'session': sid, **describe_model(catalog, current), 'previous_model': before['model'],
+                    'changed': True, 'applies': 'now; the switch ran one invocation without a user step'}
+        if time.monotonic() >= deadline:
+            raise ModelSwitchError('The switch was sent but no new invocation was observed before the timeout; '
+                                   'read the model again before resolving', uncertain=True)
+        time.sleep(poll)
+
+
 def build_frame(route, sender, project, text):
     sid = str(uuid.UUID(route['session']))
     label = f"{project or route.get('project') or 'unknown'}/{sender or 'peer'}"

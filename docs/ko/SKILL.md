@@ -124,6 +124,29 @@ python3 "$bridge_cli" reply REQUEST_ID --key UNIQUE_REPLY_KEY --file /absolute/a
 - `ask`/`wait`의 종료 코드 2는 대기 시간 초과다. 요청을 다시 보내거나 취소하지 말고 같은 ID로 다시 wait한다. 중복 전송에는 동일한 `--key`를 사용한다.
 - 같은 협의에서 이미 허용된 상대와 범위 안의 답변은 그 협업 범위에 따른다. 동료의 메시지 자체를 새로운 사용자의 승인으로 해석하지 않는다. 스킬 설치만으로 임의 협업 메시지를 발신하지 않는다.
 
+## 모델: 읽기 · 전환 · 정책
+
+**브릿지의 모든 기능은 공급자 중립이다.** 기능은 모든 공급자에 함께 들어가거나, 하나의 중립 인터페이스 뒤에 들어가고 공급자별 빈틈은 이름을 밝힌 STOP으로 보고한다. 한 공급자만 되는 명령으로 조용히 내보내지 않는다.
+
+```bash
+python3 "$bridge_cli" model NAME --project PROJECT              # 읽기 (조회 시점에 새로 읽는다)
+python3 "$bridge_cli" model NAME --project PROJECT --set MODEL  # 전환 후 재조회
+python3 "$bridge_cli" routes --project PROJECT                  # 경로마다 "model" (--no-model로 생략)
+python3 "$bridge_cli" policy                                    # 적용 중인 기본값 · 거부 목록
+```
+
+- `model`은 참가자를 경로로 찾고 그 transport에 등록된 어댑터를 부른다. 읽을 수 없으면 결과는 `model: "unknown"`과 `reason`이고, 읽은 값을 사실로 캐시하지 않는다. 어댑터가 없거나 공급자에 빈틈이 있으면 `unsupported: true`로 그 빈틈을 밝히고 종료 코드 1로 끝난다.
+- **정책**은 `<state-dir>/policy.json`에 있다. 예: `{"defaults": {"agy": "gemini-4-argon-medium"}, "deny": {"codex": ["gpt-6-astra"]}}`. 사람만 고치고, 에이전트가 요청받아 고치지 않는다. 파일이 없는 동안에는 시드 거부 목록 `{"codex": ["gpt-6-astra"]}`가 적용된다. `model --set` · `open` · `register --new`는 거부된 모델을 어느 이름으로 불러도 거절한다. `AGENT_BRIDGE_<PROVIDER>_MODEL`이나 정책 기본값으로 정해진 경우도 같다. `routes` · `sessions`는 이미 거부 모델로 도는 라이브 세션에 `denied: true`를 단다.
+- 새 세션 기본값은 `--model`, `AGENT_BRIDGE_<PROVIDER>_MODEL`, 정책 `defaults`, 공급자 자체 기본값 순서로 정한다. Codex는 어댑터가 이 순서를 받기 전까지 #12의 기본값 결정을 그대로 쓰고, 거부 목록은 지금도 적용된다.
+- **Antigravity (`agy`)**:
+  - 읽기: 마지막 generator의 `plannerConfig`. 패널이 모델 이름을 표시할 때 쓰는 출처와 같다.
+  - 전환: 대화가 대기 중일 때만 받는다. 대화가 마지막으로 쓴 플래너 설정에서 `requestedModel`만 바꿔 보내므로 나머지 설정은 유지된다. 그러면 **사용자 입력 없이 호출이 한 번 돈다**. language server가 새 모델을 적용하는 길은 이것뿐이다. 명령은 그 호출을 기다렸다가 모델을 재조회한다.
+  - 거절된 요청은 아무것도 바꾸지 않는다. 결과가 불분명하면 `uncertain`으로 남기고 다시 보내지 않는다.
+- **Claude**:
+  - 읽기: 세션 기록의 가장 최근 assistant 메시지. 호스트와 관계없이 된다.
+  - 전환과 새 세션의 모델 지정: **미지원(STOP)**. VS Code 확장은 세션 자신의 stdio 채널로만 모델을 바꾸고, 그 선택을 사용자 전역 `settings.json`에 저장한다. 실행 중인 세션은 설정 파일이 바뀌어도 그 값을 다시 읽지 않는다. 데스크톱 새 세션 링크에도 모델 항목이 없다. 그 세션의 모델 선택기를 쓴다. 데스크톱 앱 자체의 세션 도구는 별도 어댑터이고, 아직 브릿지에 들어오지 않았다.
+- **Codex**: 아직 `model`에 어댑터가 없다. `codex-model SESSION_ID --model M`은 #12와 같이 동작한다. 자세한 내용과 근거는 [usage.md](usage.md#모델-읽기--전환--정책)에 있다.
+
 ## 사용량 확인
 
 - 자신의 사용량은 내장 도구나 현재 세션에 제공된 정보로 확인할 수 있으면 그것을 우선 사용한다(Claude 데스크톱: `get_usage`, Codex: 내장 사용량 명령).

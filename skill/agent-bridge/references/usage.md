@@ -283,6 +283,28 @@ python3 "$bridge_cli" resolve MESSAGE_ID --state pending --note 'Confirmed not r
 python3 "$bridge_cli" resolve MESSAGE_ID --state done --note 'Completed'
 ```
 
+## Models: Read, Switch, Policy
+
+`model NAME --project P [--set M]` is one command over per-transport adapters (`scripts/models.py`). Measured on 2026-10-23:
+
+| Provider | Read | Switch | New-session model |
+| --- | --- | --- | --- |
+| agy | last generator `plannerConfig` (`GetCascadeTrajectoryGeneratorMetadata`, tail only via `generatorMetadataOffset`) | idle only; empty `SendUserCascadeMessage` + `cascadeConfig` (own planner, `requestedModel` changed), runs one invocation; verified live | `open`/`register --new --model` (desktop server) |
+| claude (VS Code, desktop) | transcript newest assistant `message.model`; verified live | STOP (below) | STOP (below) |
+| codex | adapter not in `model` yet | `codex-model` (#12) | `open --provider codex --model` (#12) |
+
+**Antigravity switch.** The panel's model picker sends `cascadeConfig.plannerConfig.requestedModel` with the next message. When the message is empty and the conversation is idle, that request starts one invocation on the new model, and later turns, including bridge-woken ones, stay on it.
+- Sending a bare config resets the rest of the planner (measured: `knowledgeConfig.enabled` went from true to false). So the bridge copies the last generator's `plannerConfig`, drops `planModel`/`modelName`, and sets only `requestedModel`. With that, knowledge stayed on.
+- While a turn runs, the server answers `cannot queue empty user input step`. `SendAllQueuedMessages` (a turnless switch) answers `deprecated`.
+
+**Claude gap (evidence, Claude Code 2.1.307/2.1.308).**
+- The peer socket handles only `rename`, idle notices and artifact yields; it has no set_model action.
+- `set_model` is an SDK control request on the session's own stdio host channel: the desktop app, the VS Code extension and Agent SDK `query.setModel()`.
+- The VS Code extension has no model command, model setting or URI parameter. Its `/open` link takes only `session` and `prompt`. Its picker writes `model` to the user-global `~/.claude/settings.json`, then calls `applyFlagSettings` on that one channel.
+- A running session does not hot-reload a settings-file model. Measured on the same CLI binary: turn 1 ran on haiku from `.claude/settings.local.json`; after the file was changed to sonnet, turn 2 still ran on haiku.
+- The desktop new-session link passes only `q`, `folder`, `file`, `environment`, `runner_pool` and `ssh_*`.
+- The desktop app's `set_session_model` tool exists only inside desktop-hosted sessions.
+
 ## Security & Verification
 
 Agent Bridge is a local tool trusting the current OS user account. Participant names are routing labels, not cryptographic identities, and peer messages do not substitute for human authorization.
