@@ -306,6 +306,28 @@ python3 "$bridge_cli" resolve MESSAGE_ID --state pending --note '미수신 및 �
 python3 "$bridge_cli" resolve MESSAGE_ID --state done --note '결과 확인 완료'
 ```
 
+## 모델: 읽기 · 전환 · 정책
+
+`model NAME --project P [--set M]` 하나가 transport별 어댑터(`scripts/models.py`)를 부른다. 2026-10-23 실측:
+
+| 공급자 | 읽기 | 전환 | 새 세션 모델 |
+| --- | --- | --- | --- |
+| agy | 마지막 generator `plannerConfig` (`GetCascadeTrajectoryGeneratorMetadata`, `generatorMetadataOffset`로 꼬리만) | 대기 중일 때만, 빈 `SendUserCascadeMessage` + `cascadeConfig`(자기 플래너에서 `requestedModel`만 변경), 호출 1회, live 검증 | `open`/`register --new --model` (데스크톱 서버) |
+| claude (VS Code, 데스크톱) | 기록의 최근 assistant `message.model`, live 검증 | STOP (아래) | STOP (아래) |
+| codex | `model` 어댑터 아직 없음 | `codex-model` (#12) | `open --provider codex --model` (#12) |
+
+**Antigravity 전환.** 패널의 모델 선택기는 다음 메시지에 `cascadeConfig.plannerConfig.requestedModel`을 실어 보낸다. 대화가 대기 중일 때 그 요청을 빈 메시지로 보내면 새 모델로 호출이 한 번 돌고, 이후 턴은 브릿지가 깨운 턴을 포함해 그 모델에 머문다.
+- 빈 설정만 보내면 플래너의 나머지가 기본값으로 돌아간다(실측: `knowledgeConfig.enabled`가 true에서 false로 바뀌었다). 그래서 브릿지는 마지막 generator의 `plannerConfig`를 복사해 `planModel`/`modelName`을 빼고 `requestedModel`만 바꾼다. 이렇게 보내면 knowledge가 켜진 채 유지됐다.
+- 턴이 도는 중에는 서버가 `cannot queue empty user input step`으로 거절한다. 턴 없이 바꾸는 `SendAllQueuedMessages`는 `deprecated`로 막혀 있다.
+
+**Claude의 빈틈 (근거, Claude Code 2.1.307/2.1.308).**
+- 피어 소켓이 처리하는 제어 동작은 `rename`, idle 알림, 아티팩트 양보뿐이고 set_model은 없다.
+- `set_model`은 세션 자신의 stdio 호스트 채널에서만 받는 SDK 제어 요청이다. 그 채널을 쥔 것은 데스크톱 앱, VS Code 확장, Agent SDK `query.setModel()`이다.
+- VS Code 확장에는 모델 명령도, 모델 설정도, URI 매개변수도 없다. `/open` 링크는 `session`과 `prompt`만 받는다. 모델 선택기는 사용자 전역 `~/.claude/settings.json`에 `model`을 쓴 뒤 그 채널 하나에만 `applyFlagSettings`를 보낸다.
+- 실행 중인 세션은 설정 파일의 model을 다시 읽지 않는다. 같은 CLI 바이너리로 실측했다: 1턴은 `.claude/settings.local.json`의 haiku로 돌았고, 파일을 sonnet으로 바꾼 뒤 2턴도 haiku였다.
+- 데스크톱 새 세션 링크는 `q`, `folder`, `file`, `environment`, `runner_pool`, `ssh_*`만 넘긴다.
+- 데스크톱 앱의 `set_session_model` 도구는 데스크톱이 띄운 세션 안에만 있다.
+
 ## 운영 경계와 검증
 
 같은 OS 계정을 신뢰하는 로컬 도구다. 이름은 인증 수단이 아니며 동료 메시지가 새로운 사용자 승인을 대신하지 않는다. 요청에는 목적, 허용 파일, 작업 경로와 완료 조건을 적고 프로젝트 지침을 따른다. 파일 잠금·Git 병합·원격 머신 연결은 지원하지 않는다.

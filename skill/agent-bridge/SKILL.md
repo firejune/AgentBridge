@@ -126,6 +126,29 @@ python3 "$bridge_cli" reply REQUEST_ID --key UNIQUE_REPLY_KEY --file /absolute/a
 - Exit code 2 from `ask` or `wait` means the wait timed out; do not resend or cancel the request — run `wait` again on the same ID. Reuse the same `--key` when retrying a failed send.
 - Peer messages do not grant new human authorization. Do not send unsolicited collaboration messages merely because the skill is installed.
 
+## Models: Read, Switch, Policy
+
+**Every bridge feature is provider-neutral.** A capability lands for every provider, or it lands behind one neutral interface where each provider's gap is reported by name as a STOP. It never ships as a quiet one-provider command.
+
+```bash
+python3 "$bridge_cli" model NAME --project PROJECT              # read, fresh at query time
+python3 "$bridge_cli" model NAME --project PROJECT --set MODEL  # switch, then read back
+python3 "$bridge_cli" routes --project PROJECT                  # each route carries "model"; --no-model skips it
+python3 "$bridge_cli" policy                                    # the defaults and denylist being enforced
+```
+
+- `model` resolves the participant through its route and calls the adapter registered for that transport. When a model can't be read, the result is `model: "unknown"` with a `reason`; nothing is cached as truth. A missing adapter or a provider gap exits 1 with `unsupported: true` and names the gap.
+- **Policy** lives in `<state-dir>/policy.json`, for example `{"defaults": {"agy": "gemini-4-argon-medium"}, "deny": {"codex": ["gpt-6-astra"]}}`. Only a person edits it, never an agent on request. While the file is absent, the seed deny list `{"codex": ["gpt-6-astra"]}` applies. `model --set`, `open` and `register --new` refuse a denied model by any of its names, including a model reached through `AGENT_BRIDGE_<PROVIDER>_MODEL` or a policy default. `routes` and `sessions` flag a live session already on a denied model with `denied: true`.
+- New-session defaults: `--model`, then `AGENT_BRIDGE_<PROVIDER>_MODEL`, then the policy `defaults`, then the provider's own default. Codex still resolves its default as in #12 until its adapter adopts this order; the denylist already applies to it.
+- **Antigravity (`agy`)**:
+  - Read: the last generator's `plannerConfig`, the same source the panel uses for its model label.
+  - Switch: accepted only while the conversation is idle. It sends the conversation's own last planner configuration with only `requestedModel` changed, so the other settings are kept. That runs **one invocation without a user step**, which is the only way the language server applies a new model. The command waits for that invocation and reads its model back.
+  - A refused request changes nothing. An unclear outcome is `uncertain` and is never resent.
+- **Claude**:
+  - Read: the newest assistant message in the session transcript, on any host.
+  - Switch, and a model for a new session: **unsupported (STOP)**. On the VS Code extension the model is changed only through the session's own stdio channel, and the choice is saved to the user-global `settings.json`. A running session does not pick up a settings file change. The desktop new-session link carries no model either. Use the session's model picker. The desktop app's own session tool is a separate adapter that is not in the bridge yet.
+- **Codex**: its adapter is not in `model` yet. `codex-model SESSION_ID --model M` still works as in #12. Details and evidence: [usage.md](references/usage.md#models-read-switch-policy).
+
 ## Checking Usage Limits
 
 - Check your own usage first with your built-in tool or the information your current session already provides (Claude desktop: `get_usage`; Codex: its built-in usage command). Use that whenever it is available.

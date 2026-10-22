@@ -20,6 +20,7 @@ import agy_live
 import broker
 import codex_live
 import codex_new
+import models
 import sessions
 import service
 import usage
@@ -316,6 +317,45 @@ def registration(args):
     return observation
 
 
+def broker_state_dir(args):
+    return Path(getattr(args, 'state_dir', None) or Path(args.socket).expanduser().absolute().with_suffix('.state'))
+
+
+def new_session_policy(args, provider):
+    """Apply the owner's defaults and denylist before any session is created."""
+    policy = models.load_policy(broker_state_dir(args))
+    if provider == 'codex':
+        # Codex keeps its #12 default chain; only the denylist is enforced here.
+        model, _ = codex_new.resolve_model(args.model)
+        models.require_allowed(policy, 'codex', model)
+        return
+    model, source = models.default_model(provider, args.model, policy)
+    if provider == 'claude':
+        if model is not None:
+            raise models.Unsupported(f'claude: a new session cannot be given a model ({source} asked for {model!r}). '
+                                     'The desktop new-session link and the VS Code extension carry no model; '
+                                     'the session starts on the model its host picks.')
+        return
+    if model is not None:
+        server = agy_live.discover_desktop_server()
+        found = agy_live.resolve_model(server, model)
+        models.require_allowed(policy, provider, model, found['model_id'], found['model_enum'], found.get('label'))
+        args.model = found['model_id']
+    else:
+        server = agy_live.discover_desktop_server()
+        found = agy_live.resolve_model(server, None)
+        models.require_allowed(policy, provider, found['model_id'], found['model_enum'], found.get('label'))
+
+
+def with_models(rows, policy, timeout, key='session'):
+    """Annotate live rows with a fresh model reading; never cached as truth."""
+    for row in rows:
+        route = row if 'transport' in row else {'transport':{'claude':'claude-peer'}.get(row['provider'],row['provider']),
+                                                 'session':row['id']}
+        row['model'] = models.flag(policy, models.read(route, timeout))
+    return rows
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--socket',default=str(broker.DEFAULT_SOCKET))
@@ -350,10 +390,17 @@ def main(argv=None):
     p.add_argument('--title');p.add_argument('--model')
     p.add_argument('--timeout',type=float,default=180,help='Seconds to wait for desktop session creation')
     p.add_argument('--codex-mode',choices=['auto','shared','saved'],default='auto')
+    p.add_argument('--state-dir',help='Broker state directory holding policy.json (default: socket path with .state suffix)')
     p = sub.add_parser('open',help='Open a new live desktop session')
     p.add_argument('--provider',choices=['agy','claude','codex'],default='agy')
     p.add_argument('--cwd',required=True);p.add_argument('--title');p.add_argument('--model')
     p.add_argument('--timeout',type=float,default=180)
+    p.add_argument('--state-dir')
+    p = sub.add_parser('model',help="Read a participant's model, or switch it with --set (provider-neutral)")
+    p.add_argument('name');p.add_argument('--project',required=True);p.add_argument('--set',dest='target')
+    p.add_argument('--timeout',type=float,default=30);p.add_argument('--state-dir')
+    p = sub.add_parser('policy',help='Show the model policy (defaults, denylist) the bridge enforces; read-only')
+    p.add_argument('--state-dir')
     p = sub.add_parser('codex-model',help="Switch an existing Codex thread's model from its next turn")
     p.add_argument('id',metavar='SESSION_ID');p.add_argument('--model',required=True)
     p.add_argument('--timeout',type=float,default=10)
@@ -362,11 +409,15 @@ def main(argv=None):
     p.add_argument('--cwd');p.add_argument('--search');p.add_argument('--limit',type=int,default=100)
     p.add_argument('--codex-executable',default='codex');p.add_argument('--claude-executable',default='claude')
     p.add_argument('--codex-mode',choices=['auto','shared','saved'],default='auto')
+    p.add_argument('--no-model',action='store_true',help='Skip the live model reading');p.add_argument('--state-dir')
     p = sub.add_parser('session')
     p.add_argument('provider',choices=['codex','claude','agy']);p.add_argument('id');p.add_argument('--executable')
     p.add_argument('--codex-mode',choices=['auto','shared','saved'],default='auto')
     for cmd in ('routes','channels'):
         p = sub.add_parser(cmd);p.add_argument('--project',required=True)
+        if cmd == 'routes':
+            p.add_argument('--no-model',action='store_true',help='Skip the live model reading')
+            p.add_argument('--state-dir')
     p = sub.add_parser('channel-bind')
     p.add_argument('name');p.add_argument('--project',required=True);p.add_argument('--owner',required=True)
     p.add_argument('--description',required=True);p.add_argument('--expect-generation',type=int,default=0)
@@ -435,18 +486,42 @@ def main(argv=None):
             output((service.install if args.cmd == 'install-service' else service.uninstall)(**fields))
             return 0
         if args.cmd=='open':
+            new_session_policy(args, args.provider)
             output(sessions.open_session(args.provider,args.cwd,args.title,args.model,args.timeout))
+            return 0
+        if args.cmd=='policy':
+            output(models.load_policy(broker_state_dir(args)))
+            return 0
+        if args.cmd=='model':
+            if not 0 < args.timeout <= 3600:
+                raise ValueError('Timeout must be between 0 and 3600 seconds')
+            policy = models.load_policy(broker_state_dir(args))
+            route = next((r for r in broker.request(args.socket,{'op':'routes','project':args.project})
+                          if r['name'] == args.name), None)
+            if route is None:
+                raise ValueError(f'No participant {args.name!r} is registered in project {args.project!r}')
+            if args.target is None:
+                output({'name':args.name,**models.flag(policy, models.read(route, min(args.timeout, 30)))})
+                return 0
+            output({'name':args.name,**models.switch(route, args.target, policy, args.timeout)})
             return 0
         if args.cmd=='codex-model':
             output(codex_new.set_model(args.id,args.model,args.timeout))
             return 0
         if args.cmd=='sessions':
             result = sessions.discover(args.provider,args.cwd,args.search,args.limit,args.codex_executable,args.claude_executable,args.codex_mode)
+            if not args.no_model:
+                policy = models.load_policy(broker_state_dir(args))
+                for name in ('agy','claude'):
+                    if name in result['providers']:
+                        with_models(result['providers'][name]['sessions'], policy, 10)
             output(result)
             return 1 if result['errors'] else 0
         if args.cmd=='session':
             output(sessions.inspect_session(args.provider,args.id,args.executable,args.codex_mode))
             return 0
+        if args.cmd=='register' and args.new and args.transport in ('agy','codex','claude-peer'):
+            new_session_policy(args, 'claude' if args.transport == 'claude-peer' else args.transport)
         observation = registration(args) if args.cmd=='register' else None
         if args.cmd=='deliver':
             if args.timeout<=0:
@@ -454,7 +529,7 @@ def main(argv=None):
             result = deliver(args.socket,args.id,args.timeout,args.dry_run)
             output(result)
             return 1 if result['state'] in ('failed','uncertain') else 0
-        fields = {k:v for k,v in vars(args).items() if k not in ('cmd','socket','file','discover','new','title','model','codex_mode') and not (k=='timeout' and args.cmd=='register')}
+        fields = {k:v for k,v in vars(args).items() if k not in ('cmd','socket','file','discover','new','title','model','codex_mode','state_dir','no_model') and not (k=='timeout' and args.cmd=='register')}
         fields['op'] = {'stop':'shutdown','ask':'send'}.get(args.cmd,args.cmd)
         if args.cmd in ('send','ask','reply'):
             fields['body'] = sys.stdin.read() if args.file=='-' else Path(args.file).read_text(encoding='utf-8')
@@ -472,6 +547,8 @@ def main(argv=None):
             output({'type':'sent','message':sent})
             fields = {'op':'wait','id':sent['id'],'timeout':args.timeout}
         result = broker.request(args.socket,fields,timeout=args.timeout+5 if args.cmd in ('ask','wait') else 10)
+        if args.cmd=='routes' and not args.no_model:
+            with_models(result, models.load_policy(broker_state_dir(args)), 5)
         if observation:
             result['discovery'] = observation
             if args.cmd == 'register' and args.transport == 'codex' and args.new:
@@ -485,6 +562,12 @@ def main(argv=None):
         if message['route']['transport'] == 'codex':
             message = {k:message[k] for k in ('id','state','route')}
         output({'error':str(error),'push_failed':True,'message':message})
+        return 1
+    except models.Unsupported as error:
+        output({'error':str(error),'unsupported':True})
+        return 1
+    except models.SwitchError as error:
+        output({'error':str(error),'uncertain':error.uncertain,'name':args.name,'model':args.target})
         return 1
     except codex_new.ModelSwitchError as error:
         output({'error':str(error),'uncertain':error.uncertain,'session':args.id,'model':args.model})
