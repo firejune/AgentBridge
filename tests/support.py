@@ -10,8 +10,12 @@ import broker
 
 
 class RunningBroker:
-    def __init__(self, max_messages=2048):
+    def __init__(self, max_messages=2048, usage_interval=0, codex_executable=None):
+        # Limit sampling is off unless a test names a stub app-server.
         self.max_messages = max_messages
+        self.usage = ['--usage-interval', str(usage_interval)]
+        if codex_executable:
+            self.usage += ['--codex-executable', codex_executable]
 
     def __enter__(self):
         self.temp = tempfile.TemporaryDirectory(prefix='ab-',dir='/tmp')
@@ -23,7 +27,7 @@ class RunningBroker:
     def start(self):
         cli = str(Path(broker.__file__).with_name('bridge.py'))
         self.process = subprocess.Popen([sys.executable,cli,'--socket',self.path,'serve',
-            '--state-dir',self.state_dir,'--max-messages',str(self.max_messages)],
+            '--state-dir',self.state_dir,'--max-messages',str(self.max_messages),*self.usage],
             stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
         ready = selectors.DefaultSelector()
         try:

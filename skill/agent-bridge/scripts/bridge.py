@@ -22,6 +22,7 @@ import codex_live
 import codex_new
 import sessions
 import service
+import usage
 
 def envelope(m):
     return (f"[agent-bridge peer message | {m['sender']} -> {m['recipient']}]\n"
@@ -322,6 +323,14 @@ def main(argv=None):
     p = sub.add_parser('serve',help='Run the local broker in the foreground')
     p.add_argument('--max-messages',type=int,default=2048,help='Retained messages; evict oldest unprotected done/answered/failed first')
     p.add_argument('--state-dir',help='Private routing snapshot directory (default: socket path with .state suffix)')
+    p.add_argument('--usage-interval',type=int,default=usage.DEFAULT_INTERVAL_MINUTES,
+                   help=f'Minutes between Codex limit reads (0 = off, minimum {usage.MIN_INTERVAL_MINUTES})')
+    p.add_argument('--codex-executable',default='codex')
+    p = sub.add_parser('usage',help='Recorded subscription limits; reads the history file, starts nothing')
+    p.add_argument('--provider',choices=['codex'],default='codex')
+    p.add_argument('--state-dir',help='Broker state directory (default: socket path with .state suffix)')
+    p.add_argument('--since',default='6h',help='Burn-rate and reset window, e.g. 90m, 6h, 2d')
+    p.add_argument('--json',action='store_true',help='Full records and summary')
     sub.add_parser('ping'); sub.add_parser('stop')
     for cmd in ('install-service','uninstall-service'):
         p = sub.add_parser(cmd,help='Opt-in per-user launchd service management')
@@ -387,7 +396,20 @@ def main(argv=None):
         if args.cmd=='serve':
             if args.max_messages<1:
                 raise ValueError('Message limit must be positive')
-            asyncio.run(broker.serve(args.socket,args.max_messages,args.state_dir))
+            if args.usage_interval and args.usage_interval<usage.MIN_INTERVAL_MINUTES:
+                raise ValueError(f'Usage interval must be 0 (off) or at least {usage.MIN_INTERVAL_MINUTES} minutes')
+            asyncio.run(broker.serve(args.socket,args.max_messages,args.state_dir,
+                                     args.usage_interval,args.codex_executable))
+            return 0
+        if args.cmd=='usage':
+            state_dir = args.state_dir or Path(args.socket).expanduser().absolute().with_suffix('.state')
+            records, summary, moment = usage.query(state_dir, args.since, args.provider)
+            if args.json:
+                cutoff = moment-usage.parse_since(args.since)
+                output(dict(records=[r for r in records if usage.parse_time(r['observed_at'])>=cutoff],
+                            **summary))
+            else:
+                print(usage.format_summary(summary, moment), flush=True)
             return 0
         if args.cmd in ('install-service','uninstall-service'):
             fields = dict(socket=args.socket, state_dir=args.state_dir, plist=args.plist,

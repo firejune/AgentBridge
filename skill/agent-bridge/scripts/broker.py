@@ -16,6 +16,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import route_store
+import usage
 
 DEFAULT_SOCKET = Path.home() / '.local/share/agent-bridge/bridge.sock'
 MAX_FRAME = 1024 * 1024
@@ -341,7 +342,8 @@ async def watch(state, args, reader, writer):
         await asyncio.gather(disconnected,return_exceptions=True)
 
 
-async def serve(path, max_messages=2048, state_dir=None):
+async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DEFAULT_INTERVAL_MINUTES,
+                codex_executable='codex'):
     path = Path(path).expanduser().absolute()
     path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
     lock = path.with_suffix('.lock').open('a')
@@ -352,6 +354,7 @@ async def serve(path, max_messages=2048, state_dir=None):
         raise ValueError('Broker is already running for this socket') from error
     server = None
     store = None
+    collector = None
     try:
         if path.exists():
             if not stat.S_ISSOCK(path.stat().st_mode):
@@ -359,6 +362,10 @@ async def serve(path, max_messages=2048, state_dir=None):
             path.unlink()
         store = route_store.RouteStore(state_dir or path.with_suffix('.state'))
         state = State(max_messages, store)
+        if usage_interval:
+            # Read-only limit sampling beside the broker; it never touches `state`.
+            collector = usage.Collector(usage.UsageStore(store.directory / 'usage'),
+                                        usage_interval, codex_executable).start()
         stopping = asyncio.Event()
         handlers = set()
         writers = set()
@@ -417,6 +424,8 @@ async def serve(path, max_messages=2048, state_dir=None):
         await asyncio.gather(*active,return_exceptions=True)
         await server.wait_closed()
     finally:
+        if collector is not None:
+            collector.stop()
         if server is not None:
             server.close()
             path.unlink(missing_ok=True)
