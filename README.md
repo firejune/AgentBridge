@@ -56,7 +56,7 @@ python3 ~/.agents/skills/agent-bridge/scripts/bridge.py sessions --provider all
 python3 ~/.agents/skills/agent-bridge/scripts/bridge.py sessions --provider agy
 ```
 
-If you move the repository, update the symlinks accordingly. Restarting clears messages, idempotency keys, and events. Routes and channels reload after exact session/workspace checks; unavailable live bindings are dropped.
+If you move the repository, update the symlinks accordingly. Restarting clears messages, idempotency keys, and events. Routes and channels reload after identity/workspace checks. Saved Codex routes survive temporary metadata or Desktop unavailability; confirmed mismatches and invalid stored identities are dropped. Other live-peer bindings retain their liveness checks.
 
 ## Development & Verification
 

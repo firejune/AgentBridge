@@ -281,57 +281,164 @@ class PersistenceTests(unittest.TestCase):
             self.store.load()
         self.assertEqual(victim.read_text(), 'untouched')
 
-    def test_reverification_uses_exact_session_cwd_and_live_codex_owner(self):
+    def test_codex_reverification_checks_metadata_identity_without_owner_liveness(self):
         sid = str(uuid.uuid4())
         route = dict(project='demo', name='alpha', cwd=str(self.root), session=sid,
                      transport='codex', executable=None)
         target = dict(id=sid, cwd=str(self.root), runtime_observed=True, status='idle')
         with patch.object(route_store.sessions, 'inspect_session', return_value={'session': target}) as discover, \
-                patch.object(route_store.codex_live, 'Client') as client:
+                patch.object(bridge.codex_live, 'Client', side_effect=AssertionError('No owner IPC')) as client:
             route_store.verify_route(route)
             discover.assert_called_once_with('codex', sid, None, codex_mode='auto')
-            client.return_value.__enter__.return_value.owner.assert_called_once_with(sid)
-        for bad in (dict(target, id=str(uuid.uuid4())), dict(target, cwd='/tmp')):
+            client.assert_not_called()
+        for bad, reason in ((dict(target, id=str(uuid.uuid4())), 'session UUID differs'),
+                            (dict(target, cwd=str(self.root / 'other')), 'session workspace differs')):
             with patch.object(route_store.sessions, 'inspect_session', return_value={'session': bad}), \
-                    patch.object(route_store.codex_live, 'Client') as client:
-                with self.assertRaisesRegex(ValueError, 'Session or workspace differs'):
-                    route_store.verify_route(route)
-                client.assert_not_called()
+                    self.assertRaisesRegex(ValueError, reason):
+                route_store.verify_route(route)
 
-    def test_saved_codex_unknown_runtime_restores_when_exact_desktop_owner_is_live(self):
+    def test_idle_unknown_and_limit_blocked_codex_routes_survive_without_owner_contact(self):
         sid = str(uuid.uuid4())
         self.register(transport='codex', session=sid)
         self.bind()
         before = deepcopy((self.state.endpoints, self.state.channels))
-        saved = dict(id=sid, cwd=str(self.root), runtime_observed=False,
-                     status='unknown', reported_status='notLoaded', scope='saved-metadata')
-        with FakeDesktop() as desktop, \
-                patch.dict(os.environ, {'AGENT_BRIDGE_CODEX_IPC': desktop.path}), \
-                patch.object(route_store.sessions, 'inspect_session', return_value={'session': saved}) as discover:
-            loaded = broker.State(store=self.store)
+        snapshot = self.store.path.read_bytes()
+        for status in ('idle', 'unknown', 'notLoaded'):
+            target = dict(id=sid, cwd=str(self.root), status=status, runtime_observed=False,
+                          ordinaryUsageAllowed=False)
+            with self.subTest(status=status), \
+                    patch.object(route_store.sessions, 'inspect_session', return_value={'session': target}) as discover, \
+                    patch.object(bridge.codex_live, 'Client', side_effect=AssertionError('No owner IPC')) as client:
+                loaded = broker.State(store=self.store)
             discover.assert_called_once_with('codex', sid, None, codex_mode='auto')
-            owners = [call for call in desktop.calls if call['method'] == 'thread-owner-discovery']
-            self.assertEqual([call['params']['conversationId'] for call in owners], [sid])
-            self.assertEqual({call['method'] for call in desktop.calls}, {'initialize', 'thread-owner-discovery'})
-        self.assertEqual((loaded.endpoints, loaded.channels), before)
+            client.assert_not_called()
+            self.assertEqual((loaded.endpoints, loaded.channels), before)
+            self.assertEqual(self.store.path.read_bytes(), snapshot)
 
-    def test_saved_codex_metadata_drops_without_capable_exact_desktop_owner(self):
+    def test_codex_route_survives_when_desktop_has_no_owner_or_capability(self):
         sid = str(uuid.uuid4())
         self.register(transport='codex', session=sid)
         self.bind()
-        saved = dict(id=sid, cwd=str(self.root), runtime_observed=False, status='unknown')
+        before = deepcopy((self.state.endpoints, self.state.channels))
+        target = dict(id=sid, cwd=str(self.root), status='unknown')
         for behavior in ('no-owner', 'no-capability'):
             with self.subTest(behavior=behavior), FakeDesktop(behavior) as desktop, \
                     patch.dict(os.environ, {'AGENT_BRIDGE_CODEX_IPC': desktop.path}), \
-                    patch.object(route_store.sessions, 'inspect_session', return_value={'session': saved}), \
-                    redirect_stderr(io.StringIO()) as diagnostic:
-                # Restore the frozen routing inputs before each independent load.
-                self.store.save(self.state.endpoints, self.state.channels)
+                    patch.object(route_store.sessions, 'inspect_session', return_value={'session': target}):
                 loaded = broker.State(store=self.store)
-                self.assertEqual((loaded.endpoints, loaded.channels), ({}, {}))
-                self.assertEqual(diagnostic.getvalue().count('routing_drop'), 2)
-                self.assertNotIn(sid, self.store.path.read_text())
-                self.assertEqual({call['method'] for call in desktop.calls}, {'initialize', 'thread-owner-discovery'})
+                self.assertEqual((loaded.endpoints, loaded.channels), before)
+                self.assertEqual(desktop.calls, [])
+
+    def test_unavailable_metadata_retains_codex_identity_without_rewriting_snapshot(self):
+        sid = str(uuid.uuid4())
+        self.register(transport='codex', session=sid)
+        self.bind()
+        before = deepcopy((self.state.endpoints, self.state.channels))
+        snapshot = self.store.path.read_bytes()
+        for error in (route_store.sessions.DiscoveryError('SECRET rate limited'),
+                      route_store.sessions.DiscoveryError('different or missing thread'),
+                      ConnectionRefusedError('SECRET peer socket'),
+                      subprocess.TimeoutExpired('SECRET', 1), KeyError('cwd'), TypeError('SECRET')):
+            with self.subTest(error=type(error).__name__), \
+                    patch.object(route_store.sessions, 'inspect_session', side_effect=error) as discover, \
+                    patch.object(bridge.codex_live, 'Client', side_effect=AssertionError('No owner IPC')), \
+                    redirect_stderr(io.StringIO()) as diagnostic:
+                loaded = broker.State(store=self.store)
+            self.assertEqual((loaded.endpoints, loaded.channels), before)
+            self.assertEqual(self.store.path.read_bytes(), snapshot)
+            discover.assert_called_once_with('codex', sid, None, codex_mode='auto')
+            self.assertIn('routing_retain', diagnostic.getvalue())
+            self.assertIn('retained unverified', diagnostic.getvalue())
+            self.assertNotIn('routing_drop', diagnostic.getvalue())
+            self.assertNotIn('SECRET', diagnostic.getvalue())
+
+    def test_incomplete_provider_metadata_is_not_proof_of_deletion(self):
+        sid = str(uuid.uuid4())
+        self.register(transport='codex', session=sid)
+        self.bind()
+        before = deepcopy((self.state.endpoints, self.state.channels))
+        for observation in (None, {}, {'session': None}, {'session': {}},
+                            {'session': {'id': sid}}, {'session': {'cwd': str(self.root)}},
+                            {'session': {'id': '', 'cwd': str(self.root)}},
+                            {'session': {'id': 'not-a-uuid', 'cwd': str(self.root)}}):
+            with self.subTest(observation=observation), \
+                    patch.object(route_store.sessions, 'inspect_session', return_value=observation), \
+                    redirect_stderr(io.StringIO()) as diagnostic:
+                loaded = broker.State(store=self.store)
+            self.assertEqual((loaded.endpoints, loaded.channels), before)
+            self.assertIn('metadata incomplete', diagnostic.getvalue())
+            self.assertNotIn('routing_drop', diagnostic.getvalue())
+
+    def test_invalid_or_missing_stored_codex_uuid_is_dropped_before_provider_access(self):
+        sid = str(uuid.uuid4())
+        self.register(transport='codex', session=sid)
+        self.bind()
+        valid = json.loads(self.store.path.read_text())
+        for invalid in (None, [], 123, '', 'not-a-uuid', sid.upper(), 'missing-field'):
+            raw = deepcopy(valid)
+            for route in (raw['endpoints'][0], raw['channels'][0]['route']):
+                if invalid == 'missing-field':
+                    route.pop('session')
+                else:
+                    route['session'] = invalid
+            self.store.path.write_text(json.dumps(raw))
+            with self.subTest(invalid=invalid), \
+                    patch.object(route_store.sessions, 'inspect_session') as discover, \
+                    redirect_stderr(io.StringIO()) as diagnostic:
+                loaded = broker.State(store=self.store)
+            self.assertEqual((loaded.endpoints, loaded.channels), ({}, {}))
+            discover.assert_not_called()
+            reason = 'stored session field missing' if invalid == 'missing-field' else 'stored session UUID invalid'
+            self.assertEqual(diagnostic.getvalue().count(reason), 2)
+
+    def test_missing_codex_workspace_is_dropped_with_specific_safe_check(self):
+        sid = str(uuid.uuid4())
+        self.register(transport='codex', session=sid)
+        self.bind()
+        raw = json.loads(self.store.path.read_text())
+        for route in (raw['endpoints'][0], raw['channels'][0]['route']):
+            route['cwd'] = str(self.root / 'missing')
+        self.store.path.write_text(json.dumps(raw))
+        with patch.object(route_store.sessions, 'inspect_session') as discover, \
+                redirect_stderr(io.StringIO()) as diagnostic:
+            loaded = broker.State(store=self.store)
+        self.assertEqual((loaded.endpoints, loaded.channels), ({}, {}))
+        discover.assert_not_called()
+        self.assertEqual(diagnostic.getvalue().count('workspace unavailable'), 2)
+        self.assertNotIn(str(self.root), diagnostic.getvalue())
+
+    def test_confirmed_codex_metadata_mismatch_drops_with_specific_check(self):
+        sid = str(uuid.uuid4())
+        self.register(transport='codex', session=sid)
+        self.bind()
+        for target, reason in ((dict(id=str(uuid.uuid4()), cwd=str(self.root)), 'session UUID differs'),
+                               (dict(id=sid, cwd=str(self.root / 'other')), 'session workspace differs')):
+            self.store.save(self.state.endpoints, self.state.channels)
+            with self.subTest(reason=reason), \
+                    patch.object(route_store.sessions, 'inspect_session', return_value={'session': target}), \
+                    redirect_stderr(io.StringIO()) as diagnostic:
+                loaded = broker.State(store=self.store)
+            self.assertEqual((loaded.endpoints, loaded.channels), ({}, {}))
+            self.assertEqual(diagnostic.getvalue().count(reason), 2)
+            self.assertNotIn(sid, self.store.path.read_text())
+            self.assertNotIn(str(self.root), diagnostic.getvalue())
+
+    def test_unavailable_codex_endpoint_keeps_independent_older_pinned_channel(self):
+        old, new = str(uuid.uuid4()), str(uuid.uuid4())
+        self.register(transport='codex', session=old)
+        channel = deepcopy(self.bind())
+        self.register(transport='codex', session=new)
+        def inspect(provider, sid, executable, codex_mode):
+            if sid == new:
+                raise route_store.sessions.DiscoveryError('temporarily unavailable')
+            return {'session': {'id': old, 'cwd': str(self.root)}}
+        with patch.object(route_store.sessions, 'inspect_session', side_effect=inspect) as discover, \
+                redirect_stderr(io.StringIO()):
+            loaded = broker.State(store=self.store)
+        self.assertEqual(discover.call_count, 2)
+        self.assertEqual(loaded.endpoints['demo', 'alpha']['session'], new)
+        self.assertEqual(loaded.channels['demo', 'work'], channel)
+        self.assertEqual(loaded.channels['demo', 'work']['route']['session'], old)
 
     def test_peer_and_agy_restore_never_run_claude_cli(self):
         sid = str(uuid.uuid4())

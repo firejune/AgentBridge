@@ -11,11 +11,14 @@ import tempfile
 import uuid
 
 import sessions
-import codex_live
 
 ROUTE_FIELDS = ('project', 'name', 'transport', 'cwd', 'session', 'executable')
 CHANNEL_FIELDS = ('project', 'name', 'owner', 'description', 'generation', 'active', 'route')
 MAX_SNAPSHOT = 4 * 1024 * 1024
+
+
+class RouteCheckError(ValueError):
+    """A locally diagnosed check failure, safe to include in restore diagnostics."""
 
 
 def identifier(value):
@@ -27,6 +30,8 @@ def identifier(value):
 def route_record(item, pinned=False):
     if not isinstance(item, dict):
         raise ValueError('Invalid route')
+    if 'session' not in item:
+        raise RouteCheckError('stored session field missing')
     result = {field: item[field] for field in ROUTE_FIELDS}
     for field in ('project', 'name'):
         identifier(result[field])
@@ -35,8 +40,11 @@ def route_record(item, pinned=False):
     if not isinstance(result['cwd'], str) or not Path(result['cwd']).is_absolute():
         raise ValueError('Invalid workspace')
     if result['transport'] != 'realtime' or result['session'] is not None:
-        if str(uuid.UUID(result['session'])) != result['session']:
-            raise ValueError('Invalid session')
+        try:
+            if not isinstance(result['session'], str) or str(uuid.UUID(result['session'])) != result['session']:
+                raise ValueError('Invalid session')
+        except ValueError:
+            raise RouteCheckError('stored session UUID invalid') from None
     if result['executable'] is not None and not isinstance(result['executable'], str):
         raise ValueError('Invalid executable')
     if pinned:
@@ -67,14 +75,45 @@ def channel_record(item):
 
 
 def verify_route(route):
-    """Re-check the exact UUID and workspace; no sends, turns, or Claude CLI."""
-    cwd = Path(route['cwd']).resolve(strict=True)
+    """Verify identity, not Codex liveness; return a reason for an unverified retain."""
+    try:
+        cwd = Path(route['cwd']).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        raise RouteCheckError('workspace unavailable') from None
     if not cwd.is_dir():
-        raise ValueError('Workspace unavailable')
+        raise RouteCheckError('workspace is not a directory')
     transport = route['transport']
     if transport in ('realtime', 'claude'):
         # Dedicated CLI routes have no live peer contract. Never launch a CLI
         # to restore them; their UUID/workspace are validated, not liveness.
+        return
+    if transport == 'codex':
+        # A saved route is not a promise of a currently attached Desktop owner.
+        # Never discover/wake an owner, read account limits or send during load.
+        try:
+            observation = sessions.inspect_session(
+                'codex', route['session'], route['executable'], codex_mode='auto')
+        except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired):
+            # DiscoveryError does not distinguish a missing thread from a
+            # transport/provider failure. Do not guess deletion from its text.
+            return 'Codex metadata unavailable; saved identity retained unverified'
+        target = observation.get('session') if isinstance(observation, dict) else None
+        if (not isinstance(target, dict) or not isinstance(target.get('id'), str)
+                or not isinstance(target.get('cwd'), str) or not Path(target['cwd']).is_absolute()):
+            return 'Codex metadata incomplete; saved identity retained unverified'
+        try:
+            if str(uuid.UUID(target['id'])) != target['id']:
+                raise ValueError('Invalid metadata UUID')
+        except ValueError:
+            return 'Codex metadata incomplete; saved identity retained unverified'
+        if target['id'] != route['session']:
+            raise RouteCheckError('session UUID differs')
+        try:
+            target_cwd = Path(target['cwd']).resolve()
+        except (OSError, RuntimeError, ValueError):
+            return 'Codex metadata workspace unavailable; saved identity retained unverified'
+        if target_cwd != cwd:
+            raise RouteCheckError('session workspace differs')
         return
     if transport == 'claude-peer':
         target = sessions.resolve_claude_peer(route['session'])
@@ -88,12 +127,6 @@ def verify_route(route):
     if (target['id'] != route['session']
             or Path(target['cwd']).resolve(strict=True) != cwd):
         raise ValueError('Session or workspace differs')
-    if transport == 'codex':
-        # Auto discovery can read saved metadata when the shared proxy is
-        # absent. Its runtime status is not Desktop liveness: the independent
-        # IPC owner must confirm this exact UUID and untrusted-input support.
-        with codex_live.Client(timeout=3) as client:
-            client.owner(route['session'])
 
 
 class RouteStore:
@@ -163,22 +196,29 @@ class RouteStore:
                 ('channel', data['channels'], channels, channel_record)):
             for index, raw in enumerate(items):
                 item = None
+                failed_check = 'invalid routing record'
                 try:
                     item = normalize(raw)
                     route = item['route'] if kind == 'channel' else item
                     identity = tuple(route.get(field) for field in ROUTE_FIELDS)
                     if identity not in verified:
-                        verify_route(route)
+                        failed_check = 'route verification failed'
+                        retained = verify_route(route)
+                        if isinstance(retained, str):
+                            print(json.dumps(dict(routing_retain=kind, index=index,
+                                                  project=item['project'], name=item['name'], reason=retained)),
+                                  file=sys.stderr, flush=True)
                         verified.add(identity)
                     key = (item['project'], item['name'])
                     if key in output:
+                        failed_check = 'duplicate routing key'
                         raise ValueError('Duplicate routing key')
                     output[key] = item
-                except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired):
+                except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired) as error:
                     # Exceptions from discovery can contain peer tokens/socket
                     # paths or provider payloads. Log only validated aliases and index.
                     diagnostic = dict(routing_drop=kind, index=index,
-                                      reason='invalid or unavailable route')
+                                      reason=str(error) if isinstance(error, RouteCheckError) else failed_check)
                     if item is not None:
                         diagnostic.update(project=item['project'], name=item['name'])
                     print(json.dumps(diagnostic),
