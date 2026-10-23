@@ -355,11 +355,171 @@ class ClaudeReadTest(unittest.TestCase):
         self.assertEqual(models.transcript_model(self.sid, self.root), (None, 'no assistant message yet'))
 
     def test_claude_switch_names_the_host_gap(self):
-        for host, text in (('claude-vscode', 'model picker'), ('claude-desktop', 'set_session_model'),
+        for host, text in (('claude-vscode', 'model picker'), ('claude-desktop', 'no bridge relay'),
                            ('claude-other', 'no bridge-reachable')):
             with patch.object(models, 'claude_host', return_value=host):
                 with self.assertRaisesRegex(models.Unsupported, text):
                     models.claude_switch({'session': self.sid}, 'claude-sonnet-5-5', 1)
+
+
+POST_SID = str(uuid.uuid4())
+TARGET_SID = str(uuid.uuid4())
+
+
+class FakeRelay:
+    def __init__(self, routes, reply=None, timed_out=False):
+        self.route_rows, self.reply, self.timed_out, self.asked = routes, reply, timed_out, []
+
+    def routes(self, project):
+        return self.route_rows
+
+    def ask(self, project, recipient, cwd, body, key, timeout):
+        self.asked.append({'project': project, 'recipient': recipient, 'cwd': cwd, 'body': body, 'key': key,
+                           'timeout': timeout})
+        replies = [] if self.timed_out else [{'body': self.reply}]
+        return {'id': 'm1'}, {'id': 'm1', 'timed_out': self.timed_out, 'replies': replies}
+
+
+class ClaudeDesktopSwitchTest(unittest.TestCase):
+    TARGET = {'project': 'demo', 'name': 'worker', 'transport': 'claude-peer', 'session': TARGET_SID, 'cwd': '/w'}
+    POST = {'project': 'demo', 'name': 'hq', 'transport': 'claude-peer', 'session': POST_SID, 'cwd': '/hq'}
+
+    def policy(self, post='hq'):
+        return {'path': '/state/policy.json', 'exists': True, 'defaults': {}, 'deny': {},
+                'command_post': {'claude': post} if post else {}}
+
+    def switch(self, relay, policy=None, hosts=None):
+        hosts = hosts or {TARGET_SID: 'claude-desktop', POST_SID: 'claude-desktop'}
+        with patch.object(models, 'claude_host', side_effect=lambda sid, *a: hosts[sid]), \
+                patch.object(models, 'desktop_session', return_value='local_abc'):
+            return models.switch(self.TARGET, 'claude-sonnet-5-5', policy or self.policy(), 30, relay)
+
+    def test_relays_one_request_line_and_returns_the_reading(self):
+        reply = 'done\nbridge-model-reply: {"model": "claude-sonnet-5-5", "changed": true, "applies": "next turn"}'
+        relay = FakeRelay([self.TARGET, self.POST], reply)
+        out = self.switch(relay)
+        self.assertEqual({k: out[k] for k in ('provider', 'model', 'changed', 'applies', 'via', 'session')},
+                         {'provider': 'claude', 'model': 'claude-sonnet-5-5', 'changed': True, 'applies': 'next turn',
+                          'via': 'hq', 'session': TARGET_SID})
+        (asked,) = relay.asked
+        self.assertEqual((asked['recipient'], asked['cwd'], asked['timeout']), ('hq', '/hq', 30))
+        self.assertEqual(asked['body'].count('\n'), 0)
+        self.assertTrue(asked['body'].startswith(models.REQUEST_PREFIX))
+        request = json.loads(asked['body'][len(models.REQUEST_PREFIX):])
+        self.assertEqual({k: request[k] for k in ('op', 'session_id', 'desktop_session', 'model', 'target', 'reply')},
+                         {'op': 'set_session_model', 'session_id': TARGET_SID, 'desktop_session': 'local_abc',
+                          'model': 'claude-sonnet-5-5', 'target': 'worker', 'reply': models.REPLY_PREFIX})
+        self.assertEqual(asked['key'], 'model-request:' + request['id'])
+
+    def test_no_command_post_names_the_policy_key_and_sends_nothing(self):
+        relay = FakeRelay([self.TARGET, self.POST])
+        with self.assertRaisesRegex(models.Unsupported, r'"command_post": \{"claude": "<route name>"\} in /state/policy.json'):
+            self.switch(relay, self.policy(None))
+        self.assertEqual(relay.asked, [])
+        with tempfile.TemporaryDirectory() as state:
+            self.assertEqual(models.load_policy(state)['command_post'], {})
+
+    def test_command_post_must_be_a_live_desktop_claude_peer_other_than_the_target(self):
+        cases = (
+            ([self.TARGET], None, 'not registered'),
+            ([self.TARGET, {**self.POST, 'transport': 'codex'}], None, 'must be a claude-peer route'),
+            ([self.TARGET, {**self.POST, 'session': TARGET_SID}], None, 'refuses set_session_model on the calling'),
+            ([self.TARGET, self.POST], {TARGET_SID: 'claude-desktop', POST_SID: 'claude-vscode'}, 'only a desktop-hosted'),
+        )
+        for routes, hosts, text in cases:
+            relay = FakeRelay(routes)
+            with self.subTest(text), self.assertRaisesRegex(models.Unsupported, text):
+                self.switch(relay, hosts=hosts)
+            self.assertEqual(relay.asked, [])
+        relay = FakeRelay([self.TARGET, self.POST])
+        def host(sid, *a):
+            if sid == POST_SID:
+                raise sessions.DiscoveryError('gone')
+            return 'claude-desktop'
+        with patch.object(models, 'claude_host', side_effect=host), \
+                patch.object(models, 'desktop_session', return_value=None), \
+                self.assertRaisesRegex(models.Unsupported, 'is not running'):
+            models.switch(self.TARGET, 'm', self.policy(), 30, relay)
+
+    def test_timeout_and_unreadable_replies_are_uncertain_and_an_error_reply_is_reported(self):
+        for relay, uncertain, text in (
+                (FakeRelay([self.TARGET, self.POST], timed_out=True), True, 'did not answer'),
+                (FakeRelay([self.TARGET, self.POST], 'ok, switched'), True, 'without a bridge-model-reply'),
+                (FakeRelay([self.TARGET, self.POST], 'bridge-model-reply: {"model": "x"}'), True, 'no model/changed'),
+                (FakeRelay([self.TARGET, self.POST], 'bridge-model-reply: {"error": "user declined"}'), False, 'user declined')):
+            with self.subTest(text), self.assertRaisesRegex(models.SwitchError, text) as caught:
+                self.switch(relay)
+            self.assertEqual(caught.exception.uncertain, uncertain)
+
+    def test_denied_model_never_reaches_the_command_post(self):
+        relay = FakeRelay([self.TARGET, self.POST], 'bridge-model-reply: {"model": "m", "changed": true}')
+        policy = {**self.policy(), 'deny': {'claude': ['claude-sonnet-5-5']}}
+        with self.assertRaisesRegex(ValueError, 'denylist'):
+            self.switch(relay, policy)
+        self.assertEqual(relay.asked, [])
+
+    def test_desktop_session_is_the_registry_host_id_only_when_it_is_a_desktop_one(self):
+        for record, expected in (({'hostSessionId': 'local_x'}, 'local_x'), ({'hostSessionId': 'cli'}, None), ({}, None)):
+            with patch.object(models, 'claude_record', return_value=record):
+                self.assertEqual(models.desktop_session(TARGET_SID), expected)
+        with patch.object(models, 'claude_record', side_effect=sessions.DiscoveryError('gone')):
+            self.assertIsNone(models.desktop_session(TARGET_SID))
+
+    def test_malformed_command_post_policy_is_an_error(self):
+        with tempfile.TemporaryDirectory() as state:
+            for text in ('{"command_post": "hq"}', '{"command_post": {"claude": ""}}'):
+                Path(state, 'policy.json').write_text(text)
+                with self.assertRaisesRegex(ValueError, 'command_post'):
+                    models.load_policy(state)
+
+
+class ClaudeDesktopRelayCommandTest(unittest.TestCase):
+    """`model --set` end to end through a real broker; only the push into the command post is faked."""
+
+    def test_request_reaches_the_command_post_and_its_reply_answers_the_command(self):
+        with RunningBroker() as broker:
+            for name, sid in (('worker', TARGET_SID), ('hq', POST_SID)):
+                broker.call('register', project='demo', name=name, cwd=broker.temp.name, transport='claude-peer',
+                            session=sid)
+            Path(broker.state_dir).mkdir(parents=True, exist_ok=True)
+            Path(broker.state_dir, 'policy.json').write_text('{"command_post": {"claude": "hq"}}')
+            pushed = []
+
+            def command_post(path, m):
+                pushed.append(m)
+                line = models.REPLY_PREFIX + ' ' + json.dumps({'model': 'claude-sonnet-5-5', 'changed': True,
+                                                               'applies': 'next turn'})
+                bridge.broker.request(path, {'op': 'reply', 'id': m['id'], 'body': line, 'key': 'reply-' + m['id']})
+                return {**m, 'state': 'submitted'}
+            with patch.object(bridge, 'push', side_effect=command_post), \
+                    patch.object(models, 'claude_host', return_value='claude-desktop'), \
+                    patch.object(models, 'desktop_session', return_value=None):
+                code, out = run(['--socket', broker.path, 'model', 'worker', '--project', 'demo',
+                                 '--set', 'claude-sonnet-5-5', '--timeout', '10', '--state-dir', broker.state_dir])
+            self.assertEqual(code, 0, out)
+            self.assertEqual((out['model'], out['changed'], out['applies'], out['via']),
+                             ('claude-sonnet-5-5', True, 'next turn', 'hq'))
+            (m,) = pushed
+            self.assertEqual((m['recipient'], m['sender'], m['route']['session']), ('hq', models.RELAY_NAME, POST_SID))
+            self.assertTrue(m['body'].startswith(models.REQUEST_PREFIX))
+            self.assertNotIn('desktop_session', json.loads(m['body'][len(models.REQUEST_PREFIX):]))
+            relay = [r for r in broker.call('routes', project='demo') if r['name'] == models.RELAY_NAME]
+            self.assertEqual(relay[0]['transport'], 'realtime')
+
+    def test_a_non_realtime_route_holding_the_relay_name_is_refused(self):
+        with RunningBroker() as broker:
+            for name, sid in (('worker', TARGET_SID), ('hq', POST_SID), (models.RELAY_NAME, str(uuid.uuid4()))):
+                broker.call('register', project='demo', name=name, cwd=broker.temp.name, transport='claude-peer',
+                            session=sid)
+            Path(broker.state_dir).mkdir(parents=True, exist_ok=True)
+            Path(broker.state_dir, 'policy.json').write_text('{"command_post": {"claude": "hq"}}')
+            with patch.object(bridge, 'push') as pushed, \
+                    patch.object(models, 'claude_host', return_value='claude-desktop'):
+                code, out = run(['--socket', broker.path, 'model', 'worker', '--project', 'demo',
+                                 '--set', 'claude-sonnet-5-5', '--state-dir', broker.state_dir])
+            self.assertEqual(code, 1)
+            self.assertIn('realtime sender', out['error'])
+            pushed.assert_not_called()
 
 
 if __name__ == '__main__':

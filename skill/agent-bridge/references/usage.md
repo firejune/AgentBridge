@@ -290,7 +290,7 @@ python3 "$bridge_cli" resolve MESSAGE_ID --state done --note 'Completed'
 | Provider | Read | Switch | New-session model |
 | --- | --- | --- | --- |
 | agy | last generator `plannerConfig` (`GetCascadeTrajectoryGeneratorMetadata`, tail only via `generatorMetadataOffset`) | idle only; empty `SendUserCascadeMessage` + `cascadeConfig` (own planner, `requestedModel` changed), runs one invocation; verified live | `open`/`register --new --model` (desktop server) |
-| claude (VS Code, desktop) | transcript newest assistant `message.model`; verified live | STOP (below) | STOP (below) |
+| claude (VS Code, desktop) | transcript newest assistant `message.model`; verified live | desktop: relayed through a desktop command post (below), unit-tested only; VS Code: STOP (below) | STOP (below) |
 | codex | adapter not in `model` yet | `codex-model` (#12) | `open --provider codex --model` (#12) |
 
 **Antigravity switch.** The panel's model picker sends `cascadeConfig.plannerConfig.requestedModel` with the next message. When the message is empty and the conversation is idle, that request starts one invocation on the new model, and later turns, including bridge-woken ones, stay on it.
@@ -303,7 +303,21 @@ python3 "$bridge_cli" resolve MESSAGE_ID --state done --note 'Completed'
 - The VS Code extension has no model command, model setting or URI parameter. Its `/open` link takes only `session` and `prompt`. Its picker writes `model` to the user-global `~/.claude/settings.json`, then calls `applyFlagSettings` on that one channel.
 - A running session does not hot-reload a settings-file model. Measured on the same CLI binary: turn 1 ran on haiku from `.claude/settings.local.json`; after the file was changed to sonnet, turn 2 still ran on haiku.
 - The desktop new-session link passes only `q`, `folder`, `file`, `environment`, `runner_pool` and `ssh_*`.
-- The desktop app's `set_session_model` tool exists only inside desktop-hosted sessions.
+- The desktop app's `set_session_model` tool exists only inside desktop-hosted sessions. Read from the app bundle (`app.asar`, 2026-10-23): `ccd_session_mgmt` is an internal MCP server the app's main process registers as an Agent SDK `sdk` server, so it has no socket, port or URL; a session's CLI reaches it only through `mcp_message` control requests on the stdio pipe the app owns. The handler takes the caller from that pipe, refuses the caller as its own target ("Must not be this session"), and asks the user before switching a session the caller did not start or moving it to a pricier model (not in auto or bypass permissions mode). No process outside the app can call it.
+
+**Claude desktop switch: the command post relay.** Because only a desktop-hosted session can call `set_session_model`, `model NAME --set M` on a desktop target asks one such session, the *command post*, to make the call.
+- A person names it in `policy.json`: `{"command_post": {"claude": "<route name>"}}`. The route must be a `claude-peer` route in the same project, live, on host `claude-desktop`, and not the session being switched (the app refuses a session switching itself). Without the key the command exits 1 with `unsupported: true` and names the key and the file.
+- The denylist is checked before anything is sent. The bridge then registers a `realtime` route named `model-relay` in the project if it is missing (the sender, so the reply is held for the waiting command and never pushed into the session being switched; a non-realtime route already holding that name is refused) and pushes one message to the command post over the normal `claude-peer` path. Its body is one line:
+
+  ```text
+  bridge-model-request: {"desktop_session":"local_…","id":"<uuid>","model":"M","op":"set_session_model","project":"P","reply":"bridge-model-reply:","session_id":"<target sessionId>","target":"NAME","v":1}
+  ```
+
+  Keys are sorted. `session_id` is the route's Claude Code `sessionId`; `desktop_session` is the target's `hostSessionId` from its registry record, present only when it is a desktop id (`local_…`).
+
+- **What a command post does on receiving it:** call `mcp__ccd_session_mgmt__set_session_model` for that session with `model` exactly as given. Which of the two ids the tool accepts was not measured; `list_sessions`/`get_session` show the app's own id for the session. Then answer with the bridge reply command the envelope prints. The reply body must contain one line `bridge-model-reply: {"model": "<model the app reports>", "changed": true|false, "applies": "<when, as the tool says>"}`. On failure, reply `bridge-model-reply: {"error": "<the tool's message>", "uncertain": true|false}`; `uncertain` is true only when the call may have gone through. Do not retry on the requester's behalf.
+- The command waits up to `--timeout` (default 30 s; up to 3600 when an approval card needs a person). No reply, a reply without the line, or a line without `model`/`changed` is `uncertain: true`, exit 1: the switch may still happen, so read the model before asking again and never resend. An `error` reply is reported as given.
+- The result is `{model, changed, applies, via, request}` where `via` is the command post. Read stays transcript-based: the new model shows there after the target's next turn.
 
 ## Security & Verification
 

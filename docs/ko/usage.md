@@ -313,7 +313,7 @@ python3 "$bridge_cli" resolve MESSAGE_ID --state done --note '결과 확인 완�
 | 공급자 | 읽기 | 전환 | 새 세션 모델 |
 | --- | --- | --- | --- |
 | agy | 마지막 generator `plannerConfig` (`GetCascadeTrajectoryGeneratorMetadata`, `generatorMetadataOffset`로 꼬리만) | 대기 중일 때만, 빈 `SendUserCascadeMessage` + `cascadeConfig`(자기 플래너에서 `requestedModel`만 변경), 호출 1회, live 검증 | `open`/`register --new --model` (데스크톱 서버) |
-| claude (VS Code, 데스크톱) | 기록의 최근 assistant `message.model`, live 검증 | STOP (아래) | STOP (아래) |
+| claude (VS Code, 데스크톱) | 기록의 최근 assistant `message.model`, live 검증 | 데스크톱: 데스크톱 사령탑을 거쳐 중계(아래), 단위 테스트만 · VS Code: STOP (아래) | STOP (아래) |
 | codex | `model` 어댑터 아직 없음 | `codex-model` (#12) | `open --provider codex --model` (#12) |
 
 **Antigravity 전환.** 패널의 모델 선택기는 다음 메시지에 `cascadeConfig.plannerConfig.requestedModel`을 실어 보낸다. 대화가 대기 중일 때 그 요청을 빈 메시지로 보내면 새 모델로 호출이 한 번 돌고, 이후 턴은 브릿지가 깨운 턴을 포함해 그 모델에 머문다.
@@ -326,7 +326,20 @@ python3 "$bridge_cli" resolve MESSAGE_ID --state done --note '결과 확인 완�
 - VS Code 확장에는 모델 명령도, 모델 설정도, URI 매개변수도 없다. `/open` 링크는 `session`과 `prompt`만 받는다. 모델 선택기는 사용자 전역 `~/.claude/settings.json`에 `model`을 쓴 뒤 그 채널 하나에만 `applyFlagSettings`를 보낸다.
 - 실행 중인 세션은 설정 파일의 model을 다시 읽지 않는다. 같은 CLI 바이너리로 실측했다: 1턴은 `.claude/settings.local.json`의 haiku로 돌았고, 파일을 sonnet으로 바꾼 뒤 2턴도 haiku였다.
 - 데스크톱 새 세션 링크는 `q`, `folder`, `file`, `environment`, `runner_pool`, `ssh_*`만 넘긴다.
-- 데스크톱 앱의 `set_session_model` 도구는 데스크톱이 띄운 세션 안에만 있다.
+- 데스크톱 앱의 `set_session_model` 도구는 데스크톱이 띄운 세션 안에만 있다. 앱 번들(`app.asar`, 2026-10-23)을 읽어 보면 `ccd_session_mgmt`는 앱 메인 프로세스가 Agent SDK `sdk` 서버로 등록하는 내부 MCP 서버라 소켓도 포트도 URL도 없다. 세션의 CLI는 앱이 쥔 stdio 파이프의 `mcp_message` 제어 요청으로만 닿는다. 처리기는 호출자를 그 파이프로 정하고, 호출자 자신을 대상으로 하면 거절하며("Must not be this session"), 호출자가 띄우지 않은 세션이나 더 비싼 모델로의 전환은 사용자에게 먼저 묻는다(auto · bypass 권한 모드 제외). 앱 밖의 프로세스는 이 도구를 부를 수 없다.
+
+**Claude 데스크톱 전환: 사령탑 중계.** `set_session_model`은 데스크톱이 띄운 세션만 부를 수 있으므로, 데스크톱 대상에 `model NAME --set M`을 하면 그런 세션 하나(*사령탑*)에게 호출을 맡긴다.
+- 사람이 `policy.json`에 `{"command_post": {"claude": "<경로 이름>"}}`로 지정한다. 그 경로는 같은 프로젝트의 `claude-peer` 경로이고, 살아 있으며, 호스트가 `claude-desktop`이고, 전환 대상 세션이 아니어야 한다(앱은 세션이 자기 자신을 바꾸는 것을 거절한다). 키가 없으면 종료 코드 1, `unsupported: true`로 키와 파일을 알려 준다.
+- 거부 목록은 아무것도 보내기 전에 확인한다. 그다음 브릿지는 프로젝트에 `model-relay`라는 `realtime` 경로가 없으면 등록하고(발신자다. 답이 기다리는 명령에 머물고 전환 대상 세션으로 push되지 않게 한다. 그 이름을 realtime이 아닌 경로가 쓰고 있으면 거절한다), 평소의 `claude-peer` 경로로 사령탑에 메시지 하나를 push한다. 본문은 한 줄이다:
+
+  ```text
+  bridge-model-request: {"desktop_session":"local_…","id":"<uuid>","model":"M","op":"set_session_model","project":"P","reply":"bridge-model-reply:","session_id":"<대상 sessionId>","target":"NAME","v":1}
+  ```
+
+  키는 정렬돼 있다. `session_id`는 경로의 Claude Code `sessionId`이고, `desktop_session`은 대상 레지스트리 기록의 `hostSessionId`로, 데스크톱 id(`local_…`)일 때만 실린다.
+- **사령탑이 받았을 때 할 일:** 그 세션에 대해 `model`을 그대로 넣어 `mcp__ccd_session_mgmt__set_session_model`을 부른다. 도구가 두 id 중 어느 것을 받는지는 실측하지 않았다. `list_sessions`/`get_session`이 그 세션의 앱 id를 보여 준다. 그다음 봉투에 찍힌 브릿지 reply 명령으로 답한다. 답 본문에는 `bridge-model-reply: {"model": "<앱이 알려 준 모델>", "changed": true|false, "applies": "<도구가 말한 적용 시점>"}` 한 줄이 있어야 한다. 실패하면 `bridge-model-reply: {"error": "<도구의 메시지>", "uncertain": true|false}`로 답하고, 호출이 들어갔을 수도 있을 때만 `uncertain`을 true로 한다. 요청자 대신 재시도하지 않는다.
+- 명령은 `--timeout`(기본 30초, 승인 카드에 사람이 필요하면 최대 3600초)까지 기다린다. 답이 없거나, 그 줄이 없거나, 줄에 `model`/`changed`가 없으면 `uncertain: true`, 종료 코드 1이다. 전환은 여전히 일어날 수 있으니 다시 묻기 전에 모델을 읽고, 다시 보내지 않는다. `error` 답은 받은 그대로 보고한다.
+- 결과는 `{model, changed, applies, via, request}`이고 `via`는 사령탑이다. 읽기는 여전히 기록 기반이라 새 모델은 대상의 다음 턴 뒤에 보인다.
 
 ## 운영 경계와 검증
 

@@ -148,6 +148,30 @@ def push(path, m, dry_run=False):
                note=f"pushed to Claude session {target['id']} (pid {target['pid']}, msg_id {frame['msg_id']})")
 
 
+class ModelRelay:
+    """The message path models.claude_desktop_switch asks a command post through."""
+    def __init__(self, path):
+        self.path = path
+
+    def routes(self, project):
+        return broker.request(self.path, {'op':'routes','project':project})
+
+    def ask(self, project, recipient, cwd, body, key, timeout):
+        # The sender is a realtime route so the command post's reply is held for
+        # this wait and never pushed into the session being switched.
+        mine = next((r for r in self.routes(project) if r['name'] == models.RELAY_NAME), None)
+        if mine is not None and mine['transport'] != 'realtime':
+            raise ValueError(f'Participant {models.RELAY_NAME!r} in project {project!r} is a '
+                             f"{mine['transport']} route; the model relay needs that name for a realtime sender")
+        if mine is None:
+            broker.request(self.path, {'op':'register','project':project,'name':models.RELAY_NAME,
+                                       'transport':'realtime','cwd':cwd})
+        sent = push_if_peer(self.path, broker.request(self.path, {'op':'send','project':project,
+                            'sender':models.RELAY_NAME,'recipient':recipient,'body':body,'key':key}))
+        waited = broker.request(self.path, {'op':'wait','id':sent['id'],'timeout':timeout}, timeout=timeout+5)
+        return sent, waited
+
+
 def push_if_peer(path, m):
     if m['state'] == 'pending':
         if m['route']['transport'] == 'claude-peer':
@@ -503,7 +527,7 @@ def main(argv=None):
             if args.target is None:
                 output({'name':args.name,**models.flag(policy, models.read(route, min(args.timeout, 30)))})
                 return 0
-            output({'name':args.name,**models.switch(route, args.target, policy, args.timeout)})
+            output({'name':args.name,**models.switch(route, args.target, policy, args.timeout, ModelRelay(args.socket))})
             return 0
         if args.cmd=='codex-model':
             output(codex_new.set_model(args.id,args.model,args.timeout))
