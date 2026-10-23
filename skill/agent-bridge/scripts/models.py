@@ -12,10 +12,11 @@ import uuid
 
 import agy_live
 import sessions
+import codex_live
+import codex_new
+from new_session_policy import (POLICY_FILE, SEED_DENY, default_model, denied,
+                                env_name, load_policy, require_allowed)
 
-POLICY_FILE = 'policy.json'
-# Seed from the owner's rule of 2026-10-23; applies only while no policy file exists.
-SEED_DENY = {'codex': ['gpt-6-astra']}
 PROVIDER = {'codex': 'codex', 'agy': 'agy', 'claude-peer': 'claude', 'claude': 'claude'}
 
 
@@ -36,73 +37,32 @@ class SwitchError(ValueError):
 # "command_post" names, per provider, the registered route that performs a
 # switch the bridge cannot make itself (Claude desktop: see claude_desktop_switch).
 
-def load_policy(state_dir):
-    path = Path(state_dir).expanduser() / POLICY_FILE
-    try:
-        raw = path.read_text(encoding='utf-8')
-    except FileNotFoundError:
-        return {'path': str(path), 'exists': False, 'defaults': {}, 'deny': SEED_DENY, 'command_post': {}}
-    try:
-        data = json.loads(raw)
-    except ValueError as error:
-        raise ValueError(f'{path} is not valid JSON: {error}') from None
-    if not isinstance(data, dict):
-        raise ValueError(f'{path} must hold a JSON object')
-    defaults, deny = data.get('defaults', {}), data.get('deny', {})
-    if not isinstance(defaults, dict) or not all(isinstance(k, str) and isinstance(v, str) and v.strip()
-                                                 for k, v in defaults.items()):
-        raise ValueError(f'{path}: "defaults" must map a provider to a model name')
-    if not isinstance(deny, dict) or not all(isinstance(k, str) and isinstance(v, list)
-                                             and all(isinstance(m, str) and m.strip() for m in v)
-                                             for k, v in deny.items()):
-        raise ValueError(f'{path}: "deny" must map a provider to a list of model names')
-    post = data.get('command_post', {})
-    if not isinstance(post, dict) or not all(isinstance(k, str) and isinstance(v, str) and v.strip()
-                                             for k, v in post.items()):
-        raise ValueError(f'{path}: "command_post" must map a provider to a registered route name')
-    return {'path': str(path), 'exists': True, 'defaults': defaults, 'deny': deny, 'command_post': post}
-
-
-def denied(policy, provider, *names):
-    """The first name (model id, enum or label) on the provider's denylist, else None."""
-    banned = {m.strip().casefold() for m in policy['deny'].get(provider, [])}
-    return next((n for n in names if isinstance(n, str) and n.strip().casefold() in banned), None)
-
-
-def require_allowed(policy, provider, *names):
-    hit = denied(policy, provider, *names)
-    if hit:
-        where = policy['path'] if policy['exists'] else f"the built-in seed (no {policy['path']})"
-        raise ValueError(f'Model {hit!r} is on the {provider} denylist in {where}; '
-                         'only a person edits that list')
-
-
-def env_name(provider):
-    return f'AGENT_BRIDGE_{provider.upper()}_MODEL'
-
-
-def default_model(provider, model=None, policy=None, environ=None):
-    """--model, then AGENT_BRIDGE_<PROVIDER>_MODEL, then the policy default; (model, source).
-
-    None means the provider's own default. Codex keeps its #12 resolution in
-    codex_new until its adapter adopts this one.
-    """
-    if model is not None:
-        return model, '--model'
-    name = env_name(provider)
-    value = (os.environ if environ is None else environ).get(name)
-    if value is not None:
-        if not value.strip():
-            raise ValueError(f'{name} is set but empty; unset it or pass --model')
-        return value, name
-    if policy and policy['defaults'].get(provider):
-        return policy['defaults'][provider], 'policy'
-    return None, 'provider default'
-
-
 # --- Adapters ----------------------------------------------------------------
 # An adapter is read(route, timeout) -> dict and switch(route, model, timeout)
 # -> dict, registered per transport. A missing piece raises Unsupported.
+
+def codex_read(route, timeout):
+    """Read the exact owner's resumed settings, including before a first turn."""
+    sid = str(uuid.UUID(str(route['session'])))
+    with codex_live.Client(timeout=timeout) as client:
+        owner = client.owner(sid)
+        settings = codex_new.owner_settings(client, sid, owner)
+    return {'session': sid, 'model': settings['model'],
+            'source': 'Desktop owner resumed model settings (next turn)'}
+
+
+def codex_switch(route, model, timeout, **_):
+    try:
+        return codex_new.set_model(route['session'], model, timeout=timeout)
+    except codex_new.ModelSwitchError as error:
+        raise SwitchError(str(error), error.uncertain) from None
+
+
+def codex_names(route, model, timeout):
+    # #12 accepts only the exact model/list model string, never aliases. Its
+    # switch performs catalog validation before contacting the Desktop owner.
+    return [model]
+
 
 def agy_read(route, timeout):
     return agy_live.read_model(route['session'], timeout=timeout)
@@ -302,6 +262,7 @@ def claude_switch(route, model, timeout, policy=None, relay=None):
 
 
 ADAPTERS = {
+    'codex': {'read': codex_read, 'switch': codex_switch, 'names': codex_names},
     'agy': {'read': agy_read, 'switch': agy_switch, 'names': agy_names},
     'claude-peer': {'read': claude_read, 'switch': claude_switch},
     'claude': {'read': claude_read, 'switch': claude_switch},

@@ -349,10 +349,8 @@ def new_session_policy(args, provider):
     """Apply the owner's defaults and denylist before any session is created."""
     policy = models.load_policy(broker_state_dir(args))
     if provider == 'codex':
-        # Codex keeps its #12 default chain; only the denylist is enforced here.
-        model, _ = codex_new.resolve_model(args.model)
-        models.require_allowed(policy, 'codex', model)
-        return
+        args.model, source = codex_new.resolve_model(args.model, policy=policy)
+        return source
     model, source = models.default_model(provider, args.model, policy)
     if provider == 'claude':
         if model is not None:
@@ -425,9 +423,10 @@ def main(argv=None):
     p.add_argument('--timeout',type=float,default=30);p.add_argument('--state-dir')
     p = sub.add_parser('policy',help='Show the model policy (defaults, denylist) the bridge enforces; read-only')
     p.add_argument('--state-dir')
-    p = sub.add_parser('codex-model',help="Switch an existing Codex thread's model from its next turn")
+    p = sub.add_parser('codex-model',help="Deprecated UUID alias for model NAME --set; changes next-turn settings")
     p.add_argument('id',metavar='SESSION_ID');p.add_argument('--model',required=True)
     p.add_argument('--timeout',type=float,default=10)
+    p.add_argument('--state-dir')
     p = sub.add_parser('sessions',help='Discover real CLI sessions without starting a turn')
     p.add_argument('--provider',choices=['all','codex','claude','agy'],default='all')
     p.add_argument('--cwd');p.add_argument('--search');p.add_argument('--limit',type=int,default=100)
@@ -472,6 +471,7 @@ def main(argv=None):
     p = sub.add_parser('resolve');p.add_argument('id');p.add_argument('--state',choices=['pending','submitted','done'],required=True);p.add_argument('--note',required=True)
     args = parser.parse_args(argv)
     observation = None
+    creation_model_source = None
     try:
         if args.cmd=='serve':
             if args.max_messages<1:
@@ -510,8 +510,11 @@ def main(argv=None):
             output((service.install if args.cmd == 'install-service' else service.uninstall)(**fields))
             return 0
         if args.cmd=='open':
-            new_session_policy(args, args.provider)
-            output(sessions.open_session(args.provider,args.cwd,args.title,args.model,args.timeout))
+            source = new_session_policy(args, args.provider)
+            result = sessions.open_session(args.provider,args.cwd,args.title,args.model,args.timeout)
+            if args.provider == 'codex':
+                result['model_source'] = source
+            output(result)
             return 0
         if args.cmd=='policy':
             output(models.load_policy(broker_state_dir(args)))
@@ -530,13 +533,15 @@ def main(argv=None):
             output({'name':args.name,**models.switch(route, args.target, policy, args.timeout, ModelRelay(args.socket))})
             return 0
         if args.cmd=='codex-model':
-            output(codex_new.set_model(args.id,args.model,args.timeout))
+            policy = models.load_policy(broker_state_dir(args))
+            route = {'transport':'codex','session':args.id}
+            output(models.switch(route, args.model, policy, args.timeout))
             return 0
         if args.cmd=='sessions':
             result = sessions.discover(args.provider,args.cwd,args.search,args.limit,args.codex_executable,args.claude_executable,args.codex_mode)
             if not args.no_model:
                 policy = models.load_policy(broker_state_dir(args))
-                for name in ('agy','claude'):
+                for name in ('codex','agy','claude'):
                     if name in result['providers']:
                         with_models(result['providers'][name]['sessions'], policy, 10)
             output(result)
@@ -545,8 +550,10 @@ def main(argv=None):
             output(sessions.inspect_session(args.provider,args.id,args.executable,args.codex_mode))
             return 0
         if args.cmd=='register' and args.new and args.transport in ('agy','codex','claude-peer'):
-            new_session_policy(args, 'claude' if args.transport == 'claude-peer' else args.transport)
+            creation_model_source = new_session_policy(args, 'claude' if args.transport == 'claude-peer' else args.transport)
         observation = registration(args) if args.cmd=='register' else None
+        if observation and creation_model_source is not None:
+            observation['model_source'] = creation_model_source
         if args.cmd=='deliver':
             if args.timeout<=0:
                 raise ValueError('Timeout must be positive')
@@ -591,6 +598,9 @@ def main(argv=None):
         output({'error':str(error),'unsupported':True})
         return 1
     except models.SwitchError as error:
+        if args.cmd == 'codex-model':
+            output({'error':str(error),'uncertain':error.uncertain,'session':args.id,'model':args.model})
+            return 1
         output({'error':str(error),'uncertain':error.uncertain,'name':args.name,'model':args.target})
         return 1
     except codex_new.ModelSwitchError as error:

@@ -169,6 +169,29 @@ class NewCodexTests(unittest.TestCase):
         self.assertEqual([x['params']['threadSettings'] for x in update],[{'model':codex_new.DEFAULT_MODEL}])
         self.assertNotIn('prompt',result)
 
+    def test_owner_policy_default_reaches_creation_and_readback(self):
+        policy = {'defaults': {'codex': 'requested-model'}, 'deny': {}}
+        with ModelDesktop(permissions=full_permissions()) as desktop:
+            result = self.open(desktop, policy=policy)
+        create = next(params for method,params,_ in self.calls if method=='thread/start')
+        self.assertEqual(create['model'], 'requested-model')
+        self.assertEqual((result['model'], result['model_source']), ('requested-model', 'policy'))
+
+    def test_supplied_policy_refuses_denied_flag_env_and_default_before_any_client(self):
+        policy = {'path': 'policy.json', 'exists': True,
+                  'defaults': {'codex': 'gpt-6-astra'}, 'deny': {'codex': ['gpt-6-astra']}}
+        for model, env in (('gpt-6-astra', {}), (None, {codex_new.MODEL_ENV: 'gpt-6-astra'}), (None, {})):
+            with self.subTest(model=model, env=bool(env)), patch.dict(os.environ, env), \
+                    patch.object(sessions, 'CodexClient') as creator, \
+                    patch.object(codex_live, 'Client') as owner, \
+                    self.assertRaisesRegex(codex_new.CreationError, 'denylist') as caught:
+                codex_new.open_codex(self.root, model=model, policy=policy, opener=self.urls.append)
+            self.assertFalse(caught.exception.uncertain)
+            self.assertFalse(caught.exception.created)
+            creator.assert_not_called()
+            owner.assert_not_called()
+        self.assertEqual(self.urls, [])
+
     def test_env_overrides_default_and_flag_overrides_env(self):
         os.environ[codex_new.MODEL_ENV] = 'requested-model'
         with ModelDesktop(permissions=full_permissions()) as desktop:
@@ -441,13 +464,14 @@ for line in sys.stdin:
         with patch.object(codex_new,'set_model',return_value=ok) as switch:
             out=io.StringIO()
             with patch('sys.stdout',out):
-                code=bridge.main(['codex-model',self.sid,'--model','requested-model'])
-        self.assertEqual((code,json.loads(out.getvalue())),(0,ok))
-        self.assertEqual(switch.call_args.args,(self.sid,'requested-model',10))
+                code=bridge.main(['codex-model',self.sid,'--model','requested-model','--state-dir',self.root])
+        self.assertEqual((code,json.loads(out.getvalue())),(0,{'provider':'codex',**ok}))
+        self.assertEqual(switch.call_args.args,(self.sid,'requested-model'))
+        self.assertEqual(switch.call_args.kwargs,{'timeout':10})
         with patch.object(codex_new,'set_model',side_effect=codex_new.ModelSwitchError('lost',True)):
             out=io.StringIO()
             with patch('sys.stdout',out):
-                code=bridge.main(['codex-model',self.sid,'--model','requested-model'])
+                code=bridge.main(['codex-model',self.sid,'--model','requested-model','--state-dir',self.root])
         self.assertEqual(code,1)
         self.assertEqual(json.loads(out.getvalue()),{'error':'lost','uncertain':True,'session':self.sid,'model':'requested-model'})
 

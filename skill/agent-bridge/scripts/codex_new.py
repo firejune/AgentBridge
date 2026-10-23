@@ -5,7 +5,6 @@ ownership and model readback admit a session to the bridge; no composer, native
 pipe authorization workaround, synthetic user prompt, or creation replay.
 """
 import math
-import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -13,12 +12,13 @@ import time
 import uuid
 
 import codex_live
+import new_session_policy
 
 FULL_ACCESS_PROFILE = ':danger-full-access'
 # New threads request this model when --model is omitted, so they never
 # inherit the Desktop's own default. Override per machine with MODEL_ENV.
-DEFAULT_MODEL = 'gpt-6.1-sol'
-MODEL_ENV = 'AGENT_BRIDGE_CODEX_MODEL'
+DEFAULT_MODEL = new_session_policy.DEFAULT_MODELS['codex']
+MODEL_ENV = new_session_policy.env_name('codex')
 
 
 class CreationError(ValueError):
@@ -56,16 +56,19 @@ def require_thread(value, sid, cwd, title=None):
     return value
 
 
-def resolve_model(model=None, environ=None):
-    """--model, then MODEL_ENV, then DEFAULT_MODEL; returns (model, source)."""
-    if model is not None:
-        return model, '--model'
-    value = (os.environ if environ is None else environ).get(MODEL_ENV)
-    if value is not None:
-        if not value.strip():
-            raise CreationError(f'{MODEL_ENV} is set but empty; unset it or pass --model')
-        return value, MODEL_ENV
-    return DEFAULT_MODEL, 'default'
+def resolve_model(model=None, environ=None, policy=None):
+    """Shared flag/env/policy/Sol chain; optionally enforce the supplied policy.
+
+    Callers with a broker state directory pass its loaded policy explicitly;
+    this helper never guesses a state directory or changes owner policy.
+    """
+    try:
+        chosen, source = new_session_policy.default_model('codex', model, policy, environ)
+        if policy is not None:
+            new_session_policy.require_allowed(policy, 'codex', chosen)
+        return chosen, source
+    except ValueError as error:
+        raise CreationError(str(error)) from None
 
 
 def require_model(client, model, remaining=None, missing=None):
@@ -146,7 +149,7 @@ def owner_settings(client, sid, owner):
 
 
 def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_factory=None,
-               owner_factory=None, poll=0.5):
+               owner_factory=None, poll=0.5, policy=None):
     import sessions
     if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not 0 < timeout <= 3600:
         raise CreationError('Timeout must be between 0 and 3600 seconds')
@@ -158,7 +161,7 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
     for label, value in (('--title',title),('--model',model)):
         if value is not None and (not isinstance(value, str) or not value.strip()):
             raise CreationError(f'{label} must be a nonempty string')
-    model, source = resolve_model(model)
+    model, source = resolve_model(model, policy=policy)
     missing = None if source == '--model' else (
         f'Default Codex model {model!r} (from {source}) is not advertised by the installed '
         'Codex provider; pass --model with an advertised model')
