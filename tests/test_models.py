@@ -153,9 +153,10 @@ class ModelCommandTest(unittest.TestCase):
             code, out = self.call(broker, 'model', 'cli', '--project', 'demo')
             self.assertEqual((code, out['model']), (0, 'unknown'))
             self.assertIn('realtime', out['reason'])
-            code, out = self.call(broker, 'model', 'nx', '--project', 'demo')
+            with patch.object(models.codex_live, 'Client', side_effect=ValueError('Codex owner unavailable')):
+                code, out = self.call(broker, 'model', 'nx', '--project', 'demo')
             self.assertEqual(out['model'], 'unknown')
-            self.assertIn('No read adapter is registered for codex', out['reason'])
+            self.assertEqual(out['reason'], 'Codex owner unavailable')
             code, out = self.call(broker, 'model', 'missing', '--project', 'demo')
             self.assertEqual(code, 1)
 

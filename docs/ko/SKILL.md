@@ -137,7 +137,7 @@ python3 "$bridge_cli" policy                                    # 적용 중인 
 
 - `model`은 참가자를 경로로 찾고 그 transport에 등록된 어댑터를 부른다. 읽을 수 없으면 결과는 `model: "unknown"`과 `reason`이고, 읽은 값을 사실로 캐시하지 않는다. 어댑터가 없거나 공급자에 빈틈이 있으면 `unsupported: true`로 그 빈틈을 밝히고 종료 코드 1로 끝난다.
 - **정책**은 `<state-dir>/policy.json`에 있다. 예: `{"defaults": {"agy": "gemini-4-argon-medium"}, "deny": {"codex": ["gpt-6-astra"]}}`. 사람만 고치고, 에이전트가 요청받아 고치지 않는다. 파일이 없는 동안에는 시드 거부 목록 `{"codex": ["gpt-6-astra"]}`가 적용된다. `model --set` · `open` · `register --new`는 거부된 모델을 어느 이름으로 불러도 거절한다. `AGENT_BRIDGE_<PROVIDER>_MODEL`이나 정책 기본값으로 정해진 경우도 같다. `routes` · `sessions`는 이미 거부 모델로 도는 라이브 세션에 `denied: true`를 단다.
-- 새 세션 기본값은 `--model`, `AGENT_BRIDGE_<PROVIDER>_MODEL`, 정책 `defaults`, 공급자 자체 기본값 순서로 정한다. Codex는 어댑터가 이 순서를 받기 전까지 #12의 기본값 결정을 그대로 쓰고, 거부 목록은 지금도 적용된다.
+- 새 세션 기본값은 `--model`, `AGENT_BRIDGE_<PROVIDER>_MODEL`, 정책 `defaults`, 공급자 기본값 순서로 정한다. Codex의 마지막 기본값은 `gpt-6.1-sol`이며 앱 기본 모델을 상속하지 않는다.
 - **Antigravity (`agy`)**:
   - 읽기: 마지막 generator의 `plannerConfig`. 패널이 모델 이름을 표시할 때 쓰는 출처와 같다.
   - 전환: 대화가 대기 중일 때만 받는다. 대화가 마지막으로 쓴 플래너 설정에서 `requestedModel`만 바꿔 보내므로 나머지 설정은 유지된다. 그러면 **사용자 입력 없이 호출이 한 번 돈다**. language server가 새 모델을 적용하는 길은 이것뿐이다. 명령은 그 호출을 기다렸다가 모델을 재조회한다.
@@ -146,7 +146,10 @@ python3 "$bridge_cli" policy                                    # 적용 중인 
   - 읽기: 세션 기록의 가장 최근 assistant 메시지. 호스트와 관계없이 된다.
   - **데스크톱** 세션 전환: 중계한다. 앱의 `set_session_model` 도구는 데스크톱이 띄운 세션 안에서만 부를 수 있으므로, 브릿지는 데스크톱 **사령탑**에게 그 호출을 맡긴다. 사람이 `policy.json`에 `{"command_post": {"claude": "<경로 이름>"}}`로 그 경로를 지정한다. 지정이 없으면 전환은 `unsupported`이고 그 키를 알려 준다. 사령탑은 `bridge-model-request: {…}` 한 줄을 받아 도구를 부르고, `bridge-model-reply: {"model", "changed", "applies"}` 한 줄(실패면 `{"error", "uncertain"}`)로 답한다. `--timeout` 안에 답이 없으면 `uncertain`이고 다시 보내지 않는다. 사령탑은 자기 자신을 전환할 수 없다. 규약: [usage.md](usage.md#모델-읽기--전환--정책).
   - **VS Code** 세션 전환과 새 세션의 모델 지정: **미지원(STOP)**. VS Code 확장은 세션 자신의 stdio 채널로만 모델을 바꾸고, 그 선택을 사용자 전역 `settings.json`에 저장한다. 실행 중인 세션은 설정 파일이 바뀌어도 그 값을 다시 읽지 않는다. 데스크톱 새 세션 링크에도 모델 항목이 없다. 그 세션의 모델 선택기를 쓴다.
-- **Codex**: 아직 `model`에 어댑터가 없다. `codex-model SESSION_ID --model M`은 #12와 같이 동작한다. 자세한 내용과 근거는 [usage.md](usage.md#모델-읽기--전환--정책)에 있다.
+- **Codex (`codex`)**:
+  - 읽기: 정확한 UUID의 Desktop 소유자가 확인한 **다음 턴 모델 설정**. `model` · `routes` · `sessions` 조회마다 새로 읽으며, 실행 중인 활성 턴의 모델을 뜻하지 않는다. 읽지 못하면 이유와 함께 `unknown`이다.
+  - 전환: `model NAME --set M`은 광고된 모델인지 확인하고 정확한 소유자에게 모델 필드만 한 번 보내 재조회로 검증한다. 활성 턴은 끊지 않으며, 전송 여부가 불분명하면 `uncertain`으로 남기고 재시도하지 않는다.
+  - `open` · `register --new`와 전환은 같은 정책 검사를 적용한다. `codex-model SESSION_ID --model M [--state-dir PATH]`은 폐기 예정 UUID 별칭이며 같은 거부 목록을 적용한다. 자세한 계약: [usage.md](usage.md#모델-읽기--전환--정책).
 
 ## 사용량 확인
 
@@ -175,7 +178,7 @@ python3 "$bridge_cli" register codex-worker --project PROJECT --transport codex 
 
 설치된 CLI의 공식 `app-server --stdio` JSON-RPC로 영속 대화를 하나 만들고, `thread/name/set`으로 실제 이름을 저장한 뒤 생성 프로세스를 종료한다. 별도 메타데이터 조회에서 동일 UUID·정확한 `--cwd`·요청한 제목을 다시 확인하고 `codex://threads/UUID`로 앱이 그 대화를 인계받게 한다. 해당 UUID의 정확한 IPC 소유자가 `supportsUntrustedAppInput`을 제공하고 대화를 재개했는지 확인한 뒤 등록한다. **Enter·작성기 제출·가짜 사용자 프롬프트·모델 턴·상속된 MCP 문맥·UI 자동화는 필요 없다.** macOS 앱과 CLI가 설치되어 있어야 하며, 실제 Desktop 소유자 확인이 등록 조건이다.
 
-`--title`은 실제 대화 제목이다. 명시한 `--model`은 설치된 제공자 목록에 있어야 하며 알 수 없는 모델은 생성 전에 거부한다. 제공자의 모델 자동 대체도 금지한다. 빈 영속 대화는 `thread/start`의 모델과 달리 앱 기본 모델로 인계될 수 있으므로 정확한 소유자의 모델을 읽고, 필요하면 요청한 모델만 설정한 뒤 다시 읽어 일치를 확인한다. `--model`을 생략하면 `AGENT_BRIDGE_CODEX_MODEL`(설정된 경우), 없으면 `gpt-6.1-sol`을 같은 목록 확인·재조회로 요청하며 앱 자체 기본값은 쓰지 않는다. 제공자가 그 기본값을 광고하지 않으면 이름을 밝혀 실패하니 `--model`을 넘긴다. 새 Codex 세션은 항상 지원되는 Full Access 프로필 `:danger-full-access`와 `approvalPolicy: never`로 만든다. 생성 전에 `permissionProfile/list`가 해당 프로필을 허용한다고 확인해야 하며, 프로필 부재·거부 시 더 낮은 권한으로 대체하지 않고 실패한다. 생성 응답도 전체 프로필·`dangerFullAccess` 샌드박스·`never` 정책을 확인해야 한다. 앱 인계 뒤 정확한 소유자의 다음 턴 설정을 읽고 필요할 때 그 새 대화에만 같은 프로필·정책을 적용한다. 버전이 지정된 스냅샷에서 세 항목을 다시 확인한 뒤 등록한다. `permission_settings`는 검증한 `latestThreadSettings`이며 `currentPermissions`는 지난 턴의 상태일 수 있다. `creator_settings`는 생성 응답을 별도로 보고한다. 기존 세션과 전역 사용자 설정은 생성 과정에서 변경하지 않는다.
+`--title`은 실제 대화 제목이다. 명시한 `--model`은 설치된 제공자 목록에 있어야 하며 알 수 없는 모델은 생성 전에 거부한다. 제공자의 모델 자동 대체도 금지한다. 빈 영속 대화는 `thread/start`의 모델과 달리 앱 기본 모델로 인계될 수 있으므로 정확한 소유자의 모델을 읽고, 필요하면 요청한 모델만 설정한 뒤 다시 읽어 일치를 확인한다. `--model`을 생략하면 `AGENT_BRIDGE_CODEX_MODEL`(설정된 경우), 정책 `defaults.codex`, `gpt-6.1-sol` 순서로 고른 모델을 같은 목록 확인·재조회로 요청하며 앱 자체 기본값은 쓰지 않는다. 제공자가 그 기본값을 광고하지 않으면 이름을 밝혀 실패하니 `--model`을 넘긴다. 새 Codex 세션은 항상 지원되는 Full Access 프로필 `:danger-full-access`와 `approvalPolicy: never`로 만든다. 생성 전에 `permissionProfile/list`가 해당 프로필을 허용한다고 확인해야 하며, 프로필 부재·거부 시 더 낮은 권한으로 대체하지 않고 실패한다. 생성 응답도 전체 프로필·`dangerFullAccess` 샌드박스·`never` 정책을 확인해야 한다. 앱 인계 뒤 정확한 소유자의 다음 턴 설정을 읽고 필요할 때 그 새 대화에만 같은 프로필·정책을 적용한다. 버전이 지정된 스냅샷에서 세 항목을 다시 확인한 뒤 등록한다. `permission_settings`는 검증한 `latestThreadSettings`이며 `currentPermissions`는 지난 턴의 상태일 수 있다. `creator_settings`는 생성 응답을 별도로 보고한다. 기존 세션과 전역 사용자 설정은 생성 과정에서 변경하지 않는다.
 
 `bridge.py codex-model SESSION_ID --model M`은 기존 Codex 대화의 모델을 다음 턴부터 바꾼다. `model/list`가 `M`을 광고해야 하고, 정확한 소유자의 `thread-follower-update-thread-settings`로 `{model: M}`만 보내며(권한은 건드리지 않는다), 재조회가 `M`과 같아야 성공이다. 진행 중인 턴은 끊지 않고, 전송됐을 수 있는 변경은 재시도하지 않는다(`uncertain: true`).
 
