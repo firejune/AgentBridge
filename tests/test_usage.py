@@ -714,6 +714,15 @@ class MessageUsageTests(Base):
         with patch.object(bridge, 'broker_state_dir', return_value=self.root / 'state'):
             return bridge.message_usage(None, message)
 
+    def test_explicit_state_dir_is_where_usage_is_read(self):
+        import argparse
+        args = argparse.Namespace(socket=str(self.root / 'elsewhere.sock'), state_dir=str(self.root / 'state'))
+        found = bridge.message_usage(args, {'route': {'transport': 'codex'}, 'return_route': {}})
+        self.assertNotIn('no successful read', ' '.join(found['lines']))
+        self.assertEqual(len(found['buckets']), 1)
+        args.state_dir = None  # socket-derived default holds nothing here
+        self.assertIn('no successful read', bridge.message_usage(args, {'route': {'transport': 'codex'}})['lines'][0])
+
     def test_codex_on_either_end_carries_usage_and_others_do_not(self):
         self.assertEqual(self.usage_for('codex', 'claude-peer')['provider'], 'codex')
         self.assertEqual(self.usage_for('claude-peer', 'codex')['provider'], 'codex')

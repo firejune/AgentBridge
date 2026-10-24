@@ -417,6 +417,8 @@ def close_participant(args):
     return result
 
 
+USAGE_STATE_HELP = ('Broker state directory holding usage samples, when the broker runs with its own '
+                    '--state-dir (default: socket path with .state suffix)')
 COLLECTED_USAGE = {'codex': 'codex'}  # transport -> provider the broker collects limits for
 
 
@@ -528,9 +530,11 @@ def main(argv=None):
         g = p.add_mutually_exclusive_group(required=True)
         g.add_argument('--to',dest='recipient');g.add_argument('--channel')
         p.add_argument('--file',required=True);p.add_argument('--key',required=True)
+        p.add_argument('--state-dir',help=USAGE_STATE_HELP)
         if cmd=='ask':
             p.add_argument('--timeout',type=float,default=60)
     p = sub.add_parser('reply');p.add_argument('id');p.add_argument('--file',required=True);p.add_argument('--key',required=True)
+    p.add_argument('--state-dir',help=USAGE_STATE_HELP)
     for cmd in ('watch','inbox'):
         p = sub.add_parser(cmd);p.add_argument('name',nargs='?');p.add_argument('--project',required=True);p.add_argument('--channel')
         if cmd=='watch':
