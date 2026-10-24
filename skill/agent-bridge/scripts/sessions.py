@@ -278,12 +278,20 @@ def inspect_session(provider, sid, executable=None, codex_mode='auto'):
     return {'session':matches[0],'warning':None}
 
 
-def open_session(provider='agy', cwd=None, title=None, model=None, timeout=180):
+def open_session(provider='agy', cwd=None, title=None, model=None, timeout=180, host='desktop', ide=None):
+    if host != 'desktop' and provider != 'claude':
+        raise DiscoveryError(f'--host {host} applies only to Claude Code (claude / claude-peer)')
+    if ide and host != 'ide':
+        raise DiscoveryError('--ide needs --host ide')
     if provider == 'codex':
         return codex_new.open_codex(cwd=cwd, title=title, model=model, timeout=timeout)
     if provider == 'claude':
         if not cwd:
-            raise DiscoveryError('Provide --cwd when opening a new Claude Code desktop session')
+            raise DiscoveryError('Provide --cwd when opening a new Claude Code session')
+        if host == 'ide':
+            return open_claude_ide(cwd=cwd, title=title, model=model, timeout=timeout, ide=ide or DEFAULT_IDE)
+        if host != 'desktop':
+            raise DiscoveryError(f'Unknown Claude host {host!r}; use desktop or ide')
         return open_claude(cwd=cwd, title=title, model=model, timeout=timeout)
     if provider != 'agy':
         raise DiscoveryError(f'Opening a new session is supported only for Antigravity Desktop (agy), Claude Code desktop (claude), and Codex desktop (codex), not {provider!r}')
@@ -376,11 +384,11 @@ def claude_new_session_url(cwd, prompt):
 
 def open_url(url):
     if not shutil.which('open'):
-        raise DiscoveryError('Opening a Claude Code desktop session needs the macOS `open` command')
+        raise DiscoveryError('Opening a new Claude Code session needs the macOS `open` command')
     result = subprocess.run(['open', url], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             stdin=subprocess.DEVNULL, text=True, timeout=10)
     if result.returncode:
-        raise DiscoveryError('The claude:// link was not opened: ' + result.stderr.strip()[-500:])
+        raise DiscoveryError(f'The link {url.split(":", 1)[0]}:// was not opened: ' + result.stderr.strip()[-500:])
 
 
 def claude_live_records(root):
@@ -452,4 +460,105 @@ def open_claude(cwd, title=None, model=None, timeout=180, sessions_dir=None, ope
             raise DiscoveryError(f'No new live Claude Code session appeared under {folder} within {timeout:g}s. '
                                  'The composer opens with the first message prefilled; the session starts only '
                                  'when someone presses Enter in the app. Then bind it with register --discover --session ID.')
+        time.sleep(poll)
+
+
+# --- Opening a new Claude Code IDE session ----------------------------------
+# The Claude Code extension (VS Code, Cursor, Antigravity IDE) registers a URI
+# handler: <scheme>://anthropic.claude-code/open?prompt=TEXT opens a new
+# conversation tab and only prefills the composer. Measured on extension
+# 2.1.309: the tab starts its CLI at once, so a live registry record with
+# entrypoint claude-vscode and a messaging socket appears with no Enter, and a
+# peer push wakes it. The link has no folder parameter; the IDE routes it to
+# the last active window. So the bridge first runs the IDE's own CLI with the
+# folder (which focuses the window holding it, or opens one), waits, opens the
+# link, and accepts only a new record under that folder. A new record under
+# another folder is a stray tab in the wrong window: reported, never bound.
+CLAUDE_IDE_ENTRYPOINT = 'claude-vscode'
+CLAUDE_IDE_EXTENSION = 'anthropic.claude-code'
+DEFAULT_IDE = 'antigravity-ide'
+CLAUDE_IDES = {
+    'antigravity-ide': {'scheme': 'antigravity-ide', 'cli': 'antigravity-ide',
+                        'bundle': '/Applications/Antigravity IDE.app/Contents/Resources/app/bin/antigravity-ide'},
+    'vscode': {'scheme': 'vscode', 'cli': 'code',
+               'bundle': '/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code'},
+    'cursor': {'scheme': 'cursor', 'cli': 'cursor',
+               'bundle': '/Applications/Cursor.app/Contents/Resources/app/bin/cursor'},
+}
+
+
+def claude_ide_url(ide, prompt):
+    query = urlencode([('prompt', prompt)]) if prompt else ''
+    return f"{CLAUDE_IDES[ide]['scheme']}://{CLAUDE_IDE_EXTENSION}/open" + (f'?{query}' if query else '')
+
+
+def ide_cli(ide):
+    spec = CLAUDE_IDES[ide]
+    found = shutil.which(spec['cli'])
+    if found:
+        return found
+    if os.access(spec['bundle'], os.X_OK):
+        return spec['bundle']
+    raise DiscoveryError(f"The {ide} command line ({spec['cli']}) was not found; install it from the IDE "
+                         'so the bridge can focus the window that holds the folder')
+
+
+def focus_ide_folder(ide, folder):
+    result = subprocess.run([ide_cli(ide), str(folder)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            stdin=subprocess.DEVNULL, text=True, timeout=30)
+    if result.returncode:
+        raise DiscoveryError(f'{ide} did not open {folder}: ' + result.stderr.strip()[-500:])
+
+
+def open_claude_ide(cwd, title=None, model=None, timeout=180, ide=DEFAULT_IDE, sessions_dir=None,
+                    opener=None, focuser=None, settle=3.0, poll=0.5):
+    if model:
+        raise DiscoveryError('The Claude IDE new-session link carries no model; the session starts on the '
+                             "IDE's selected model")
+    if ide not in CLAUDE_IDES:
+        raise DiscoveryError(f'Unknown IDE {ide!r}; use one of: ' + ', '.join(sorted(CLAUDE_IDES)))
+    if not cwd or not str(cwd).strip():
+        raise DiscoveryError('Workspace --cwd is required to open a Claude Code IDE session')
+    if not 0 < timeout <= 3600:
+        raise DiscoveryError('Timeout must be between 0 and 3600 seconds')
+    folder = Path(cwd).expanduser().resolve()
+    if not folder.is_dir():
+        raise DiscoveryError(f'Workspace directory does not exist: {folder}')
+    root = Path(sessions_dir) if sessions_dir else claude_sessions_dir()
+    prompt = str(title).strip() if isinstance(title, str) and title.strip() else None
+    url = claude_ide_url(ide, prompt)
+    (focuser or focus_ide_folder)(ide, folder)
+    if settle:
+        time.sleep(settle)  # A window opened just now must become the active one before the link lands.
+    before = {r['sessionId'] for r in claude_live_records(root)}
+    opened_at = time.time() * 1000
+    (opener or open_url)(url)
+    deadline = time.monotonic() + timeout
+    while True:
+        fresh = [r for r in claude_live_records(root)
+                 if r['sessionId'] not in before
+                 and r.get('entrypoint') == CLAUDE_IDE_ENTRYPOINT
+                 and not (isinstance(r.get('startedAt'), (int, float)) and r['startedAt'] < opened_at - 5000)]
+        mine = {r['sessionId'] for r in fresh if same_or_inside(r.get('cwd'), folder)}
+        stray = [{'id': r['sessionId'], 'cwd': r.get('cwd'), 'pid': r['pid']}
+                 for r in fresh if r['sessionId'] not in mine]
+        if stray and not mine:
+            raise DiscoveryError(f'A new Claude IDE session opened under {stray[0]["cwd"]}, not {folder}: the link '
+                                 'reached another window. It is not registered and is left open (close its tab). '
+                                 'stray=' + json.dumps(stray))
+        if len(mine) > 1:
+            raise DiscoveryError(f'{len(mine)} new Claude IDE sessions appeared under {folder}; not choosing one '
+                                 '(bind the right one with register --discover --session ID)')
+        if mine:
+            sid = next(iter(mine))
+            try:
+                row = resolve_claude_peer(sid, root)
+            except DiscoveryError:
+                row = None  # The record exists before the inbox socket is announced.
+            if row:
+                return {'created': True, 'session': row, 'host': 'ide', 'ide': ide,
+                        'url': url, 'prompt': prompt, 'warning': None}
+        if time.monotonic() >= deadline:
+            raise DiscoveryError(f'No new live Claude IDE session appeared under {folder} within {timeout:g}s. '
+                                 f'Check that {ide} is running with the Claude Code extension enabled.')
         time.sleep(poll)

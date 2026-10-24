@@ -274,6 +274,22 @@ python3 "$bridge_cli" register claude-worker --project PROJECT --transport claud
 | 키 입력 자동화로 Enter | 포커스가 있는 아무 창에 입력된다 | 기각 |
 
 탐지: 폴더를 신뢰하면 앱이 `LocalSessions.saveTrust`를 기록하고 그 폴더에 잠깐짜리 「temporary query」 CLI를 띄운다. 그 `~/.claude/sessions/<pid>.json`은 `entrypoint: "claude-desktop"`이지만 `hostSessionId`가 없고 몇 초 안에 끝난다. 진짜 세션 레코드에는 `hostSessionId: "local_…"`가 있다. `--new`는 링크를 연 뒤 새로 생겼고, 살아 있고, `--cwd` 아래이며, `entrypoint == "claude-desktop"`, `hostSessionId`가 `local_`로 시작하고, 메시징 소켓을 알린 레코드 정확히 하나를 기다린다.
+
+### Claude Code IDE 새 세션 열기
+
+```bash
+python3 "$bridge_cli" open --provider claude --host ide --cwd /path/to/workspace [--ide antigravity-ide|vscode|cursor]
+python3 "$bridge_cli" register claude-worker --project PROJECT --transport claude-peer \
+  --new --host ide --cwd /path/to/workspace --timeout 120
+```
+
+Antigravity IDE + Claude Code 확장 2.1.309에서 측정했다(비공식이라 바뀔 수 있다):
+
+- 확장의 URI 핸들러는 `/open?session=&prompt=`를 받아 `claude-vscode.primaryEditor.open`을 부른다. `session`이 없으면 새 대화 탭을 열고, `prompt`는 입력창을 채울 뿐이다.
+- 탭은 CLI를 바로 띄운다: Enter 없이 약 1초 안에 `entrypoint: "claude-vscode"`, `peerProtocol: 1`, 메시징 소켓이 있는 라이브 레코드가 생겼다(`hostSessionId`는 없다). 한 번도 전송하지 않은 그 세션에 push하자 약 5초 만에 답이 왔고, 첫 턴 뒤에도 `sessionId`는 그대로였다.
+- IDE 메인 프로세스는 확장 URI를 마지막 활성 창으로 보낸다(쿼리에 `windowId=<번호>`가 있으면 그 창이지만 브릿지가 읽을 수 없는 내부 번호다). 그래서 브릿지는 IDE CLI(`antigravity-ide`·`code`·`cursor`, `PATH` 또는 앱 번들)로 폴더를 먼저 열고 3초 기다린 뒤 링크를 연다.
+
+탐지: 링크를 연 뒤 새로 생겼고, 살아 있고, `entrypoint == "claude-vscode"`이며, `--cwd` 아래이고, 메시징 소켓을 알린 레코드 정확히 하나. 다른 폴더 아래 새 IDE 레코드가 생기면 즉시 `stray`로 실패한다(링크가 다른 창에 갔고, 그 탭은 등록 없이 열려 있다). 후보가 둘이면 고르지 않고 실패한다. 출력에는 `created`·`session`·`host: "ide"`·`ide`·`url`·`prompt`가 실린다.
 - **수신 게이트**: 받는 쪽의 `crossSessionInbound` 설정이 정한다. `accept`면 바로 큐에 들어가고, `hold`면 그 세션에서 사람 승인을 기다리며, `refuse`면 버려진다. 브릿지는 이 결과를 볼 수 없다.
 - ⚠️ **문서화되지 않은 Claude Code 내부 프로토콜(peerProtocol 1)**이다. Claude Code 업데이트로 레지스트리·키·프레임 모양이 바뀌면 위 실패로 시끄럽게 멈춘다. 그때는 push 코드를 고친다. `deliver ID --dry-run`은 키 없이 보낼 프레임을 보여 준다.
 - **브로커 버전**: `claude-peer`를 모르는 이전 코드로 떠 있는 브로커는 등록을 `Unknown transport`로 거부한다. 공유 브로커는 참가자들과 맞춘 뒤에만 재시작한다(재시작하면 메모리 상태가 사라진다).

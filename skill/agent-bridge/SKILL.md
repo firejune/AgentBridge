@@ -67,6 +67,16 @@ python3 "$bridge_cli" register claude-agent --project PROJECT --transport claude
   - Opens `claude://code/new?folder=…&q=…` — the link behind the app's own "New Claude Code Session Here" Finder service. The app shows its new-session composer at that folder with the first message prefilled. **The session starts only when someone presses Enter** (and confirms workspace trust if the app asks for a new folder); the bridge never presses it for them and never launches a standalone CLI.
   - Waits up to `--timeout` seconds (default 180) for one new live record in `~/.claude/sessions` under that folder with `entrypoint == "claude-desktop"` and a desktop `hostSessionId` (`local_…`), then registers it and prints the `sessionId` and `desktop_session`. The short-lived probe CLI the app starts after trusting a folder has no `hostSessionId` and is ignored. Two new sessions under the folder → fails without choosing. Timeout → exit 1 with nothing registered.
   - `--title` is the prefilled first message (the app titles the session from it). `--model` is rejected: the link carries no model, so pick it in the composer.
+- **Opening a new Claude Code IDE session (`--host ide`)** — no human step:
+
+  ```bash
+  python3 "$bridge_cli" register claude-worker --project PROJECT --transport claude-peer \
+    --new --host ide [--ide antigravity-ide|vscode|cursor] --cwd /path/to/workspace --timeout 120
+  ```
+
+  - Runs the IDE's own CLI with the folder (it focuses the window that holds the folder, or opens one), waits 3 s, then opens `<scheme>://anthropic.claude-code/open`. The extension opens a new conversation tab whose CLI starts at once, so a live record with `entrypoint == "claude-vscode"` and a messaging socket appears without Enter, and the first `send`/`ask` wakes it.
+  - Binds exactly one new record under `--cwd`. The link has no folder parameter and lands in the active window: a new record under another folder means it reached the wrong window, so it fails and reports that session as `stray` (left open, not registered). Two new records fail without choosing.
+  - `--title` only prefills the composer (default empty, since the first instruction arrives by push). `--model` is refused; the tab starts on the IDE's selected model. The window comes to the front.
 
 ### 2. Push into a Live Codex / ChatGPT Desktop Session (`codex`)
 

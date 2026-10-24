@@ -321,7 +321,8 @@ def registration(args):
         if not args.cwd:
             raise ValueError('--new requires --cwd')
         provider = 'claude' if args.transport == 'claude-peer' else args.transport
-        observation = sessions.open_session(provider, cwd=args.cwd, title=args.title, model=args.model, timeout=args.timeout)
+        observation = sessions.open_session(provider, cwd=args.cwd, title=args.title, model=args.model, timeout=args.timeout,
+                                            host=getattr(args, 'host', 'desktop'), ide=getattr(args, 'ide', None))
         args.session = observation['session']['id']
         args.cwd = observation['session']['cwd']
         return observation
@@ -355,7 +356,7 @@ def new_session_policy(args, provider):
     if provider == 'claude':
         if model is not None:
             raise models.Unsupported(f'claude: a new session cannot be given a model ({source} asked for {model!r}). '
-                                     'The desktop new-session link and the VS Code extension carry no model; '
+                                     'Neither the desktop new-session link nor the IDE extension link carries a model; '
                                      'the session starts on the model its host picks.')
         return
     if model is not None:
@@ -411,12 +412,16 @@ def main(argv=None):
     p.add_argument('--new',action='store_true',help='Open a new Antigravity, Claude Code, or Codex desktop session and register it')
     p.add_argument('--title');p.add_argument('--model')
     p.add_argument('--timeout',type=float,default=180,help='Seconds to wait for desktop session creation')
+    p.add_argument('--host',choices=['desktop','ide'],default='desktop',help='Claude Code host for --new: the desktop app (Enter needed) or an IDE extension (no human step)')
+    p.add_argument('--ide',choices=sorted(sessions.CLAUDE_IDES),help=f'IDE for --host ide (default {sessions.DEFAULT_IDE})')
     p.add_argument('--codex-mode',choices=['auto','shared','saved'],default='auto')
     p.add_argument('--state-dir',help='Broker state directory holding policy.json (default: socket path with .state suffix)')
     p = sub.add_parser('open',help='Open a new live desktop session')
     p.add_argument('--provider',choices=['agy','claude','codex'],default='agy')
     p.add_argument('--cwd',required=True);p.add_argument('--title');p.add_argument('--model')
     p.add_argument('--timeout',type=float,default=180)
+    p.add_argument('--host',choices=['desktop','ide'],default='desktop',help='Claude Code host: the desktop app (Enter needed) or an IDE extension (no human step)')
+    p.add_argument('--ide',choices=sorted(sessions.CLAUDE_IDES),help=f'IDE for --host ide (default {sessions.DEFAULT_IDE})')
     p.add_argument('--state-dir')
     p = sub.add_parser('model',help="Read a participant's model, or switch it with --set (provider-neutral)")
     p.add_argument('name');p.add_argument('--project',required=True);p.add_argument('--set',dest='target')
@@ -511,7 +516,7 @@ def main(argv=None):
             return 0
         if args.cmd=='open':
             source = new_session_policy(args, args.provider)
-            result = sessions.open_session(args.provider,args.cwd,args.title,args.model,args.timeout)
+            result = sessions.open_session(args.provider,args.cwd,args.title,args.model,args.timeout,host=args.host,ide=args.ide)
             if args.provider == 'codex':
                 result['model_source'] = source
             output(result)
