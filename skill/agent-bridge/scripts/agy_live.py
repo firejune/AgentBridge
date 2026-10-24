@@ -817,3 +817,32 @@ def deliver(route, message_id, text, sender=None, project=None, timeout=10, dry_
     except (OSError, ValueError, TypeError, KeyError) as error:
         raise DeliveryError(f'Antigravity delivery failed: {error}', uncertain=mutation_sent) from None
 
+
+
+# --- Archiving (close) --------------------------------------------------------
+# The agent panel's own Archive action sends exactly this annotation; the server
+# stamps archivalStatusTimestamp itself. Measured: the conversation leaves the
+# panel. Sending archived=false afterwards did not bring it back to the panel,
+# so restore is not confirmed and the bridge never offers it.
+def archive_agy(sid, timeout=5):
+    server, row = resolve_agy(sid, timeout=timeout)
+    if row['status'] == 'running':
+        raise DeliveryError(f'Antigravity session {sid} is running; archive it after the turn ends')
+    rpc_call(server['url'], server['csrf'], 'UpdateConversationAnnotations',
+             {'cascadeId': row['id'], 'annotations': {'archived': True}, 'mergeAnnotations': True},
+             timeout=timeout)
+    try:
+        data = rpc_call(server['url'], server['csrf'], 'GetAllCascadeTrajectories', {}, timeout=timeout)
+        annotations = ((trajectory_summaries(data) or {}).get(row['id']) or {}).get('annotations') or {}
+    except DeliveryError as error:
+        raise ArchiveUncertain(f'Archive was sent but could not be read back: {error}') from None
+    if annotations.get('archived') is not True:
+        raise ArchiveUncertain('Archive was sent but the conversation does not read back as archived')
+    return {'closed': True, 'method': 'archive', 'session': row['id'], 'host': server.get('app_dir'),
+            'archived_at': annotations.get('archivalStatusTimestamp'), 'restore_confirmed': False,
+            'note': 'Hidden from the agent panel. Restoring from outside the panel is not confirmed; '
+                    'permanent deletion is left to the owner.'}
+
+
+class ArchiveUncertain(DeliveryError):
+    pass

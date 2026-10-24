@@ -370,6 +370,53 @@ def new_session_policy(args, provider):
         models.require_allowed(policy, provider, found['model_id'], found['model_enum'], found.get('label'))
 
 
+CODEX_CLOSE_GAP = ('codex: Desktop holds the thread, so app-server thread/archive is refused '
+                   '("active writer") and Desktop IPC has no archive request. Tracked in AgentBridge #27; '
+                   'archive it from the Codex sidebar meanwhile.')
+
+
+def close_session(route, timeout):
+    """Archive-or-stop one route's session; never deletes anything."""
+    transport, sid = route['transport'], route.get('session')
+    if transport == 'claude-peer':
+        try:
+            return sessions.close_claude(sid, own_session=os.environ.get('CLAUDE_CODE_SESSION_ID'), timeout=timeout)
+        except sessions.DiscoveryError as error:
+            if str(error).startswith('unsupported host '):
+                host = str(error).removeprefix('unsupported host ')
+                raise models.Unsupported(f'claude ({host}): closing is measured only on the IDE extension '
+                                         '(claude-vscode); close this session in its app') from None
+            raise
+    if transport == 'agy':
+        return agy_live.archive_agy(sid, timeout=timeout)
+    if transport == 'codex':
+        raise models.Unsupported(CODEX_CLOSE_GAP)
+    return {'closed': False, 'method': 'none', 'session': sid,
+            'note': f'{transport} routes have no provider session to close'}
+
+
+def close_participant(args):
+    if not 0 < args.timeout <= 600:
+        raise ValueError('Timeout must be between 0 and 600 seconds')
+    route = next((r for r in broker.request(args.socket,{'op':'routes','project':args.project})
+                  if r['name'] == args.name), None)
+    if route is None:
+        raise ValueError(f'No participant {args.name!r} is registered in project {args.project!r}')
+    result = {'name': args.name, 'project': args.project, 'transport': route['transport'],
+              **close_session(route, args.timeout)}
+    if args.keep_route:
+        result['route_removed'] = False
+        return result
+    try:
+        broker.request(args.socket,{'op':'unregister','project':args.project,'name':args.name})
+        result['route_removed'] = True
+    except ValueError as error:
+        result['route_removed'] = False
+        result['route_note'] = ('The running broker predates route removal; restart it to pick up this version'
+                                if str(error) == 'Unknown operation' else str(error))
+    return result
+
+
 def with_models(rows, policy, timeout, key='session'):
     """Annotate live rows with a fresh model reading; never cached as truth."""
     for row in rows:
@@ -426,6 +473,10 @@ def main(argv=None):
     p = sub.add_parser('model',help="Read a participant's model, or switch it with --set (provider-neutral)")
     p.add_argument('name');p.add_argument('--project',required=True);p.add_argument('--set',dest='target')
     p.add_argument('--timeout',type=float,default=30);p.add_argument('--state-dir')
+    p = sub.add_parser('close',help="Close a participant's session without deleting it, then remove its route")
+    p.add_argument('name');p.add_argument('--project',required=True)
+    p.add_argument('--keep-route',action='store_true',help='Close the session but keep the route registered')
+    p.add_argument('--timeout',type=float,default=10)
     p = sub.add_parser('policy',help='Show the model policy (defaults, denylist) the bridge enforces; read-only')
     p.add_argument('--state-dir')
     p = sub.add_parser('codex-model',help="Deprecated UUID alias for model NAME --set; changes next-turn settings")
@@ -521,6 +572,9 @@ def main(argv=None):
                 result['model_source'] = source
             output(result)
             return 0
+        if args.cmd=='close':
+            output(close_participant(args))
+            return 0
         if args.cmd=='policy':
             output(models.load_policy(broker_state_dir(args)))
             return 0
@@ -601,6 +655,9 @@ def main(argv=None):
         return 1
     except models.Unsupported as error:
         output({'error':str(error),'unsupported':True})
+        return 1
+    except agy_live.ArchiveUncertain as error:
+        output({'error':str(error),'uncertain':True,'name':args.name})
         return 1
     except models.SwitchError as error:
         if args.cmd == 'codex-model':

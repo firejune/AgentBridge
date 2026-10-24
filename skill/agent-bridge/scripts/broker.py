@@ -72,6 +72,14 @@ class State:
         self.endpoints, self.channels = endpoints, channels
         return item
 
+    def routing_remove(self, collection, key):
+        endpoints, channels = self.endpoints.copy(), self.channels.copy()
+        item = (endpoints if collection == 'endpoints' else channels).pop(key)
+        if self.store is not None:
+            self.store.save(endpoints, channels)
+        self.endpoints, self.channels = endpoints, channels
+        return item
+
     def make_room(self, parent=None):
         if len(self.messages) < self.max_messages:
             return
@@ -201,6 +209,15 @@ class State:
             return self.routing_change('endpoints', (project,name), item)
         if op == 'routes':
             return [x for (p,_),x in self.endpoints.items() if p==args['project']]
+        if op == 'unregister':
+            key = (args['project'], args['name'])
+            if key not in self.endpoints:
+                raise ValueError(f'No participant {args["name"]!r} is registered in project {args["project"]!r}')
+            owned = sorted(name for (project,name),item in self.channels.items()
+                           if project==args['project'] and item.get('active') and item['owner']==args['name'])
+            if owned:
+                raise ValueError(f'{args["name"]!r} owns active channel(s) {", ".join(owned)}; close or hand them off first')
+            return self.routing_remove('endpoints', key)
         if op == 'channel-bind':
             project, name = args['project'], identifier(args['name'])
             existing = self.channels.get((project,name))

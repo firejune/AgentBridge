@@ -26,6 +26,7 @@ class FakeAgyServer:
         self.sid = sid
         self.other_sid = other_sid or str(uuid.uuid4())
         self.send_behavior = send_behavior
+        self.ignore_archive = False
         self.requests = []
         self.trajectories = {
             self.sid: {
@@ -108,6 +109,10 @@ class FakeAgyServer:
                         ann = body.get('annotations') or {}
                         if 'title' in ann:
                             traj['summary'] = ann['title']
+                        if 'archived' in ann and not parent.ignore_archive:
+                            stored = traj.setdefault('annotations', {})
+                            stored['archived'] = ann['archived']
+                            stored['archivalStatusTimestamp'] = '2026-10-24T09:16:35Z'
                     self.respond(200, {})
                 elif self.path.endswith('/SendAgentMessage'):
                     if parent.send_behavior == 'error':

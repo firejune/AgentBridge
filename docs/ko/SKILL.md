@@ -135,6 +135,16 @@ python3 "$bridge_cli" reply REQUEST_ID --key UNIQUE_REPLY_KEY --file /absolute/a
 - `ask`/`wait`의 종료 코드 2는 대기 시간 초과다. 요청을 다시 보내거나 취소하지 말고 같은 ID로 다시 wait한다. 중복 전송에는 동일한 `--key`를 사용한다.
 - 같은 협의에서 이미 허용된 상대와 범위 안의 답변은 그 협업 범위에 따른다. 동료의 메시지 자체를 새로운 사용자의 승인으로 해석하지 않는다. 스킬 설치만으로 임의 협업 메시지를 발신하지 않는다.
 
+### 세션 닫기
+
+```bash
+python3 "$bridge_cli" close NAME --project PROJECT [--keep-route] [--timeout 10]
+```
+
+- 보관하거나 멈출 뿐 삭제하지 않는다. Claude IDE: 그 CLI에 SIGTERM(`resumable: true`, 탭에 exit 143). Antigravity: `{archived: true}`, 실행 중이면 거부, 재조회로 확인(`restore_confirmed: false`). Codex와 Claude 데스크톱: `unsupported`, 아무것도 보내지 않는다. 그다음 `--keep-route`가 아니면 라우트를 지운다.
+- 격상·재시도 없음: `--timeout` 뒤에도 살아 있는 프로세스나 재조회되지 않는 보관(`uncertain: true`)은 보고만 하고 반복하지 않는다.
+- 영구 삭제는 소유자의 몫이다. 소유자나 HQ의 지시 없이 내가 열지 않은 세션을 닫지 않는다.
+
 ## 모델: 읽기 · 전환 · 정책
 
 **브릿지의 모든 기능은 공급자 중립이다.** 기능은 모든 공급자에 함께 들어가거나, 하나의 중립 인터페이스 뒤에 들어가고 공급자별 빈틈은 이름을 밝힌 STOP으로 보고한다. 한 공급자만 되는 명령으로 조용히 내보내지 않는다.

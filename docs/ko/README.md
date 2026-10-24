@@ -54,6 +54,20 @@ flowchart LR
 
 자세한 내용: [SKILL.md](SKILL.md)와 [usage.md](usage.md).
 
+## 세션 닫기
+
+`close NAME --project PROJECT`는 참가자의 세션을 멈추거나 보관한 뒤 라우트를 지운다(`--keep-route`면 남긴다). 아무것도 영구 삭제하지 않는다. 영구 삭제는 소유자가 한다.
+
+| transport | `close`가 하는 일 | 되돌리기 |
+| --- | --- | --- |
+| IDE 확장의 `claude-peer` | 등록된 그 CLI 프로세스에 SIGTERM. 탭에 "process exited with code 143"이 뜬다 | 그 탭에 입력하면 같은 세션이 이어진다 |
+| 데스크톱의 `claude-peer` | `unsupported` (미측정) | — |
+| `agy` | `{archived: true}` 주석 = 패널의 Archive 동작. `running`이면 거부 | 패널 밖에서의 복원은 미확인 |
+| `codex` | `unsupported`: 데스크톱이 스레드를 쥐고 있다 (AgentBridge #27) | — |
+| `realtime` / `claude` | 라우트만 지운다 | — |
+
+호출한 Claude 세션 자신은 거부한다. 활성 채널을 가진 라우트는 지우지 않는다. 이 버전 이전에 뜬 브로커는 라우트를 지우려면 재시작이 필요하다고 알린다.
+
 ## 전역 스킬 연결
 
 로컬 환경에서는 아래 네 경로를 동일한 `skill/agent-bridge` 폴더로 심볼릭 링크해 공용으로 사용할 수 있다.
