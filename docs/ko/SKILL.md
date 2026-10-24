@@ -162,6 +162,7 @@ python3 "$bridge_cli" policy                                    # 적용 중인 
 - **Antigravity (`agy`)**:
   - 읽기: 마지막 generator의 `plannerConfig`. 패널이 모델 이름을 표시할 때 쓰는 출처와 같다.
   - 전환: 대화가 대기 중일 때만 받는다. 대화가 마지막으로 쓴 플래너 설정에서 `requestedModel`만 바꿔 보내므로 나머지 설정은 유지된다. 그러면 **사용자 입력 없이 호출이 한 번 돈다**. language server가 새 모델을 적용하는 길은 이것뿐이다. 명령은 그 호출을 기다렸다가 모델을 재조회한다.
+  - **전환은 새 모델로 실제 턴 하나를 쓴다**: 실측 generator 2–8개, 실행 10–90초(#21). 명령은 `--timeout` 안에서 대기 상태가 되길 기다리고 `generators_spent`·`status_after`·`busy_after`를 보고한다. `busy_after: true`여도 전환은 끝난 것이다. 일이나 다음 전환은 대기 상태가 된 뒤에 보내고, 전환을 다시 보내지 않는다.
   - 거절된 요청은 아무것도 바꾸지 않는다. 결과가 불분명하면 `uncertain`으로 남기고 다시 보내지 않는다.
 - **Claude**:
   - 읽기: 세션 기록의 가장 최근 assistant 메시지. 호스트와 관계없이 된다.

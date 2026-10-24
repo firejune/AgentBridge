@@ -164,6 +164,7 @@ python3 "$bridge_cli" policy                                    # the defaults a
 - **Antigravity (`agy`)**:
   - Read: the last generator's `plannerConfig`, the same source the panel uses for its model label.
   - Switch: accepted only while the conversation is idle. It sends the conversation's own last planner configuration with only `requestedModel` changed, so the other settings are kept. That runs **one invocation without a user step**, which is the only way the language server applies a new model. The command waits for that invocation and reads its model back.
+  - **The switch costs a real turn on the new model**: measured 2–8 generators and 10–90 s running (#21). The command waits for idle within `--timeout` and reports `generators_spent`, `status_after` and `busy_after`. With `busy_after: true` the switch is done; wait for idle before sending work or another switch, and do not resend it.
   - A refused request changes nothing. An unclear outcome is `uncertain` and is never resent.
 - **Claude**:
   - Read: the newest assistant message in the session transcript, on any host.
