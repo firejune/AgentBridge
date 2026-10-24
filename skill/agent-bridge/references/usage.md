@@ -265,6 +265,22 @@ How the path was chosen (measured against Claude desktop with Claude Code 2.1.29
 
 Detection: after trusting a folder the app logs `LocalSessions.saveTrust` and starts a short-lived "temporary query" CLI there. Its `~/.claude/sessions/<pid>.json` has `entrypoint: "claude-desktop"` but no `hostSessionId`, and it exits within seconds. The real session's record also has `hostSessionId: "local_…"`. `--new` waits for exactly one record that is new since the link opened, alive, under `--cwd`, `entrypoint == "claude-desktop"`, `hostSessionId` starting with `local_`, and announcing a messaging socket.
 
+### Opening a New Claude Code IDE Session
+
+```bash
+python3 "$bridge_cli" open --provider claude --host ide --cwd /path/to/workspace [--ide antigravity-ide|vscode|cursor]
+python3 "$bridge_cli" register claude-worker --project PROJECT --transport claude-peer \
+  --new --host ide --cwd /path/to/workspace --timeout 120
+```
+
+Measured on Antigravity IDE with the Claude Code extension 2.1.309 (internal and unversioned, so it may change):
+
+- The extension's URI handler takes `/open?session=&prompt=` and runs `claude-vscode.primaryEditor.open`. Without `session` it opens a new conversation tab; `prompt` only prefills the composer.
+- The tab starts its CLI at once: a live record with `entrypoint: "claude-vscode"`, `peerProtocol: 1` and a messaging socket appeared within about 1 s, with no Enter and no `hostSessionId`. A push into that never-submitted session was answered in about 5 s, and its `sessionId` did not change after the first turn.
+- The IDE main process sends an extension URI to the last active window unless the query carries `windowId=<number>`, an internal id the bridge cannot read. So the bridge runs the IDE CLI (`antigravity-ide`, `code` or `cursor`, found on `PATH` or in the app bundle) with the folder first, waits 3 s, then opens the link.
+
+Detection: exactly one record that is new since the link opened, alive, `entrypoint == "claude-vscode"`, under `--cwd`, and announcing a messaging socket. A new IDE record under another folder fails at once as `stray` (the link reached another window; that tab stays open and unregistered). Two candidates fail without choosing. Output carries `created`, `session`, `host: "ide"`, `ide`, `url` and `prompt`.
+
 ## Pushing & Delivering to Codex, Antigravity, and Idle CLI Sessions
 
 `codex`, `claude-peer`, and `agy` push automatically during `send`, `ask`, and `reply`, and can be retried explicitly with `deliver` if left `pending`. Idle dedicated `claude` CLI sessions are dispatched explicitly via `deliver`.

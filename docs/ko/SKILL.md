@@ -65,6 +65,16 @@ python3 "$bridge_cli" register claude-agent --project PROJECT --transport claude
   - 앱의 Finder 서비스 「New Claude Code Session Here」가 쓰는 링크 `claude://code/new?folder=…&q=…`를 연다. 앱은 그 폴더의 새 세션 입력창을 첫 메시지가 채워진 채로 띄운다. **세션은 사람이 Enter를 눌러야 시작된다**(새 폴더면 앱이 묻는 작업 공간 신뢰도). 브릿지는 대신 누르지 않고 별도 CLI도 띄우지 않는다.
   - `--timeout`초(기본 180) 동안 `~/.claude/sessions`에 그 폴더 아래 `entrypoint == "claude-desktop"`이고 데스크톱 `hostSessionId`(`local_…`)가 있는 새 라이브 레코드 하나를 기다렸다가 등록하고 `sessionId`와 `desktop_session`을 출력한다. 폴더를 신뢰한 직후 앱이 띄우는 잠깐짜리 조회 CLI는 `hostSessionId`가 없어 무시한다. 새 세션이 둘이면 고르지 않고 실패하고, 시간이 지나면 등록 없이 종료 코드 1이다.
   - `--title`은 미리 채울 첫 메시지다(앱이 그것으로 세션 제목을 짓는다). `--model`은 거부한다 — 링크에 모델이 없으니 입력창에서 고른다.
+- **Claude Code IDE 새 세션 열기(`--host ide`)** — 사람 단계 없음:
+
+  ```bash
+  python3 "$bridge_cli" register claude-worker --project PROJECT --transport claude-peer \
+    --new --host ide [--ide antigravity-ide|vscode|cursor] --cwd /path/to/workspace --timeout 120
+  ```
+
+  - IDE 자체 CLI로 폴더를 열어(그 폴더를 가진 창을 앞으로 가져오거나 새 창을 연다) 3초 기다린 뒤 `<scheme>://anthropic.claude-code/open`을 연다. 확장이 새 대화 탭을 열면 그 CLI가 바로 떠서 Enter 없이 `entrypoint == "claude-vscode"`이고 메시징 소켓이 있는 라이브 레코드가 생기고, 첫 `send`/`ask`가 그 세션을 깨운다.
+  - `--cwd` 아래 새 레코드 정확히 하나를 등록한다. 링크에 폴더 파라미터가 없어 활성 창으로 가므로, 다른 폴더 아래 새 레코드가 생기면 엉뚱한 창에 간 것이라 실패하고 그 세션을 `stray`로 보고한다(열어 둔 채, 등록 안 함). 새 레코드가 둘이면 고르지 않고 실패한다.
+  - `--title`은 입력창을 미리 채울 뿐이다(첫 지시는 push로 오므로 기본은 비움). `--model`은 거부한다 — 탭은 IDE에서 고른 모델로 시작한다. 창이 앞으로 나온다.
 
 ### 2. Codex / ChatGPT 데스크톱의 라이브 세션에 push (`codex`)
 

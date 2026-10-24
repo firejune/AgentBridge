@@ -279,5 +279,99 @@ class OpenClaudeTests(unittest.TestCase):
             self.assertIn('hello',user['message']['content'])
 
 
+class OpenClaudeIdeTests(unittest.TestCase):
+    """open/register --new --host ide: focus the folder's window, open the extension link, bind the new record."""
+    IDE = {'entrypoint':'claude-vscode'}
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='abi-',dir='/tmp')
+        self.root = Path(self.temp.name)
+        self.sid = str(uuid.uuid4())
+        self.fakes, self.urls, self.focused = [], [], []
+
+    def tearDown(self):
+        for fake in self.fakes:
+            fake.close()
+        self.temp.cleanup()
+
+    def opener(self, *records):
+        def open_link(url):
+            self.urls.append(url)
+            for sid, pid, extra in records:
+                self.fakes.append(FakeClaude(self.temp.name,sid,pid=pid,extra=extra))
+        return open_link
+
+    def open(self, **kwargs):
+        kwargs.setdefault('opener',self.opener((self.sid,None,self.IDE)))
+        kwargs.setdefault('focuser',lambda ide,folder: self.focused.append((ide,folder)))
+        return sessions.open_claude_ide(str(self.root),sessions_dir=self.root/'sessions',settle=0,poll=0.01,**kwargs)
+
+    def test_focuses_folder_then_binds_new_ide_record_without_prefill(self):
+        opened = self.open()
+        self.assertEqual((opened['created'],opened['host'],opened['ide']),(True,'ide','antigravity-ide'))
+        self.assertEqual(opened['session']['id'],self.sid)
+        self.assertEqual(self.focused,[('antigravity-ide',self.root.resolve())])
+        self.assertEqual(self.urls,['antigravity-ide://anthropic.claude-code/open'])
+        self.assertIsNone(opened['prompt'])
+
+    def test_title_prefills_and_ide_picks_scheme(self):
+        self.open(title='Fresh worker',ide='cursor')
+        parts = urlsplit(self.urls[0])
+        self.assertEqual((parts.scheme,parts.netloc,parts.path),('cursor','anthropic.claude-code','/open'))
+        self.assertEqual(parse_qs(parts.query)['prompt'],['Fresh worker'])
+
+    def test_desktop_record_and_preexisting_ide_record_are_not_taken(self):
+        self.fakes.append(FakeClaude(self.temp.name,str(uuid.uuid4()),pid=os.getppid(),extra=self.IDE))
+        with self.assertRaisesRegex(ValueError,'No new live Claude IDE session'):
+            self.open(opener=self.urls.append,timeout=0.05)
+        with self.assertRaisesRegex(ValueError,'No new live Claude IDE session'):
+            self.open(opener=self.opener((self.sid,None,{'entrypoint':'claude-desktop','hostSessionId':'local_x'})),timeout=0.05)
+
+    def test_record_in_another_window_is_reported_as_stray(self):
+        other = tempfile.mkdtemp(prefix='abo-',dir='/tmp')
+        try:
+            with self.assertRaisesRegex(ValueError,'reached another window') as caught:
+                self.open(opener=self.opener((self.sid,None,{**self.IDE,'cwd':other})),timeout=1)
+            self.assertIn(self.sid,str(caught.exception))
+        finally:
+            os.rmdir(other)
+
+    def test_two_new_records_fail_without_choosing(self):
+        two = self.opener((self.sid,None,self.IDE),(str(uuid.uuid4()),os.getppid(),self.IDE))
+        with self.assertRaisesRegex(ValueError,'not choosing one'):
+            self.open(opener=two,timeout=1)
+
+    def test_rejects_model_unknown_ide_and_missing_folder_before_focusing(self):
+        with self.assertRaisesRegex(ValueError,'carries no model'):
+            self.open(model='opus')
+        with self.assertRaisesRegex(ValueError,'Unknown IDE'):
+            self.open(ide='notepad')
+        with self.assertRaisesRegex(ValueError,'does not exist'):
+            sessions.open_claude_ide(str(self.root/'missing'),opener=self.urls.append,focuser=self.focused.append)
+        self.assertEqual((self.urls,self.focused),([],[]))
+
+    def test_open_session_routes_hosts(self):
+        with mock.patch.object(sessions,'open_claude_ide',return_value='ide') as ide, \
+                mock.patch.object(sessions,'open_claude',return_value='desktop') as desk:
+            self.assertEqual(sessions.open_session('claude',cwd=str(self.root),host='ide'),'ide')
+            self.assertEqual(sessions.open_session('claude',cwd=str(self.root)),'desktop')
+        self.assertEqual(ide.call_args.kwargs['ide'],'antigravity-ide')
+        desk.assert_called_once()
+        with self.assertRaisesRegex(ValueError,'applies only to Claude'):
+            sessions.open_session('codex',cwd=str(self.root),host='ide')
+        with self.assertRaisesRegex(ValueError,'needs --host ide'):
+            sessions.open_session('claude',cwd=str(self.root),ide='vscode')
+
+    def test_register_new_passes_host_and_ide(self):
+        import argparse
+        args = argparse.Namespace(new=True,discover=False,session=None,transport='claude-peer',cwd=str(self.root),
+                                  title=None,model=None,timeout=1,host='ide',ide='vscode')
+        row = {'session':{'id':self.sid,'cwd':str(self.root)}}
+        with mock.patch.object(sessions,'open_session',return_value=row) as opened:
+            bridge.registration(args)
+        self.assertEqual((opened.call_args.kwargs['host'],opened.call_args.kwargs['ide']),('ide','vscode'))
+        self.assertEqual(args.session,self.sid)
+
+
 if __name__=='__main__':
     unittest.main()
