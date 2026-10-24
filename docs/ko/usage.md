@@ -124,7 +124,7 @@ python3 "$bridge_cli" watch --project my-app --channel modal-view \
 
 ## 라우팅 저장과 선택적 launchd
 
-`serve --state-dir PATH`는 소유자 전용 디렉터리(0700)의 `routes.json`(0600)에 endpoint·채널을 저장한다. 기본은 소켓 경로의 확장자를 `.state`로 바꾼 디렉터리이며, 기본 소켓에서는 `~/.local/share/agent-bridge/bridge.state/`다. 등록·채널 연결·닫기마다 허용 필드만 새 임시 파일에 쓰고 flush·fsync한 뒤 원자 교체한다. 교체가 성공한 뒤에만 메모리 변경을 수락하므로 저장 실패는 이전 파일과 메모리를 유지한다. 별도 디렉터리 잠금이 서로 다른 소켓의 동시 쓰기도 막는다. 최상위 형식이 손상되거나 지원하지 않는 버전이면 덮어쓰지 않고 기동을 거부한다. 디렉터리 항목 자체는 fsync하지 않으므로 갑작스러운 전원 손실까지 보장하지 않는다.
+`serve --state-dir PATH`는 소유자 전용 디렉터리(0700)의 `routes.json`(0600)에 endpoint·채널을 저장한다. 기본은 소켓 경로의 확장자를 `.state`로 바꾼 디렉터리이며, 기본 소켓에서는 `~/.local/share/agent-bridge/bridge.state/`다. 등록·라우트 제거(`close`가 쓰는 `unregister`)·채널 연결·닫기마다 허용 필드만 새 임시 파일에 쓰고 flush·fsync한 뒤 원자 교체한다. 교체가 성공한 뒤에만 메모리 변경을 수락하므로 저장 실패는 이전 파일과 메모리를 유지한다. 별도 디렉터리 잠금이 서로 다른 소켓의 동시 쓰기도 막는다. 최상위 형식이 손상되거나 지원하지 않는 버전이면 덮어쓰지 않고 기동을 거부한다. 디렉터리 항목 자체는 fsync하지 않으므로 갑작스러운 전원 손실까지 보장하지 않는다.
 
 저장 대상은 프로젝트·이름·전송 방식·세션 UUID·작업 경로·선택 실행 파일과 채널 소유자·설명·세대·활성 여부·고정 주소다. 메시지·전달 상태·중복키·이벤트·토큰·발견한 상대 소켓·PID·discovery 원문은 저장하지 않는다. 이 파일은 비공개 로컬 라우팅이며 버전 관리에 넣지 않는다.
 
@@ -195,7 +195,7 @@ python3 "$bridge_cli" register agy-agent --project my-app --transport agy \
    python3 "$bridge_cli" register agy-ide-agent --project my-app --transport agy \
      --session AGY_CONVERSATION_UUID --discover
    ```
-4. **또는 새 Antigravity 데스크톱 세션을 즉시 생성·등록한다**:
+4. **또는 새 Antigravity 데스크톱 세션(`--host ide`면 Antigravity IDE 대화)을 즉시 생성·등록한다**:
    ```bash
    # 단독 생성 (생성된 세션 UUID, cwd, model, project_id 반환):
    python3 "$bridge_cli" open --provider agy --cwd /path/to/workspace \
@@ -205,7 +205,7 @@ python3 "$bridge_cli" register agy-agent --project my-app --transport agy \
    python3 "$bridge_cli" register agy-worker --project my-app --transport agy \
      --new --cwd /path/to/workspace --title "Motion Worker"
    ```
-   `open` 및 `register --new`는 실행 중인 Antigravity 데스크톱 `language_server`(`--app_data_dir antigravity`)에 새 대화를 만들고, 데스크톱 프로젝트(`~/.gemini/config/projects/*.json`)가 있으면 자동으로 매칭하며, 기본 대화형 에이전트 사양(`customAgentSpec`)을 초기화해 0-step 신규 세션도 브릿지 메시지가 도착하는 즉시 깨어나 첫 턴을 시작하도록 준비한다.
+   `open` 및 `register --new`는 실행 중인 Antigravity 데스크톱 `language_server`(`--app_data_dir antigravity`)에 새 대화를 만들고, 데스크톱 프로젝트(`~/.gemini/config/projects/*.json`)가 있으면 자동으로 매칭하며, 기본 대화형 에이전트 사양(`customAgentSpec`)을 초기화해 0-step 신규 세션도 브릿지 메시지가 도착하는 즉시 깨어나 첫 턴을 시작하도록 준비한다. `--host ide`면 같은 생성을 IDE `language_server`(`--app_data_dir antigravity-ide`)로 보내고, 폴더는 `workspaceUris`로 넘기며 프로젝트 매칭은 하지 않는다. 2026-10-24 실측: IDE 서버 하나가 모든 IDE 창을 맡아서 창이 없는 폴더에도 되고, IDE 에이전트 패널은 모든 워크스페이스의 대화를 보여 준다(다른 워크스페이스 대화를 열면 새 창으로 열지 지금 창을 바꿀지 묻는다).
 
 `--codex-mode auto`는 공유 서버 연결 실패 시 저장 목록으로 전환하며 warning을 반환한다. `shared`는 전환 없이 실패하고, `saved`는 저장 목록만 조회한다. 임시 조회 프로세스는 끝나면 정리한다. 한쪽 실패 시 다른 쪽 결과를 보존하고 `errors` 및 종료 코드 1로 알린다.
 
@@ -356,6 +356,32 @@ python3 "$bridge_cli" resolve MESSAGE_ID --state done --note '결과 확인 완�
 - **사령탑이 받았을 때 할 일:** 그 세션에 대해 `model`을 그대로 넣어 `mcp__ccd_session_mgmt__set_session_model`을 부른다. 도구가 두 id 중 어느 것을 받는지는 실측하지 않았다. `list_sessions`/`get_session`이 그 세션의 앱 id를 보여 준다. 그다음 봉투에 찍힌 브릿지 reply 명령으로 답한다. 답 본문에는 `bridge-model-reply: {"model": "<앱이 알려 준 모델>", "changed": true|false, "applies": "<도구가 말한 적용 시점>"}` 한 줄이 있어야 한다. 실패하면 `bridge-model-reply: {"error": "<도구의 메시지>", "uncertain": true|false}`로 답하고, 호출이 들어갔을 수도 있을 때만 `uncertain`을 true로 한다. 요청자 대신 재시도하지 않는다.
 - 명령은 `--timeout`(기본 30초, 승인 카드에 사람이 필요하면 최대 3600초)까지 기다린다. 답이 없거나, 그 줄이 없거나, 줄에 `model`/`changed`가 없으면 `uncertain: true`, 종료 코드 1이다. 전환은 여전히 일어날 수 있으니 다시 묻기 전에 모델을 읽고, 다시 보내지 않는다. `error` 답은 받은 그대로 보고한다.
 - 결과는 `{model, changed, applies, via, request}`이고 `via`는 사령탑이다. 읽기는 여전히 기록 기반이라 새 모델은 대상의 다음 턴 뒤에 보인다.
+
+## 세션 닫기
+
+```bash
+python3 "$bridge_cli" close NAME --project PROJECT [--keep-route] [--timeout 10]
+```
+
+`close`는 등록된 라우트 하나의 세션을 멈추거나 보관한 뒤, 브로커의 `unregister`로 그 라우트를 지운다. 아무것도 삭제하지 않고 재시도하지 않는다. 2026-10-24에 브릿지가 만든 세션으로 측정했다:
+
+| transport / host | 동작 | 관찰 | 되돌리기 |
+| --- | --- | --- | --- |
+| `claude-peer`, `claude-vscode` (확장 2.1.310) | 레지스트리에서 다시 읽은 그 pid에 SIGTERM, `--timeout`까지 기다리고 격상하지 않음 | 1초 안에 종료, 레코드 제거, 15초간 재기동 없음, RSS 약 310 MB 해제, 기록 유지. 탭에 "Claude Code process exited with code 143" | 그 탭에 입력하면 같은 `sessionId`가 새 pid로 이어짐 |
+| `claude-peer`, `claude-desktop` | 같음 | 3초 안에 종료, 20초간 재기동 없음. 앱에 「세션이 중단되었습니다」와 「다시 시도」 | 그 세션에 메시지를 보내면 같은 `sessionId`·`hostSessionId`로 이어짐 |
+| `agy` (데스크톱·IDE) | `running`이면 거부. 대화를 가진 서버에 `UpdateConversationAnnotations {archived: true}`, `annotations.archived` 재조회 | 에이전트 패널·데스크톱 사이드바에서 사라짐. `archivalStatusTimestamp`는 서버가 스스로 찍는다 | 바깥에서 `{archived: false}`를 보내도 IDE 패널에 돌아오지 않았고 보관함 화면도 못 찾음. 복원 미확인 |
+| `codex` | `unsupported`, 아무것도 보내지 않음 (AgentBridge #27) | 데스크톱이 스레드를 쥐고 있으면 app-server `thread/archive`가 "active writer"로 거절. 데스크톱 IPC에 보관·언로드 요청 없음 | — |
+| `realtime` / `claude` | 라우트만 지움 | — | — |
+
+이 동작을 고른 이유: Claude에는 바깥에서 깨끗하게 끝낼 통로가 없고(피어 소켓은 `user` 프레임만 받아 `/exit`가 닿지 않는다), Antigravity 패널의 Archive·Restore가 바로 이 `archived` 주석이다(IDE 번들에서 읽음).
+
+규칙:
+
+- 호출한 Claude 세션 자신(`CLAUDE_CODE_SESSION_ID`)은 거부한다. 위 둘 밖의 Claude host는 `unsupported`.
+- 보낸 뒤 실패했거나 재조회되지 않는 보관은 `uncertain: true`이고 다시 보내지 않는다.
+- 활성 채널을 가진 라우트는 지우지 않는다(채널을 먼저 닫거나 넘긴다). `--keep-route`면 지우지 않는다. `unregister` 이전에 뜬 브로커는 "Unknown operation"으로 답하고, `close`는 재시작이 필요하다고 알리며 닫기 자체는 유효하다.
+- 브로커를 재시작하면 메모리의 메시지와 ID가 사라진다. 회신을 기다리는 세션과 먼저 조율한다.
+- 영구 삭제는 소유자의 몫이다.
 
 ## 운영 경계와 검증
 

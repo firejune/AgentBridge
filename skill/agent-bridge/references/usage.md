@@ -120,7 +120,7 @@ The current reply parent, active waits, and terminal replies needed by an unfini
 
 ## Routing Storage and Opt-In launchd
 
-`serve --state-dir PATH` stores `routes.json` beneath an owner-private directory (0700, file 0600). Without this option, the socket path's suffix is replaced by `.state`; for the default socket this is `~/.local/share/agent-bridge/bridge.state/`. Every registration, channel bind, and channel close writes an allowlisted complete snapshot to a temporary file, flushes and fsyncs it, then atomically replaces the previous snapshot. Memory changes only after replacement succeeds. A separate state-directory lock also prevents two sockets from writing the same routing store. Corrupt or unsupported top-level snapshots refuse startup without overwriting the file.
+`serve --state-dir PATH` stores `routes.json` beneath an owner-private directory (0700, file 0600). Without this option, the socket path's suffix is replaced by `.state`; for the default socket this is `~/.local/share/agent-bridge/bridge.state/`. Every registration, route removal (`unregister`, used by `close`), channel bind, and channel close writes an allowlisted complete snapshot to a temporary file, flushes and fsyncs it, then atomically replaces the previous snapshot. Memory changes only after replacement succeeds. A separate state-directory lock also prevents two sockets from writing the same routing store. Corrupt or unsupported top-level snapshots refuse startup without overwriting the file.
 
 Only project/name, transport, session UUID, workspace, optional executable, and channel ownership/description/generation/active flag and pinned route are stored. No message bodies, idempotency keys, delivery state, event history, provider tokens, discovered peer socket paths, PIDs, or discovery payloads are stored. This is a private local routing file; keep it out of version control. Atomic replacement protects complete snapshots, but directory entries are not fsynced: sudden power loss is outside the durability guarantee.
 
@@ -195,7 +195,7 @@ python3 "$bridge_cli" register agy-agent --project my-app --transport agy \
    python3 "$bridge_cli" register agy-ide-agent --project my-app --transport agy \
      --session AGY_CONVERSATION_UUID --discover
    ```
-4. **Or open a new Antigravity Desktop session on demand**:
+4. **Or open a new Antigravity Desktop session (or, with `--host ide`, an Antigravity IDE conversation) on demand**:
    ```bash
    # Standalone creation (returns new session UUID, cwd, model, and project_id):
    python3 "$bridge_cli" open --provider agy --cwd /path/to/workspace \
@@ -205,7 +205,7 @@ python3 "$bridge_cli" register agy-agent --project my-app --transport agy \
    python3 "$bridge_cli" register agy-worker --project my-app --transport agy \
      --new --cwd /path/to/workspace --title "Motion Worker"
    ```
-   `open` and `register --new` target the running Antigravity Desktop `language_server` (`--app_data_dir antigravity`), bind the workspace to its matching Desktop project (`~/.gemini/config/projects/*.json`) when present, and initialize the default interactive agent specification so the fresh 0-step session immediately wakes and executes its first turn when a bridge message is pushed.
+   `open` and `register --new` target the running Antigravity Desktop `language_server` (`--app_data_dir antigravity`), bind the workspace to its matching Desktop project (`~/.gemini/config/projects/*.json`) when present, and initialize the default interactive agent specification so the fresh 0-step session immediately wakes and executes its first turn when a bridge message is pushed. With `--host ide` the same creation goes to the IDE `language_server` (`--app_data_dir antigravity-ide`) with the folder in `workspaceUris` and no project matching. Measured 2026-10-24: one IDE server serves every IDE window, so this works for any folder, even one with no window open, and the IDE agent panel lists conversations from every workspace (opening one from another workspace asks whether to open a new window or switch).
 
 ## Session Handoff
 
@@ -340,6 +340,32 @@ python3 "$bridge_cli" resolve MESSAGE_ID --state done --note 'Completed'
 - **What a command post does on receiving it:** call `mcp__ccd_session_mgmt__set_session_model` for that session with `model` exactly as given. Which of the two ids the tool accepts was not measured; `list_sessions`/`get_session` show the app's own id for the session. Then answer with the bridge reply command the envelope prints. The reply body must contain one line `bridge-model-reply: {"model": "<model the app reports>", "changed": true|false, "applies": "<when, as the tool says>"}`. On failure, reply `bridge-model-reply: {"error": "<the tool's message>", "uncertain": true|false}`; `uncertain` is true only when the call may have gone through. Do not retry on the requester's behalf.
 - The command waits up to `--timeout` (default 30 s; up to 3600 when an approval card needs a person). No reply, a reply without the line, or a line without `model`/`changed` is `uncertain: true`, exit 1: the switch may still happen, so read the model before asking again and never resend. An `error` reply is reported as given.
 - The result is `{model, changed, applies, via, request}` where `via` is the command post. Read stays transcript-based: the new model shows there after the target's next turn.
+
+## Closing a Session
+
+```bash
+python3 "$bridge_cli" close NAME --project PROJECT [--keep-route] [--timeout 10]
+```
+
+`close` stops or archives the session behind one registered route and then removes the route through the broker's `unregister` operation. It never deletes anything and never retries. Measured 2026-10-24 on sessions the bridge created:
+
+| Transport / host | Action | Observed | Undo |
+| --- | --- | --- | --- |
+| `claude-peer`, `claude-vscode` (extension 2.1.310) | SIGTERM to the exact registered pid, re-read from the registry; wait up to `--timeout`, never escalate | exit within 1 s, record removed, no respawn in 15 s, about 310 MB RSS freed, transcript kept; tab shows "Claude Code process exited with code 143" | typing in that tab resumed the same `sessionId` under a new pid |
+| `claude-peer`, `claude-desktop` | same | exit within 3 s, no respawn in 20 s; the app shows "session interrupted" with a retry button | a message in that session resumed the same `sessionId` and `hostSessionId` |
+| `agy` (desktop and IDE) | refuse while `running`; `UpdateConversationAnnotations {archived: true}` on the server holding it; read back `annotations.archived` | the conversation left the agent panel / Desktop sidebar; the server stamps `archivalStatusTimestamp` itself | `{archived: false}` from outside did not bring it back to the IDE panel, and no archived view was found; restore is not confirmed |
+| `codex` | `unsupported`, nothing sent (AgentBridge #27) | app-server `thread/archive` is refused with "active writer" while Desktop owns the thread; Desktop IPC exposes no archive or unload request | — |
+| `realtime` / `claude` | route removal only | — | — |
+
+Why these actions: there is no external clean exit for Claude (the peer socket takes only `user` frames, so `/exit` is unreachable), and the Antigravity panel's own Archive and Restore actions are exactly the `archived` annotation (read from the IDE bundle).
+
+Rules:
+
+- The caller's own Claude session (`CLAUDE_CODE_SESSION_ID`) is refused. Claude hosts other than the two above are `unsupported`.
+- An archive request that fails after it was sent, or that does not read back, is `uncertain: true` and is not resent.
+- A route that owns an active channel is not removed (close or hand off the channel first). `--keep-route` skips removal. A broker started before `unregister` existed answers "Unknown operation"; `close` then reports that the broker needs a restart, and the close itself stands.
+- Restarting the broker loses in-memory messages and their IDs: coordinate with the sessions that are waiting on replies first.
+- Permanent deletion is left to the owner.
 
 ## Security & Verification
 
