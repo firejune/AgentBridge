@@ -203,8 +203,10 @@ class ModelCommandTest(unittest.TestCase):
 class FakeAgy:
     """Stub language_server: steps grow as invocations run."""
 
-    def __init__(self, status='CASCADE_RUN_STATUS_IDLE', generators=None, on_switch='run', model_after=None):
+    def __init__(self, status='CASCADE_RUN_STATUS_IDLE', generators=None, on_switch='run', model_after=None,
+                 busy_polls=None):
         self.status = status
+        self.busy_polls = busy_polls  # polls the switch turn stays running; -1 = never finishes
         self.generators = generators if generators is not None else [self.gen('MODEL_PLACEHOLDER_M320', knowledge=True)]
         self.on_switch, self.model_after = on_switch, model_after
         self.calls = []
@@ -225,6 +227,10 @@ class FakeAgy:
             rows = self.generators[payload.get('generatorMetadataOffset', 0):]
             return {'generatorMetadata': rows} if rows else {}
         if method == 'GetAllCascadeTrajectories':
+            if self.status == 'CASCADE_RUN_STATUS_RUNNING' and self.busy_polls:
+                self.busy_polls -= 1
+                if self.busy_polls == 0:
+                    self.status = 'CASCADE_RUN_STATUS_IDLE'
             return {'trajectorySummaries': {SID: self.summary()}}
         if method == 'SendUserCascadeMessage':
             if self.on_switch == 'refuse':
@@ -234,6 +240,8 @@ class FakeAgy:
             if self.on_switch == 'run':
                 model = self.model_after or payload['cascadeConfig']['plannerConfig']['requestedModel']['model']
                 self.generators.append({'plannerConfig': {**payload['cascadeConfig']['plannerConfig'], 'planModel': model}})
+                if self.busy_polls is not None:
+                    self.status = 'CASCADE_RUN_STATUS_RUNNING'
             return {}
         raise AssertionError(method)
 
@@ -282,6 +290,33 @@ class AgyModelTest(unittest.TestCase):
         self.assertNotIn('modelName', planner)
         self.assertEqual(frame['deliveryStrategy'], agy_live.NEXT_INVOCATION)
         self.assertNotIn('items', frame)
+
+    def test_switch_reports_its_cost_and_waits_for_idle(self):
+        fake = FakeAgy(busy_polls=3)
+        result = self.switch(fake)
+        self.assertEqual((result['generators_spent'], result['status_after'], result['busy_after']), (1, 'idle', False))
+        self.assertEqual(len(self.sent(fake)), 1)
+
+    def test_switch_still_running_at_the_deadline_is_reported_busy_not_resent(self):
+        fake = FakeAgy(busy_polls=-1)
+        result = self.switch(fake, timeout=0.05)
+        self.assertEqual((result['changed'], result['status_after'], result['busy_after']), (True, 'running', True))
+        self.assertEqual(len(self.sent(fake)), 1)
+
+    def test_failed_idle_poll_keeps_the_confirmed_switch(self):
+        fake = FakeAgy(busy_polls=-1)
+        real, polls = fake.rpc, []
+        def flaky(url, csrf, method, payload, timeout=5):
+            if method == 'GetAllCascadeTrajectories' and fake.status == 'CASCADE_RUN_STATUS_RUNNING':
+                polls.append(1)
+                if len(polls) == 2:
+                    raise agy_live.DeliveryError('connection reset')
+            return real(url, csrf, method, payload, timeout)
+        fake.rpc = flaky
+        result = self.switch(fake)
+        self.assertEqual((result['changed'], result['status_after'], result['busy_after']), (True, 'unknown', None))
+        self.assertIn('busy state could not be read', result['warning'])
+        self.assertEqual(len(self.sent(fake)), 1)
 
     def test_switch_to_the_current_model_sends_nothing(self):
         fake = FakeAgy()
