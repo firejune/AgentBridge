@@ -359,7 +359,7 @@ class OpenClaudeIdeTests(unittest.TestCase):
         desk.assert_called_once()
         with self.assertRaisesRegex(ValueError,'applies only to Claude'):
             sessions.open_session('codex',cwd=str(self.root),host='ide')
-        with self.assertRaisesRegex(ValueError,'needs --host ide'):
+        with self.assertRaisesRegex(ValueError,'needs --provider claude --host ide'):
             sessions.open_session('claude',cwd=str(self.root),ide='vscode')
 
     def test_register_new_passes_host_and_ide(self):

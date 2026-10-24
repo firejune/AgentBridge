@@ -279,10 +279,10 @@ def inspect_session(provider, sid, executable=None, codex_mode='auto'):
 
 
 def open_session(provider='agy', cwd=None, title=None, model=None, timeout=180, host='desktop', ide=None):
-    if host != 'desktop' and provider != 'claude':
-        raise DiscoveryError(f'--host {host} applies only to Claude Code (claude / claude-peer)')
-    if ide and host != 'ide':
-        raise DiscoveryError('--ide needs --host ide')
+    if host != 'desktop' and provider not in ('claude', 'agy'):
+        raise DiscoveryError(f'--host {host} applies only to Claude Code (claude / claude-peer) and Antigravity (agy)')
+    if ide and (host != 'ide' or provider != 'claude'):
+        raise DiscoveryError('--ide picks the IDE of a Claude Code session; it needs --provider claude --host ide')
     if provider == 'codex':
         return codex_new.open_codex(cwd=cwd, title=title, model=model, timeout=timeout)
     if provider == 'claude':
@@ -294,10 +294,10 @@ def open_session(provider='agy', cwd=None, title=None, model=None, timeout=180, 
             raise DiscoveryError(f'Unknown Claude host {host!r}; use desktop or ide')
         return open_claude(cwd=cwd, title=title, model=model, timeout=timeout)
     if provider != 'agy':
-        raise DiscoveryError(f'Opening a new session is supported only for Antigravity Desktop (agy), Claude Code desktop (claude), and Codex desktop (codex), not {provider!r}')
+        raise DiscoveryError(f'Opening a new session is supported only for Antigravity (agy), Claude Code (claude) and Codex desktop (codex), not {provider!r}')
     if not cwd:
-        raise DiscoveryError('Provide --cwd when opening a new Antigravity Desktop session')
-    return agy_live.open_agy(cwd=cwd, title=title, model=model)
+        raise DiscoveryError('Provide --cwd when opening a new Antigravity session')
+    return agy_live.open_agy(cwd=cwd, title=title, model=model, host=host)
 
 
 

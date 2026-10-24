@@ -110,6 +110,7 @@ python3 "$bridge_cli" register agy-worker --project PROJECT --transport agy \
   - 워크스페이스가 데스크톱 프로젝트(`~/.gemini/config/projects/*.json` 또는 기존 trajectory)에 등록되어 있으면 해당 `projectId`에 자동 연결해 데스크톱 앱 사이드바의 해당 프로젝트 아래에 세션이 나타나며, 미등록 경로는 `workspaceUris`로 생성한다.
   - 기본 대화형 에이전트 사양(`customAgentSpec`: `builtinAgent.defaultAgent` + `planModel`)을 함께 설정하므로, 막 생성된 0-step 세션도 브릿지 `send`/`ask`가 도착하면 곧바로 첫 턴을 깨워 13개 빌트인 도구와 함께 실행한다.
   - `bridge.py register NAME --project PROJECT --transport agy --new --cwd /path/to/workspace [--title TITLE] [--model MODEL]`을 쓰면 데스크톱 세션 생성과 브로커 등록을 한 번에 마친다.
+  - **Antigravity IDE(`--host ide`)**: `open`이나 `register --new`에 `--host ide`를 붙이면 IDE language_server(`--app_data_dir antigravity-ide`)에 대화를 만든다. IDE 서버 하나가 모든 IDE 창을 맡고 대화는 `workspaceUris`로 `--cwd`를 받으므로, 창이 열려 있지 않은 폴더에도 된다. 데스크톱 프로젝트 매칭은 건너뛴다. IDE 에이전트 패널은 모든 워크스페이스의 대화를 보여 주고, 열 때 새 창으로 열지 지금 창을 바꿀지 묻는다. 모델 해석·정책 기본값·차단 목록은 IDE 서버의 카탈로그로 적용한다. 사람 단계는 없다.
 - **다른 세션(HQ·Claude·Codex 등)에서 이 채널을 찾고 연결하는 방법**:
   1. `python3 "$bridge_cli" routes --project PROJECT` 및 `python3 "$bridge_cli" channels --project PROJECT`로 이미 등록된 참가자 이름이나 바인딩된 채널이 있는지 확인한다.
   2. 아직 등록되지 않았다면 `python3 "$bridge_cli" sessions --provider agy`(또는 `--cwd /path/to/workspace` 추가)를 실행해 현재 열려 있는 Antigravity IDE(`scope: "Antigravity IDE live trajectory registry"`)와 데스크톱(`scope: "Antigravity desktop live trajectory registry"`) 대화의 UUID(`id`), 제목(`name`), 작업 경로(`cwd`)를 조회한다.

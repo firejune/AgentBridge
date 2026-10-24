@@ -309,7 +309,7 @@ python3 "$bridge_cli" resolve MESSAGE_ID --state done --note 'Completed'
 
 | Provider | Read | Switch | New-session model |
 | --- | --- | --- | --- |
-| agy | last generator `plannerConfig` (`GetCascadeTrajectoryGeneratorMetadata`, tail only via `generatorMetadataOffset`) | idle only; empty `SendUserCascadeMessage` + `cascadeConfig` (own planner, `requestedModel` changed), runs one invocation; verified live | `open`/`register --new --model` (desktop server) |
+| agy | last generator `plannerConfig` (`GetCascadeTrajectoryGeneratorMetadata`, tail only via `generatorMetadataOffset`) | idle only; empty `SendUserCascadeMessage` + `cascadeConfig` (own planner, `requestedModel` changed), runs one invocation; verified live | `open`/`register --new --model` (desktop server, or IDE server with `--host ide`) |
 | claude (VS Code, desktop) | transcript newest assistant `message.model`; verified live | desktop: relayed through a desktop command post (below), unit-tested only; VS Code: STOP (below) | STOP (below) |
 | codex | exact Desktop owner's resumed **NEXT-TURN settings**, fresh in `model`, `routes`, `sessions`; unknown with reason when unreadable (stub-tested) | `model NAME --set M`: advertised model, exact owner, model-only update and readback, one attempt; active turn continues | `open`/`register --new`: flag > env > policy `defaults.codex` > `gpt-6.1-sol`; denylist checked before creation |
 
