@@ -237,12 +237,24 @@ def discover_server(timeout=5):
     return discover_servers(timeout=timeout)[0]
 
 
-def discover_desktop_server(timeout=5):
-    servers = discover_servers(timeout=timeout)
-    for server in servers:
-        if server.get('app_dir') == 'antigravity':
+# One language server per app serves every window of that app (measured on the
+# IDE with two windows open), so a host names exactly one server.
+HOST_APP_DIRS = {'desktop': 'antigravity', 'ide': 'antigravity-ide'}
+
+
+def discover_host_server(host='desktop', timeout=5):
+    app_dir = HOST_APP_DIRS.get(host)
+    if app_dir is None:
+        raise DeliveryError(f'Unknown Antigravity host {host!r}; use desktop or ide')
+    for server in discover_servers(timeout=timeout):
+        if server.get('app_dir') == app_dir:
             return server
-    raise DeliveryError('Antigravity desktop language_server is not running')
+    label = 'desktop' if host == 'desktop' else 'IDE'
+    raise DeliveryError(f'Antigravity {label} language_server is not running')
+
+
+def discover_desktop_server(timeout=5):
+    return discover_host_server('desktop', timeout=timeout)
 
 
 def gemini_projects_dir():
@@ -497,16 +509,18 @@ def read_agy(sid, timeout=5):
     return {'session': row, 'warning': None}
 
 
-def open_agy(cwd, title=None, model=None, timeout=5):
+def open_agy(cwd, title=None, model=None, timeout=5, host='desktop'):
     if not cwd or not str(cwd).strip():
-        raise DeliveryError('Workspace --cwd is required to open an Antigravity desktop session')
+        raise DeliveryError('Workspace --cwd is required to open an Antigravity session')
     target_path = Path(cwd).expanduser().resolve()
     if not target_path.is_dir():
         raise DeliveryError(f'Workspace directory does not exist: {target_path}')
 
-    server = discover_desktop_server(timeout=timeout)
+    server = discover_host_server(host, timeout=timeout)
     model_info = resolve_model(server, model, timeout=timeout)
-    project_id = find_desktop_project_id(server, str(target_path))
+    # Desktop projects group conversations in its sidebar; the IDE takes the
+    # workspace folder directly and lists every workspace's conversations.
+    project_id = find_desktop_project_id(server, str(target_path)) if host == 'desktop' else None
     cid = str(uuid.uuid4())
     base_payload = {
         'cascadeId': cid,
@@ -577,6 +591,7 @@ def open_agy(cwd, title=None, model=None, timeout=5):
         'model': model_info['model_id'],
         'model_enum': model_info['model_enum'],
         'project_id': project_id,
+        'host': host,
         'warning': None,
     }
 

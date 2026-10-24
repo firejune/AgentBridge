@@ -328,7 +328,7 @@ python3 "$bridge_cli" resolve MESSAGE_ID --state done --note '결과 확인 완�
 
 | 공급자 | 읽기 | 전환 | 새 세션 모델 |
 | --- | --- | --- | --- |
-| agy | 마지막 generator `plannerConfig` (`GetCascadeTrajectoryGeneratorMetadata`, `generatorMetadataOffset`로 꼬리만) | 대기 중일 때만, 빈 `SendUserCascadeMessage` + `cascadeConfig`(자기 플래너에서 `requestedModel`만 변경), 호출 1회, live 검증 | `open`/`register --new --model` (데스크톱 서버) |
+| agy | 마지막 generator `plannerConfig` (`GetCascadeTrajectoryGeneratorMetadata`, `generatorMetadataOffset`로 꼬리만) | 대기 중일 때만, 빈 `SendUserCascadeMessage` + `cascadeConfig`(자기 플래너에서 `requestedModel`만 변경), 호출 1회, live 검증 | `open`/`register --new --model` (데스크톱 서버, `--host ide`면 IDE 서버) |
 | claude (VS Code, 데스크톱) | 기록의 최근 assistant `message.model`, live 검증 | 데스크톱: 데스크톱 사령탑을 거쳐 중계(아래), 단위 테스트만 · VS Code: STOP (아래) | STOP (아래) |
 | codex | `model` 어댑터 아직 없음 | `codex-model` (#12) | `open --provider codex --model` (#12) |
 

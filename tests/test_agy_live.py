@@ -7,10 +7,12 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bridge
+import sessions
 from support import RunningBroker
 
 CSRF = 'ca5f-' + 'ab' * 16
@@ -410,6 +412,44 @@ class AgyLiveTests(unittest.TestCase):
                 with mock.patch('subprocess.check_output', side_effect=fake_check_output):
                     server = agy_live.discover_desktop_server()
             self.assertEqual((server['app_dir'], server['summaries']), ('antigravity', {}))
+
+    def ide_servers(self, fake, desktop=False):
+        rows = [{'pid': 2002, 'app_dir': 'antigravity-ide', 'url': fake.url, 'csrf': CSRF, 'summaries': {}}]
+        if desktop:
+            rows.insert(0, {'pid': 2001, 'app_dir': 'antigravity', 'url': 'http://127.0.0.1:1', 'csrf': CSRF, 'summaries': {}})
+        return rows
+
+    def test_open_host_ide_creates_on_the_ide_server_with_workspace_uri(self):
+        import agy_live
+        with FakeAgyServer(self.root, self.sid) as fake, \
+                mock.patch.object(agy_live, 'discover_servers', return_value=self.ide_servers(fake, desktop=True)), \
+                mock.patch.object(agy_live, 'find_desktop_project_id') as projects:
+            opened = sessions.open_session('agy', cwd=str(self.root), title='IDE Worker', host='ide')
+        projects.assert_not_called()
+        self.assertEqual((opened['created'], opened['host'], opened['project_id']), (True, 'ide', None))
+        self.assertEqual((opened['session']['cwd'], opened['session']['name']), (str(self.root), 'IDE Worker'))
+        start = [body for path, _, body in fake.requests if path.endswith('/StartCascade')]
+        self.assertEqual(len(start), 1)
+        self.assertEqual(start[0]['workspaceUris'], [self.root.as_uri()])
+        self.assertNotIn('projectEnvConfig', start[0])
+
+    def test_host_ide_without_an_ide_server_fails_by_name(self):
+        import agy_live
+        desktop_only = [{'pid': 2001, 'app_dir': 'antigravity', 'url': 'http://127.0.0.1:1', 'csrf': CSRF, 'summaries': {}}]
+        with mock.patch.object(agy_live, 'discover_servers', return_value=desktop_only):
+            with self.assertRaisesRegex(ValueError, 'IDE language_server is not running'):
+                agy_live.open_agy(str(self.root), host='ide')
+            self.assertEqual(agy_live.discover_desktop_server()['app_dir'], 'antigravity')
+        with self.assertRaisesRegex(ValueError, 'Unknown Antigravity host'):
+            agy_live.discover_host_server('cloud')
+
+    def test_ide_flag_is_claude_only_and_host_reaches_agy(self):
+        with self.assertRaisesRegex(ValueError, '--ide picks the IDE of a Claude Code session'):
+            sessions.open_session('agy', cwd=str(self.root), host='ide', ide='vscode')
+        with mock.patch.object(sessions.agy_live, 'open_agy', return_value='ok') as opened:
+            self.assertEqual(sessions.open_session('agy', cwd=str(self.root), host='ide'), 'ok')
+            sessions.open_session('agy', cwd=str(self.root))
+        self.assertEqual([c.kwargs['host'] for c in opened.call_args_list], ['ide', 'desktop'])
 
     def test_non_map_summaries_are_still_refused(self):
         import agy_live
