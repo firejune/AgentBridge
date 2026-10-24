@@ -104,9 +104,11 @@ Edit the canonical files under `skill/agent-bridge/` rather than duplicating scr
 
 Supervision is opt-in: `install-service` installs a per-user launchd agent; `uninstall-service` unloads and removes it. To inspect without loading anything, use `install-service --generate-only --plist /absolute/path/agent.plist`, then `plutil -lint /absolute/path/agent.plist`. `KeepAlive` restarts even after `stop`; uninstall the service to keep it down. See the [operations reference](skill/agent-bridge/references/usage.md#routing-storage-and-opt-in-launchd) before installation.
 
-## Subscription limits (Codex)
+## Subscription limits (Codex, Antigravity)
 
-Each bucket line ends with a risk state (`holds until reset`, `AT RISK: empty ~T before reset`, `EXHAUSTED`, `risk unknown`), and every `send` / `ask` / `reply` to or from a `codex` route carries the same lines as a `usage` field in the sender's output, so a command post sees them whenever it hands out work (#32).
+**Antigravity (#34)**: a second collector thread reads `GetCascadeModelConfigData` from whichever Antigravity language server runs (one RPC, no tokens). Each model carries `quotaInfo { remainingFraction, resetTime }`, the figures the app shows; models of one family share them, so the buckets are `agy/gemini` and `agy/partner` (every non-Gemini model), split per model only if a family disagrees. No window length is reported. History goes to `<state-dir>/usage/agy.jsonl`; query with `usage --provider agy`.
+
+Each bucket line ends with a risk state (`holds until reset`, `AT RISK: empty ~T before reset`, `EXHAUSTED`, `risk unknown`), and every `send` / `ask` / `reply` to or from a `codex` or `agy` route carries the same lines as a `usage` field in the sender's output, so a command post sees them whenever it hands out work (#32).
 
 The broker samples Codex subscription limits in a daemon thread of the same process, so no extra service is installed. Every `serve --usage-interval 15` minutes (minimum 5, `0` turns it off) it starts a private `codex app-server --stdio`, sends `initialize`, `initialized` and `account/rateLimits/read`, and stops the process. That read starts no thread or turn, delivers nothing to any session, and costs no model tokens.
 

@@ -95,9 +95,11 @@ python3 ~/.agents/skills/agent-bridge/scripts/bridge.py sessions --provider agy
 
 서비스는 명시적 `install-service`로 설치한다. `install-service --generate-only --plist /absolute/review/agent.plist`와 `plutil -lint /absolute/review/agent.plist`는 서비스 로드 없이 검토한다. KeepAlive는 `stop` 뒤에도 다시 기동하므로 계속 중지하려면 `uninstall-service`로 제거한다. 자세한 경로·복원·운영 계약은 [사용법](usage.md#라우팅-저장과-선택적-launchd)을 읽는다.
 
-## 구독 한도 (Codex)
+## 구독 한도 (Codex, Antigravity)
 
-버킷 줄마다 위험 상태(`holds until reset`·`AT RISK: empty ~T before reset`·`EXHAUSTED`·`risk unknown`)가 붙고, `codex` 라우트로 가거나 거기서 오는 `send`·`ask`·`reply`는 같은 줄을 보낸 쪽 출력의 `usage` 필드로 싣는다. 사령탑은 일을 맡길 때마다 그것을 보게 된다(#32).
+**Antigravity(#34)**: 두 번째 수집 스레드가 떠 있는 Antigravity language server에서 `GetCascadeModelConfigData`를 읽는다(RPC 한 번, 토큰 없음). 모델마다 앱이 보여 주는 `quotaInfo { remainingFraction, resetTime }`가 있고, 같은 계열 모델은 값을 공유하므로 버킷은 `agy/gemini`와 `agy/partner`(Gemini 아닌 모델 전부)다. 계열 안에서 값이 어긋나면 모델별로 나눈다. 창 길이는 알려 주지 않는다. 기록은 `<state-dir>/usage/agy.jsonl`, 조회는 `usage --provider agy`.
+
+버킷 줄마다 위험 상태(`holds until reset`·`AT RISK: empty ~T before reset`·`EXHAUSTED`·`risk unknown`)가 붙고, `codex`·`agy` 라우트로 가거나 거기서 오는 `send`·`ask`·`reply`는 같은 줄을 보낸 쪽 출력의 `usage` 필드로 싣는다. 사령탑은 일을 맡길 때마다 그것을 보게 된다(#32).
 
 브로커는 같은 프로세스의 데몬 스레드에서 Codex 구독 한도를 표본으로 읽는다. 서비스를 따로 설치하지 않는다. `serve --usage-interval 15`분마다(최소 5, `0`은 끔) 전용 `codex app-server --stdio`를 띄워 `initialize`·`initialized`·`account/rateLimits/read`만 보내고 프로세스를 끝낸다. 이 읽기는 스레드·턴을 시작하지 않고, 어느 세션에도 전달하지 않으며, 모델 토큰을 쓰지 않는다.
 
