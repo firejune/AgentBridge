@@ -106,6 +106,8 @@ Supervision is opt-in: `install-service` installs a per-user launchd agent; `uni
 
 ## Subscription limits (Codex)
 
+Each bucket line ends with a risk state (`holds until reset`, `AT RISK: empty ~T before reset`, `EXHAUSTED`, `risk unknown`), and every `send` / `ask` / `reply` to or from a `codex` route carries the same lines as a `usage` field in the sender's output, so a command post sees them whenever it hands out work (#32).
+
 The broker samples Codex subscription limits in a daemon thread of the same process, so no extra service is installed. Every `serve --usage-interval 15` minutes (minimum 5, `0` turns it off) it starts a private `codex app-server --stdio`, sends `initialize`, `initialized` and `account/rateLimits/read`, and stops the process. That read starts no thread or turn, delivers nothing to any session, and costs no model tokens.
 
 Samples go to `<state-dir>/usage/codex.jsonl`, one record per bucket and window: `observed_at` and `resets_at` in UTC, `limit_id`, `slot` (`primary`/`secondary`), `used_percent`, `window_mins`, `allowed`, `reset_credits`, `source`, `status` (`ok`, `failed`, or `stale` when the reported reset time has already passed). Account identifiers and plan names are dropped before writing. A failed read is stored with null values and is shown as unknown, never as 0%. Unchanged samples (a `resets_at` within 60 s counts as unchanged, since the server's value drifts by a second between reads) are skipped for up to an hour, failures back off up to 4 hours, and the file keeps 30 days and at most 5 MB, replaced atomically on each write.

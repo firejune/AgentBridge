@@ -435,6 +435,55 @@ def summarize(records, now, since):
     return dict(buckets=rows, last_failure=None if latest_failure is None else utc(latest_failure))
 
 
+# Risk (#32): the recent burn against the official resets_at. The early-reset
+# estimate is not guaranteed, so it never makes a bucket look safe. The window
+# is 3 h, not 1 h: the store keeps a sample only when it changes or an hour has
+# passed (DEDUP_SECONDS), so one hour often holds a single record. summarize()
+# already restarts the window at a reset inside it.
+RISK_BURN_SINCE = timedelta(hours=3)
+RISK_BURN_LABEL = '3h'
+
+
+def risk(row, rate, now):
+    used, remaining = row['used_percent'], row['remaining_percent']
+    if (used is not None and used >= 100) or row['allowed'] is False:
+        return dict(state='exhausted', reason='usage is at the limit')
+    if row['freshness'] != 'fresh':
+        return dict(state='unknown', reason=f"latest sample is {row['freshness']}")
+    if remaining is None or row['resets_at'] is None:
+        return dict(state='unknown', reason='remaining or resets_at missing')
+    if rate is None:
+        return dict(state='unknown', reason=f'fewer than 2 samples in the last {RISK_BURN_LABEL}')
+    until = (parse_time(row['resets_at']) - now).total_seconds()
+    if until <= 0:
+        return dict(state='unknown', reason='reset is due; waiting for a new sample')
+    burn = rate['percent_per_hour']
+    if burn <= 0:
+        return dict(state='holds', burn_per_hour=burn)
+    empty = remaining / burn * 3600
+    if empty < until:
+        return dict(state='at_risk', burn_per_hour=burn, empty_at=utc(now + timedelta(seconds=empty)))
+    return dict(state='holds', burn_per_hour=burn)
+
+
+def assess(summary, records, now):
+    short = {(r['limit_id'], r['slot']): r['rate'] for r in summarize(records, now, RISK_BURN_SINCE)['buckets']}
+    for row in summary['buckets']:
+        row['risk'] = risk(row, short.get((row['limit_id'], row['slot'])), now)
+    return summary
+
+
+def risk_text(verdict):
+    state = verdict['state']
+    if state == 'at_risk':
+        return f"AT RISK: empty ~{local(verdict['empty_at'])} before reset"
+    if state == 'exhausted':
+        return 'EXHAUSTED'
+    if state == 'holds':
+        return 'holds until reset'
+    return f"risk unknown ({verdict['reason']})"
+
+
 def width(event):
     return (parse_time(event['window_end']) - parse_time(event['window_start'])).total_seconds()
 
@@ -561,6 +610,8 @@ def format_summary(summary, now):
             parts.append(f"next early reset ~{local(guess['centre'])} "
                          f"[est, n={guess['n']}, {guess['source']}"
                          + (', overdue]' if guess['state'] == 'overdue' else ']'))
+        if row.get('risk'):
+            parts.append(risk_text(row['risk']))
         lines.append(' · '.join(parts))
         for boundary in row['resets']:
             lines.append(f"  RESET between {local(boundary['after'])} and {local(boundary['before'])}: "
@@ -638,6 +689,7 @@ def query(state_dir, since='6h', provider='codex', now=None):
     announcements = announced(AnnouncementStore(directory).load())
     summary = annotate(summarize(records, now, parse_since(since)), all_events(directory, records),
                        announcements, now)
+    assess(summary, records, now)
     summary['announcements'] = announcements
     return records, summary, now
 
@@ -646,3 +698,30 @@ def seed_announcements(state_dir, path, now=None):
     now = now or datetime.now(timezone.utc)
     store = AnnouncementStore(Path(state_dir).expanduser() / 'usage')
     return dict(added=len(store.seed(path, now)), total=len(store.load()), path=str(store.path))
+
+
+def brief(state_dir, provider='codex', now=None):
+    """The compact per-bucket lines a bridge message carries (#32). Files only; never raises."""
+    try:
+        _, summary, now = query(state_dir, '1h', provider, now)
+    except Exception as error:  # A broken store must never fail or delay a send.
+        return dict(provider=provider, state='unknown', reason=f'usage unreadable: {error}', lines=[])
+    rows, lines = [], []
+    for row in summary['buckets']:
+        name = f"{row['provider']} {window_name(row['window_mins'])}" + ('' if row['slot'] == 'primary' else f" {row['slot']}")
+        remaining = 'unknown' if row['remaining_percent'] is None else f"{row['remaining_percent']:g}% left"
+        burn = row['risk'].get('burn_per_hour')
+        parts = [f'{name}: {remaining}']
+        if burn is not None:
+            parts.append(f'burn {burn:+.2f}%p/h ({RISK_BURN_LABEL})')
+        if row['resets_at']:
+            parts.append(f"resets {local(row['resets_at'])}")
+        parts.append(risk_text(row['risk']))
+        lines.append(' · '.join(parts))
+        rows.append(dict(limit_id=row['limit_id'], slot=row['slot'], remaining_percent=row['remaining_percent'],
+                         resets_at=row['resets_at'], observed_at=row['observed_at'], **row['risk']))
+    order = ('exhausted', 'at_risk', 'unknown', 'holds')
+    worst = min((r['state'] for r in rows), key=order.index, default='unknown')
+    if not rows:
+        lines.append(f'{provider}: risk unknown (no successful read recorded)')
+    return dict(provider=provider, state=worst, buckets=rows, lines=lines)
