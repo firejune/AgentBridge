@@ -371,7 +371,7 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
         raise ValueError('Broker is already running for this socket') from error
     server = None
     store = None
-    collector = None
+    collectors = []
     try:
         if path.exists():
             if not stat.S_ISSOCK(path.stat().st_mode):
@@ -381,8 +381,9 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
         state = State(max_messages, store)
         if usage_interval:
             # Read-only limit sampling beside the broker; it never touches `state`.
-            collector = usage.Collector(usage.UsageStore(store.directory / 'usage'),
-                                        usage_interval, codex_executable).start()
+            collectors = [usage.Collector(usage.UsageStore(store.directory / 'usage', provider=provider),
+                                          usage_interval, codex_executable).start()
+                          for provider in usage.PROVIDERS]
         stopping = asyncio.Event()
         handlers = set()
         writers = set()
@@ -441,7 +442,7 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
         await asyncio.gather(*active,return_exceptions=True)
         await server.wait_closed()
     finally:
-        if collector is not None:
+        for collector in collectors:
             collector.stop()
         if server is not None:
             server.close()
