@@ -317,7 +317,7 @@ def registration(args):
         if args.discover or args.session:
             raise ValueError('--new cannot be combined with --session or --discover')
         if args.transport not in ('agy','claude-peer','codex'):
-            raise ValueError('--new is supported only with --transport agy (Antigravity Desktop), claude-peer (Claude Code desktop), or codex (Codex desktop)')
+            raise ValueError('--new is supported only with --transport agy (Antigravity desktop or IDE), claude-peer (Claude Code desktop or IDE), or codex (Codex desktop)')
         if not args.cwd:
             raise ValueError('--new requires --cwd')
         provider = 'claude' if args.transport == 'claude-peer' else args.transport
@@ -409,14 +409,14 @@ def main(argv=None):
     p.add_argument('--transport',choices=['realtime','codex','claude','claude-peer','agy'],default='realtime')
     p.add_argument('--session');p.add_argument('--cwd');p.add_argument('--executable')
     p.add_argument('--discover',action='store_true')
-    p.add_argument('--new',action='store_true',help='Open a new Antigravity, Claude Code, or Codex desktop session and register it')
+    p.add_argument('--new',action='store_true',help='Open a new Antigravity, Claude Code, or Codex session and register it')
     p.add_argument('--title');p.add_argument('--model')
     p.add_argument('--timeout',type=float,default=180,help='Seconds to wait for desktop session creation')
     p.add_argument('--host',choices=['desktop','ide'],default='desktop',help='Host for --new (claude-peer, agy): desktop app or IDE. Claude desktop needs Enter; Claude IDE, agy desktop and agy IDE do not')
     p.add_argument('--ide',choices=sorted(sessions.CLAUDE_IDES),help=f'IDE for --host ide (default {sessions.DEFAULT_IDE})')
     p.add_argument('--codex-mode',choices=['auto','shared','saved'],default='auto')
     p.add_argument('--state-dir',help='Broker state directory holding policy.json (default: socket path with .state suffix)')
-    p = sub.add_parser('open',help='Open a new live desktop session')
+    p = sub.add_parser('open',help='Open a new live session (Claude Code, Codex, Antigravity; desktop or IDE)')
     p.add_argument('--provider',choices=['agy','claude','codex'],default='agy')
     p.add_argument('--cwd',required=True);p.add_argument('--title');p.add_argument('--model')
     p.add_argument('--timeout',type=float,default=180)

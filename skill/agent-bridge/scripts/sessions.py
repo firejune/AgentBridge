@@ -294,7 +294,7 @@ def open_session(provider='agy', cwd=None, title=None, model=None, timeout=180, 
             raise DiscoveryError(f'Unknown Claude host {host!r}; use desktop or ide')
         return open_claude(cwd=cwd, title=title, model=model, timeout=timeout)
     if provider != 'agy':
-        raise DiscoveryError(f'Opening a new session is supported only for Antigravity Desktop (agy), Claude Code desktop (claude), and Codex desktop (codex), not {provider!r}')
+        raise DiscoveryError(f'Opening a new session is supported only for Antigravity (agy), Claude Code (claude) and Codex desktop (codex), not {provider!r}')
     if not cwd:
         raise DiscoveryError('Provide --cwd when opening a new Antigravity session')
     return agy_live.open_agy(cwd=cwd, title=title, model=model, host=host)
