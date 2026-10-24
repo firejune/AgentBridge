@@ -562,3 +562,37 @@ def open_claude_ide(cwd, title=None, model=None, timeout=180, ide=DEFAULT_IDE, s
             raise DiscoveryError(f'No new live Claude IDE session appeared under {folder} within {timeout:g}s. '
                                  f'Check that {ide} is running with the Claude Code extension enabled.')
         time.sleep(poll)
+
+
+# --- Closing a Claude Code IDE session --------------------------------------
+# There is no external clean exit: the peer socket accepts only user frames, so
+# /exit is unreachable. Measured on extension 2.1.310: SIGTERM ends the CLI at
+# once, its registry record goes away and nothing respawns; the tab shows
+# "process exited with code 143", the transcript stays, and typing in that tab
+# resumes the same sessionId. That makes it a close that can be undone.
+CLOSABLE_CLAUDE_HOSTS = ('claude-vscode',)
+
+
+def close_claude(sid, own_session=None, timeout=10, sessions_dir=None, killer=None, poll=0.2):
+    row = resolve_claude_peer(sid, sessions_dir)
+    if own_session and str(own_session) == row['id']:
+        raise DiscoveryError('Refusing to close the calling session itself')
+    try:
+        record = json.loads(Path(row['registry']).read_text(encoding='utf-8'))
+    except (OSError, ValueError) as error:
+        raise DiscoveryError(f'Cannot read the registry record of Claude session {sid}: {error}') from None
+    host = record.get('entrypoint') or 'unknown'
+    if host not in CLOSABLE_CLAUDE_HOSTS:
+        raise DiscoveryError(f'unsupported host {host}')
+    pid = row['pid']
+    (killer or os.kill)(pid, signal.SIGTERM)
+    deadline = time.monotonic() + timeout
+    while pid_alive(pid):
+        if time.monotonic() >= deadline:
+            raise DiscoveryError(f'Claude session {sid} (pid {pid}) is still running {timeout:g}s after SIGTERM; '
+                                 'not escalating. Check it before trying again.')
+        time.sleep(poll)
+    return {'closed': True, 'method': 'terminate', 'session': row['id'], 'host': host, 'pid': pid,
+            'resumable': True,
+            'note': 'The IDE tab shows "process exited with code 143". The transcript is kept; '
+                    'typing in that tab resumes the same session.'}

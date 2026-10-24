@@ -53,6 +53,20 @@ Calling `send`, `ask`, or `reply` from any participant automatically routes and 
 
 Details: [SKILL.md](skill/agent-bridge/SKILL.md) and [usage.md](skill/agent-bridge/references/usage.md).
 
+## Closing Sessions
+
+`close NAME --project PROJECT` stops or archives a participant's session and then removes its route (`--keep-route` keeps it). It never deletes anything; permanent deletion is left to the owner.
+
+| Transport | What `close` does | Undo |
+| --- | --- | --- |
+| `claude-peer` on the IDE extension | SIGTERM to the exact registered CLI process; the tab shows "process exited with code 143" | Type in that tab: the same session resumes |
+| `claude-peer` on desktop | `unsupported` (not measured) | — |
+| `agy` | `{archived: true}` annotation, the panel's own Archive action; refused while `running` | Not confirmed from outside the panel |
+| `codex` | `unsupported`: Desktop holds the thread (AgentBridge #27) | — |
+| `realtime` / `claude` | Route removal only | — |
+
+The caller's own Claude session is refused. A route that owns an active channel is not removed. A broker started before this version reports that it needs a restart to remove routes.
+
 ## Global Skill Installation
 
 Symlink the four standard skill discovery paths to `skill/agent-bridge` so all local agents share the same single copy:
