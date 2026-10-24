@@ -564,13 +564,19 @@ def open_claude_ide(cwd, title=None, model=None, timeout=180, ide=DEFAULT_IDE, s
         time.sleep(poll)
 
 
-# --- Closing a Claude Code IDE session --------------------------------------
+# --- Closing a Claude Code session ------------------------------------------
 # There is no external clean exit: the peer socket accepts only user frames, so
-# /exit is unreachable. Measured on extension 2.1.310: SIGTERM ends the CLI at
-# once, its registry record goes away and nothing respawns; the tab shows
-# "process exited with code 143", the transcript stays, and typing in that tab
-# resumes the same sessionId. That makes it a close that can be undone.
-CLOSABLE_CLAUDE_HOSTS = ('claude-vscode',)
+# /exit is unreachable. Measured on the IDE extension 2.1.310 and on desktop:
+# SIGTERM ends the CLI, its registry record goes away and nothing respawns; the
+# transcript stays, and a new message in that session resumes the same
+# sessionId (desktop keeps the same hostSessionId). That makes it a close that
+# can be undone.
+CLOSABLE_CLAUDE_HOSTS = {
+    'claude-vscode': 'The IDE tab shows "process exited with code 143". The transcript is kept; '
+                     'typing in that tab resumes the same session.',
+    'claude-desktop': 'The desktop app shows "session interrupted" with a retry button. The transcript is '
+                      'kept; sending a message in that session resumes the same session.',
+}
 
 
 def close_claude(sid, own_session=None, timeout=10, sessions_dir=None, killer=None, poll=0.2):
@@ -593,6 +599,4 @@ def close_claude(sid, own_session=None, timeout=10, sessions_dir=None, killer=No
                                  'not escalating. Check it before trying again.')
         time.sleep(poll)
     return {'closed': True, 'method': 'terminate', 'session': row['id'], 'host': host, 'pid': pid,
-            'resumable': True,
-            'note': 'The IDE tab shows "process exited with code 143". The transcript is kept; '
-                    'typing in that tab resumes the same session.'}
+            'resumable': True, 'note': CLOSABLE_CLAUDE_HOSTS[host]}
