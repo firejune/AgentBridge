@@ -97,6 +97,8 @@ python3 ~/.agents/skills/agent-bridge/scripts/bridge.py sessions --provider agy
 
 ## 구독 한도 (Codex)
 
+버킷 줄마다 위험 상태(`holds until reset`·`AT RISK: empty ~T before reset`·`EXHAUSTED`·`risk unknown`)가 붙고, `codex` 라우트로 가거나 거기서 오는 `send`·`ask`·`reply`는 같은 줄을 보낸 쪽 출력의 `usage` 필드로 싣는다. 사령탑은 일을 맡길 때마다 그것을 보게 된다(#32).
+
 브로커는 같은 프로세스의 데몬 스레드에서 Codex 구독 한도를 표본으로 읽는다. 서비스를 따로 설치하지 않는다. `serve --usage-interval 15`분마다(최소 5, `0`은 끔) 전용 `codex app-server --stdio`를 띄워 `initialize`·`initialized`·`account/rateLimits/read`만 보내고 프로세스를 끝낸다. 이 읽기는 스레드·턴을 시작하지 않고, 어느 세션에도 전달하지 않으며, 모델 토큰을 쓰지 않는다.
 
 표본은 `<state-dir>/usage/codex.jsonl`에 버킷·창마다 한 줄로 남는다: UTC의 `observed_at`·`resets_at`, `limit_id`, `slot`(`primary`/`secondary`), `used_percent`, `window_mins`, `allowed`, `reset_credits`, `source`, `status`(`ok`·`failed`, 보고된 리셋 시각이 이미 지났으면 `stale`). 계정 식별자와 플랜 이름은 쓰기 전에 버린다. 읽기 실패는 null로 저장되고 0%가 아니라 「알 수 없음」으로 표시된다. 값이 같으면(서버의 `resets_at`은 읽을 때마다 1초쯤 흔들리므로 60초 안의 차이는 같은 값으로 본다) 한 시간까지 건너뛰고, 실패는 최대 4시간까지 간격을 늘리며, 파일은 30일·5 MB 안에서 매번 원자적으로 교체된다.

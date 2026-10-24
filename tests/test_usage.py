@@ -651,3 +651,93 @@ class EventCliTests(EventBase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RiskTests(Base):
+    def brief(self, now):
+        return usage.brief(self.root / 'state', now=now)
+
+    def hourly(self, *used, **fields):
+        for hour, value in enumerate(used):
+            self.add(T0 + timedelta(minutes=61 * hour), used=value, **fields)
+        return T0 + timedelta(minutes=61 * (len(used) - 1) + 1)
+
+    def test_burn_that_empties_before_reset_is_at_risk_with_the_empty_time(self):
+        now = self.hourly(40, 42, 44)
+        found = self.brief(now)
+        (row,) = found['buckets']
+        self.assertEqual((found['state'], row['state']), ('at_risk', 'at_risk'))
+        hours = 56 / row['burn_per_hour']
+        self.assertAlmostEqual(usage.parse_time(row['empty_at']).timestamp(), (now + timedelta(hours=hours)).timestamp(), delta=1)
+        self.assertIn('AT RISK: empty ~', found['lines'][0])
+        self.assertIn('(3h)', found['lines'][0])
+
+    def test_slow_or_flat_burn_holds(self):
+        self.assertEqual(self.brief(self.hourly(40, 40.5, 41))['state'], 'holds')
+        self.tearDown(); self.setUp()
+        self.assertEqual(self.brief(self.hourly(40, 40, 40))['state'], 'holds')
+
+    def test_exhausted_beats_everything(self):
+        self.add(T0, used=100, allowed=False)
+        self.assertEqual(self.brief(T0)['state'], 'exhausted')
+
+    def test_missing_stale_sparse_and_due_are_unknown(self):
+        self.assertEqual(self.brief(T0)['state'], 'unknown')  # nothing recorded
+        self.add(T0)
+        self.assertIn('fewer than 2 samples', self.brief(T0)['buckets'][0]['reason'])
+        self.assertIn('stale', self.brief(T0 + timedelta(minutes=91))['buckets'][0]['reason'])
+        self.tearDown(); self.setUp()
+        soon = int((T0 + timedelta(minutes=90)).timestamp())
+        now = self.hourly(40, 41, resets=soon)
+        self.assertEqual(self.brief(now + timedelta(minutes=30))['buckets'][0]['reason'], 'reset is due; waiting for a new sample')
+
+    def test_broken_store_is_unknown_and_never_raises(self):
+        with patch.object(usage, 'query', side_effect=OSError('disk gone')):
+            found = self.brief(T0)
+        self.assertEqual(found['state'], 'unknown')
+        self.assertIn('disk gone', found['reason'])
+
+    def test_usage_line_carries_the_state(self):
+        now = self.hourly(40, 42, 44)
+        text = usage.format_summary(usage.query(self.root / 'state', '6h', now=now)[1], now)
+        self.assertIn('AT RISK', text)
+
+
+class MessageUsageTests(Base):
+    def setUp(self):
+        super().setUp()
+        for hour, value in enumerate((40, 42, 44)):
+            self.add(T0 + timedelta(minutes=61 * hour), used=value)
+
+    def usage_for(self, *transports):
+        message = {'route': {'transport': transports[0]}, 'return_route': {'transport': transports[1]}}
+        with patch.object(bridge, 'broker_state_dir', return_value=self.root / 'state'):
+            return bridge.message_usage(None, message)
+
+    def test_codex_on_either_end_carries_usage_and_others_do_not(self):
+        self.assertEqual(self.usage_for('codex', 'claude-peer')['provider'], 'codex')
+        self.assertEqual(self.usage_for('claude-peer', 'codex')['provider'], 'codex')
+        self.assertIsNone(self.usage_for('claude-peer', 'agy'))
+        self.assertIsNone(self.usage_for('realtime', 'realtime'))
+
+    def test_send_output_carries_usage_only_for_codex_routes(self):
+        with RunningBroker() as server, patch.object(bridge, 'broker_state_dir', return_value=self.root / 'state'):
+            cwd = str(self.root)
+            server.call('register', project='p', name='hq', cwd=cwd)
+            server.call('register', project='p', name='w', cwd=cwd)
+            body = self.root / 'b.txt'; body.write_text('hi')
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = bridge.main(['--socket', server.path, 'send', '--project', 'p', '--from', 'hq', '--to', 'w',
+                                    '--key', 'k1', '--file', str(body)])
+            self.assertEqual(code, 0)
+            self.assertNotIn('usage', json.loads(out.getvalue()))
+            sent = server.call('send', project='p', sender='hq', recipient='w', body='x', key='k2')
+            with patch.object(bridge, 'push_if_peer', side_effect=lambda path, m: {**m, 'route': {**m['route'], 'transport': 'codex'}}):
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    bridge.main(['--socket', server.path, 'reply', sent['id'], '--key', 'k3', '--file', str(body)])
+            carried = json.loads(out.getvalue())['usage']
+            # Real clock: the fixture samples are stale, so the honest verdict is unknown.
+            self.assertEqual((carried['provider'], carried['state']), ('codex', 'unknown'))
+            self.assertIn('stale', carried['lines'][0])

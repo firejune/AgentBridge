@@ -417,6 +417,24 @@ def close_participant(args):
     return result
 
 
+COLLECTED_USAGE = {'codex': 'codex'}  # transport -> provider the broker collects limits for
+
+
+def message_usage(args, message):
+    """Usage lines for a message that involves a collected provider (#32); None otherwise."""
+    transports = {(message.get(k) or {}).get('transport') for k in ('route', 'return_route')}
+    providers = sorted({COLLECTED_USAGE[t] for t in transports if t in COLLECTED_USAGE})
+    if not providers:
+        return None
+    briefs = [usage.brief(broker_state_dir(args), p) for p in providers]
+    return briefs[0] if len(briefs) == 1 else briefs
+
+
+def with_usage(args, message):
+    found = message_usage(args, message)
+    return message if found is None else {**message, 'usage': found}
+
+
 def with_models(rows, policy, timeout, key='session'):
     """Annotate live rows with a fresh model reading; never cached as truth."""
     for row in rows:
@@ -630,11 +648,12 @@ def main(argv=None):
                 output(event)
             return 0
         if args.cmd in ('send','reply'):
-            output(push_if_peer(args.socket,broker.request(args.socket,fields)))
+            output(with_usage(args, push_if_peer(args.socket,broker.request(args.socket,fields))))
             return 0
         if args.cmd=='ask':
             sent = push_if_peer(args.socket,broker.request(args.socket,fields))
-            output({'type':'sent','message':sent})
+            found = message_usage(args, sent)
+            output({'type':'sent','message':sent} | ({} if found is None else {'usage': found}))
             fields = {'op':'wait','id':sent['id'],'timeout':args.timeout}
         result = broker.request(args.socket,fields,timeout=args.timeout+5 if args.cmd in ('ask','wait') else 10)
         if args.cmd=='routes' and not args.no_model:
@@ -651,7 +670,9 @@ def main(argv=None):
         message = error.message
         if message['route']['transport'] == 'codex':
             message = {k:message[k] for k in ('id','state','route')}
-        output({'error':str(error),'push_failed':True,'message':message})
+        result = {'error':str(error),'push_failed':True,'message':message}
+        found = message_usage(args, error.message)
+        output(result if found is None else {**result, 'usage': found})
         return 1
     except models.Unsupported as error:
         output({'error':str(error),'unsupported':True})
