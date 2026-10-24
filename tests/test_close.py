@@ -72,7 +72,16 @@ class CloseClaudeTests(unittest.TestCase):
         self.assertEqual(sent, [(child.pid, 15)])
         self.assertIn('code 143', closed['note'])
 
-    def test_refuses_own_session_desktop_host_and_never_escalates(self):
+    def test_desktop_session_is_closable_with_its_own_note(self):
+        child = subprocess.Popen(['sleep', '30'])
+        self.fake(pid=child.pid, extra={'entrypoint': 'claude-desktop', 'hostSessionId': 'local_x'})
+        def kill(pid, sig):
+            os.kill(pid, sig); child.wait()
+        closed = sessions.close_claude(self.sid, sessions_dir=self.root/'sessions', killer=kill, poll=0.01)
+        self.assertEqual((closed['host'], closed['resumable']), ('claude-desktop', True))
+        self.assertIn('session interrupted', closed['note'])
+
+    def test_refuses_own_session_unknown_host_and_never_escalates(self):
         self.fake()
         kill = mock.Mock()
         with self.assertRaisesRegex(ValueError, 'calling session itself'):
@@ -83,8 +92,8 @@ class CloseClaudeTests(unittest.TestCase):
         kill.assert_called_once()
         self.fakes.pop().close()
         (self.root/'sessions'/f'{os.getpid()}.json').unlink()
-        self.fake(pid=os.getppid(), extra={'entrypoint': 'claude-desktop', 'hostSessionId': 'local_x'})
-        with self.assertRaisesRegex(ValueError, 'unsupported host claude-desktop'):
+        self.fake(pid=os.getppid(), extra={'entrypoint': 'sdk-cli'})
+        with self.assertRaisesRegex(ValueError, 'unsupported host sdk-cli'):
             sessions.close_claude(self.sid, sessions_dir=self.root/'sessions', killer=kill)
         kill.assert_called_once()
 

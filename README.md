@@ -60,7 +60,7 @@ Details: [SKILL.md](skill/agent-bridge/SKILL.md) and [usage.md](skill/agent-brid
 | Transport | What `close` does | Undo |
 | --- | --- | --- |
 | `claude-peer` on the IDE extension | SIGTERM to the exact registered CLI process; the tab shows "process exited with code 143" | Type in that tab: the same session resumes |
-| `claude-peer` on desktop | `unsupported` (not measured) | — |
+| `claude-peer` on desktop | SIGTERM to the exact registered CLI process; the app shows "session interrupted" with a retry button | Send a message in that session: the same session resumes |
 | `agy` | `{archived: true}` annotation, the panel's own Archive action; refused while `running` | Not confirmed from outside the panel |
 | `codex` | `unsupported`: Desktop holds the thread (AgentBridge #27) | — |
 | `realtime` / `claude` | Route removal only | — |

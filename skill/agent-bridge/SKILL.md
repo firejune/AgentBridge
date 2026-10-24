@@ -143,7 +143,7 @@ python3 "$bridge_cli" reply REQUEST_ID --key UNIQUE_REPLY_KEY --file /absolute/a
 python3 "$bridge_cli" close NAME --project PROJECT [--keep-route] [--timeout 10]
 ```
 
-- Archive or stop, never delete. Claude IDE: SIGTERM to the exact CLI (`resumable: true`; the tab shows exit 143). Antigravity: `{archived: true}`, refused while running, read back (`restore_confirmed: false`). Codex and Claude desktop: `unsupported`, nothing sent. Then the route is removed unless `--keep-route`.
+- Archive or stop, never delete. Claude IDE and desktop: SIGTERM to the exact CLI (`resumable: true`; the IDE tab shows exit 143, desktop shows "session interrupted"). Antigravity: `{archived: true}`, refused while running, read back (`restore_confirmed: false`). Codex: `unsupported` (#27: no external archive or unload), nothing sent. Then the route is removed unless `--keep-route`.
 - No escalation and no retries: a process still alive after `--timeout`, or an archive that does not read back (`uncertain: true`), is reported, not repeated.
 - Permanent deletion is the owner's. Do not close sessions you did not open unless the owner or HQ says so.
 

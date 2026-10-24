@@ -385,7 +385,7 @@ def close_session(route, timeout):
             if str(error).startswith('unsupported host '):
                 host = str(error).removeprefix('unsupported host ')
                 raise models.Unsupported(f'claude ({host}): closing is measured only on the IDE extension '
-                                         '(claude-vscode); close this session in its app') from None
+                                         'and desktop; close this session in its app') from None
             raise
     if transport == 'agy':
         return agy_live.archive_agy(sid, timeout=timeout)

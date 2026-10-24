@@ -141,7 +141,7 @@ python3 "$bridge_cli" reply REQUEST_ID --key UNIQUE_REPLY_KEY --file /absolute/a
 python3 "$bridge_cli" close NAME --project PROJECT [--keep-route] [--timeout 10]
 ```
 
-- 보관하거나 멈출 뿐 삭제하지 않는다. Claude IDE: 그 CLI에 SIGTERM(`resumable: true`, 탭에 exit 143). Antigravity: `{archived: true}`, 실행 중이면 거부, 재조회로 확인(`restore_confirmed: false`). Codex와 Claude 데스크톱: `unsupported`, 아무것도 보내지 않는다. 그다음 `--keep-route`가 아니면 라우트를 지운다.
+- 보관하거나 멈출 뿐 삭제하지 않는다. Claude IDE·데스크톱: 그 CLI에 SIGTERM(`resumable: true`, IDE 탭엔 exit 143, 데스크톱엔 「세션이 중단되었습니다」). Antigravity: `{archived: true}`, 실행 중이면 거부, 재조회로 확인(`restore_confirmed: false`). Codex: `unsupported`(#27: 바깥에서 보관·언로드 불가), 아무것도 보내지 않는다. 그다음 `--keep-route`가 아니면 라우트를 지운다.
 - 격상·재시도 없음: `--timeout` 뒤에도 살아 있는 프로세스나 재조회되지 않는 보관(`uncertain: true`)은 보고만 하고 반복하지 않는다.
 - 영구 삭제는 소유자의 몫이다. 소유자나 HQ의 지시 없이 내가 열지 않은 세션을 닫지 않는다.
 
