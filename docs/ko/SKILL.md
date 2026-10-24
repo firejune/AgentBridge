@@ -167,6 +167,7 @@ python3 "$bridge_cli" policy                                    # 적용 중인 
 - **Claude**:
   - 읽기: 세션 기록의 가장 최근 assistant 메시지. 호스트와 관계없이 된다.
   - **데스크톱** 세션 전환: 중계한다. 앱의 `set_session_model` 도구는 데스크톱이 띄운 세션 안에서만 부를 수 있으므로, 브릿지는 데스크톱 **사령탑**에게 그 호출을 맡긴다. 사람이 `policy.json`에 `{"command_post": {"claude": "<경로 이름>"}}`로 그 경로를 지정한다. 지정이 없으면 전환은 `unsupported`이고 그 키를 알려 준다. 사령탑은 `bridge-model-request: {…}` 한 줄을 받아 도구를 부르고, `bridge-model-reply: {"model", "changed", "applies"}` 한 줄(실패면 `{"error", "uncertain"}`)로 답한다. `--timeout` 안에 답이 없으면 `uncertain`이고 다시 보내지 않는다. 사령탑은 자기 자신을 전환할 수 없다. 규약: [usage.md](usage.md#모델-읽기--전환--정책).
+  - **전환 결과가 확인이다**(앱이 돌려준 답, `applies: next turn`). 이후 `model`·`routes` 조회는 대화 기록의 마지막 답변 모델을 읽으므로, 그 세션이 한 턴 돌기 전까지 옛 모델이 보인다(#20). 그 조회를 보고 다시 전환하지 않는다. 앱의 승인 창이 다시 뜰 수 있고 지휘소에 중계 메시지가 하나 더 들어간다.
   - **VS Code** 세션 전환과 새 세션의 모델 지정: **미지원(STOP)**. VS Code 확장은 세션 자신의 stdio 채널로만 모델을 바꾸고, 그 선택을 사용자 전역 `settings.json`에 저장한다. 실행 중인 세션은 설정 파일이 바뀌어도 그 값을 다시 읽지 않는다. 데스크톱 새 세션 링크에도 모델 항목이 없다. 그 세션의 모델 선택기를 쓴다.
 - **Codex (`codex`)**:
   - 읽기: 정확한 UUID의 Desktop 소유자가 확인한 **다음 턴 모델 설정**. `model` · `routes` · `sessions` 조회마다 새로 읽으며, 실행 중인 활성 턴의 모델을 뜻하지 않는다. 읽지 못하면 이유와 함께 `unknown`이다.
