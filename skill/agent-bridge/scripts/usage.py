@@ -100,10 +100,65 @@ def normalize(result, observed):
     return records
 
 
-def failed(observed, reason):
-    return dict(observed_at=utc(observed), provider='codex', limit_id=None, slot=None,
+def failed(observed, reason, provider='codex'):
+    return dict(observed_at=utc(observed), provider=provider, limit_id=None, slot=None,
                 used_percent=None, window_mins=None, resets_at=None, allowed=None,
-                reset_credits=None, source=SOURCE, status='failed', reason=reason)
+                reset_credits=None, source=SOURCES[provider], status='failed', reason=reason)
+
+
+# --- Antigravity (#34) ---------------------------------------------------------
+# The language server reports quota per model (quotaInfo.remainingFraction and
+# resetTime), the same figures the app shows. Models of one family share them,
+# so a family is one bucket, as Codex reports one account bucket. A family whose
+# models disagree is kept per model rather than averaged. No window length is
+# reported. Desktop and IDE servers serve one account: one read is enough.
+AGY_SOURCE = 'antigravity language_server GetCascadeModelConfigData'
+
+
+def agy_family(model_id):
+    return 'gemini' if str(model_id).startswith('gemini') else 'partner'
+
+
+def normalize_agy(result, observed):
+    configs = result.get('clientModelConfigs') if isinstance(result, dict) else None
+    if not isinstance(configs, list):
+        raise ValueError('model config response has no clientModelConfigs')
+    families = {}
+    for config in configs:
+        quota = config.get('quotaInfo') if isinstance(config, dict) else None
+        if not isinstance(quota, dict) or not isinstance(config.get('modelId'), str):
+            continue
+        fraction = number(quota.get('remainingFraction'))
+        if fraction is None:
+            continue  # A model without a reading says nothing about its family.
+        resets = quota.get('resetTime')
+        resets_at = utc(parse_time(resets.replace('Z', '+00:00'))) if isinstance(resets, str) else None
+        families.setdefault(agy_family(config['modelId']), []).append((config['modelId'], fraction, resets_at))
+    if not families:
+        raise ValueError('no model reports quotaInfo')
+    records = []
+    for family in sorted(families):
+        models = families[family]
+        values = {(fraction, resets_at) for _, fraction, resets_at in models}
+        groups = ([(family, *values.pop())] if len(values) == 1
+                  else [(f'{family}:{model}', fraction, resets_at) for model, fraction, resets_at in sorted(models)])
+        for limit_id, fraction, resets_at in groups:
+            used = None if fraction is None else round((1 - fraction) * 100, 4)
+            status = 'stale' if resets_at is not None and parse_time(resets_at) <= observed else 'ok'
+            records.append(dict(observed_at=utc(observed), provider='agy', limit_id=limit_id, slot='primary',
+                                used_percent=used, window_mins=None, resets_at=resets_at, allowed=None,
+                                reset_credits=None, source=AGY_SOURCE, status=status, reason=None))
+    return records
+
+
+def read_agy(timeout=10):
+    """One read-only RPC on whichever Antigravity language server is running."""
+    import agy_live  # local: keeps Codex-only use free of the Antigravity module
+    servers = agy_live.discover_servers(timeout=timeout)
+    return agy_live.rpc_call(servers[0]['url'], servers[0]['csrf'], 'GetCascadeModelConfigData', {}, timeout=timeout)
+
+
+SOURCES = {'codex': SOURCE, 'agy': AGY_SOURCE}
 
 
 def read_codex(executable='codex', timeout=10):
@@ -114,9 +169,11 @@ def read_codex(executable='codex', timeout=10):
 
 class UsageStore:
     """Bounded, owner-private JSONL history; every write replaces the file atomically."""
-    name, fields, key = 'codex.jsonl', FIELDS, 'observed_at'
+    name, fields, key = '{provider}.jsonl', FIELDS, 'observed_at'
 
-    def __init__(self, directory, retention_days=RETENTION_DAYS, max_bytes=MAX_BYTES):
+    def __init__(self, directory, retention_days=RETENTION_DAYS, max_bytes=MAX_BYTES, provider='codex'):
+        self.provider = provider
+        self.name = self.name.format(provider=provider)
         self.directory = Path(directory).expanduser().absolute()
         self.path = self.directory / self.name
         self.retention = timedelta(days=retention_days)
@@ -146,7 +203,7 @@ class UsageStore:
                     records.append({field: item.get(field) for field in self.fields})
                 except (ValueError, KeyError, TypeError):
                     # Dropped on the next write. Never echo the line itself.
-                    print(json.dumps(dict(usage_drop='codex', reason='invalid history line')),
+                    print(json.dumps(dict(usage_drop=self.provider, reason='invalid history line')),
                           file=sys.stderr, flush=True)
             return records
 
@@ -200,10 +257,10 @@ class UsageStore:
 
 class EventStore(UsageStore):
     """Reset events derived from the samples, kept for a year and de-duplicated by window."""
-    name, fields, key = 'codex-events.jsonl', EVENT_FIELDS, 'window_end'
+    name, fields, key = '{provider}-events.jsonl', EVENT_FIELDS, 'window_end'
 
-    def __init__(self, directory, retention_days=EVENT_RETENTION_DAYS, max_bytes=EVENT_MAX_BYTES):
-        super().__init__(directory, retention_days, max_bytes)
+    def __init__(self, directory, retention_days=EVENT_RETENTION_DAYS, max_bytes=EVENT_MAX_BYTES, provider='codex'):
+        super().__init__(directory, retention_days, max_bytes, provider)
 
     def merge(self, events, now):
         """Add events whose (bucket, window) is new; written only when something is added."""
@@ -312,13 +369,13 @@ def failure_reason(error):
     return 'invalid or failed response'
 
 
-def sample(store, reader, clock, events=None):
+def sample(store, reader, clock, events=None, normalizer=None):
     now = clock()
     try:
-        records = normalize(reader(), now)
+        records = (normalizer or NORMALIZERS[store.provider])(reader(), now)
     except (ValueError, OSError, KeyError, TypeError, OverflowError,
             subprocess.TimeoutExpired) as error:
-        records = [failed(now, failure_reason(error))]
+        records = [failed(now, failure_reason(error), store.provider)]
     if store.append(records, now) and events is not None:
         # Derived from the history alone, so events survive the samples' 30 days.
         events.merge(detect(store.load()), now)
@@ -332,12 +389,12 @@ class Collector:
         if interval_minutes < MIN_INTERVAL_MINUTES:
             raise ValueError(f'Usage interval must be at least {MIN_INTERVAL_MINUTES} minutes')
         self.store, self.interval = store, interval_minutes * 60
-        self.events = EventStore(store.directory)
-        self.reader = reader or (lambda: read_codex(executable))
+        self.events = EventStore(store.directory, provider=store.provider)
+        self.reader = reader or (read_agy if store.provider == 'agy' else lambda: read_codex(executable))
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.failures = 0
         self.stopping = threading.Event()
-        self.thread = threading.Thread(target=self.run, name='usage-collector', daemon=True)
+        self.thread = threading.Thread(target=self.run, name=f'usage-collector-{store.provider}', daemon=True)
 
     def delay(self):
         if not self.failures:
@@ -349,7 +406,7 @@ class Collector:
             records = sample(self.store, self.reader, self.clock, self.events)
         except Exception as error:  # noqa: BLE001 - the thread must outlive any one cycle.
             # Storage failures never stop the broker; report without paths or payloads.
-            print(json.dumps(dict(usage_sample='codex', status='store_failed',
+            print(json.dumps(dict(usage_sample=self.store.provider, status='store_failed',
                                   reason=type(error).__name__)), file=sys.stderr, flush=True)
             self.failures += 1
             return
@@ -546,10 +603,10 @@ def horizons(official, guess):
                 stop_risk_horizon=official)
 
 
-def all_events(store_dir, records):
+def all_events(store_dir, records, provider='codex'):
     """Persisted events plus those derivable from the current samples, de-duplicated."""
     merged, known = [], set()
-    for item in EventStore(store_dir).load() + detect(records):
+    for item in EventStore(store_dir, provider=provider).load() + detect(records):
         if event_key(item) not in known:
             known.add(event_key(item))
             merged.append(item)
@@ -578,6 +635,11 @@ def span(seconds):
     return f'{days}d{hours}h' if days else f'{hours}h{minutes:02d}m' if hours else f'{minutes}m'
 
 
+def pct(value):
+    """Codex reports whole percents; Antigravity fractions become long decimals."""
+    return f'{round(value, 1):g}'
+
+
 def window_name(minutes):
     if minutes is None:
         return 'window ?'
@@ -588,7 +650,7 @@ def format_summary(summary, now):
     lines = []
     for row in summary['buckets']:
         name = f"{row['provider']}/{row['limit_id']}" + ('' if row['slot'] == 'primary' else f"/{row['slot']}")
-        remaining = 'unknown' if row['remaining_percent'] is None else f"{row['remaining_percent']:g}% left"
+        remaining = 'unknown' if row['remaining_percent'] is None else f"{pct(row['remaining_percent'])}% left"
         if row['used_percent'] is not None and row['used_percent'] >= 100:
             remaining = 'EXHAUSTED 0% left'
         if row['resets_at'] is None:
@@ -597,7 +659,8 @@ def format_summary(summary, now):
             until = (parse_time(row['resets_at']) - now).total_seconds()
             resets = (f"resets {local(row['resets_at'])} (in {span(until)})" if until > 0
                       else f"reset was due {local(row['resets_at'])}")
-        parts = [f"{name} {window_name(row['window_mins'])}: {remaining}", resets,
+        window = '' if row['window_mins'] is None else f" {window_name(row['window_mins'])}"
+        parts = [f"{name}{window}: {remaining}", resets,
                  f"observed {local(row['observed_at'])} ({span(row['age_seconds'])} ago, {row['freshness']})"]
         if row['allowed'] is False:
             parts.append('usage not allowed')
@@ -618,10 +681,11 @@ def format_summary(summary, now):
                          f"used {boundary['used_before']:g}% -> {boundary['used_after']:g}%"
                          + ('' if boundary['resets_at_before'] == boundary['resets_at_after']
                             else ', next reset moved'))
+    provider = summary.get('provider', 'codex')
     if not summary['buckets']:
-        lines.append('codex: unknown (no successful read recorded)')
+        lines.append(f'{provider}: unknown (no successful read recorded)')
     if summary['last_failure']:
-        lines.append(f"codex: last failed read {local(summary['last_failure'])}")
+        lines.append(f"{provider}: last failed read {local(summary['last_failure'])}")
     return '\n'.join(lines)
 
 
@@ -675,20 +739,22 @@ def format_events(summary, announcements):
         lines.append(f"spend horizon: {spend}")
         lines.append(f"stop risk horizon: {stop}")
     if not summary['buckets']:
-        lines.append('codex: unknown (no successful read recorded)')
+        lines.append(f"{summary.get('provider', 'codex')}: unknown (no successful read recorded)")
     return '\n'.join(lines)
 
 
 def query(state_dir, since='6h', provider='codex', now=None):
     """Reads the history, event and announcement files; never collects or calls anything."""
-    if provider != 'codex':
-        raise ValueError('Only the codex provider is collected')
+    if provider not in PROVIDERS:
+        raise ValueError(f'Collected providers are {", ".join(PROVIDERS)}')
     now = now or datetime.now(timezone.utc)
     directory = Path(state_dir).expanduser() / 'usage'
-    records = UsageStore(directory).load()
-    announcements = announced(AnnouncementStore(directory).load())
-    summary = annotate(summarize(records, now, parse_since(since)), all_events(directory, records),
+    records = UsageStore(directory, provider=provider).load()
+    # Promo-reset announcements exist only for Codex.
+    announcements = announced(AnnouncementStore(directory).load()) if provider == 'codex' else []
+    summary = annotate(summarize(records, now, parse_since(since)), all_events(directory, records, provider),
                        announcements, now)
+    summary['provider'] = provider
     assess(summary, records, now)
     summary['announcements'] = announcements
     return records, summary, now
@@ -708,8 +774,9 @@ def brief(state_dir, provider='codex', now=None):
         return dict(provider=provider, state='unknown', reason=f'usage unreadable: {error}', lines=[])
     rows, lines = [], []
     for row in summary['buckets']:
-        name = f"{row['provider']} {window_name(row['window_mins'])}" + ('' if row['slot'] == 'primary' else f" {row['slot']}")
-        remaining = 'unknown' if row['remaining_percent'] is None else f"{row['remaining_percent']:g}% left"
+        label = window_name(row['window_mins']) if row['window_mins'] is not None else row['limit_id']
+        name = f"{row['provider']} {label}" + ('' if row['slot'] == 'primary' else f" {row['slot']}")
+        remaining = 'unknown' if row['remaining_percent'] is None else f"{pct(row['remaining_percent'])}% left"
         burn = row['risk'].get('burn_per_hour')
         parts = [f'{name}: {remaining}']
         if burn is not None:
@@ -725,3 +792,7 @@ def brief(state_dir, provider='codex', now=None):
     if not rows:
         lines.append(f'{provider}: risk unknown (no successful read recorded)')
     return dict(provider=provider, state=worst, buckets=rows, lines=lines)
+
+
+NORMALIZERS = {'codex': normalize, 'agy': normalize_agy}
+PROVIDERS = tuple(NORMALIZERS)

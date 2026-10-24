@@ -419,7 +419,7 @@ def close_participant(args):
 
 USAGE_STATE_HELP = ('Broker state directory holding usage samples, when the broker runs with its own '
                     '--state-dir (default: socket path with .state suffix)')
-COLLECTED_USAGE = {'codex': 'codex'}  # transport -> provider the broker collects limits for
+COLLECTED_USAGE = {'codex': 'codex', 'agy': 'agy'}  # transport -> provider the broker collects limits for
 
 
 def message_usage(args, message):
@@ -457,7 +457,7 @@ def main(argv=None):
                    help=f'Minutes between Codex limit reads (0 = off, minimum {usage.MIN_INTERVAL_MINUTES})')
     p.add_argument('--codex-executable',default='codex')
     p = sub.add_parser('usage',help='Recorded subscription limits; reads the history file, starts nothing')
-    p.add_argument('--provider',choices=['codex'],default='codex')
+    p.add_argument('--provider',choices=list(usage.PROVIDERS),default='codex')
     p.add_argument('--state-dir',help='Broker state directory (default: socket path with .state suffix)')
     p.add_argument('--since',default='6h',help='Burn-rate and reset window, e.g. 90m, 6h, 2d')
     p.add_argument('--json',action='store_true',help='Full records and summary')

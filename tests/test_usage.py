@@ -726,7 +726,8 @@ class MessageUsageTests(Base):
     def test_codex_on_either_end_carries_usage_and_others_do_not(self):
         self.assertEqual(self.usage_for('codex', 'claude-peer')['provider'], 'codex')
         self.assertEqual(self.usage_for('claude-peer', 'codex')['provider'], 'codex')
-        self.assertIsNone(self.usage_for('claude-peer', 'agy'))
+        self.assertEqual(self.usage_for('claude-peer', 'agy')['provider'], 'agy')
+        self.assertIsNone(self.usage_for('claude-peer', 'claude-peer'))
         self.assertIsNone(self.usage_for('realtime', 'realtime'))
 
     def test_send_output_carries_usage_only_for_codex_routes(self):
@@ -750,3 +751,61 @@ class MessageUsageTests(Base):
             # Real clock: the fixture samples are stale, so the honest verdict is unknown.
             self.assertEqual((carried['provider'], carried['state']), ('codex', 'unknown'))
             self.assertIn('stale', carried['lines'][0])
+
+
+def agy_config(model, fraction=0.5, reset='2026-10-29T18:16:07Z'):
+    quota = {} if fraction is None else {'remainingFraction': fraction, 'resetTime': reset}
+    return {'label': model, 'modelId': model, 'quotaInfo': quota}
+
+
+class AgyUsageTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='ab-agyq-', dir='/tmp')
+        self.root = Path(self.temp.name)
+        self.store = usage.UsageStore(self.root / 'state' / 'usage', provider='agy')
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_families_that_agree_are_one_bucket_each(self):
+        result = {'clientModelConfigs': [agy_config('gemini-4-argon-high', 0.9707855, '2026-10-24T17:19:56Z'),
+                                         agy_config('gemini-3.8-flash-low', 0.9707855, '2026-10-24T17:19:56Z'),
+                                         agy_config('claude-opus-5-5-high', 0.2640812),
+                                         agy_config('gpt-oss-120b-medium', 0.2640812)]}
+        records = usage.normalize_agy(result, T0)
+        self.assertEqual([(r['limit_id'], r['used_percent'], r['resets_at']) for r in records],
+                         [('gemini', 2.9215, '2026-10-24T17:19:56+00:00'),
+                          ('partner', 73.5919, '2026-10-29T18:16:07+00:00')])
+        self.assertEqual({r['provider'] for r in records}, {'agy'})
+        self.assertIsNone(records[0]['window_mins'])
+
+    def test_a_family_that_disagrees_is_kept_per_model(self):
+        result = {'clientModelConfigs': [agy_config('gemini-4-argon-high', 0.9), agy_config('gemini-3.8-flash-low', 0.8)]}
+        ids = [r['limit_id'] for r in usage.normalize_agy(result, T0)]
+        self.assertEqual(ids, ['gemini:gemini-3.8-flash-low', 'gemini:gemini-4-argon-high'])
+
+    def test_missing_quota_is_skipped_and_none_at_all_is_a_failed_sample(self):
+        records = usage.normalize_agy({'clientModelConfigs': [agy_config('gemini-x', None), agy_config('gemini-y', 0.4)]}, T0)
+        self.assertEqual([(r['limit_id'], r['used_percent']) for r in records], [('gemini', 60.0)])
+        stored = usage.sample(self.store, lambda: {'clientModelConfigs': [agy_config('gemini-x', None)]}, lambda: T0)
+        self.assertEqual((stored[0]['status'], stored[0]['provider'], stored[0]['used_percent']), ('failed', 'agy', None))
+
+    def test_no_server_is_failed_not_zero_and_files_stay_separate(self):
+        def down():
+            raise OSError('Antigravity language_server (desktop or IDE) is not running')
+        usage.sample(self.store, down, lambda: T0)
+        self.assertTrue((self.root / 'state' / 'usage' / 'agy.jsonl').exists())
+        self.assertFalse((self.root / 'state' / 'usage' / 'codex.jsonl').exists())
+        _, summary, now = usage.query(self.root / 'state', '6h', 'agy', now=T0)
+        text = usage.format_summary(summary, now)
+        self.assertIn('agy: unknown (no successful read recorded)', text)
+        self.assertIn('agy: last failed read', text)
+
+    def test_collector_for_agy_uses_the_agy_reader(self):
+        collector = usage.Collector(self.store, reader=lambda: {'clientModelConfigs': [agy_config('gemini-z', 0.25)]},
+                                    clock=lambda: T0)
+        self.assertIs(collector.events.provider, 'agy')
+        collector.cycle()
+        found = usage.brief(self.root / 'state', 'agy', now=T0 + timedelta(minutes=1))
+        self.assertEqual(found['provider'], 'agy')
+        self.assertTrue(found['lines'][0].startswith('agy gemini: 25% left'))
