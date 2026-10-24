@@ -828,9 +828,13 @@ def archive_agy(sid, timeout=5):
     server, row = resolve_agy(sid, timeout=timeout)
     if row['status'] == 'running':
         raise DeliveryError(f'Antigravity session {sid} is running; archive it after the turn ends')
-    rpc_call(server['url'], server['csrf'], 'UpdateConversationAnnotations',
-             {'cascadeId': row['id'], 'annotations': {'archived': True}, 'mergeAnnotations': True},
-             timeout=timeout)
+    try:
+        rpc_call(server['url'], server['csrf'], 'UpdateConversationAnnotations',
+                 {'cascadeId': row['id'], 'annotations': {'archived': True}, 'mergeAnnotations': True},
+                 timeout=timeout)
+    except DeliveryError as error:
+        # The update may have been applied before the failure; never resend it.
+        raise ArchiveUncertain(f'Archive request failed after it was sent; the outcome is unknown: {error}') from None
     try:
         data = rpc_call(server['url'], server['csrf'], 'GetAllCascadeTrajectories', {}, timeout=timeout)
         annotations = ((trajectory_summaries(data) or {}).get(row['id']) or {}).get('annotations') or {}

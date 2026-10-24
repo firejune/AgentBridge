@@ -119,6 +119,19 @@ class ArchiveAgyTests(unittest.TestCase):
         sent = [b for p, _, b in fake.requests if p.endswith('/UpdateConversationAnnotations')]
         self.assertEqual(len(sent), 1)
 
+    def test_failed_archive_request_is_uncertain_and_not_resent(self):
+        with FakeAgyServer(self.root, self.sid) as fake, self.env(fake):
+            real = agy_live.rpc_call
+            def flaky(url, csrf, method, payload, timeout=5):
+                if method == 'UpdateConversationAnnotations':
+                    raise agy_live.DeliveryError('timed out')
+                return real(url, csrf, method, payload, timeout)
+            with mock.patch.object(agy_live, 'rpc_call', side_effect=flaky) as calls:
+                with self.assertRaisesRegex(agy_live.ArchiveUncertain, 'outcome is unknown'):
+                    agy_live.archive_agy(fake.other_sid)
+        updates = [c for c in calls.call_args_list if c.args[2] == 'UpdateConversationAnnotations']
+        self.assertEqual(len(updates), 1)
+
 
 class CloseCommandTests(unittest.TestCase):
     def test_codex_is_a_named_gap_and_keeps_the_route(self):
