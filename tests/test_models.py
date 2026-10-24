@@ -103,7 +103,7 @@ class NewSessionPolicyTest(unittest.TestCase):
         Path(self.state, 'policy.json').write_text('{"deny": {"agy": ["Gemini 3.8 Flash (Medium)"]}}')
         server = {'url': 'http://127.0.0.1:1', 'csrf': 'x'}
         found = {'model_enum': 'MODEL_PLACEHOLDER_M319', 'model_id': 'gemini-3.8-flash-medium', 'label': 'Gemini 3.8 Flash (Medium)'}
-        with patch.object(agy_live, 'discover_desktop_server', return_value=server), \
+        with patch.object(agy_live, 'discover_host_server', return_value=server), \
                 patch.object(agy_live, 'resolve_model', return_value=found), \
                 patch.object(agy_live, 'open_agy') as opened:
             code, out = run(['open', '--provider', 'agy', '--cwd', self.state, '--model', 'MODEL_PLACEHOLDER_M319',
