@@ -303,6 +303,21 @@ class AgyModelTest(unittest.TestCase):
         self.assertEqual((result['changed'], result['status_after'], result['busy_after']), (True, 'running', True))
         self.assertEqual(len(self.sent(fake)), 1)
 
+    def test_failed_idle_poll_keeps_the_confirmed_switch(self):
+        fake = FakeAgy(busy_polls=-1)
+        real, polls = fake.rpc, []
+        def flaky(url, csrf, method, payload, timeout=5):
+            if method == 'GetAllCascadeTrajectories' and fake.status == 'CASCADE_RUN_STATUS_RUNNING':
+                polls.append(1)
+                if len(polls) == 2:
+                    raise agy_live.DeliveryError('connection reset')
+            return real(url, csrf, method, payload, timeout)
+        fake.rpc = flaky
+        result = self.switch(fake)
+        self.assertEqual((result['changed'], result['status_after'], result['busy_after']), (True, 'unknown', None))
+        self.assertIn('busy state could not be read', result['warning'])
+        self.assertEqual(len(self.sent(fake)), 1)
+
     def test_switch_to_the_current_model_sends_nothing(self):
         fake = FakeAgy()
         result = self.switch(fake, 'Gemini 3.8 Flash (Low)')

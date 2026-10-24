@@ -714,12 +714,24 @@ def set_model(sid, model, timeout=30, poll=1.0):
                                uncertain=' HTTP ' not in str(error)) from None
     deadline = time.monotonic() + timeout
     current = None
+    def switched(**state):
+        return {'session': sid, **describe_model(catalog, current), 'previous_model': before['model'],
+                'changed': True, 'applies': 'now; the switch ran one invocation without a user step', **state}
+
     while True:
-        summary = (rpc_call(server['url'], server['csrf'], 'GetAllCascadeTrajectories', {}, timeout=10)
-                   .get('trajectorySummaries') or {}).get(sid, {})
-        latest, latest_count = last_generator(server, sid, int(summary.get('stepCount') or 0), 10)
+        try:
+            summary = (rpc_call(server['url'], server['csrf'], 'GetAllCascadeTrajectories', {}, timeout=10)
+                       .get('trajectorySummaries') or {}).get(sid, {})
+            latest, latest_count = last_generator(server, sid, int(summary.get('stepCount') or 0), 10)
+        except DeliveryError as error:
+            if current is None:
+                raise
+            # The switch is already confirmed; only the busy state is unknown.
+            return switched(generators_spent=spent, status_after='unknown', busy_after=None,
+                            warning=f'The switch landed, but its busy state could not be read: {error}')
         if current is None and latest_count > count and generator_model(latest):
             current = generator_model(latest)
+            spent = latest_count - count
             if current != target['model_enum']:
                 raise ModelSwitchError(f"Antigravity reads back model {describe_model(catalog, current)['model']!r}, "
                                        f"not {target['model_id']!r}", uncertain=True)
@@ -728,10 +740,7 @@ def set_model(sid, model, timeout=30, poll=1.0):
             # The switch is a real turn on the new model (#21): measured 2-8
             # generators and 10-90 s busy. Report what it spent and whether the
             # conversation is still working, so a caller does not retry blindly.
-            return {'session': sid, **describe_model(catalog, current), 'previous_model': before['model'],
-                    'changed': True, 'applies': 'now; the switch ran one invocation without a user step',
-                    'generators_spent': latest_count - count, 'status_after': status,
-                    'busy_after': status != 'idle'}
+            return switched(generators_spent=latest_count - count, status_after=status, busy_after=status != 'idle')
         if current is None and time.monotonic() >= deadline:
             raise ModelSwitchError('The switch was sent but no new invocation was observed before the timeout; '
                                    'read the model again before resolving', uncertain=True)
