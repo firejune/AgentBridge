@@ -89,6 +89,8 @@ One root and one way in and out for agent worktrees (#38). The main checkout sta
 4. Its owner session is not alive or possibly alive (Claude live registry, Codex threads, Antigravity trajectories).
 5. Nothing uses it: no live session cwd and no open file or process cwd (one `lsof` call) is inside it.
 
+`sweep` never removes a worktree whose owner session is still alive, so it does not clean up after its own caller. The owner removes its worktree right after the merge: `git worktree remove PATH` (no `--force`) and `git branch -D BRANCH`. `sweep` handles what is left once the owner has gone. Worktrees created before `wt` (no `OWNER.json`) move to the root, or get `wt adopt`, when their PR finishes; moving a live one breaks the session using it.
+
 A failing session provider or `lsof` blocks every removal (`--providers` narrows the set consulted). `--apply` re-checks cleanliness and open files right before `git worktree remove` (never `--force`) and `git branch -D`. Remote branches are never touched. Second checkouts of the same origin are reported as clones and never removed. `gh` is the only network call; the comparison uses the last fetched `origin` state.
 
 ## Global Skill Installation

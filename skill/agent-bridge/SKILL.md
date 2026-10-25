@@ -187,7 +187,9 @@ python3 "$bridge_cli" policy                                    # the defaults a
 ## Agent Worktrees
 
 - Write code only in a worktree under `<workspace>/.worktrees/<repo>/<agent>-<issue>`; the main checkout stays on `main`. Create it with `bridge.py wt new REPO AGENT ISSUE` (or `--detach REF` for a read-only pin) instead of a sibling folder or a clone.
-- `bridge.py wt list --text` shows owner, PR, clean/dirty and live use; `bridge.py wt sweep` is a dry run. Run `--apply` only when the owner asks. Contract: [README](../../README.md#agent-worktrees-wt).
+- `bridge.py wt list --text` shows owner, PR, clean/dirty and live use; `bridge.py wt sweep` is a dry run. Run `--apply` only when the owner asks.
+- `sweep` keeps every worktree whose owner session is alive, its caller's included. Remove your own right after the merge with `git worktree remove PATH` (no `--force`) and `git branch -D BRANCH`.
+- An agent that does not run git gets its worktree from its coordinator and does not create, move or remove worktrees. Contract: [README](../../README.md#agent-worktrees-wt).
 
 ## Operational Boundaries
 
