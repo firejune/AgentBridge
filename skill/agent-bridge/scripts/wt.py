@@ -315,7 +315,7 @@ def gh_pulls(repo):
     """PRs of the repository by head branch, or an error string. The only network call."""
     try:
         result = subprocess.run(['gh', 'pr', 'list', '--state', 'all', '--limit', '1000', '--json',
-                                 'number,state,url,headRefName,mergedAt'], cwd=repo, stdout=subprocess.PIPE,
+                                 'number,state,url,headRefName,headRefOid,mergedAt'], cwd=repo, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError) as error:
         return str(error)
@@ -327,14 +327,16 @@ def gh_pulls(repo):
     return pulls
 
 
-def pr_state(pulls, branch):
+def pr_state(pulls, branch, head=None):
     if isinstance(pulls, str):
         return {'state': 'unknown', 'error': pulls}
     found = pulls.get(branch or '', [])
     for state in ('OPEN', 'MERGED', 'CLOSED'):
-        hit = next((p for p in found if p['state'] == state), None)
-        if hit:
-            return {'state': state.lower(), 'number': hit['number'], 'url': hit['url']}
+        # Of several merged PRs from one branch name, prefer the one whose head is this HEAD.
+        hits = sorted((p for p in found if p['state'] == state), key=lambda p: p.get('headRefOid') != head)
+        if hits:
+            return {'state': state.lower(), 'number': hits[0]['number'], 'url': hits[0]['url'],
+                    'head': hits[0].get('headRefOid')}
     return {'state': 'none'}
 
 
@@ -351,10 +353,13 @@ def content_landed(path, base):
     fork = git(path, 'merge-base', base, 'HEAD', check=False)
     if fork.returncode:
         return False, f'no merge-base with {base}'
-    changed = [p for p in out(path, 'diff', '--no-renames', '--name-only', fork.stdout.strip(), 'HEAD').splitlines() if p]
+    # -z: names arrive verbatim (no C-quoting of non-ASCII, spaces or quotes); :(literal) stops glob magic.
+    names = git(path, 'diff', '-z', '--no-renames', '--name-only', fork.stdout.strip(), 'HEAD').stdout
+    changed = [p for p in names.split('\0') if p]
     if not changed:
         return True, 'no changes beyond the merge-base'
-    same = git(path, 'diff', '--quiet', '--no-renames', 'HEAD', base, '--', *changed, check=False).returncode == 0
+    same = git(path, 'diff', '--quiet', '--no-renames', 'HEAD', base, '--',
+               *(f':(literal){p}' for p in changed), check=False).returncode == 0
     return same, (f'{len(changed)} changed paths equal {base}' if same else f'changed paths differ from {base}')
 
 
@@ -401,14 +406,16 @@ def assess(repo, entry, root, live, holders, pulls, base, blockers):
         reasons.append('git status failed')
     elif row['dirty']:
         reasons.append(f'dirty: {row["dirty"]} modified or untracked files')
-    row['pr'] = pr_state(pulls, branch) if branch else {'state': 'none'}
+    row['pr'] = pr_state(pulls, branch, entry.get('HEAD')) if branch else {'state': 'none'}
     if row['pr']['state'] == 'open':
         reasons.append(f'PR #{row["pr"]["number"]} is open')
     elif row['pr']['state'] == 'closed':
         reasons.append(f'PR #{row["pr"]["number"]} was closed without merging')
-    if row['pr']['state'] == 'merged':
-        row['landed'], row['landed_by'] = True, f'PR #{row["pr"]["number"]} merged'
-    elif row['pr']['state'] in ('none', 'unknown'):
+    merged_here = row['pr']['state'] == 'merged' and row['pr'].get('head') == entry.get('HEAD')
+    if merged_here:
+        row['landed'], row['landed_by'] = True, f'PR #{row["pr"]["number"]} merged at this HEAD'
+    elif row['pr']['state'] in ('none', 'unknown', 'merged'):
+        # A merged PR that does not cover HEAD (commits after the merge) falls back to the content test.
         if base:
             row['landed'], row['landed_by'] = content_landed(path, base)
         else:

@@ -114,9 +114,39 @@ class WorktreeTests(unittest.TestCase):
         path = Path(self.new()['path'])
         self.commit(path)
         self.land_squash(path,text='rewritten later\n')
-        self.pulls = {'claude/7-x':[{'number':3,'state':'MERGED','url':'u','headRefName':'claude/7-x'}]}
+        self.pulls = {'claude/7-x':[{'number':3,'state':'MERGED','url':'u','headRefName':'claude/7-x',
+                                     'headRefOid':run(path,'rev-parse','HEAD')}]}
         row = self.row(self.sweep(),path)
-        self.assertEqual((row['action'],row['landed_by']),('remove','PR #3 merged'))
+        self.assertEqual((row['action'],row['landed_by']),('remove','PR #3 merged at this HEAD'))
+
+    def test_keeps_commits_made_after_the_pr_merged(self):
+        path = Path(self.new()['path'])
+        self.commit(path)
+        merged_head = run(path,'rev-parse','HEAD')
+        self.land_squash(path)
+        self.commit(path,'later.txt','follow-up\n')
+        self.pulls = {'claude/7-x':[{'number':3,'state':'MERGED','url':'u','headRefName':'claude/7-x',
+                                     'headRefOid':merged_head}]}
+        row = self.row(self.sweep(apply=True),path)
+        self.assertEqual(row['action'],'keep')
+        self.assertIn('not landed: changed paths differ from origin/main',row['reasons'])
+        self.assertTrue(path.exists())
+
+    def test_keeps_unlanded_files_with_unusual_names(self):
+        for i,name in enumerate(('café.txt','with space.txt','quo"te.txt','star*.txt')):
+            with self.subTest(name=name):
+                path = Path(self.new(issue=f'n{i}')['path'])
+                self.commit(path,name,'unlanded\n')
+                row = self.row(self.sweep(apply=True),path)
+                self.assertEqual(row['action'],'keep')
+                self.assertIn('not landed: changed paths differ from origin/main',row['reasons'])
+                self.assertTrue(path.exists())
+
+    def test_landed_files_with_unusual_names_are_removable(self):
+        path = Path(self.new()['path'])
+        self.commit(path,'café q"*.txt','same\n')
+        self.land_squash(path,'café q"*.txt','same\n')
+        self.assertEqual(self.row(self.sweep(),path)['action'],'remove')
 
     def test_keeps_dirty(self):
         path = Path(self.new()['path'])
