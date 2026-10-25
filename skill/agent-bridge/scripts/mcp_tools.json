@@ -1,0 +1,327 @@
+{
+  "tools": [
+    {
+      "name": "bridge_status",
+      "description": "Read adapter connectivity, runtime exposure, configured alias names, and limits. Phase 0 exposes ONLY this tool. Does not prove Dot custom-MCP compatibility. Caller identity and authorization come exclusively from the connection. Annotations are advisory, never authorization.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "contract_version": {
+                "type": "string",
+                "const": "0.1.0"
+              },
+              "server_time": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "phase": {
+                "type": "string",
+                "enum": [
+                  "connectivity_only",
+                  "enabled"
+                ]
+              },
+              "daemon_status": {
+                "type": "string",
+                "enum": [
+                  "ready",
+                  "degraded",
+                  "unreachable"
+                ]
+              },
+              "writes_enabled": {
+                "type": "boolean"
+              },
+              "enabled_tools": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "bridge_status",
+                    "bridge_sessions_list",
+                    "bridge_session_create",
+                    "bridge_message_send",
+                    "bridge_operation_get"
+                  ]
+                },
+                "minItems": 1,
+                "maxItems": 5,
+                "uniqueItems": true,
+                "contains": {
+                  "const": "bridge_status"
+                }
+              },
+              "allowed_workspace_aliases": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_-]{0,31}$",
+                  "description": "An operator-configured alias returned by bridge_status; never a path or arbitrary cwd.",
+                  "not": {
+                    "pattern": "[^A-Za-z0-9_-]"
+                  }
+                },
+                "uniqueItems": true
+              },
+              "capabilities": {
+                "type": "object",
+                "properties": {
+                  "dedicated_claude_sessions": {
+                    "type": "boolean"
+                  },
+                  "asynchronous_operations": {
+                    "type": "boolean"
+                  },
+                  "durable_idempotency": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "dedicated_claude_sessions",
+                  "asynchronous_operations",
+                  "durable_idempotency"
+                ],
+                "additionalProperties": false
+              },
+              "limits": {
+                "type": "object",
+                "properties": {
+                  "max_message_bytes": {
+                    "type": "integer",
+                    "const": 32768
+                  },
+                  "max_wait_ms": {
+                    "type": "integer",
+                    "const": 5000
+                  },
+                  "max_result_page_chars": {
+                    "type": "integer",
+                    "const": 16000
+                  },
+                  "operation_retention_hours": {
+                    "type": "integer",
+                    "const": 168
+                  },
+                  "idempotency_retention_hours": {
+                    "type": "integer",
+                    "const": 720
+                  }
+                },
+                "required": [
+                  "max_message_bytes",
+                  "max_wait_ms",
+                  "max_result_page_chars",
+                  "operation_retention_hours",
+                  "idempotency_retention_hours"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "contract_version",
+              "server_time",
+              "phase",
+              "daemon_status",
+              "writes_enabled",
+              "enabled_tools",
+              "allowed_workspace_aliases",
+              "capabilities",
+              "limits"
+            ],
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "phase": {
+                      "const": "connectivity_only"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "writes_enabled": {
+                      "const": false
+                    },
+                    "enabled_tools": {
+                      "const": [
+                        "bridge_status"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "writes_enabled": {
+                      "const": false
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "enabled_tools": {
+                      "not": {
+                        "contains": {
+                          "enum": [
+                            "bridge_session_create",
+                            "bridge_message_send"
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "writes_enabled": {
+                      "const": true
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "phase": {
+                      "const": "enabled"
+                    },
+                    "enabled_tools": {
+                      "allOf": [
+                        {
+                          "contains": {
+                            "const": "bridge_session_create"
+                          }
+                        },
+                        {
+                          "contains": {
+                            "const": "bridge_message_send"
+                          }
+                        }
+                      ]
+                    },
+                    "capabilities": {
+                      "properties": {
+                        "durable_idempotency": {
+                          "const": true
+                        },
+                        "dedicated_claude_sessions": {
+                          "const": true
+                        },
+                        "asynchronous_operations": {
+                          "const": true
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": [
+                  "INVALID_ARGUMENT",
+                  "PHASE_DISABLED",
+                  "NOT_AUTHORIZED",
+                  "NOT_FOUND",
+                  "WORKSPACE_NOT_ALLOWED",
+                  "IDEMPOTENCY_CONFLICT",
+                  "IDEMPOTENCY_EXPIRED",
+                  "SESSION_BUSY",
+                  "CAPACITY_EXCEEDED",
+                  "BACKEND_UNAVAILABLE",
+                  "BACKEND_PROTOCOL_ERROR",
+                  "DELIVERY_UNKNOWN",
+                  "OPERATION_EXPIRED",
+                  "INTERNAL_ERROR"
+                ]
+              },
+              "message": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2048
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "operation_id": {
+                "type": "string",
+                "pattern": "^op_[A-Za-z0-9_-]{16,128}$",
+                "not": {
+                  "pattern": "[^A-Za-z0-9_-]"
+                }
+              }
+            },
+            "required": [
+              "code",
+              "message",
+              "retryable"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [],
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "properties": {
+              "ok": {
+                "const": true
+              }
+            },
+            "required": [
+              "ok",
+              "data"
+            ],
+            "not": {
+              "required": [
+                "error"
+              ]
+            }
+          },
+          {
+            "properties": {
+              "ok": {
+                "const": false
+              }
+            },
+            "required": [
+              "ok",
+              "error"
+            ],
+            "not": {
+              "required": [
+                "data"
+              ]
+            }
+          }
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    }
+  ]
+}

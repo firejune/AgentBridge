@@ -140,6 +140,23 @@ spend horizon: 10-23 02:58 KST (estimate)
 stop risk horizon: 10-27 15:46 KST (official resets_at)
 ```
 
+## MCP 파사드 (Phase 0: `bridge_status`만)
+
+`scripts/mcp_server.py`는 브릿지를 MCP 클라이언트에 노출한다(계약 0.1.0). Phase 0(`connectivity_only`)에서는 읽기 전용 도구 `bridge_status` 하나만 목록에 올리고 실행한다. 계획된 세션·메시지 도구를 포함한 다른 이름은 모두 알 수 없는 도구로 거절한다. 상태 조회는 브로커 소켓에 `ping` 한 번(`bridge.py ping`과 같은 요청)만 보내며, 세션 발견·전송·생성·등록을 하지 않는다. `daemon_status`는 `ready`(ping이 instance로 응답)·`unreachable`(연결 불가)·`degraded`(연결됐으나 응답 형식 이상) 중 하나이고, `unreachable`도 도구 오류가 아닌 정상 관측이다. 브로커 카운터와 instance ID는 내보내지 않는다.
+
+전송은 stdio(기본) 또는 `--http PORT`의 Streamable HTTP다. HTTP는 `127.0.0.1`에만 바인딩하고 `POST /mcp`를 JSON 응답 모드로 처리하며, `GET`은 405, notification은 202, 자기 루프백 origin과 `--allow-origin`으로 지정한 정확한 값 외의 `Origin`은 403이다. `--socket`으로 기본이 아닌 브로커를 고른다.
+
+Codex 클라이언트 등록(stdio — `args`는 셸 확장이 안 되므로 절대 경로):
+
+```toml
+# ~/.codex/config.toml
+[mcp_servers.agent-bridge]
+command = "/ABSOLUTE/PATH/TO/python3"
+args = ["/ABSOLUTE/PATH/TO/.agents/skills/agent-bridge/scripts/mcp_server.py"]
+```
+
+또는 `codex mcp add agent-bridge -- /ABSOLUTE/PATH/TO/python3 /ABSOLUTE/PATH/TO/mcp_server.py`. HTTP 클라이언트는 `python3 scripts/mcp_server.py --http 8765`를 띄우고 `url = "http://127.0.0.1:8765/mcp"`로 등록한다. 등록 뒤 클라이언트에서 `bridge_status`를 호출한다. 로컬에서 호출이 된다고 다른 클라이언트에 도구가 노출된다는 뜻은 아니다. 쓰기 도구는 의도한 클라이언트에서 Phase 0 호출이 확인되고 쓰기가 승인될 때까지 꺼 둔다.
+
 ## 개발·검증
 
 ```bash
