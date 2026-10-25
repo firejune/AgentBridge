@@ -135,3 +135,11 @@ Changing or removing a grant invalidates its ID and prevents queued dispatch;
 already sent requests may still finish. No transcript or historical HQ messages
 are exposed. Reply content remains untrusted. Local grants and live IDs must
 never be committed to source control.
+
+## Broker reply retention
+
+After correlated reply text is committed, the facade marks those replies done
+through the existing broker resolve API. Pending cleanup IDs are durable and
+retried without resending; cleanup failures never overwrite a successful result.
+Cleanup stops if the broker instance changes and never resolves uncertain replies.
+Previously completed operations without cleanup IDs are not retroactively swept.

@@ -216,6 +216,21 @@ class Backend:
         replies = self.rpc('wait', id=mid, timeout=0.01)['replies']
         return m, [r for r in replies if r.get('reply_to') == mid and isinstance(r.get('body'),str) and r['body'].strip()]
 
+    def retire_reply(self, mid, parent):
+        try:
+            reply = self.rpc('show', id=mid)
+        except ValueError as error:
+            if str(error) == 'Unknown message; broker may have restarted':
+                return
+            raise
+        if reply.get('reply_to') != parent:
+            raise ValueError('Reply correlation changed')
+        if reply.get('state') in ('done','answered','failed'):
+            return
+        if reply.get('state') not in ('pending','received','in_progress'):
+            raise ValueError('Reply delivery remains uncertain')
+        self.rpc('resolve', id=mid, state='done', note='MCP result durably captured')
+
 
 class Engine:
     def __init__(self, config, backend, start=True):
@@ -464,6 +479,8 @@ class Engine:
                     self.dispatch(op)
                 elif op['status']=='running' and op['kind']=='message_send':
                     self.observe(op)
+                elif op['status']=='succeeded' and op.get('pending_reply_cleanup'):
+                    self.cleanup_replies(op)
                 elif op['status'] in ('succeeded','failed') and not op.get('expired') and time.time()-op.get('finished_epoch',time.time()) >= RETENTION:
                     self.update(op,expired=True,message=None,result=None,text=None)
             except Exception:
@@ -569,13 +586,30 @@ class Engine:
                 text = '\n\n'.join(r['body'] for r in sorted(replies,key=lambda r:(r['created'],r['id'])))
                 if len(text.encode()) > MAX_RESULT:
                     self.fail(op,'CAPACITY_EXCEEDED',False); return
-                self.update(op,status='succeeded',stage='complete',text=text,result={'type':'message_result'})
+                self.update(op,status='succeeded',stage='complete',text=text,result={'type':'message_result'},
+                            pending_reply_cleanup=[r['id'] for r in replies])
+                self.cleanup_replies(op)
             elif state=='failed':
                 self.fail(op,'BACKEND_UNAVAILABLE',False)
             elif state=='uncertain' or (recovering and state in ('pending','dispatching')):
                 self.fail(op)
         except Exception:
             self.fail(op)
+
+    def cleanup_replies(self, op):
+        # Only after the result commit. Cleanup retries never replay message effects.
+        try:
+            if self.backend.instance() != op['instance']:
+                self.update(op,pending_reply_cleanup=[])
+                return
+            remaining = list(op.get('pending_reply_cleanup',[]))
+            for mid in list(remaining):
+                self.backend.retire_reply(mid,op['backend_id'])
+                remaining.remove(mid)
+                self.update(op,pending_reply_cleanup=list(remaining))
+        except Exception:
+            # Keep durable success and remaining IDs through outages or lost resolve replies.
+            return
 
     def cursor(self, principal, kind, obj, offset):
         payload = json.dumps([principal,kind,obj,offset,int(time.time())+3600],separators=(',',':')).encode()

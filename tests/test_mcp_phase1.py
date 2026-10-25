@@ -45,6 +45,7 @@ class FakeBackend:
         self.pushes+=1; self.messages[m['id']]['state']='submitted'
         if self.crash=='push': raise RuntimeError('response lost')
         return self.messages[m['id']].copy()
+    def retire_reply(self,mid,parent): pass
     def observe(self,mid):
         return self.messages[mid].copy(),self.replies.get(mid,[])
 
@@ -72,6 +73,23 @@ class PhaseTest(unittest.TestCase):
         return self.call('bridge_message_send',agent_session_id=sid,message=text,idempotency_key=key)
     def restart(self):
         self.engine.close(); self.engine=phase.Engine(self.config,self.backend,start=False)
+
+
+    def test_reply_cleanup_failure_keeps_success_and_resumes_without_send(self):
+        sid=self.create()['agent_session_id'];a=self.send(sid)['data'];self.engine.tick()
+        op=self.engine.operation(a['operation_id'],'owner-a')
+        self.backend.replies[op['backend_id']]=[{'id':'r1','reply_to':op['backend_id'],'created':1,'body':'durable'}]
+        def fail(mid,parent):raise OSError('temporary outage')
+        self.backend.retire_reply=fail;self.engine.tick()
+        saved=self.engine.operation(op['operation_id'],'owner-a')
+        self.assertEqual(saved['status'],'succeeded')
+        self.assertEqual(saved['pending_reply_cleanup'],['r1'])
+        self.restart();calls=[]
+        self.backend.retire_reply=lambda mid,parent:calls.append((mid,parent))
+        self.engine.tick()
+        self.assertEqual(calls,[('r1',op['backend_id'])])
+        self.assertEqual(self.backend.pushes,1)
+        self.assertEqual(self.engine.operation(op['operation_id'],'owner-a')['pending_reply_cleanup'],[])
 
     def grant(self):
         self.config['pinned_sessions']={'hq':{'uuid':str(uuid.uuid4()),'cwd':str(self.root),
@@ -322,5 +340,41 @@ class BrokerIntegrationTest(unittest.TestCase):
                     self.assertEqual(result['status'],'succeeded')
             finally:
                 engine.close()
+
+
+class ReviewRegressionTest(unittest.TestCase):
+    def exercise(self, count, ledgers, capacity):
+        with RunningBroker(max_messages=capacity) as running, tempfile.TemporaryDirectory(dir='/tmp') as temp:
+            root=str(Path(temp).resolve()); engines=[]
+            config={'principal':'same-owner','tunnel_id':'same-tunnel','writes_enabled':True,
+                    'scopes':list(set(phase.SCOPES.values())),
+                    'workspaces':{'test':{'cwd':root,'root':root,'project':'test-project','ide':sessions_ide()}}}
+            row={'id':str(uuid.uuid4()),'cwd':root,'status':'idle'}
+            try:
+                with patch.object(phase.sessions,'open_session',return_value={'session':row}), patch.object(phase.sessions,'resolve_claude_peer',return_value=row), patch.object(phase.bridge,'new_session_policy'):
+                    for n in range(ledgers):
+                        c=dict(config,state_dir=root+'/ledger'+str(n))
+                        e=phase.Engine(c,phase.Backend(running.path),start=False); engines.append(e)
+                        a=e.call('bridge_session_create',{'workspace_alias':'test','idempotency_key':'same-create-key-0001'})['data'];e.tick()
+                        e.sid=e.operation(a['operation_id'],'same-owner')['agent_session_id']
+                    for n in range(count):
+                        e=engines[n % ledgers]
+                        key='same-message-key-0001' if ledgers>1 else 'message-key-00000'+str(n)
+                        a=e.call('bridge_message_send',{'agent_session_id':e.sid,'message':'hello','idempotency_key':key})['data']
+                        def push(path,m):
+                            running.call('claim',id=m['id'])
+                            return running.call('finish',id=m['id'],state='submitted')
+                        with patch.object(phase.bridge,'push_if_peer',side_effect=push):e.tick()
+                        op=e.operation(a['operation_id'],'same-owner')
+                        self.assertEqual(op['status'],'running')
+                        r=running.call('reply',id=op['backend_id'],body='answer',key='reply-'+str(n))
+                        e.tick()
+                        self.assertEqual(e.operation(a['operation_id'],'same-owner')['status'],'succeeded')
+                        if ledgers==1:self.assertEqual(running.call('show',id=r['id'])['state'],'done')
+            finally:
+                for e in engines:e.close()
+
+    def test_consumed_replies_do_not_exhaust_small_broker(self):
+        self.exercise(5,1,3)
 
 if __name__=='__main__': unittest.main()
