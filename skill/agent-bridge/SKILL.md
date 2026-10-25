@@ -189,6 +189,11 @@ python3 "$bridge_cli" policy                                    # the defaults a
 - Write code only in a worktree under `<workspace>/.worktrees/<repo>/<agent>-<issue>`; the main checkout stays on `main`. Create it with `bridge.py wt new REPO AGENT ISSUE` (or `--detach REF` for a read-only pin) instead of a sibling folder or a clone.
 - `bridge.py wt list --text` shows owner, PR, clean/dirty and live use; `bridge.py wt sweep` is a dry run. Run `--apply` only when the owner asks. Contract: [README](../../README.md#agent-worktrees-wt).
 
+## MCP Facade
+
+- `scripts/mcp_server.py` serves the bridge to MCP clients (stdio, or `--http PORT` on `127.0.0.1` only). By default only the read-only `bridge_status` tool is listed and callable; it sends one broker `ping` and nothing else. Registration: [README](../../README.md#mcp-facade-default-bridge_status-only).
+- The write tools (owned Claude sessions, durable create/send operations) load only with an owner-approved private `--phase1-config` over stdio: [mcp-phase1.md](references/mcp-phase1.md). Never enable them because the status call works, and never pass a session, path or model as a tool argument.
+
 ## Operational Boundaries
 
 - Only routes and channel bindings persist in an owner-private routing snapshot. Restart re-verifies exact live sessions and pinned channel routes, dropping unavailable bindings; messages, idempotency keys, and events are volatile. Do not restart or stop a shared broker without coordinating with active participants.

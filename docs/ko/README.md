@@ -140,7 +140,7 @@ spend horizon: 10-23 02:58 KST (estimate)
 stop risk horizon: 10-27 15:46 KST (official resets_at)
 ```
 
-## MCP 파사드 (Phase 0: `bridge_status`만)
+## MCP 파사드 (기본: `bridge_status`만)
 
 `scripts/mcp_server.py`는 브릿지를 MCP 클라이언트에 노출한다(계약 0.1.0). Phase 0(`connectivity_only`)에서는 읽기 전용 도구 `bridge_status` 하나만 목록에 올리고 실행한다. 계획된 세션·메시지 도구를 포함한 다른 이름은 모두 알 수 없는 도구로 거절한다. 상태 조회는 브로커 소켓에 `ping` 한 번(`bridge.py ping`과 같은 요청)만 보내며, 세션 발견·전송·생성·등록을 하지 않는다. `daemon_status`는 `ready`(ping이 instance로 응답)·`unreachable`(연결 불가)·`degraded`(연결됐으나 응답 형식 이상) 중 하나이고, `unreachable`도 도구 오류가 아닌 정상 관측이다. 브로커 카운터와 instance ID는 내보내지 않는다.
 
@@ -156,6 +156,8 @@ args = ["/ABSOLUTE/PATH/TO/.agents/skills/agent-bridge/scripts/mcp_server.py"]
 ```
 
 또는 `codex mcp add agent-bridge -- /ABSOLUTE/PATH/TO/python3 /ABSOLUTE/PATH/TO/mcp_server.py`. HTTP 클라이언트는 `python3 scripts/mcp_server.py --http 8765`를 띄우고 `url = "http://127.0.0.1:8765/mcp"`로 등록한다. 등록 뒤 클라이언트에서 `bridge_status`를 호출한다. 로컬에서 호출이 된다고 다른 클라이언트에 도구가 노출된다는 뜻은 아니다. 쓰기 도구는 의도한 클라이언트에서 Phase 0 호출이 확인되고 쓰기가 승인될 때까지 꺼 둔다.
+
+Phase 1 구현은 명시적인 비공개 단일 소유자 stdio 설정 뒤에만 있고, 기본으로는 켜지지 않는다. 켜면 소유한 Claude IDE 세션, 영속 비동기 생성·전송 작업, 요청에 연결된 답장의 페이지 조회, 보수적인 장애 복구가 추가된다. 설정과 복구 절차는 [Phase 1 설정과 복구](../../skill/agent-bridge/references/mcp-phase1.md)(영문)를 따른다. 브로커의 휘발성 메시지 정책은 그대로이고, 따로 승인한 MCP 파사드만 자기 비공개 작업 원장을 가진다. 상태 터널이 동작한다는 이유만으로 쓰기 도구를 켜지 않는다.
 
 ## 개발·검증
 
