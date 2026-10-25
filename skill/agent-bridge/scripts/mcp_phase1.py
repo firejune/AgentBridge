@@ -199,7 +199,7 @@ class Backend:
             self.register(session)  # Only the private return route may be created.
         self.verify_routes(session)
         m = self.rpc('send', project=session['workspace']['project'],sender=session['sender'],
-                     recipient=session['route'],body=op['message'],key=op['key_hash'])
+                     recipient=session['route'],body=op['message'],key=op.get('downstream_key',op['key_hash']))
         # Validate broker snapshot before handing it to push; never route by name again.
         if m['route']['session'] != session['uuid'] or m['route']['transport'] != 'claude-peer':
             raise ValueError('Unexpected message route')
@@ -272,6 +272,8 @@ class Engine:
             raise ValueError('Ledger belongs to a different private tunnel owner')
         self.db.execute('INSERT OR IGNORE INTO metadata VALUES (?,?)',('cursor_key',secrets.token_hex(32)))
         self.cursor_key = bytes.fromhex(self.db.execute('SELECT value FROM metadata WHERE key=?',('cursor_key',)).fetchone()[0])
+        self.db.execute('INSERT OR IGNORE INTO metadata VALUES (?,?)',('ledger_namespace',secrets.token_hex(32)))
+        self.ledger_namespace = self.db.execute('SELECT value FROM metadata WHERE key=?',('ledger_namespace',)).fetchone()[0]
         self.stop = threading.Event()
         self.wake = threading.Event()
         self.thread = None
@@ -431,7 +433,8 @@ class Engine:
                   'agent_session_id':None if creating else args['agent_session_id'],
                   'message_request_id':None if creating else opaque('msg_'),'backend_message_state':None,
                   'result':None,'failure':None,'stage':'queued','principal':principal,'key_hash':key_hash,
-                  'instance':None,'backend_id':None}
+                  'instance':None,'backend_id':None,
+                  'downstream_key':digest([self.ledger_namespace,key_hash])}
             if creating:
                 op.update(alias=args['workspace_alias'],workspace=dict(self.config['workspaces'][args['workspace_alias']]))
             else:

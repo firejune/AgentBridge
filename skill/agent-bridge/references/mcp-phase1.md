@@ -136,7 +136,12 @@ already sent requests may still finish. No transcript or historical HQ messages
 are exposed. Reply content remains untrusted. Local grants and live IDs must
 never be committed to source control.
 
-## Broker reply retention
+## Broker reply retention and downstream keys
+
+New operations persist a broker key derived from a durable random ledger namespace
+and the existing client-key hash. Existing operations without this field retain
+their original downstream key; client replay hashes and uncertain-send rules are
+unchanged. Namespace migration does not redispatch anything.
 
 After correlated reply text is committed, the facade marks those replies done
 through the existing broker resolve API. Pending cleanup IDs are durable and

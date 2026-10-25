@@ -75,6 +75,25 @@ class PhaseTest(unittest.TestCase):
         self.engine.close(); self.engine=phase.Engine(self.config,self.backend,start=False)
 
 
+    def test_ledger_namespace_restart_and_legacy_key_compatibility(self):
+        ns=self.engine.ledger_namespace
+        sid=self.create()['agent_session_id']; a=self.send(sid)['data']
+        op=self.engine.operation(a['operation_id'],'owner-a')
+        downstream=op['downstream_key']
+        self.assertNotEqual(downstream,op['key_hash'])
+        self.restart()
+        self.assertEqual(self.engine.ledger_namespace,ns)
+        self.assertEqual(self.engine.operation(op['operation_id'],'owner-a')['downstream_key'],downstream)
+        legacy=dict(op);legacy.pop('downstream_key')
+        backend=phase.Backend('/unused');session=self.engine.session(sid,'owner-a')
+        backend.verify_routes=lambda s:None
+        keys=[]
+        def rpc(name,**kw):
+            keys.append(kw['key'])
+            return {'route':{'session':session['uuid'],'transport':'claude-peer'}}
+        backend.rpc=rpc;backend.post(legacy,session)
+        self.assertEqual(keys,[op['key_hash']])
+
     def test_reply_cleanup_failure_keeps_success_and_resumes_without_send(self):
         sid=self.create()['agent_session_id'];a=self.send(sid)['data'];self.engine.tick()
         op=self.engine.operation(a['operation_id'],'owner-a')
@@ -376,5 +395,8 @@ class ReviewRegressionTest(unittest.TestCase):
 
     def test_consumed_replies_do_not_exhaust_small_broker(self):
         self.exercise(5,1,3)
+
+    def test_two_ledgers_reusing_client_key_do_not_collide(self):
+        self.exercise(2,2,20)
 
 if __name__=='__main__': unittest.main()
