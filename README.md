@@ -110,9 +110,9 @@ python3 ~/.agents/skills/agent-bridge/scripts/bridge.py sessions --provider agy
 
 If you move the repository, update the symlinks accordingly. Restarting clears messages, idempotency keys, and events. Routes and channels reload after identity/workspace checks. Saved Codex routes survive temporary metadata or Desktop unavailability; confirmed mismatches and invalid stored identities are dropped. Other live-peer bindings retain their liveness checks.
 
-## MCP Facade (Phase 0: `bridge_status` only)
+## MCP Facade (default: `bridge_status` only)
 
-`scripts/mcp_server.py` exposes the bridge to MCP clients (contract 0.1.0). Phase 0 (`connectivity_only`) lists and runs exactly one read-only tool, `bridge_status`; every other name, including the planned session/message tools, is refused as an unknown tool. The status call sends one `ping` to the broker socket, the same request `bridge.py ping` makes, and never discovers, sends, opens or registers anything. `daemon_status` is `ready` (ping answered with an instance), `unreachable` (no connection) or `degraded` (connected, malformed answer); `unreachable` is a valid result, not a tool error. Broker counters and the instance ID are not exposed.
+`scripts/mcp_server.py` exposes the bridge to MCP clients (contract 0.1.0). Phase 0 (`connectivity_only`) lists and runs exactly one read-only tool, `bridge_status`; every other name, including the opt-in session/message tools, is refused as an unknown tool. The status call sends one `ping` to the broker socket, the same request `bridge.py ping` makes, and never discovers, sends, opens or registers anything. `daemon_status` is `ready` (ping answered with an instance), `unreachable` (no connection) or `degraded` (connected, malformed answer); `unreachable` is a valid result, not a tool error. Broker counters and the instance ID are not exposed.
 
 Transports: stdio (default) or Streamable HTTP with `--http PORT`, which binds `127.0.0.1` only, serves `POST /mcp` in JSON response mode, answers `GET` with 405 and notifications with 202, and refuses any `Origin` other than its own loopback origins and exact `--allow-origin` values with 403. `--socket` selects a non-default broker.
 
@@ -126,6 +126,14 @@ args = ["/ABSOLUTE/PATH/TO/.agents/skills/agent-bridge/scripts/mcp_server.py"]
 ```
 
 or `codex mcp add agent-bridge -- /ABSOLUTE/PATH/TO/python3 /ABSOLUTE/PATH/TO/mcp_server.py`. For an HTTP client, run `python3 scripts/mcp_server.py --http 8765` and register `url = "http://127.0.0.1:8765/mcp"`. Then call `bridge_status` from the client; a successful local call does not prove a different client exposes the tool. The write tools stay off until a phase-0 call from the intended client is confirmed and writes are approved.
+
+Phase 1 implementation is available behind an explicit, private single-owner stdio
+configuration; it is not enabled by default. It adds owned Claude IDE sessions,
+durable asynchronous create/send operations, correlated reply pagination and
+conservative crash recovery. See [Phase 1 configuration and recovery](skill/agent-bridge/references/mcp-phase1.md).
+The broker's volatile correspondence policy is unchanged; the separately approved
+MCP facade keeps its own private operation ledger. Never activate write tools
+merely because the status tunnel works.
 
 ## Development & Verification
 

@@ -73,7 +73,7 @@ def error(mid, code, message):
     return {'jsonrpc': '2.0', 'id': mid, 'error': {'code': code, 'message': message}}
 
 
-def handle(message, path):
+def handle(message, path, engine=None):
     """One JSON-RPC message in, one response or None (notification/response) out."""
     if not isinstance(message, dict) or message.get('jsonrpc') != '2.0':
         return error(None, -32600, 'Invalid Request: one JSON-RPC 2.0 object; batches are not supported')
@@ -94,12 +94,29 @@ def handle(message, path):
     if method == 'ping':
         return {'jsonrpc': '2.0', 'id': mid, 'result': {}}
     if method == 'tools/list':
-        return {'jsonrpc': '2.0', 'id': mid, 'result': {'tools': TOOLS}}
+        return {'jsonrpc': '2.0', 'id': mid, 'result': {'tools': engine.tools() if engine else TOOLS}}
     if method == 'tools/call':
         name = params.get('name')
-        if name not in ENABLED_TOOLS:
+        if name not in ([t['name'] for t in engine.tools()] if engine else ENABLED_TOOLS):
             return error(mid, -32602, f'Unknown tool: {name}')
         arguments = params.get('arguments')
+        if engine is not None:
+            from mcp_phase1 import Fault
+            if name == 'bridge_status':
+                try:
+                    engine.authorized(name, engine.principal)
+                    engine.validate(name, {} if arguments is None else arguments)
+                    data = status(path)
+                    data.update(phase='enabled', writes_enabled=True,
+                                enabled_tools=[t['name'] for t in engine.tools()],
+                                allowed_workspace_aliases=sorted(engine.config['workspaces']),
+                                capabilities=dict.fromkeys(data['capabilities'], True))
+                    payload = {'ok': True, 'data': data}
+                except Fault as exc:
+                    payload = {'ok': False, 'error': exc.payload}
+            else:
+                payload = engine.call(name, {} if arguments is None else arguments)
+            return {'jsonrpc': '2.0', 'id': mid, 'result': tool_result(payload)}
         if arguments not in (None, {}):
             return {'jsonrpc': '2.0', 'id': mid, 'result': tool_result({'ok': False, 'error': {
                 'code': 'INVALID_ARGUMENT', 'message': 'bridge_status takes no arguments',
@@ -108,7 +125,7 @@ def handle(message, path):
     return error(mid, -32601, f'Method not found: {method}')
 
 
-def serve_stdio(path, stdin=sys.stdin, stdout=sys.stdout):
+def serve_stdio(path, stdin=sys.stdin, stdout=sys.stdout, engine=None):
     for line in stdin:
         if not line.strip():
             continue
@@ -117,7 +134,7 @@ def serve_stdio(path, stdin=sys.stdin, stdout=sys.stdout):
         except ValueError:
             response = error(None, -32700, 'Parse error')
         else:
-            response = handle(message, path)
+            response = handle(message, path, engine)
         if response is not None:
             stdout.write(json.dumps(response, ensure_ascii=False) + '\n')
             stdout.flush()
@@ -200,9 +217,28 @@ def main(argv=None):
                         help='Serve Streamable HTTP POST /mcp on 127.0.0.1:PORT instead of stdio')
     parser.add_argument('--allow-origin', action='append', default=[], metavar='ORIGIN',
                         help='Extra exact Origin accepted over HTTP (loopback origins are always accepted)')
+    parser.add_argument('--phase1-config', metavar='FILE',
+                        help='Explicit approved private-tunnel principal/workspace config; stdio only')
+    parser.add_argument('--recover-registration', metavar='OPERATION_ID',
+                        help='Explicit local repair of known created UUID; never creates or sends')
     args = parser.parse_args(argv)
+    if args.recover_registration and not args.phase1_config:
+        parser.error('--recover-registration requires the approved Phase 1 configuration')
+    if args.phase1_config and args.http is not None:
+        parser.error('Phase 1 is private-tunnel stdio only; unauthenticated HTTP cannot enable writes')
     if args.http is None:
-        serve_stdio(args.socket)
+        engine = None
+        if args.phase1_config:
+            from mcp_phase1 import Backend, Engine, load_config
+            engine = Engine(load_config(args.phase1_config), Backend(args.socket), start=not args.recover_registration)
+        try:
+            if args.recover_registration:
+                print(json.dumps({'ok': True, 'data': engine.recover_registration(args.recover_registration)}))
+            else:
+                serve_stdio(args.socket, engine=engine)
+        finally:
+            if engine:
+                engine.close()
         return 0
     server = serve_http(args.socket, args.http, args.allow_origin)
     print(json.dumps({'mcp': f'http://127.0.0.1:{server.server_address[1]}/mcp'}), flush=True)
