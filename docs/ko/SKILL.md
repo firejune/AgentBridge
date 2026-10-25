@@ -182,6 +182,11 @@ python3 "$bridge_cli" policy                                    # 적용 중인 
 - 세션 토큰 사용량을 구독 잔여 한도로 해석하지 않는다. 컨텍스트 잔량·세션 토큰·API 비용은 구독 한도와 다른 지표다.
 - **메시지마다 위험 상태(#32)**: `usage` 줄 끝에 `holds until reset`·`AT RISK: empty ~T before reset`·`EXHAUSTED`·`risk unknown (사유)` 중 하나가 붙는다. 최근 3시간 소모 속도를 공식 `resets_at`에 대 본 판정이다(조기 리셋 추정은 쓰지 않는다). 라우트나 회신 라우트가 `codex`나 `agy`인 `send`·`ask`·`reply`는 보낸 쪽 출력에 `usage` 필드(`state`, 버킷별 줄)를 싣는다. 일을 맡기기 전에 읽는다. `at_risk`나 `exhausted`면 속도를 늦추거나 일을 옮긴다. 받는 쪽 메시지는 그대로이고, 저장소를 못 읽으면 전송은 실패하지 않고 `unknown`이 된다. Claude 라우트에는 필드가 없다(한도를 수집하지 않는다).
 
+## MCP 파사드
+
+- `scripts/mcp_server.py`가 브릿지를 MCP 클라이언트에 노출한다(stdio, 또는 `127.0.0.1` 전용 `--http PORT`). 기본으로는 읽기 전용 `bridge_status` 하나만 목록에 오르고 호출된다. 브로커에 `ping` 한 번만 보내고 다른 일은 하지 않는다. 등록법: [README](README.md#mcp-파사드-기본-bridge_status만).
+- 쓰기 도구(소유한 Claude 세션, 영속 생성·전송 작업)는 소유자가 승인한 비공개 `--phase1-config`를 stdio로 줄 때만 올라온다: [mcp-phase1.md](../../skill/agent-bridge/references/mcp-phase1.md)(영문). 상태 호출이 된다는 이유로 켜지 않고, 세션·경로·모델을 도구 인자로 넘기지 않는다.
+
 ## 실행 경계
 
 - endpoint·채널 바인딩만 소유자 전용 파일에 저장한다. 재시작 시 정확한 라이브 세션과 채널의 고정 주소를 재검증하고, 사용할 수 없는 바인딩은 제거한다. 메시지·중복키·이벤트는 초기화된다. 기존 공유 브로커를 임의로 재시작하거나 종료하지 않는다. 직접 시작한 인스턴스는 참가자들의 작업 종료를 확인한 뒤 정리한다.
