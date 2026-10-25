@@ -67,6 +67,30 @@ Details: [SKILL.md](skill/agent-bridge/SKILL.md) and [usage.md](skill/agent-brid
 
 The caller's own Claude session is refused. A route that owns an active channel is not removed. A broker started before this version reports that it needs a restart to remove routes.
 
+## Agent Worktrees (`wt`)
+
+One root and one way in and out for agent worktrees (#38). The main checkout stays on `main`; all writing happens in `<workspace>/.worktrees/<repo>/<agent>-<issue>`, outside every repository so tools that walk the tree without reading `.gitignore` never see another agent's work. `wt` lives in its own module ([wt.py](skill/agent-bridge/scripts/wt.py)) and uses only the live-session discovery from `sessions.py`.
+
+| Command | What it does |
+| --- | --- |
+| `wt new REPO AGENT ISSUE [--base main] [--slug S]` | Branch `AGENT/ISSUE-<slug>` (slug from the issue title via `gh` unless given) from `origin/<base>`; refuses an existing path or branch |
+| `wt new REPO AGENT ISSUE --detach REF` | Read-only pin (`git worktree add --detach`), never a separate clone |
+| `wt adopt PATH --agent A --issue N` | Owner record for an existing worktree, so `sweep` can judge it |
+| `wt list [--repo R] [--text]` | Every worktree of every repository in the workspace (main, root, harness-owned, elsewhere) with owner, branch, PR state, clean/dirty, last touched, sessions whose cwd is inside and processes holding files inside |
+| `wt sweep [--apply] [--text]` | Dry run unless `--apply` |
+
+`new` and `adopt` write `OWNER.json` (`agent`, `session`, `provider`, `issue`, `repo`, `created`, `purpose: work\|pin`) into the worktree's admin directory (`.git/worktrees/<id>/`): it cannot be committed, never makes the tree dirty and goes away with the worktree. The session defaults to the caller's (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`); pass `--session` otherwise. `--workspace` (env `AGENT_BRIDGE_WORKSPACE`, default: the parent of the current repository's main checkout) and `--root` (env `AGENT_BRIDGE_WT_ROOT`, default `<workspace>/.worktrees`) move both.
+
+`sweep` removes a worktree and its local branch only when all of these hold; everything else is kept with its reasons:
+
+1. It has an owner record and is not the main checkout, locked, or in a harness-owned location (`<repo>/.claude/worktrees/`, `~/.codex/worktrees/`: read, never moved or removed).
+2. Clean: no modified or untracked files.
+3. Landed: its PR is merged, or with no PR every path the branch changed (merge-base to tip) is identical on `origin/<base>`. Ancestry is not the test, because squash merges never make a branch an ancestor of `main`. An open or closed-unmerged PR is kept.
+4. Its owner session is not alive or possibly alive (Claude live registry, Codex threads, Antigravity trajectories).
+5. Nothing uses it: no live session cwd and no open file or process cwd (one `lsof` call) is inside it.
+
+A failing session provider or `lsof` blocks every removal (`--providers` narrows the set consulted). `--apply` re-checks cleanliness and open files right before `git worktree remove` (never `--force`) and `git branch -D`. Remote branches are never touched. Second checkouts of the same origin are reported as clones and never removed. `gh` is the only network call; the comparison uses the last fetched `origin` state.
+
 ## Global Skill Installation
 
 Symlink the four standard skill discovery paths to `skill/agent-bridge` so all local agents share the same single copy:

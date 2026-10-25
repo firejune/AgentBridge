@@ -184,6 +184,11 @@ python3 "$bridge_cli" policy                                    # the defaults a
 - Do not read session token usage as remaining subscription limit. Context window, session tokens and API cost are different metrics.
 - **Risk state on every message (#32)**: each `usage` line ends with `holds until reset`, `AT RISK: empty ~T before reset`, `EXHAUSTED` or `risk unknown (reason)`, from the last 3 h of burn against the official `resets_at` (never the early-reset estimate). Every `send`, `ask` and `reply` whose route or return route is `codex` or `agy` carries a `usage` field in the sender's output (`state`, per-bucket lines). Read it before handing out work: `at_risk` or `exhausted` means pace or move the work. The recipient's message is unchanged, and an unreadable store gives `unknown`, never a failed send. Claude routes get no field (limits are not collected).
 
+## Agent Worktrees
+
+- Write code only in a worktree under `<workspace>/.worktrees/<repo>/<agent>-<issue>`; the main checkout stays on `main`. Create it with `bridge.py wt new REPO AGENT ISSUE` (or `--detach REF` for a read-only pin) instead of a sibling folder or a clone.
+- `bridge.py wt list --text` shows owner, PR, clean/dirty and live use; `bridge.py wt sweep` is a dry run. Run `--apply` only when the owner asks. Contract: [README](../../README.md#agent-worktrees-wt).
+
 ## Operational Boundaries
 
 - Only routes and channel bindings persist in an owner-private routing snapshot. Restart re-verifies exact live sessions and pinned channel routes, dropping unavailable bindings; messages, idempotency keys, and events are volatile. Do not restart or stop a shared broker without coordinating with active participants.
