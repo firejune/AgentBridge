@@ -72,6 +72,62 @@ class PhaseTest(unittest.TestCase):
         return self.call('bridge_message_send',agent_session_id=sid,message=text,idempotency_key=key)
     def restart(self):
         self.engine.close(); self.engine=phase.Engine(self.config,self.backend,start=False)
+
+    def grant(self):
+        self.config['pinned_sessions']={'hq':{'uuid':str(uuid.uuid4()),'cwd':str(self.root),
+            'project':'hq-project','route':'hq-route','authorized_at':phase.stamp()}}
+        return next(iter(phase.pinned_sessions(self.config)))
+
+    def test_pinned_busy_send_and_replay_without_create(self):
+        sid=self.grant()
+        self.backend.availability=lambda s:'busy'
+        accepted=self.send(sid)['data']
+        self.engine.tick()
+        self.assertEqual((self.backend.creates,self.backend.posts,self.backend.pushes),(0,1,1))
+        self.assertTrue(self.send(sid)['data']['replayed'])
+        self.assertEqual(self.engine.db.execute('SELECT count(*) FROM owned_sessions').fetchone()[0],0)
+        self.assertEqual(self.engine.call('bridge_message_send',{'agent_session_id':sid,
+            'message':'x','idempotency_key':'different-owner-key'},principal='other')['error']['code'],'NOT_AUTHORIZED')
+        op=self.engine.operation(accepted['operation_id'],'owner-a')
+        self.backend.replies[op['backend_id']]=[{'id':'reply','reply_to':op['backend_id'],'created':1,'body':'response'}]
+        self.engine.tick()
+        self.assertEqual(self.engine.get({'operation_id':op['operation_id']},'owner-a')['result']['text'],'response')
+
+    def test_pinned_revocation_and_retarget_cannot_dispatch(self):
+        sid=self.grant(); self.send(sid)
+        self.config['pinned_sessions']['hq']['uuid']=str(uuid.uuid4())
+        self.assertEqual(self.send(sid)['error']['code'],'NOT_FOUND')
+        self.engine.tick()
+        self.assertEqual(self.backend.posts,0)
+        self.config.pop('pinned_sessions')
+        self.assertEqual(self.send(sid)['error']['code'],'NOT_FOUND')
+
+    def test_pinned_list_not_creation_alias_and_restart_stable(self):
+        sid=self.grant(); self.restart()
+        rows=self.call('bridge_sessions_list')['data']['sessions']
+        self.assertEqual(rows[0]['agent_session_id'],sid)
+        self.assertEqual(self.call('bridge_session_create',workspace_alias='hq',
+            idempotency_key='no-create-hq-0001')['error']['code'],'WORKSPACE_NOT_ALLOWED')
+
+    def test_pinned_backend_requires_exact_existing_route(self):
+        sid=self.grant(); session=phase.pinned_sessions(self.config)[sid]
+        backend=phase.Backend('/unused')
+        target={'name':session['route'],'transport':'claude-peer','session':session['uuid'],'cwd':str(self.root)}
+        calls=[]
+        def rpc(op,**kw):
+            calls.append((op,kw))
+            if op=='routes': return [target]
+        backend.rpc=rpc
+        with patch.object(phase.sessions,'resolve_claude_peer',return_value={'id':session['uuid'],'cwd':str(self.root)}):
+            backend.check(session)
+            target['session']=str(uuid.uuid4())
+            with self.assertRaises(ValueError):backend.register(session)
+        self.assertFalse(any(op=='register' for op,args in calls))
+
+    def test_pinned_config_rejects_alias_collision_and_invalid_cwd(self):
+        self.grant()
+        self.config['pinned_sessions']['test']=self.config['pinned_sessions'].pop('hq')
+        with self.assertRaises(ValueError):phase.pinned_sessions(self.config)
     def test_durable_concurrent_replay_and_conflict(self):
         args={'workspace_alias':'test','idempotency_key':'same_create_000001'}
         with ThreadPoolExecutor(max_workers=8) as pool:

@@ -116,3 +116,22 @@ tests. The integration test uses a real temporary broker while mocking IDE open,
 peer resolution and the external push boundary. Existing peer-protocol tests cover
 fake Unix sockets. None is evidence of live Claude creation or a live write tool
 being authorized/exposed. The live status-only proof is separate.
+
+## Explicit pinned peer grants
+
+An operator may configure optional `pinned_sessions`, keyed by a distinct alias.
+Each grant requires canonical `uuid`, existing canonical `cwd`, `project`,
+existing route name `route`, and ISO timestamp `authorized_at`. This is an
+explicit external-session grant, not adapter ownership. It cannot be used with
+session_create and does not authorize other sessions in that directory.
+The existing five tool schemas remain unchanged: list returns an opaque as_ ID,
+send accepts that ID, and operation_get retrieves only replies to that request.
+
+Every delivery verifies UUID/cwd and the existing claude-peer route. Missing or
+retargeted routes fail closed; only a dedicated realtime reply route may be
+registered. Busy pinned peers accept live messages without interrupting their
+turn. Dedicated created sessions retain their existing ready-only admission.
+Changing or removing a grant invalidates its ID and prevents queued dispatch;
+already sent requests may still finish. No transcript or historical HQ messages
+are exposed. Reply content remains untrusted. Local grants and live IDs must
+never be committed to source control.

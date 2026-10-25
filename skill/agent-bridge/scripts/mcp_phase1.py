@@ -68,13 +68,14 @@ def load_config(path):
     if not stat.S_ISREG(s.st_mode) or s.st_uid != os.getuid() or stat.S_IMODE(s.st_mode) != 0o600:
         raise ValueError('Phase 1 configuration must be owner-only (0600)')
     config = json.loads(Path(path).read_text())
-    if set(config) != {'principal','scopes','workspaces','state_dir','tunnel_id','writes_enabled'}:
+    if set(config) - {'pinned_sessions'} != {'principal','scopes','workspaces','state_dir','tunnel_id','writes_enabled'}:
         raise ValueError('Unexpected Phase 1 configuration fields')
     if config['writes_enabled'] is not True or not config['principal'] or not config['tunnel_id']:
         raise ValueError('An approved private tunnel owner mapping is required')
     if set(config['scopes']) != set(SCOPES.values()):
         raise ValueError('Phase 1 requires exactly the three bridge scopes')
     validate_workspaces(config['workspaces'])
+    pinned_sessions(config)
     return config
 
 
@@ -93,6 +94,34 @@ def validate_workspaces(workspaces):
                 raise ValueError('Workspace paths must be existing canonical absolute directories')
         if not Path(w['cwd']).is_relative_to(w['root']):
             raise ValueError('Workspace is outside its allowed root')
+
+
+def pinned_sessions(config):
+    """Explicit grants, never inferred ownership or arbitrary route adoption."""
+    grants = config.get('pinned_sessions', {})
+    if not isinstance(grants, dict):
+        raise ValueError('Pinned sessions must be a mapping')
+    result = {}
+    for alias, g in grants.items():
+        if (not re.fullmatch(r'[a-z][a-z0-9_-]{0,31}', alias)
+                or alias in config['workspaces']
+                or set(g) != {'uuid','cwd','project','route','authorized_at'}):
+            raise ValueError('Invalid pinned session grant')
+        if str(uuid.UUID(g['uuid'])) != g['uuid']:
+            raise ValueError('Canonical session UUID required')
+        cwd = Path(g['cwd'])
+        if not cwd.is_absolute() or not cwd.is_dir() or str(cwd.resolve()) != str(cwd):
+            raise ValueError('Canonical existing pinned cwd required')
+        broker.identifier(g['project']); broker.identifier(g['route'])
+        datetime.fromisoformat(g['authorized_at'])
+        identity = digest([config['principal'], config['tunnel_id'], alias, g])
+        sid = 'as_' + identity[:32]
+        result[sid] = {'id':sid, 'uuid':g['uuid'], 'alias':alias,
+            'workspace':{'cwd':g['cwd'], 'root':g['cwd'], 'project':g['project'], 'ide':'antigravity-ide'},
+            'route':g['route'], 'sender':'mcp-' + identity[32:],
+            'created_at':g['authorized_at'], 'last_activity_at':g['authorized_at'],
+            'principal':config['principal'], 'registered':True, 'pinned':True}
+    return result
 
 
 class Backend:
@@ -123,6 +152,12 @@ class Backend:
         row = sessions.resolve_claude_peer(session['uuid'])
         if row['id'] != session['uuid'] or Path(row['cwd']).resolve() != Path(session['workspace']['cwd']):
             raise ValueError('Session identity changed')
+        if session.get('pinned'):
+            rows = self.rpc('routes', project=session['workspace']['project'])
+            route = next((r for r in rows if r['name'] == session['route']), {})
+            if (route.get('transport'),route.get('session'),route.get('cwd')) != (
+                    'claude-peer',session['uuid'],session['workspace']['cwd']):
+                raise ValueError('Pinned route changed')
         return row
 
     def availability(self, session):
@@ -145,6 +180,8 @@ class Backend:
                 if any(existing.get(k) != v for k,v in fields.items()):
                     raise ValueError('Route collision')
             else:
+                if session.get('pinned') and fields is expected:
+                    raise ValueError('Pinned target route missing')
                 self.rpc('register', **fields)
         self.verify_routes(session)
 
@@ -158,6 +195,8 @@ class Backend:
                 raise ValueError('Route changed')
 
     def post(self, op, session):
+        if session.get('pinned'):
+            self.register(session)  # Only the private return route may be created.
         self.verify_routes(session)
         m = self.rpc('send', project=session['workspace']['project'],sender=session['sender'],
                      recipient=session['route'],body=op['message'],key=op['key_hash'])
@@ -181,6 +220,7 @@ class Backend:
 class Engine:
     def __init__(self, config, backend, start=True):
         validate_workspaces(config['workspaces'])
+        pinned_sessions(config)
         self.config, self.backend = config, backend
         self.principal = config['principal']
         self.scopes = frozenset(config['scopes'])
@@ -259,6 +299,8 @@ class Engine:
             op.update(fields); self.save(op)
 
     def session(self, sid, principal):
+        if principal == self.principal and sid in pinned_sessions(self.config):
+            return pinned_sessions(self.config)[sid]
         with self.lock:
             row = self.db.execute('SELECT doc FROM owned_sessions WHERE id=? AND principal=?',(sid,principal)).fetchone()
         if row is None:
@@ -364,7 +406,7 @@ class Engine:
                 raise Fault('CAPACITY_EXCEEDED')
             try:
                 self.backend.instance()
-                if not creating and (not session.get('registered') or self.backend.availability(session) != 'ready'):
+                if not creating and (not session.get('registered') or self.backend.availability(session) not in (('ready','busy') if session.get('pinned') else ('ready',))):
                     raise ValueError('Unavailable dedicated session')
             except Exception:
                 raise Fault('BACKEND_UNAVAILABLE') from None
@@ -385,6 +427,10 @@ class Engine:
         return self.accepted(op,False)
 
     def allowed(self, session):
+        if session.get('pinned'):
+            if pinned_sessions(self.config).get(session['id']) != session:
+                raise Fault('NOT_AUTHORIZED')
+            return
         # An alias remap cannot silently retarget a previously accepted operation.
         if self.config['workspaces'].get(session['alias']) != session['workspace']:
             raise Fault('WORKSPACE_NOT_ALLOWED')
@@ -434,7 +480,7 @@ class Engine:
                 self.allowed({'alias':op['alias'],'workspace':op['workspace']})
             else:
                 session = self.session(op['agent_session_id'],op['principal']); self.allowed(session)
-                if self.backend.availability(session) != 'ready':
+                if self.backend.availability(session) not in (('ready','busy') if session.get('pinned') else ('ready',)):
                     raise Fault('BACKEND_UNAVAILABLE')
         except Exception:
             self.fail(op,'BACKEND_UNAVAILABLE',unknown=False); return
@@ -552,7 +598,11 @@ class Engine:
         with self.lock:
             rows = self.db.execute('SELECT doc FROM owned_sessions WHERE principal=? AND id>? ORDER BY id LIMIT ?',
                                     (principal,last,args.get('limit',20)+1)).fetchall()
-        owned = [json.loads(r[0]) for r in rows]; more = len(owned)>args.get('limit',20)
+        owned = [json.loads(r[0]) for r in rows]
+        if principal == self.principal:
+            owned += [s for s in pinned_sessions(self.config).values() if s['id'] > last]
+        owned.sort(key=lambda s:s['id'])
+        more = len(owned)>args.get('limit',20)
         owned = owned[:args.get('limit',20)]; result = []
         ops = self.rows()
         for s in owned:
