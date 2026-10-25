@@ -217,6 +217,14 @@ class WorktreeTests(unittest.TestCase):
         self.assertIn('codex session discovery failed',row['reasons'])
         self.assertEqual(report['errors'],{'codex':'app-server down'})
 
+    def test_list_flags_a_main_checkout_off_the_base_branch(self):
+        main = lambda: self.row(wt.survey(workspace=self.ws,root=self.root,live=[],holders=[],
+                                          pulls_for=lambda repo: {}),self.repo)
+        self.assertEqual(main()['reasons'],['main checkout'])
+        run(self.repo,'checkout','-qb','feature')
+        self.assertEqual(main()['reasons'],['main checkout','main checkout is on feature, not main'])
+        self.assertEqual(main()['action'],'keep')
+
     def test_remove_rechecks_cleanliness(self):
         path = Path(self.new()['path'])
         row = self.row(self.sweep(),path)

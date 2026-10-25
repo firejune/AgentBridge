@@ -381,7 +381,11 @@ def assess(repo, entry, root, live, holders, pulls, base, blockers):
            'branch': branch, 'detached': bool(entry.get('detached')), 'head': (entry.get('HEAD') or '')[:12]}
     reasons = []
     if row['location'] == 'main':
-        return {**row, 'action': 'keep', 'reasons': ['main checkout']}
+        reasons = ['main checkout']
+        expected = base.split('/', 1)[1] if base else None
+        if expected and branch != expected:  # The main checkout stays on the base branch (#38 rule 1).
+            reasons.append(f'main checkout is on {branch or "a detached HEAD"}, not {expected}')
+        return {**row, 'action': 'keep', 'reasons': reasons}
     if not path.is_dir():
         return {**row, 'action': 'keep', 'reasons': ['directory is missing (git worktree prune clears it)']}
     if row['location'] == 'harness':
@@ -509,8 +513,9 @@ def text(report, sweep_mode=False):
         users = len(row.get('in_use_by', [])) + len(row.get('open_by', []))
         lines.append(f'{row["action"]:6} {row["location"]:7} {row["path"]}  [{row["branch"] or "detached"}] '
                      f'{who} {pr_text} {state} in-use:{users} {row.get("last_touched") or ""}')
-        if row['reasons'] and row['location'] != 'main':
-            lines.append('       - ' + '; '.join(row['reasons']))
+        shown = row['reasons'][1:] if row['location'] == 'main' else row['reasons']
+        if shown:
+            lines.append('       - ' + '; '.join(shown))
     for clone in report['clones']:
         lines.append(f'clone  {clone["path"]}  (same origin as {clone["of"]}; reported, never removed)')
     if 'summary' in report:
