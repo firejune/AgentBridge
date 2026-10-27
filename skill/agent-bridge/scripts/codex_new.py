@@ -22,7 +22,7 @@ MODEL_ENV = new_session_policy.env_name('codex')
 
 
 class CreationError(ValueError):
-    def __init__(self, reason, uncertain=False, session=None, adopted=False, stage=None):
+    def __init__(self, reason, uncertain=False, session=None, adopted=False, stage=None, result=None):
         super().__init__(reason)
         self.uncertain = uncertain
         self.session = session
@@ -30,6 +30,11 @@ class CreationError(ValueError):
         self.adopted = adopted
         self.stage = stage
         self.cancelled = False
+        self.result = result if result is not None else open_result()
+        self.result.update(error=str(reason), uncertain=uncertain, created=self.created,
+                           adopted=adopted, stage=stage or 'preflight')
+        if session is not None and self.result['session']['id'] is None:
+            self.result['session']['id'] = session
 
 
 def adoption_url(sid):
@@ -64,8 +69,8 @@ def resolve_model(model=None, environ=None, policy=None):
     """
     try:
         chosen, source = new_session_policy.default_model('codex', model, policy, environ)
-        if policy is not None:
-            new_session_policy.require_allowed(policy, 'codex', chosen)
+        if policy is not None and new_session_policy.denied(policy, 'codex', chosen):
+            raise CreationError('Requested Codex model is on the owner denylist; only a person edits that list')
         return chosen, source
     except ValueError as error:
         raise CreationError(str(error)) from None
@@ -126,6 +131,39 @@ def has_full_access(settings, sandbox_key='sandboxPolicy'):
             and isinstance(sandbox, dict) and sandbox.get('type') == 'dangerFullAccess')
 
 
+def permission_diagnostics(values, sandbox_key='sandboxPolicy'):
+    """Keep only permission identifiers, never roots, messages or transport data."""
+    values = values if isinstance(values, dict) else {}
+    profile, sandbox = values.get('activePermissionProfile'), values.get(sandbox_key)
+    profile_id = profile.get('id') if isinstance(profile, dict) else None
+    if profile_id not in (None, ':danger-full-access', ':workspace', ':workspace-write', ':read-only'):
+        profile_id = '<unrecognized>'
+    approval = values.get('approvalPolicy')
+    if approval not in (None, 'never', 'on-request', 'on-failure', 'untrusted'):
+        approval = '<unrecognized>'
+    sandbox_type = sandbox.get('type') if isinstance(sandbox, dict) else None
+    if sandbox_type not in (None, 'dangerFullAccess', 'workspaceWrite', 'readOnly', 'externalSandbox'):
+        sandbox_type = '<unrecognized>'
+    clean_profile = None if not isinstance(profile, dict) else {'id': profile_id}
+    if clean_profile is not None and profile.get('extends', False) is None:
+        clean_profile['extends'] = None
+    return {'activePermissionProfile': clean_profile, 'approvalPolicy': approval,
+            sandbox_key: None if not isinstance(sandbox, dict) else {'type': sandbox_type}}
+
+
+def open_result():
+    """One public shape, including refusals before a thread UUID exists."""
+    return {'created': False, 'adopted': False, 'registered': False, 'uncertain': False,
+            'stage': 'preflight', 'error': None, 'registration_error': None,
+            'session': {'provider': 'codex', 'id': None, 'name': None, 'cwd': None,
+                        'status': 'unknown', 'reported_status': 'unknown', 'runtime_observed': False,
+                        'source': None, 'updated_at': None, 'observed_at': None, 'scope': 'saved-metadata'},
+            'owner': None, 'url': None, 'model': None, 'model_source': None,
+            'creator_settings': None, 'permission_settings': None, 'permission_settings_source': None,
+            'settings_update': {'applied': None, 'resultType': None},
+            'existing_sessions': [], 'warning': None}
+
+
 def permission_settings(client, sid, owner):
     # latestThreadSettings are the app's confirmed subsequent-turn inputs;
     # currentPermissions may still describe the last completed turn.
@@ -133,8 +171,41 @@ def permission_settings(client, sid, owner):
     values = state.get('latestThreadSettings')
     if not isinstance(values, dict):
         raise CreationError('Exact Codex Desktop owner returned no next-turn permission settings')
-    return {key:values.get(key) for key in
-            ('activePermissionProfile','approvalPolicy','sandboxPolicy')}
+    return permission_diagnostics(values)
+
+
+def matching_threads(client, folder, title, remaining):
+    """Scan all saved pages; any incomplete scan refuses creation."""
+    import sessions
+    cursor, seen, matches = None, set(), {}
+    while True:
+        client.timeout = remaining()
+        params = {'limit': 100, 'sortKey': 'updated_at', 'useStateDbOnly': True, 'cwd': str(folder)}
+        if cursor is not None:
+            params['cursor'] = cursor
+        page = client.call('thread/list', params)
+        rows = page.get('data')
+        if not isinstance(rows, list):
+            raise CreationError('Codex duplicate check returned no saved thread list; use --new only intentionally')
+        for row in rows:
+            if not isinstance(row, dict):
+                raise CreationError('Codex duplicate check returned invalid saved metadata')
+            if row.get('name') == title:
+                cwd = row.get('cwd')
+                if not isinstance(cwd, str) or not cwd:
+                    raise CreationError('Codex duplicate check returned no workspace for a matching title')
+                if Path(cwd).expanduser().resolve() == folder:
+                    try:
+                        saved = sessions.codex_row(row, 'saved')
+                    except (ValueError, KeyError, TypeError, AttributeError):
+                        raise CreationError('Codex duplicate check returned invalid matching thread identity') from None
+                    matches[saved['id']] = saved
+        cursor = page.get('nextCursor')
+        if cursor is None:
+            return list(matches.values())
+        if not isinstance(cursor, str) or not cursor or cursor in seen or len(seen) >= 10000:
+            raise CreationError('Codex duplicate check returned an invalid or repeated cursor')
+        seen.add(cursor)
 
 
 def owner_settings(client, sid, owner):
@@ -149,41 +220,55 @@ def owner_settings(client, sid, owner):
 
 
 def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_factory=None,
-               owner_factory=None, poll=0.5, policy=None):
+               owner_factory=None, poll=0.5, policy=None, force_new=False):
     import sessions
-    if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not 0 < timeout <= 3600:
-        raise CreationError('Timeout must be between 0 and 3600 seconds')
-    if not cwd or not str(cwd).strip():
-        raise CreationError('Workspace --cwd is required to create a Codex desktop session')
-    folder = Path(cwd).expanduser().resolve()
-    if not folder.is_dir():
-        raise CreationError(f'Workspace directory does not exist: {folder}')
-    for label, value in (('--title',title),('--model',model)):
-        if value is not None and (not isinstance(value, str) or not value.strip()):
-            raise CreationError(f'{label} must be a nonempty string')
-    model, source = resolve_model(model, policy=policy)
-    missing = None if source == '--model' else (
-        f'Default Codex model {model!r} (from {source}) is not advertised by the installed '
-        'Codex provider; pass --model with an advertised model')
-    if opener is None and not shutil.which('open'):
-        raise CreationError('Adopting a Codex thread in Desktop needs the macOS `open` command')
-    factory = client_factory or sessions.CodexClient
-    owners = owner_factory or codex_live.Client
-    deadline = time.monotonic() + timeout
+    result = open_result()
     sid, adopted, attempted, stage = None, False, False, 'preflight'
-
-    def remaining():
-        left = deadline - time.monotonic()
-        if left <= 0:
-            raise CreationError('Codex session creation/adoption timed out; use the returned UUID to recover')
-        return min(left, 10)
-
     try:
-        with factory(mode='saved',timeout=remaining(),experimental=True) as creator:
+        if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not 0 < timeout <= 3600:
+            raise CreationError('Timeout must be between 0 and 3600 seconds')
+        if not cwd or not str(cwd).strip():
+            raise CreationError('Workspace --cwd is required to create a Codex desktop session')
+        folder = Path(cwd).expanduser().resolve()
+        if not folder.is_dir():
+            raise CreationError('Workspace directory does not exist')
+        for label, value in (('--title', title), ('--model', model)):
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise CreationError(f'{label} must be a nonempty string')
+        model, source = resolve_model(model, policy=policy)
+        result.update(model=model, model_source=source)
+        result['session'].update(cwd=str(folder), name=title)
+        missing = None if source == '--model' else (
+            f'Default Codex model {model!r} (from {source}) is not advertised by the installed '
+            'Codex provider; pass --model with an advertised model')
+        if opener is None and not shutil.which('open'):
+            raise CreationError('Adopting a Codex thread in Desktop needs the macOS `open` command')
+        factory = client_factory or sessions.CodexClient
+        owners = owner_factory or codex_live.Client
+        deadline = time.monotonic() + timeout
+
+        def remaining():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise CreationError('Codex session creation/adoption timed out; use the returned UUID to recover')
+            return min(left, 10)
+
+        with factory(mode='saved', timeout=remaining(), experimental=True) as creator:
+            if title is not None and not force_new:
+                stage = 'duplicate'
+                matches = matching_threads(creator, folder, title, remaining)
+                if matches:
+                    result['existing_sessions'] = matches
+                    if len(matches) == 1:
+                        result['session'] = matches[0]
+                        result['url'] = adoption_url(matches[0]['id'])
+                    raise CreationError('Saved Codex thread(s) already match --title and --cwd; '
+                                        'inspect their exact IDs or pass --new intentionally')
+            stage = 'preflight'
             require_full_access_profile(creator, folder, remaining)
             require_model(creator, model, remaining, missing)
-            params = {'cwd':str(folder),'ephemeral':False,'allowProviderModelFallback':False,
-                      'permissions':FULL_ACCESS_PROFILE,'approvalPolicy':'never','model':model}
+            params = {'cwd': str(folder), 'ephemeral': False, 'allowProviderModelFallback': False,
+                      'permissions': FULL_ACCESS_PROFILE, 'approvalPolicy': 'never', 'model': model}
             stage, attempted = 'create', True
             creator.timeout = remaining()
             created = creator.call('thread/start', params)
@@ -191,30 +276,30 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
             if not isinstance(thread, dict):
                 raise CreationError('Codex thread/start returned no thread')
             sid = str(uuid.UUID(thread['id']))
+            result.update(created=True, url=adoption_url(sid))
+            result['session']['id'] = sid
             require_thread(thread, sid, folder)
+            result['session'] = sessions.codex_row(thread, 'saved')
+            result['creator_settings'] = permission_diagnostics(created, 'sandbox')
             if created.get('model') != model:
                 raise CreationError('Codex creator substituted the requested --model')
             if not has_full_access(created, 'sandbox'):
                 raise CreationError('Codex creator did not confirm Full Access with approvalPolicy never')
-            effective = {key:created.get(key) for key in
-                         ('approvalPolicy','approvalsReviewer','sandbox','activePermissionProfile')}
             if title is not None:
                 stage = 'title'
                 creator.timeout = remaining()
-                creator.call('thread/name/set', {'threadId':sid,'name':title})
-        # Closing the creator is required before Desktop takes over. A fresh,
-        # metadata-only client proves this is a persisted thread, not that
-        # short-lived server's in-memory session.
+                creator.call('thread/name/set', {'threadId': sid, 'name': title})
+        # Close the creator before proving persistence and exact Desktop adoption.
         stage = 'persistence'
-        with factory(mode='saved',timeout=remaining()) as reader:
-            require_thread(reader.call('thread/read', {'threadId':sid,'includeTurns':False}).get('thread'),
-                           sid, folder, title)
+        with factory(mode='saved', timeout=remaining()) as reader:
+            stored = require_thread(reader.call('thread/read', {'threadId': sid, 'includeTurns': False}).get('thread'),
+                                    sid, folder, title)
+            result['session'] = sessions.codex_row(stored, 'saved')
         stage = 'adoption'
-        url = adoption_url(sid)
         if opener is None:
-            open_link(url, remaining())
+            open_link(result['url'], remaining())
         else:
-            opener(url)
+            opener(result['url'])
         while True:
             remaining()
             try:
@@ -222,28 +307,39 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                 with client:
                     owner = client.owner(sid)
                     adopted = True
+                    result.update(adopted=True, owner=owner)
                     stage = 'model'
                     settings = owner_settings(client, sid, owner)
                     stage = 'permissions'
                     permissions = permission_settings(client, sid, owner)
+                    result.update(permission_settings=permissions,
+                                  permission_settings_source='Desktop owner latestThreadSettings')
                     updates = {}
                     if not has_full_access(permissions):
                         updates.update(permissions=FULL_ACCESS_PROFILE, approvalPolicy='never')
                     if settings['model'] != model:
                         updates['model'] = model
                     if updates:
-                        # Change only this newly created thread, never global
-                        # config or the permissions of an existing session.
+                        # Only a thread created by this call can reach this mutation.
+                        if 'model' in updates:
+                            stage = 'model'
                         response = client.call('thread-follower-update-thread-settings',
-                            {'conversationId':sid,'threadSettings':updates}, 2, owner, mutation=True)
-                        result = response.get('result')
-                        if (response.get('resultType') != 'success' or not isinstance(result, dict)
-                                or result.get('applied') is not True):
+                            {'conversationId': sid, 'threadSettings': updates}, 2, owner, mutation=True)
+                        applied = response.get('result')
+                        applied = applied.get('applied') if isinstance(applied, dict) else None
+                        response_type = response.get('resultType')
+                        result['settings_update'] = {
+                            'applied': applied if isinstance(applied, bool) else None,
+                            'resultType': response_type if response_type in ('success', 'error') else '<unrecognized>'}
+                        # Read effective permissions even when the ack refuses the update.
+                        result['permission_settings'] = permissions = permission_settings(client, sid, owner)
+                        if response_type != 'success' or applied is not True:
                             raise CreationError('Exact Codex Desktop owner did not confirm new-thread settings update')
                         settings = owner_settings(client, sid, owner)
-                        permissions = permission_settings(client, sid, owner)
                     if settings['model'] != model:
+                        stage = 'model'
                         raise CreationError('Exact Codex Desktop owner substituted the requested --model')
+                    stage = 'permissions'
                     if not has_full_access(permissions):
                         raise CreationError('Exact Codex Desktop owner did not confirm Full Access with approvalPolicy never')
                     break
@@ -252,21 +348,17 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                     raise  # Never replay a possibly sent settings mutation.
                 time.sleep(min(poll, max(0, deadline-time.monotonic())))
         stage = 'verification'
-        with factory(mode='saved',timeout=remaining()) as reader:
-            stored = require_thread(reader.call('thread/read', {'threadId':sid,'includeTurns':False}).get('thread'),
+        with factory(mode='saved', timeout=remaining()) as reader:
+            stored = require_thread(reader.call('thread/read', {'threadId': sid, 'includeTurns': False}).get('thread'),
                                     sid, folder, title)
-        row = sessions.codex_row(stored, 'saved')
-        return {'created':True,'adopted':True,'session':row,'owner':owner,'url':url,
-                'model':settings['model'],'model_source':source,'creator_settings':effective,
-                'permission_settings':permissions,'permission_settings_source':'Desktop owner latestThreadSettings',
-                'warning':None}
+        result.update(session=sessions.codex_row(stored, 'saved'), stage='complete')
+        return result
     except BaseException as error:
-        # Preserve recovery identity even when title, adoption, model update or
-        # registration cannot be confirmed. No automatic second thread/start.
         if not isinstance(error, (Exception, KeyboardInterrupt)):
             raise
-        message = str(error) if isinstance(error, CreationError) else 'Codex creation/adoption failed; do not create another thread automatically'
-        failure = CreationError(message, attempted, sid, adopted, stage)
+        message = str(error) if isinstance(error, CreationError) else (
+            'Codex creation/adoption failed; do not create another thread automatically')
+        failure = CreationError(message, attempted, sid, adopted, stage, result=result)
         failure.cancelled = isinstance(error, KeyboardInterrupt)
         raise failure from None
 

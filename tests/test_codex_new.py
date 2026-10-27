@@ -27,9 +27,11 @@ def full_permissions():
 
 class ModelDesktop(FakeDesktop):
     def __init__(self, model='app-default', reject_update=False, keep_model=False, behavior='active',
-                 permissions=None, refuse_permissions=False, stale_current=False, drop_update=False):
+                 permissions=None, refuse_permissions=False, stale_current=False, drop_update=False,
+                 update_error=False):
         super().__init__(behavior)
         self.drop_update = drop_update
+        self.update_error = update_error
         self.model, self.reject_update, self.keep_model = model, reject_update, keep_model
         self.permissions = permissions or {'activePermissionProfile':{'id':':workspace'},
             'approvalPolicy':'on-request','sandboxPolicy':{'type':'workspaceWrite'}}
@@ -58,6 +60,10 @@ class ModelDesktop(FakeDesktop):
         if method == 'thread-follower-read-model-settings':
             response['result'] = {'settings':{'model':self.model,'resumeState':'resumed'}}
         else:
+            if self.update_error:
+                response.update(resultType='error', error='secret /private/transport')
+                self.write(sock, response)
+                return True
             values = request['params']['threadSettings']
             if not self.keep_model and 'model' in values:
                 self.model = values['model']
@@ -82,6 +88,7 @@ class NewCodexTests(unittest.TestCase):
         self.profiles = [{'id':codex_new.FULL_ACCESS_PROFILE,'allowed':True}]
         self.creator_full_access = True
         self.catalog = [{'model':'requested-model'},{'model':codex_new.DEFAULT_MODEL}]
+        self.saved_pages = {None: {'data': [], 'nextCursor': None}}
         env = patch.dict(os.environ)
         env.start()
         self.addCleanup(env.stop)
@@ -108,6 +115,8 @@ class NewCodexTests(unittest.TestCase):
                     return {'data':test.profiles,'nextCursor':None}
                 if method == 'model/list':
                     return {'data':test.catalog,'nextCursor':None}
+                if method == 'thread/list':
+                    return test.saved_pages[params.get('cursor')]
                 if method == 'thread/start':
                     return {'thread':dict(test.thread),'model':'substituted' if test.substitute_model else params.get('model','creator-default'),
                             'cwd':test.root, 'approvalPolicy':'never' if test.creator_full_access else 'on-request',
@@ -251,6 +260,284 @@ class NewCodexTests(unittest.TestCase):
         self.assertEqual(caught.exception.stage,'permissions')
         self.assertEqual(sum(x['method']=='thread-follower-update-thread-settings' for x in desktop.calls),1)
 
+    def cli_open(self, desktop, *extra):
+        real_open = codex_new.open_codex
+        def create(**kwargs):
+            return real_open(**kwargs, client_factory=self.factory, opener=self.urls.append,
+                             owner_factory=lambda **kw: codex_live.Client(desktop.path, **kw), poll=.005)
+        out = io.StringIO()
+        with patch.object(codex_new, 'open_codex', side_effect=create), patch('sys.stdout', out):
+            code = bridge.main(['open', '--provider', 'codex', '--cwd', self.root,
+                                '--model', 'requested-model', '--state-dir', self.root, *extra])
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 1, out.getvalue())
+        value = json.loads(lines[0])
+        self.assertIsInstance(value, dict)
+        return code, value
+
+    def test_issue44_shape_success_refusal_and_early_failure(self):
+        with ModelDesktop() as desktop:
+            code, success = self.cli_open(desktop)
+        self.assertEqual(code, 0)
+        with ModelDesktop(refuse_permissions=True) as desktop:
+            code, refusal = self.cli_open(desktop)
+        self.assertEqual(code, 1)
+        with ModelDesktop() as desktop:
+            code, early = self.cli_open(desktop, '--timeout', '0')
+        self.assertEqual(code, 1)
+        self.assertEqual(set(success), set(refusal))
+        self.assertEqual(set(success), set(early))
+        self.assertIsInstance(early['session'], dict)
+        self.assertIsNone(early['session']['id'])
+        self.assertEqual(set(success['session']), set(early['session']))
+        self.assertEqual(refusal['session']['id'], self.sid)
+        self.assertEqual(refusal['session']['cwd'], self.root)
+        self.assertEqual(success['stage'], 'complete')
+        self.assertFalse(success['uncertain'])
+
+    def test_issue44_shape_policy_and_registration_failure(self):
+        with ModelDesktop() as desktop:
+            _, success = self.cli_open(desktop)
+            with patch.object(bridge, 'new_session_policy', side_effect=ValueError('secret /private/config')):
+                code, failure = self.cli_open(desktop)
+            self.assertEqual(code, 1)
+            self.assertEqual(set(success), set(failure))
+            self.assertNotIn('secret', json.dumps(failure))
+            self.assertNotIn('/private/config', json.dumps(failure))
+            with patch.object(bridge.broker, 'request', side_effect=OSError('secret /private/socket')):
+                code, failure = self.cli_open(desktop, '--register', 'worker', '--project', 'demo')
+            self.assertEqual(code, 1)
+            self.assertEqual(set(success), set(failure))
+            self.assertEqual(failure['session']['id'], self.sid)
+            self.assertFalse(failure['registered'])
+            self.assertNotIn('secret', json.dumps(failure))
+
+    def test_issue44_diagnostics_effective_permissions_and_update(self):
+        with ModelDesktop(refuse_permissions=True) as desktop, self.assertRaises(codex_new.CreationError) as caught:
+            expected = json.loads(json.dumps(desktop.permissions))
+            desktop.permissions['credential'] = 'secret'
+            desktop.permissions['sandboxPolicy']['writableRoots'] = ['/private/secret']
+            self.open(desktop)
+        result = caught.exception.result
+        self.assertEqual(result['permission_settings'], expected)
+        self.assertEqual(result['settings_update'], {'applied': True, 'resultType': 'success'})
+        self.assertEqual(result['permission_settings_source'], 'Desktop owner latestThreadSettings')
+        self.assertNotIn('secret', json.dumps(result))
+
+    def test_issue44_diagnostics_rejected_ack_still_reads_effective_settings(self):
+        with ModelDesktop(model='requested-model', refuse_permissions=True, reject_update=True) as desktop:
+            code, result = self.cli_open(desktop)
+        self.assertEqual(code, 1)
+        self.assertEqual(result['settings_update'], {'applied': False, 'resultType': 'success'})
+        self.assertEqual(result['permission_settings']['approvalPolicy'], 'on-request')
+        self.assertEqual(result['stage'], 'permissions')
+        self.assertEqual(sum(x['method']=='thread-follower-update-thread-settings' for x in desktop.calls), 1)
+
+    def test_issue44_registration_on_permission_refusal_preserves_failure(self):
+        with RunningBroker() as server, ModelDesktop(refuse_permissions=True) as desktop:
+            # Patch only the broker destination; creation still uses real fixture IPC.
+            original = bridge.broker.request
+            with patch.object(bridge.broker, 'request', side_effect=lambda _, fields, **kw: original(server.path, fields, **kw)):
+                code, result = self.cli_open(desktop, '--register', 'worker', '--project', 'demo')
+            self.assertEqual(code, 1)
+            self.assertTrue(result['registered'])
+            self.assertTrue(result['created'])
+            self.assertTrue(result['adopted'])
+            self.assertEqual(result['stage'], 'permissions')
+            self.assertIsNotNone(result['error'])
+            self.assertEqual(server.call('routes', project='demo')[0]['session'], self.sid)
+
+    def test_issue44_registration_refuses_unadopted_and_model_failure(self):
+        for stage, adopted in (('adoption', False), ('model', True)):
+            failure = codex_new.CreationError('failed', True, self.sid, adopted, stage)
+            with RunningBroker() as server, patch.object(codex_new, 'open_codex', side_effect=failure):
+                out = io.StringIO()
+                with patch('sys.stdout', out):
+                    code = bridge.main(['--socket', server.path, 'open', '--provider', 'codex', '--cwd', self.root,
+                                        '--register', 'worker', '--project', 'demo', '--state-dir', self.root])
+                self.assertEqual(code, 1)
+                self.assertFalse(json.loads(out.getvalue())['registered'])
+                self.assertEqual(server.call('routes', project='demo'), [])
+
+    def test_issue44_duplicate_scans_all_pages_and_never_touches_owner(self):
+        self.saved_pages = {
+            None: {'data': [dict(self.thread, id=str(uuid.uuid4()), name='other') for _ in range(100)], 'nextCursor': 'second'},
+            'second': {'data': [dict(self.thread, name='Worker')], 'nextCursor': None}}
+        with ModelDesktop(refuse_permissions=True) as desktop, self.assertRaises(codex_new.CreationError) as caught:
+            self.open(desktop, title='Worker')
+        self.assertEqual(caught.exception.stage, 'duplicate')
+        self.assertFalse(caught.exception.created)
+        self.assertFalse(caught.exception.uncertain)
+        self.assertEqual(caught.exception.result['session']['id'], self.sid)
+        self.assertEqual(sum(m=='thread/list' for m,_,_ in self.calls), 2)
+        self.assertFalse(any(m in ('thread/start', 'thread/name/set') for m,_,_ in self.calls))
+        self.assertEqual(desktop.calls, [])
+        self.assertEqual(self.urls, [])
+
+    def test_issue44_duplicate_multiple_matches_no_selection_and_new_escape(self):
+        other = str(uuid.uuid4())
+        self.saved_pages = {None: {'data': [dict(self.thread, name='Worker'), dict(self.thread, id=other, name='Worker')], 'nextCursor': None}}
+        with ModelDesktop() as desktop, self.assertRaises(codex_new.CreationError) as caught:
+            self.open(desktop, title='Worker')
+        self.assertIsNone(caught.exception.result['session']['id'])
+        self.assertEqual(len(caught.exception.result['existing_sessions']), 2)
+        self.assertIn('--new', str(caught.exception))
+        self.assertEqual(desktop.calls, [])
+        self.calls.clear()
+        with ModelDesktop() as desktop:
+            result = self.open(desktop, title='Worker', force_new=True)
+        self.assertTrue(result['created'])
+        self.assertFalse(any(m=='thread/list' for m,_,_ in self.calls))
+
+    def test_issue44_duplicate_repeated_cursor_refuses_without_creating(self):
+        self.saved_pages = {None: {'data': [], 'nextCursor': 'again'}, 'again': {'data': [], 'nextCursor': 'again'}}
+        with ModelDesktop() as desktop, self.assertRaises(codex_new.CreationError) as caught:
+            self.open(desktop, title='Worker')
+        self.assertFalse(caught.exception.created)
+        self.assertEqual(caught.exception.stage, 'duplicate')
+        self.assertEqual(desktop.calls, [])
+        self.assertFalse(any(m=='thread/start' for m,_,_ in self.calls))
+
+    def test_issue44_duplicate_exact_title_and_resolved_cwd_controls(self):
+        self.saved_pages = {None: {'data': [dict(self.thread, name='worker'),
+            dict(self.thread, name='Worker', cwd=self.root + '/elsewhere')], 'nextCursor': None}}
+        with ModelDesktop() as desktop:
+            result = self.open(desktop, title='Worker')
+        self.assertTrue(result['created'])
+        self.saved_pages = {None: {'data': [dict(self.thread, name='Worker', cwd=self.root + '/.')], 'nextCursor': None}}
+        with ModelDesktop() as desktop, self.assertRaises(codex_new.CreationError) as caught:
+            self.open(desktop, title='Worker')
+        self.assertEqual(caught.exception.stage, 'duplicate')
+        self.assertEqual(desktop.calls, [])
+
+    def test_issue44_duplicate_malformed_page_never_creates(self):
+        for page in ({'data': [], 'nextCursor': 12}, {'data': None},
+                     {'data': [dict(self.thread, name='Worker', id='invalid')]},
+                     {'data': [dict(self.thread, name='Worker', cwd=None)]}):
+            with self.subTest(page=page):
+                self.saved_pages = {None: page}
+                self.calls.clear()
+                with ModelDesktop() as desktop, self.assertRaises(codex_new.CreationError) as caught:
+                    self.open(desktop, title='Worker')
+                self.assertEqual(caught.exception.stage, 'duplicate')
+                self.assertFalse(caught.exception.created)
+                self.assertFalse(any(m=='thread/start' for m,_,_ in self.calls))
+                self.assertEqual(desktop.calls, [])
+
+    def test_issue44_cli_new_skips_duplicate_scan(self):
+        self.saved_pages = {None: {'data': [dict(self.thread, name='Worker')], 'nextCursor': None}}
+        with ModelDesktop() as desktop:
+            code, result = self.cli_open(desktop, '--title', 'Worker', '--new')
+        self.assertEqual(code, 0)
+        self.assertTrue(result['created'])
+        self.assertFalse(any(m=='thread/list' for m,_,_ in self.calls))
+
+    def test_issue44_ambiguous_create_has_null_id_and_no_retry(self):
+        self.fail_method = 'thread/start'
+        with ModelDesktop() as desktop:
+            code, result = self.cli_open(desktop)
+        self.assertEqual(code, 1)
+        self.assertTrue(result['uncertain'])
+        self.assertFalse(result['created'])
+        self.assertIsNone(result['session']['id'])
+        self.assertEqual(sum(m=='thread/start' for m,_,_ in self.calls), 1)
+        self.assertEqual(desktop.calls, [])
+
+    def test_issue44_registration_both_failures_preserve_refusal_and_one_attempt(self):
+        with ModelDesktop(refuse_permissions=True) as desktop, \
+                patch.object(bridge.broker, 'request', side_effect=OSError('secret socket')) as register:
+            code, result = self.cli_open(desktop, '--register', 'worker', '--project', 'demo')
+        self.assertEqual(code, 1)
+        self.assertEqual(result['stage'], 'permissions')
+        self.assertIn('Full Access', result['error'])
+        self.assertIsNotNone(result['registration_error'])
+        self.assertFalse(result['registered'])
+        self.assertNotIn('secret', json.dumps(result))
+        self.assertEqual(register.call_count, 1)
+
+    def test_issue44_registration_success_and_refusal_share_keys(self):
+        with ModelDesktop() as desktop, patch.object(bridge.broker, 'request', return_value={}) as register:
+            code, success = self.cli_open(desktop, '--register', 'worker', '--project', 'demo')
+        self.assertEqual(code, 0)
+        self.assertTrue(success['registered'])
+        self.assertEqual(register.call_count, 1)
+        with ModelDesktop(refuse_permissions=True) as desktop, patch.object(bridge.broker, 'request', return_value={}):
+            code, refusal = self.cli_open(desktop, '--register', 'worker', '--project', 'demo')
+        self.assertEqual(code, 1)
+        self.assertEqual(set(success), set(refusal))
+        self.assertTrue(refusal['registered'])
+
+    def test_issue44_registration_invalid_pair_stops_before_creation(self):
+        for extra in (('--register', 'worker'), ('--project', 'demo')):
+            with ModelDesktop() as desktop:
+                code, result = self.cli_open(desktop, *extra)
+            self.assertEqual(code, 1)
+            self.assertIsNone(result['session']['id'])
+            self.assertFalse(result['created'])
+        self.assertEqual(self.calls, [])
+
+    def test_issue44_registration_register_new_keeps_permission_refusal(self):
+        real_open = codex_new.open_codex
+        with ModelDesktop(refuse_permissions=True) as desktop:
+            def create(**kwargs):
+                self.assertTrue(kwargs['force_new'])
+                return real_open(**kwargs, client_factory=self.factory, opener=self.urls.append,
+                                 owner_factory=lambda **kw: codex_live.Client(desktop.path, **kw))
+            with patch.object(codex_new, 'open_codex', side_effect=create), \
+                    patch.object(bridge.broker, 'request', return_value={}) as register:
+                out = io.StringIO()
+                with patch('sys.stdout', out):
+                    code = bridge.main(['register', 'worker', '--project', 'demo', '--transport', 'codex',
+                                        '--new', '--cwd', self.root, '--state-dir', self.root])
+        value = json.loads(out.getvalue())
+        self.assertEqual(code, 1)
+        self.assertTrue(value['registered'])
+        self.assertEqual(value['stage'], 'permissions')
+        self.assertEqual(register.call_count, 1)
+
+    def test_issue44_diagnostics_unknown_values_are_redacted(self):
+        clean = codex_new.permission_diagnostics({'approvalPolicy': {'secret': '/private/config'},
+            'activePermissionProfile': {'id': 'secret', 'extends': '/private/config'},
+            'sandboxPolicy': {'type': 'secret', 'credential': 'secret'}})
+        self.assertNotIn('secret', json.dumps(clean))
+        self.assertNotIn('/private', json.dumps(clean))
+        self.assertFalse(codex_new.has_full_access(clean))
+
+    def test_issue44_diagnostics_ambiguous_settings_update_never_replays(self):
+        with ModelDesktop(drop_update=True) as desktop:
+            code, result = self.cli_open(desktop)
+        self.assertEqual(code, 1)
+        self.assertTrue(result['created'])
+        self.assertTrue(result['adopted'])
+        self.assertTrue(result['uncertain'])
+        self.assertEqual(result['settings_update'], {'applied': None, 'resultType': None})
+        self.assertEqual(sum(x['method']=='thread-follower-update-thread-settings' for x in desktop.calls), 1)
+
+    def test_issue44_diagnostics_error_response_reports_type_without_payload(self):
+        with ModelDesktop(model='requested-model', refuse_permissions=True, update_error=True) as desktop:
+            code, result = self.cli_open(desktop)
+        self.assertEqual(code, 1)
+        self.assertEqual(result['stage'], 'permissions')
+        self.assertEqual(result['settings_update'], {'applied': None, 'resultType': 'error'})
+        self.assertEqual(result['permission_settings']['approvalPolicy'], 'on-request')
+        self.assertNotIn('secret', json.dumps(result))
+        self.assertNotIn('/private/transport', json.dumps(result))
+        self.assertEqual(sum(x['method']=='thread-follower-update-thread-settings' for x in desktop.calls), 1)
+
+    def test_issue44_retry_same_title_and_cwd_refuses_saved_thread(self):
+        with ModelDesktop(refuse_permissions=True) as desktop:
+            code, first = self.cli_open(desktop, '--title', 'Worker')
+        self.assertEqual(code, 1)
+        self.saved_pages = {None: {'data': [dict(self.thread)], 'nextCursor': None}}
+        with ModelDesktop() as desktop:
+            code, retry = self.cli_open(desktop, '--title', 'Worker')
+        self.assertEqual(code, 1)
+        self.assertEqual(retry['stage'], 'duplicate')
+        self.assertEqual(retry['session']['id'], first['session']['id'])
+        self.assertFalse(retry['created'])
+        self.assertEqual(sum(m=='thread/start' for m,_,_ in self.calls), 1)
+        self.assertEqual(desktop.calls, [])
+
     def test_creator_substitution_is_not_accepted(self):
         self.substitute_model = True
         with ModelDesktop() as desktop, self.assertRaisesRegex(codex_new.CreationError,'substituted') as caught:
@@ -334,8 +621,9 @@ class NewCodexTests(unittest.TestCase):
             codex_new.open_codex(self.root+'/absent',client_factory=self.factory,opener=self.urls.append)
 
     def test_open_register_cli_and_registration_failure_preserve_identity(self):
-        result={'created':True,'adopted':True,'session':{**self.thread,'status':'unknown'},'warning':None}
-        with RunningBroker() as server, patch.object(codex_new,'open_codex',return_value=result) as create:
+        result = codex_new.open_result()
+        result.update(created=True, adopted=True, session=sessions.codex_row(self.thread, 'saved'), stage='complete')
+        with RunningBroker() as server, patch.object(codex_new,'open_codex',side_effect=lambda **_: json.loads(json.dumps(result))) as create:
             out=io.StringIO()
             with patch('sys.stdout',out):
                 code=bridge.main(['--socket',server.path,'register','worker','--project','demo','--transport','codex',
@@ -344,7 +632,7 @@ class NewCodexTests(unittest.TestCase):
             self.assertTrue(json.loads(out.getvalue())['registered'])
             self.assertEqual(create.call_args.kwargs['model'],'requested-model')
             self.assertEqual(server.call('routes',project='demo')[0]['session'],self.sid)
-        with patch.object(codex_new,'open_codex',return_value=result) as create:
+        with patch.object(codex_new,'open_codex',side_effect=lambda **_: json.loads(json.dumps(result))) as create:
             out=io.StringIO()
             with patch('sys.stdout',out):
                 code=bridge.main(['--socket',self.root+'/absent.sock','register','worker','--project','demo',
@@ -354,7 +642,7 @@ class NewCodexTests(unittest.TestCase):
             self.assertTrue(value['created'])
             self.assertTrue(value['adopted'])
             self.assertFalse(value['registered'])
-            self.assertEqual(value['session'],self.sid)
+            self.assertEqual(value['session']['id'],self.sid)
             self.assertEqual(create.call_count,1)
 
     def test_partial_failure_cli_reports_stage_and_never_registers(self):
@@ -390,6 +678,7 @@ for line in sys.stdin:
  if m=='initialize':r={{'userAgent':'fixture'}}
  elif m=='permissionProfile/list':r={{'data':[{{'id':':danger-full-access','allowed':True}}]}}
  elif m=='model/list':r={{'data':[{{'model':'requested-model'}}]}}
+ elif m=='thread/list':r={{'data':[],'nextCursor':None}}
  elif m=='thread/start':
   t={{'id':{self.sid!r},'cwd':{self.root!r},'ephemeral':False,'source':'vscode','status':{{'type':'idle'}},'name':None}}
   state.write_text(json.dumps(t));r={{'thread':t,'model':p['model'],'approvalPolicy':'never','activePermissionProfile':{{'id':':danger-full-access'}},'sandbox':{{'type':'dangerFullAccess'}}}}
