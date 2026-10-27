@@ -622,11 +622,14 @@ class EventCliTests(EventBase):
         forbidden = AssertionError('a query must not collect or call anything')
         state = str(self.root / 'state')
         import sessions
-        with patch.object(usage, 'read_codex', side_effect=forbidden), \
+        # CLI queries and announcement retention share the fixed fixture clock.
+        with patch.object(usage, 'datetime', wraps=datetime) as clock, \
+                patch.object(usage, 'read_codex', side_effect=forbidden), \
                 patch.object(usage, 'sample', side_effect=forbidden), \
                 patch.object(sessions, 'CodexClient', side_effect=forbidden), \
                 patch('subprocess.Popen', side_effect=forbidden), \
                 patch('socket.socket', side_effect=forbidden):
+            clock.now.return_value = T0 + timedelta(minutes=15)
             out = io.StringIO()
             with redirect_stdout(out):
                 self.assertEqual(bridge.main(['--socket', '/tmp/ab-never.sock', 'usage', '--state-dir', state,
