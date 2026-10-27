@@ -371,6 +371,55 @@ def new_session_policy(args, provider):
         models.require_allowed(policy, provider, found['model_id'], found['model_enum'], found.get('label'))
 
 
+def open_codex_result(args):
+    """Keep Codex creation, refusal and route recovery in one result envelope."""
+    result = codex_new.open_result()
+    source, cancelled = None, False
+    try:
+        if args.cmd == 'open':
+            if bool(args.register) != bool(args.project):
+                raise codex_new.CreationError('--register NAME and --project P must be supplied together')
+        elif args.session or args.discover:
+            raise codex_new.CreationError('--new cannot be combined with --session or --discover')
+        source = new_session_policy(args, 'codex')
+        result = sessions.open_session('codex', cwd=args.cwd, title=args.title, model=args.model,
+            timeout=args.timeout, host=args.host, ide=args.ide, force_new=args.new)
+    except codex_new.CreationError as error:
+        result = error.result
+        cancelled = error.cancelled
+    except KeyboardInterrupt:
+        result['error'] = 'Codex open interrupted before a result was available'
+        cancelled = True
+    except (ValueError, OSError, subprocess.TimeoutExpired, KeyError, TypeError):
+        # Policy files and transport exceptions can contain local paths or secrets.
+        result['error'] = 'Codex open preflight failed; check provider, host and model policy'
+    if source is not None:
+        result['model_source'] = source
+    name = args.register if args.cmd == 'open' else args.name
+    can_register = (not cancelled and result['created'] and result['adopted']
+                    and (result['error'] is None or result['stage'] == 'permissions')
+                    and result['session']['id'] and result['session']['cwd'])
+    if name and can_register:
+        try:
+            broker.request(args.socket, {'op': 'register', 'name': name, 'project': args.project,
+                'transport': 'codex', 'session': result['session']['id'], 'cwd': result['session']['cwd']})
+            result['registered'] = True
+        except (ValueError, OSError, subprocess.TimeoutExpired, KeyError, TypeError):
+            # Registration was sent once; do not replay an ambiguous broker write.
+            result['registration_error'] = 'Codex route registration could not be confirmed; inspect routes before retrying'
+            result['uncertain'] = True
+            if result['error'] is None:
+                result.update(error=result['registration_error'], stage='registration')
+        except KeyboardInterrupt:
+            result['registration_error'] = 'Codex route registration interrupted; inspect routes before retrying'
+            result['uncertain'] = True
+            cancelled = True
+            if result['error'] is None:
+                result.update(error=result['registration_error'], stage='registration')
+    output(result)
+    return 130 if cancelled else (1 if result['error'] else 0)
+
+
 CODEX_CLOSE_GAP = ('codex: Desktop holds the thread, so app-server thread/archive is refused '
                    '("active writer") and Desktop IPC has no archive request. Tracked in AgentBridge #27; '
                    'archive it from the Codex sidebar meanwhile.')
@@ -494,6 +543,9 @@ def main(argv=None):
     p.add_argument('--host',choices=['desktop','ide'],default='desktop',help='Host (claude, agy): desktop app or IDE. Claude desktop needs Enter; Claude IDE, agy desktop and agy IDE do not')
     p.add_argument('--ide',choices=sorted(sessions.CLAUDE_IDES),help=f'IDE for --host ide (default {sessions.DEFAULT_IDE})')
     p.add_argument('--state-dir')
+    p.add_argument('--register', metavar='NAME', help='Codex: bind the created/adopted thread, including a permission refusal')
+    p.add_argument('--project', help='Project for --register')
+    p.add_argument('--new', action='store_true', help='Codex: explicitly create despite a saved title/cwd match')
     p = sub.add_parser('model',help="Read a participant's model, or switch it with --set (provider-neutral)")
     p.add_argument('name');p.add_argument('--project',required=True);p.add_argument('--set',dest='target')
     p.add_argument('--timeout',type=float,default=30);p.add_argument('--state-dir')
@@ -559,6 +611,11 @@ def main(argv=None):
     observation = None
     creation_model_source = None
     try:
+        if ((args.cmd == 'open' and args.provider == 'codex') or
+                (args.cmd == 'register' and args.transport == 'codex' and args.new)):
+            return open_codex_result(args)
+        if args.cmd == 'open' and (args.register or args.project or args.new):
+            raise ValueError('--register, --project and --new on open apply only to --provider codex')
         if args.cmd=='serve':
             if args.max_messages<1:
                 raise ValueError('Message limit must be positive')

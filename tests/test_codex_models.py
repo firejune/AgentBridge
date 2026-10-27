@@ -261,8 +261,10 @@ class CodexModelsTest(unittest.TestCase):
                                if registering else ['open', '--provider', 'codex'])
                     extra = ['--model', explicit] if explicit else []
                     env = {codex_new.MODEL_ENV: env_model} if env_model else {}
-                    created = {'created': True, 'adopted': True, 'model': expected, 'model_source': '--model',
-                               'session': {'id': self.sid, 'cwd': str(self.state)}}
+                    created = codex_new.open_result()
+                    created.update(created=True, adopted=True, model=expected, model_source='--model',
+                                   stage='complete')
+                    created['session'].update(id=self.sid, cwd=str(self.state))
                     with patch.dict(os.environ, env), \
                             patch.object(codex_new, 'open_codex', return_value=created) as create, \
                             patch.object(bridge.broker, 'request', return_value=dict(self.route)) as broker:
@@ -270,7 +272,7 @@ class CodexModelsTest(unittest.TestCase):
                     self.assertEqual(code, 0, out)
                     create.assert_called_once()
                     self.assertEqual(create.call_args.kwargs['model'], expected)
-                    result = out['discovery'] if registering else out
+                    result = out
                     self.assertEqual((result['model'], result['model_source']), (expected, source))
                     if registering:
                         self.assertTrue(out['registered'])

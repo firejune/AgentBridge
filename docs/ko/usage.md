@@ -392,15 +392,34 @@ python3 "$bridge_cli" close NAME --project PROJECT [--keep-route] [--timeout 10]
 ### Codex Desktop 세션 자동 생성
 
 ```bash
-python3 "$bridge_cli" open --provider codex --cwd /path/to/workspace --title "작업 세션" --model MODEL
+python3 "$bridge_cli" open --provider codex --cwd PATH --title "작업 세션" --model MODEL \
+  --register codex-worker --project PROJECT
 python3 "$bridge_cli" register codex-worker --project PROJECT --transport codex \
   --new --cwd /path/to/workspace --title "작업 세션" --model MODEL --timeout 180
 ```
 
 설치된 CLI의 공식 `app-server --stdio` JSON-RPC로 영속 대화를 하나 만들고, `thread/name/set`으로 실제 이름을 저장한 뒤 생성 프로세스를 종료한다. 별도 메타데이터 조회에서 동일 UUID·정확한 `--cwd`·요청한 제목을 다시 확인하고 `codex://threads/UUID`로 앱이 그 대화를 인계받게 한다. 해당 UUID의 정확한 IPC 소유자가 `supportsUntrustedAppInput`을 제공하고 대화를 재개했는지 확인한 뒤 등록한다. **Enter·작성기 제출·가짜 사용자 프롬프트·모델 턴·상속된 MCP 문맥·UI 자동화는 필요 없다.** macOS 앱과 CLI가 설치되어 있어야 하며, 실제 Desktop 소유자 확인이 등록 조건이다.
 
-`--title`은 실제 대화 제목이다. 명시한 `--model`은 설치된 제공자 목록에 있어야 하며 알 수 없는 모델은 생성 전에 거부한다. 제공자의 모델 자동 대체도 금지한다. 빈 영속 대화는 `thread/start`의 모델과 달리 앱 기본 모델로 인계될 수 있으므로 정확한 소유자의 모델을 읽고, 필요하면 요청한 모델만 설정한 뒤 다시 읽어 일치를 확인한다. `--model`을 생략하면 `AGENT_BRIDGE_CODEX_MODEL`(설정된 경우), 없으면 `gpt-6.1-sol`을 같은 목록 확인·재조회로 요청하며 앱 자체 기본값은 쓰지 않는다. 제공자가 그 기본값을 광고하지 않으면 이름을 밝혀 실패하니 `--model`을 넘긴다. 새 Codex 세션은 항상 지원되는 Full Access 프로필 `:danger-full-access`와 `approvalPolicy: never`로 만든다. 생성 전에 `permissionProfile/list`가 해당 프로필을 허용한다고 확인해야 하며, 프로필 부재·거부 시 더 낮은 권한으로 대체하지 않고 실패한다. 생성 응답도 전체 프로필·`dangerFullAccess` 샌드박스·`never` 정책을 확인해야 한다. 앱 인계 뒤 정확한 소유자의 다음 턴 설정을 읽고 필요할 때 그 새 대화에만 같은 프로필·정책을 적용한다. 버전이 지정된 스냅샷에서 세 항목을 다시 확인한 뒤 등록한다. `permission_settings`는 검증한 `latestThreadSettings`이며 `currentPermissions`는 지난 턴의 상태일 수 있다. `creator_settings`는 생성 응답을 별도로 보고한다. 기존 세션과 전역 사용자 설정은 생성 과정에서 변경하지 않는다.
+`--title`은 실제 대화 제목이다. 명시한 `--model`은 설치된 제공자 목록에 있어야 하며 알 수 없는 모델은 생성 전에 거부한다. 제공자의 모델 자동 대체도 금지한다. 빈 영속 대화는 `thread/start`의 모델과 달리 앱 기본 모델로 인계될 수 있으므로 정확한 소유자의 모델을 읽고, 필요하면 요청한 모델만 설정한 뒤 다시 읽어 일치를 확인한다. `--model`을 생략하면 `AGENT_BRIDGE_CODEX_MODEL`(설정된 경우), 없으면 `gpt-6.1-sol`을 같은 목록 확인·재조회로 요청하며 앱 자체 기본값은 쓰지 않는다. 제공자가 그 기본값을 광고하지 않으면 이름을 밝혀 실패하니 `--model`을 넘긴다. 새 Codex 세션은 항상 지원되는 Full Access 프로필 `:danger-full-access`와 `approvalPolicy: never`로 만든다. 생성 전에 `permissionProfile/list`가 해당 프로필을 허용한다고 확인해야 하며, 프로필 부재·거부 시 더 낮은 권한으로 대체하지 않고 실패한다. 생성 응답도 전체 프로필·`dangerFullAccess` 샌드박스·`never` 정책을 확인해야 한다. 앱 인계 뒤 정확한 소유자의 다음 턴 설정을 읽고 필요할 때 그 새 대화에만 같은 프로필·정책을 적용한다. 열기 성공에는 버전이 지정된 스냅샷에서 세 항목의 재확인이 필요하다. `permission_settings`는 거부 시에도 실제 `latestThreadSettings`를 보고하며 `currentPermissions`는 지난 턴의 상태일 수 있다. `creator_settings`는 생성 응답을 별도로 보고한다. 기존 세션과 전역 사용자 설정은 생성 과정에서 변경하지 않는다.
 
-생성 요청은 한 번만 보낸다. `--timeout`은 전체 흐름의 기한이며 마지막 IPC 호출·프로세스 정리에 짧고 제한된 초과 시간이 생길 수 있다. 생성 뒤 실패하면 `session`, `created`, `adopted`, `registered: false`, `stage`, `uncertain`을 보존한다. 생성 요청 전송 뒤 UUID가 없으면 결과 미확인이다. `--new`를 자동 재실행하지 않는다. 정확한 UUID를 확인하고 남은 인계·모델 검증을 마친 뒤 등록한다. 브로커 등록만 실패하면 생성 결과와 UUID가 남으므로 `register --transport codex --session ID --discover`로 기존 대화를 등록할 수 있다. 성공한 `register --new`는 `registered: true`를, `discovery` 안에 `created`, `adopted`, 검증한 모델을 반환한다. 이 값은 작업 완료가 아니다.
+Codex `open`과 `register --transport codex --new`는 파싱된 호출마다 stdout에 JSON 객체 하나를 출력한다. 성공·권한 거부·정책 등 초기 실패도 키가 같고 `session`은 항상 저장 세션 행 객체다. UUID를 모르면 `session.id`는 null이다. 아직 관찰하지 못한 값은 생략하지 않고 null로 둔다.
+
+| 필드 | 의미 |
+| --- | --- |
+| `created`, `adopted`, `registered`, `uncertain` | 생성·정확한 Desktop 소유 확인·라우트 접수·부수 효과의 불확실성을 각각 표시 |
+| `stage`, `error`, `registration_error`, `warning` | 성공은 `stage: "complete"`, `error: null`; 등록 오류는 별도 진단도 보존 |
+| `session` | `provider`, `id`, `name`, `cwd`, `status`, `reported_status`, `runtime_observed`, `source`, `updated_at`, `observed_at`, `scope`; 저장 메타데이터는 실행 상태가 아님 |
+| `owner`, `url`, `model`, `model_source` | 확인한 정확한 소유자·링크, 요청 모델과 선택 근거 |
+| `creator_settings`, `permission_settings`, `permission_settings_source` | 생성 응답과 실제 Desktop 권한을 구분하며 미관찰은 null |
+| `settings_update` | 항상 `{ "applied": boolean-or-null, "resultType": string-or-null }`; 응답을 못 받으면 null |
+| `existing_sessions` | 중복 거부의 일치 행 목록, 그 외에는 빈 배열 |
+
+권한 진단은 프로필 식별자·승인 정책·샌드박스 타입만 남긴다. 알 수 없는 식별자는 `<unrecognized>`로 가리고 루트 경로·임의 응답 필드·전송 예외·크리덴셜은 제외한다. `applied: true` 응답도 실제 권한 일치를 뜻하지 않는다. `creator_settings`는 `sandbox`, `permission_settings`는 `sandboxPolicy`를 쓰며 후자의 출처는 `Desktop owner latestThreadSettings`다.
+
+`open --register NAME --project P`는 생성·인계된 대화를 같은 호출에서 등록한다. 두 옵션은 함께 필요하며 Codex 전용이다. 권한 단계만 실패해도 등록은 한 번 시도한다. 이때 `registered: true`여도 원래 거부·`stage: "permissions"`·`error`·종료 코드 1을 유지한다. 모델·영속화·인계 실패에는 등록하지 않는다. 등록까지 실패하면 `registration_error`를 별도로 남기고 원래 거부를 유지한다. 열기는 성공했으나 등록만 실패하면 `stage: "registration"`과 종료 코드 1이다. 성공은 0, 중단은 130이다. `register --transport codex --new`도 같은 형식이며 생성 정보는 `discovery` 대신 최상위에 둔다. 이 흐름은 진단·메시지를 저장하지 않으며 기존 비공개 endpoint 라우팅 스냅샷에만 라우트가 남을 수 있다.
+
+제목이 있는 일반 Codex `open`은 생성 전에 보관되지 않은 저장 세션의 모든 페이지에서 정확한 제목과 정규화한 cwd를 비교한다. 일치하면 종료 코드 1·`stage: "duplicate"`로 거부한다. 한 후보는 `session`에, 여러 후보는 `session.id: null`과 `existing_sessions`에 전부 담는다. 후보를 자동 선택·인계·개명하거나 권한을 바꾸지 않는다. 목록이 불완전하거나 잘못되어도 생성하지 않는다. `open --new`는 이 검사를 명시적으로 건너뛰고, `register --new`도 새 생성 요청이다. 제목이 없으면 중복 검사를 할 수 없다. 이 검사는 프로세스 간 원자적 잠금이 아니므로 동시 생성이나 저장 목록 반영 지연에는 경쟁 가능성이 남는다.
+
+생성·설정 변경은 각각 한 번만 전송한다. `--timeout`은 전체 기한이며 마지막 IPC 호출·프로세스 정리에 짧고 제한된 초과 시간이 생길 수 있다. 생성 전송 뒤 UUID를 못 받으면 `uncertain: true`, `created: false`, `session.id: null`이며 나중의 목록에 후보가 없더라도 자동 재생성하지 않는다. 다른 부분 실패는 정확한 UUID로 확인한다. 등록 실패에도 행이 남으므로 라우트를 확인한 뒤 `register --transport codex --session ID --discover`로 복구할 수 있다. 설정 변경·등록·`--new`를 자동 재시도하지 않는다. 어떤 결과도 작업 완료를 뜻하지 않는다.
 
 앱 서버 스키마는 설치된 CLI에서 생성하며 생성 필드에 필요한 실험 API 기능을 명시적으로 협상한다. 정확한 UUID 딥 링크와 소유자·설정·스냅샷 IPC는 업데이트로 바뀔 수 있는 내부 계약이다. 스냅샷은 정확한 UUID·발신 소유자·수신자·프로토콜 버전을 확인하고 크기 초과·불완전 프레임을 거부하며 실패해도 구독을 해제한다. native app-tools 파이프를 사용하거나 권한을 우회하지 않는다. 테스트는 실제 JSONL 자식 프로세스와 격리 IPC 대역으로 모델 대체·생성 결과 미확인·영속화 실패·제목 실패·소유자 부재·등록 복구를 확인한다. CLI 생성만 성공한 상태를 Desktop 세션 성공으로 부르지 않는다.
