@@ -352,6 +352,30 @@ class AgyLiveTests(unittest.TestCase):
             self.assertEqual(bad_model.returncode, 1)
             self.assertIn('Unknown Antigravity model', json.loads(bad_model.stdout)['error'])
 
+            # 4) Omitting --title falls back to participant name on register --new,
+            #    workspace folder name on open, and first message line when untitled.
+            reg_fallback = self.cli(server.path, env, 'register', 'jinni-desk-76', '--project', 'demo',
+                                    '--transport', 'agy', '--new', '--cwd', str(unregistered_dir))
+            self.assertEqual(reg_fallback.returncode, 0, reg_fallback.stdout)
+            self.assertEqual(json.loads(reg_fallback.stdout)['discovery']['session']['name'], 'jinni-desk-76')
+
+            open_fallback = self.cli(sock, env, 'open', '--provider', 'agy', '--cwd', str(unregistered_dir))
+            self.assertEqual(open_fallback.returncode, 0, open_fallback.stdout)
+            open_fallback_json = json.loads(open_fallback.stdout)
+            self.assertEqual(open_fallback_json['session']['name'], 'subworkspace')
+
+            untitled_sid = open_fallback_json['session']['id']
+            fake.trajectories[untitled_sid]['summary'] = ''
+            self.cli(server.path, env, 'register', 'agy-untitled', '--project', 'demo',
+                     '--transport', 'agy', '--session', untitled_sid, '--discover')
+            sent_untitled = self.cli(
+                server.path, env, 'send', '--project', 'demo',
+                '--from', 'codex-agent', '--to', 'agy-untitled', '--key', 'k-untitled', '--file', '-',
+                stdin='# Card: rig-c/adapters#76 — phaser, three\nDetails here',
+            )
+            self.assertEqual(sent_untitled.returncode, 0, sent_untitled.stdout)
+            self.assertEqual(fake.trajectories[untitled_sid]['summary'], 'Card: rig-c/adapters#76 — phaser, three')
+
     def test_discovers_both_desktop_and_ide_servers_while_skipping_lsp_workers(self):
         from unittest import mock
         import agy_live

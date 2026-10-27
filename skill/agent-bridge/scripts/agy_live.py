@@ -561,10 +561,9 @@ def open_agy(cwd, title=None, model=None, timeout=5, host='desktop'):
         )
 
     actual_cid = str(uuid.UUID(start_resp.get('cascadeId') or cid))
-    clean_title = str(title).strip() if isinstance(title, str) and title.strip() else None
-    annotations = {'lastUserViewTime': observed_now()}
-    if clean_title:
-        annotations['title'] = clean_title
+    clean_title = (str(title).strip() if isinstance(title, str) and title.strip()
+                   else (target_path.name or str(target_path)))
+    annotations = {'lastUserViewTime': observed_now(), 'title': clean_title}
     try:
         rpc_call(
             server['url'],
@@ -798,6 +797,22 @@ def wake_session(url, csrf, sid, initial_status=None, timeout=5):
     return 'running'
 
 
+def fallback_delivery_title(text, route, target):
+    if isinstance(text, str) and text.strip():
+        body = text
+        if body.startswith('[agent-bridge peer message |') and '\n\n' in body:
+            body = body.split('\n\n', 1)[1]
+        for raw_line in body.splitlines():
+            line = re.sub(r'^#+\s*', '', raw_line.strip()).strip()
+            if line and not line.startswith('Answer through the bridge,'):
+                return line[:120]
+    for candidate in (route.get('name') if isinstance(route, dict) else None,
+                      Path(target['cwd']).name if isinstance(target, dict) and target.get('cwd') else None):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()[:120]
+    return None
+
+
 def deliver(route, message_id, text, sender=None, project=None, timeout=10, dry_run=False):
     mutation_sent = False
     try:
@@ -820,6 +835,23 @@ def deliver(route, message_id, text, sender=None, project=None, timeout=10, dry_
         mutation_sent = True
         rpc_call(server['url'], server['csrf'], 'SendAgentMessage', frame, timeout=timeout)
         wake_state = wake_session(server['url'], server['csrf'], sid, target['status'], timeout=timeout)
+        if not target.get('name'):
+            auto_title = fallback_delivery_title(text, route, target)
+            if auto_title:
+                try:
+                    rpc_call(
+                        server['url'],
+                        server['csrf'],
+                        'UpdateConversationAnnotations',
+                        {
+                            'cascadeId': sid,
+                            'annotations': {'title': auto_title},
+                            'mergeAnnotations': True,
+                        },
+                        timeout=timeout,
+                    )
+                except DeliveryError:
+                    pass
         return {
             'session': sid,
             'pid': server['pid'],

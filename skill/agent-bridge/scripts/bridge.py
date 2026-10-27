@@ -322,7 +322,10 @@ def registration(args):
         if not args.cwd:
             raise ValueError('--new requires --cwd')
         provider = 'claude' if args.transport == 'claude-peer' else args.transport
-        observation = sessions.open_session(provider, cwd=args.cwd, title=args.title, model=args.model, timeout=args.timeout,
+        title = args.title
+        if args.transport == 'agy' and (not isinstance(title, str) or not title.strip()):
+            title = getattr(args, 'name', None)
+        observation = sessions.open_session(provider, cwd=args.cwd, title=title, model=args.model, timeout=args.timeout,
                                             host=getattr(args, 'host', 'desktop'), ide=getattr(args, 'ide', None))
         args.session = observation['session']['id']
         args.cwd = observation['session']['cwd']
