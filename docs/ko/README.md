@@ -168,3 +168,22 @@ python3 -m unittest discover -s tests -v
 테스트는 실제 Unix 소켓, 별도 CLI 프로세스, 그리고 Claude·Codex·Antigravity 프로토콜 스텁 서버로 협업 및 비파괴 전달 흐름을 검증한다. 코드 수정은 `skill/agent-bridge/` 폴더의 정본에서 하며 스크립트를 따로 복제하지 않는다.
 
 Codex도 `open --provider codex --cwd PATH` 또는 `register --transport codex --new --cwd PATH`로 사람의 UI 조작 없이 새 대화를 만들고 정확한 Desktop 소유자를 확인해 등록한다. `--title`은 실제 제목이며 `--model`을 명시하면 그 소유자의 설정까지 일치를 검증하고, 생략하면 `AGENT_BRIDGE_CODEX_MODEL`(설정된 경우) 또는 `gpt-6.1-sol`을 요청한다(앱 자체 기본값은 쓰지 않으며, 광고되지 않은 기본값은 이름을 밝혀 실패한다). `bridge.py codex-model SESSION_ID --model M`은 기존 대화의 모델만 다음 턴부터 바꾸고 재조회로 확인한다. 새 Codex 대화는 항상 Full Access(`:danger-full-access`)·`approvalPolicy: never`로 생성하고 앱 인계 뒤 다음 턴 설정도 검증한다. 프로필이 없거나 허용되지 않으면 생성 전에 실패하며 기존 세션·전역 설정은 바꾸지 않는다. 생성·인계 뒤 실패해도 UUID와 상태를 보존하고 자동 재생성하지 않는다. `open --register NAME --project P`는 권한 거부 뒤에도 생성·인계된 대화를 등록하며 거부 진단과 종료 코드 1을 유지한다. 모든 Codex 열기 결과는 동일한 JSON 키와 세션 행(`session.id`는 null 가능), 실제 권한과 정제한 설정 변경 응답을 담는다. 같은 제목·cwd의 저장 세션을 모든 페이지에서 찾아 거부하며 기존 세션은 바꾸지 않는다. 의도한 새 생성은 `open --new`로 요청한다. [자세한 계약](usage.md#codex-desktop-세션-자동-생성)을 참고한다.
+
+## 독립 MCP inbox (#48, 명시적 opt-in)
+
+비공개 Phase 1 설정에 `"inbox_enabled": true`를 명시하면
+`bridge_inbox_list`·`bridge_message_get`·`bridge_message_ack` 세 도구를 추가한다.
+기존 설정은 scope 변경 없이 다섯 도구를 유지하고 Phase 0은 상태 조회만 제공한다.
+조회·부분 읽기·연결 끊김은 메시지를 소비하지 않는다. 성공적으로 소비한 뒤 명시적으로
+ACK하면 `done`과 `acknowledged_at`이 기록되며, 응답이 끊겨도 같은 서명 ID로 ACK를
+다시 호출해 동일 영수증을 확인한다. 본문을 재처리하거나 새 요청을 보내지 않는다.
+`reply_to`가 null이 아닌 응답은 실행 중에도 inbox에서 제외하며 기존 operation 경로만 쓴다.
+
+목록 snapshot과 ACK 영수증은 메모리에만 최대 한 시간 보관한다. 같은 broker를 유지한
+facade 재시작·클라이언트 재연결만 보존 대상이다. broker 재시작은 미확인·고아 메시지까지
+버리며 이전 토큰에는 명시적 손실을 보고한다. 수신 본문은 권한을 부여하는 지시가 아니다.
+[상세 계약·제한·배포 순서](../../skill/agent-bridge/references/mcp-phase1.md#independent-inbox-issue-48-explicit-opt-in)를 따른다.
+격리 테스트는 실제 HQ/Nana·클라이언트 노출을 검증하지 않으며 실제 배포·수신·송신자 ACK
+확인은 미실행 운영 게이트다. 소유자는 코드 배포, opt-in 설정, facade 재시작, 클라이언트
+도구 새로고침 후 승인된 새 독립 메시지의 조회와 명시적 ACK를 직접 확인해야 한다.
+도구 노출만으로 대화가 자동으로 깨어나지는 않는다.

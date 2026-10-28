@@ -4,6 +4,7 @@ from collections import deque
 from copy import deepcopy
 from datetime import datetime, timezone
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ import signal
 import socket
 import stat
 import sys
+import time
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -20,6 +22,12 @@ import usage
 
 DEFAULT_SOCKET = Path.home() / '.local/share/agent-bridge/bridge.sock'
 MAX_FRAME = 1024 * 1024
+INBOX_TTL = 3600
+INBOX_MAX_SNAPSHOTS = 16
+INBOX_SNAPSHOT_BYTES = 4 * 1024 * 1024
+INBOX_TOTAL_BYTES = 16 * 1024 * 1024
+INBOX_PAGE_BYTES = 128 * 1024
+INBOX_MAX_RECEIPTS = 8192
 
 
 def now():
@@ -58,9 +66,14 @@ class State:
         self.subscribers = []
         self.answers = {}
         self.waiters = {}
+        self.inbox_snapshots = {}
+        self.inbox_receipts = {}
         self.store = store
         if store is not None:
             self.endpoints, self.channels = store.load()
+        # Volatile endpoint history distinguishes unused inbox pins from removed
+        # return routes. Restored endpoints are already initialized this epoch.
+        self.inbox_initialized_routes = set(self.endpoints)
 
     def routing_change(self, collection, key, item):
         endpoints, channels = self.endpoints.copy(), self.channels.copy()
@@ -70,6 +83,8 @@ class State:
         if self.store is not None:
             self.store.save(endpoints, channels)
         self.endpoints, self.channels = endpoints, channels
+        if collection == 'endpoints':
+            self.inbox_initialized_routes.add(key)
         return item
 
     def routing_remove(self, collection, key):
@@ -189,8 +204,135 @@ class State:
             self.answers[reply_to].set()
         return m
 
+    @staticmethod
+    def inbox_metadata(message, slot):
+        def address(route):
+            return {key: route.get(key) for key in ('project', 'name', 'transport', 'channel', 'generation')}
+        body = message['body']
+        return {'id': message['id'], 'agent_session_id': slot,
+                'created_at': message['created'], 'project': message['project'],
+                'sender': address(message['return_route']), 'recipient': address(message['route']),
+                'provenance': 'broker_route', 'reply_to': None, 'state': message['state'],
+                'acknowledged': message.get('acknowledged_at') is not None,
+                'acknowledged_at': message.get('acknowledged_at'),
+                'body_chars': len(body), 'body_bytes': len(body.encode('utf-8')),
+                'body_sha256': hashlib.sha256(body.encode('utf-8')).hexdigest()}
+
+    def inbox_action(self, args):
+        # Runs in the same event-loop turn as route/epoch checks and ACK mutation.
+        if args.get('instance') is not None and args['instance'] != self.instance:
+            raise ValueError('BROKER_RESTARTED')
+        owner, context, routes = args['owner'], args['context'], args['routes']
+        if (not isinstance(owner, str) or len(owner) != 64 or not isinstance(context, str)
+                or len(context) != 64 or not isinstance(routes, list) or len(routes) > 64):
+            raise ValueError('INVALID_ARGUMENT')
+        selected = {}
+        uninitialized = []
+        for entry in routes:
+            expected = entry['route']
+            key = (expected['project'], expected['name'])
+            actual = self.endpoints.get(key)
+            if (args['op'] == 'inbox_list' and entry['slot'] in args.get('uninitialized_pins', ())
+                    and actual is None and key not in self.inbox_initialized_routes):
+                uninitialized.append(entry['slot'])
+                continue  # A configured pin need not have sent its first message.
+            if actual is None or route_key(actual) != route_key(expected):
+                raise ValueError('ROUTE_CHANGED')
+            selected[route_key(expected)] = entry['slot']
+        current = time.time()
+        self.inbox_snapshots = {k: v for k, v in self.inbox_snapshots.items() if v['expires'] > current}
+        self.inbox_receipts = {k: v for k, v in self.inbox_receipts.items() if v['expires'] > current}
+        op = args['op']
+        if op == 'inbox_list':
+            limit, offset = args.get('limit', 20), args.get('offset', 0)
+            if type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or offset < 0:
+                raise ValueError('INVALID_ARGUMENT')
+            snapshot_id = args.get('snapshot')
+            if snapshot_id:
+                snapshot = self.inbox_snapshots.get(snapshot_id)
+                if snapshot is None:
+                    raise ValueError('CURSOR_EXPIRED')
+                if (snapshot['owner'], snapshot['context']) != (owner, context):
+                    raise ValueError('NOT_FOUND')
+            else:
+                if offset:
+                    raise ValueError('INVALID_ARGUMENT')
+                items = []
+                for message in self.messages.values():
+                    slot = selected.get(route_key(message['route']))
+                    # Correlated replies are ALWAYS operation-only, even before an
+                    # operation has saved its backend ID or observed its first reply.
+                    if slot is not None and message['reply_to'] is None and message['state'] not in TERMINAL_STATES:
+                        items.append(self.inbox_metadata(message, slot))
+                items.sort(key=lambda m: (m['created_at'], m['id']))
+                size = len(json.dumps(items, ensure_ascii=False).encode())
+                if size > INBOX_SNAPSHOT_BYTES:
+                    raise ValueError('CAPACITY_EXCEEDED')
+                if any(len(json.dumps(item, ensure_ascii=False).encode()) > INBOX_PAGE_BYTES // 2 for item in items):
+                    raise ValueError('INBOX_ITEM_TOO_LARGE')
+                snapshot_id = str(uuid.uuid4())
+                snapshot = {'owner': owner, 'context': context, 'items': items,
+                            'expires': current + INBOX_TTL, 'bytes': size}
+            if offset > len(snapshot['items']):
+                raise ValueError('INVALID_ARGUMENT')
+            page = []
+            for item in snapshot['items'][offset:offset + limit]:
+                if len(json.dumps(page + [item], ensure_ascii=False).encode()) > INBOX_PAGE_BYTES:
+                    break
+                page.append(item)
+            end = offset + len(page)
+            if end < len(snapshot['items']) and snapshot_id not in self.inbox_snapshots:
+                if (len(self.inbox_snapshots) >= INBOX_MAX_SNAPSHOTS
+                        or sum(v['bytes'] for v in self.inbox_snapshots.values()) + snapshot['bytes'] > INBOX_TOTAL_BYTES):
+                    raise ValueError('CAPACITY_EXCEEDED')
+                self.inbox_snapshots[snapshot_id] = snapshot
+            return {'messages': page, 'snapshot': snapshot_id, 'offset': end,
+                    'has_more': end < len(snapshot['items']), 'expires': snapshot['expires'],
+                    'uninitialized_agent_session_ids': uninitialized,
+                    'broker_instance': self.instance}
+        mid = args['id']
+        receipt_key = (owner, context, mid)
+        receipt = self.inbox_receipts.get(receipt_key)
+        if op == 'inbox_ack' and receipt is not None:
+            return dict(receipt['result'])
+        message = self.messages.get(mid)
+        if message is None:
+            raise ValueError('MESSAGE_UNAVAILABLE')
+        slot = selected.get(route_key(message['route']))
+        if slot is None or message['reply_to'] is not None:
+            raise ValueError('NOT_FOUND')
+        if op == 'inbox_get':
+            offset, count = args.get('offset', 0), args.get('max_chars', 8000)
+            if type(offset) is not int or not 0 <= offset <= len(message['body']) or type(count) is not int or not 1 <= count <= 16000:
+                raise ValueError('INVALID_ARGUMENT')
+            result = self.inbox_metadata(message, slot)
+            end = min(offset + count, len(message['body']))
+            result.update(body=message['body'][offset:end], offset=offset, end=end,
+                          has_more=end < len(message['body']), broker_instance=self.instance)
+            # Check the actual envelope as well: oversized route metadata never
+            # mutates a message or makes an unacknowledged payload unavailable.
+            if len(wire({'result': result, 'instance': self.instance})) > INBOX_PAGE_BYTES:
+                raise ValueError('INBOX_ITEM_TOO_LARGE')
+            return result
+        if op != 'inbox_ack':
+            raise ValueError('INVALID_ARGUMENT')
+        if message['state'] in TERMINAL_STATES:
+            raise ValueError('ACK_EXPIRED')
+        if message['state'] in ('dispatching', 'uncertain'):
+            raise ValueError('DELIVERY_UNKNOWN')
+        if len(self.inbox_receipts) >= INBOX_MAX_RECEIPTS:
+            raise ValueError('CAPACITY_EXCEEDED')
+        result = {'id': mid, 'acknowledged': True, 'acknowledged_at': now(),
+                  'broker_instance': self.instance, 'reconcile_until': current + INBOX_TTL}
+        self.inbox_receipts[receipt_key] = {'result': result, 'expires': current + INBOX_TTL}
+        message['acknowledged_at'] = result['acknowledged_at']
+        self.status(message, 'done', 'Explicit MCP inbox acknowledgement')
+        return dict(result)
+
     def action(self, args):
         op = args['op']
+        if op in ('inbox_list', 'inbox_get', 'inbox_ack'):
+            return self.inbox_action(args)
         if op == 'ping':
             return {'instance':self.instance,'messages':len(self.messages),'subscribers':len(self.subscribers)}
         if op == 'register':

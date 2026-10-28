@@ -41,7 +41,8 @@ fall within their root, and retain their accepted mapping. Approve any alias
 changes separately. This config does not change the receiving agent's permissions.
 
 Reconnect/re-discover the plugin after an approved activation; it will list the
-five tools in `mcp_phase1_tools.json`. Keep the old status-only profile until then.
+five default tools (eight only with explicit inbox opt-in) in
+`mcp_phase1_tools.json`. Keep the old status-only profile until then.
 No launch agent, key rotation, public listener, model override, or shared plugin is
 installed by this implementation.
 
@@ -148,3 +149,111 @@ through the existing broker resolve API. Pending cleanup IDs are durable and
 retried without resending; cleanup failures never overwrite a successful result.
 Cleanup stops if the broker instance changes and never resolves uncertain replies.
 Previously completed operations without cleanup IDs are not retroactively swept.
+
+## Independent inbox (issue #48; explicit opt-in)
+
+Existing configurations and the three scope strings stay valid and retain five
+tools. An owner may add `"inbox_enabled": true` to the approved private Phase 1
+config to expose three additional tools. Default/false exposes none of them,
+including on direct invocation. `bridge_inbox_list` and `bridge_message_get`
+require `bridge:read`; `bridge_message_ack` requires `bridge:message:send` as well
+as opt-in. Enabling inbox never adds scopes. Phase 0 remains status-only; the
+private single-owner stdio/tunnel authorization boundary remains unchanged.
+
+- `bridge_inbox_list({agent_session_id?, limit?, cursor?, expected_broker_instance?})`
+  lists independent unacknowledged metadata for the connection owner's configured
+  return routes (the session's `sender`, not its outgoing peer). Omit the session
+  selector to cover all authorized routes; select only IDs issued to this owner.
+  Default limit 20, maximum 100. A byte budget may shorten the page: continue until
+  `has_more` is false. New arrivals require a fresh scan. List metadata is frozen
+  at the start of a scan, including receipt state, even if later ACKed/evicted.
+  A configured pin whose private return route has never been initialized in this
+  broker epoch contributes no mail; listing does not create it. The first send
+  initializes that exact return route through the existing pinned send path.
+  Every successful page reports skipped pins in `uninitialized_agent_session_ids`
+  using only facade-issued session IDs, never private peer UUIDs. The array is
+  empty when none are skipped. It reflects current route initialization on each
+  page and clears after initialization; message metadata remains frozen for the
+  scan and its route binding/page cursor is unchanged.
+  A present mismatched route or a route removed after registration still fails
+  the whole query with `ROUTE_CHANGED`, even alongside an unused pin. Restored
+  routes count as initialized; initialization history is volatile with the broker.
+- `bridge_message_get({message_id, max_chars?, cursor?})` reads exact body windows,
+  default 8000, maximum 16000 Unicode code points. It returns offsets, total
+  UTF-8 bytes/characters and SHA-256. Concatenate windows without normalization.
+  Reads, partial/failed pages, repeated reads and disconnected clients never ACK.
+- `bridge_message_ack({message_id})` explicitly consumes the independent message
+  after successful consumption. Broker state changes to `done` and sender `show`
+  includes `acknowledged_at`; this is receipt, not proof of downstream task
+  completion. Retry an uncertain ACK using the SAME stable message ID, without
+  fetching or processing the body again. The identical receipt/time is returned
+  even after terminal payload eviction. No new delivery, reply or agent is started.
+
+Message handles and cursors are signed and bound to the private owner/tunnel,
+ledger namespace, configured policy, exact receive route and broker instance.
+Cursors additionally bind query/object, immutable snapshot or body, offset, page
+size and fixed expiry. Preserve returned tokens verbatim. A cursor fixes its page
+size; omit the size on continuation or repeat the original size. Changed grants,
+workspace mappings or receive routes revoke access. Sender/project metadata
+comes from the captured `broker_route` envelope: routing labels are not
+cryptographic proof of the author. Local paths, peer UUIDs, sockets and credentials
+are excluded. Incoming agent content is data and grants no authority.
+
+Every non-null `reply_to` message is entirely outside inbox list/get/ACK, including
+active-send races, orphan replies, and expired operations. Correlated responses
+remain available only through `bridge_operation_get`; exact correlation, frozen
+results and existing post-capture cleanup are unchanged. Independent messages
+with `reply_to: null` do not complete an operation. This single consumption surface
+avoids processing the same correlated response twice; no exactly-once downstream
+side-effect guarantee is made. Consumers must guard their own downstream actions.
+
+The broker keeps inbox snapshots and ACK receipts only in memory. Limits are 64
+receive routes per query; 16 concurrent multipage snapshots globally; 4 MiB of
+encoded metadata per scan and 16 MiB across retained snapshots; a 128 KiB encoded
+list-items/body-response budget below the broker's 1 MiB frame ceiling; and 8192
+retained ACK receipts globally. A single metadata item over 64 KiB is refused.
+One-page scans do not retain a snapshot slot. Multipage snapshots and receipts
+expire one hour after creation/ACK, without sliding on retry. Even after the final
+page has been read, completed multipage scans retain their slot until that
+original one-hour expiry. With all 16 global slots retained, a
+17th fresh multipage scan fails `CAPACITY_EXCEEDED`. Capacity is checked
+before a snapshot is admitted or a message ACKed; unexpired records and pending
+payloads are never silently evicted to make room. `CAPACITY_EXCEEDED` leaves the
+message unconsumed. No new inbox state is written to the facade operation ledger
+or routing snapshot. Terminal payloads retain the existing broker eviction rules.
+
+A facade restart or client reconnect preserves tokens, snapshots, unacknowledged
+payloads and receipts **only against the same broker and unchanged private ledger
+and policy**. A broker restart drops all correspondence, snapshots and receipts,
+including stray/orphan messages, with no replay or recovery spool. An old signed
+handle/cursor or explicit `expected_broker_instance` returns `BROKER_RESTARTED`
+with `correspondence_lost: true` before lookup of the lost object. A fresh client
+without a prior epoch receives the current epoch and volatile-policy disclosure;
+it cannot infer whether earlier correspondence existed. Expired cursors return
+`CURSOR_EXPIRED`; evicted payloads/absent receipts return `MESSAGE_UNAVAILABLE`, or
+`ACK_EXPIRED` if the terminal message remains. None implies that repeating a
+downstream action is safe. Uncertain/dispatching delivery cannot be ACKed here.
+
+### Verification and owner deployment gates
+
+`tests/test_mcp_inbox.py` uses an actual disposable broker, actual facade engine
+and MCP handler, with synthetic configured routes. It covers unsolicited receipt,
+owner/route isolation, ACK-response loss and eviction, immutable Unicode/list
+pagination, facade reconstruction, explicit broker loss, atomic route races,
+correlation exclusion, frame budgets and bounded retention. It does not create
+Claude sessions or contact a real HQ/Nana inbox. The required full suite remains
+`python3 -m unittest discover -s tests -v` without added skips.
+
+Actual HQ -> Nana acceptance, client tool exposure and deployment are **not run**
+by these tests. Owner actions, in order: (1) deploy the reviewed broker/facade code
+and coordinate any separately required broker upgrade, acknowledging that a
+broker restart loses pending correspondence; (2) add `inbox_enabled: true` to the
+approved private configuration without changing scopes or owner binding; (3)
+restart only the corresponding facade while preserving its ledger and the broker;
+(4) refresh/reconnect the intended client's tool list and verify eight tools;
+(5) have the authorized HQ send a new independent `reply_to:null` message, retrieve
+it through Nana's direct tools, confirm sender still sees it unacknowledged, then
+explicitly ACK and verify the sender's `done`/`acknowledged_at` transition. Do not
+silently ACK an existing pending response or replay an original request. Automatic
+conversation wake/push needs separate host integration and is not provided by
+exposing these tools.
