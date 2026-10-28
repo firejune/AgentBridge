@@ -254,6 +254,50 @@ class InboxIntegrationTests(unittest.TestCase):
             self.assertEqual(self.call(name, message_id=handle)['error']['code'], 'INVALID_ARGUMENT')
         self.assertEqual(self.running.call('show', id=a['id'])['state'], 'pending')
 
+    def test_unused_new_pin_does_not_mask_pending_mail_or_changed_routes(self):
+        message = self.send('valid pending mail')
+        self.send('second pending mail')
+        self.config['pinned_sessions']['unused'] = {
+            'uuid': str(uuid.uuid4()), 'cwd': self.root, 'project': 'test-project',
+            'route': 'unused', 'authorized_at': phase.stamp()}
+        unused = next(s for s in phase.pinned_sessions(self.config).values()
+                      if s['alias'] == 'unused')
+        self.assertTrue(unused['registered'])
+        # The peer target exists; Backend.post has never created its return route.
+        self.running.call('register', project='test-project', name=unused['route'],
+            cwd=self.root, transport='claude-peer', session=unused['uuid'])
+        before = self.running.call('routes', project='test-project')
+        self.assertNotIn(unused['sender'], [r['name'] for r in before])
+        listing = self.listing()
+        self.assertEqual(len(listing['messages']), 2)
+        self.assertEqual(listing['uninitialized_agent_session_ids'], [unused['id']])
+        self.assertNotIn(unused['uuid'], json.dumps(listing))
+        first = self.listing(limit=1)
+        self.assertTrue(first['has_more'])
+        self.assertEqual(first['uninitialized_agent_session_ids'], [unused['id']])
+        last = self.listing(cursor=first['next_cursor'])
+        self.assertFalse(last['has_more'])
+        self.assertEqual(last['uninitialized_agent_session_ids'], [unused['id']])
+        self.assertEqual(before, self.running.call('routes', project='test-project'))
+        handle = self.handle(message)
+        self.assertEqual(self.data('bridge_message_get', message_id=handle)['body'], message['body'])
+        # A present but changed route must fail even with an unused pin alongside.
+        self.running.call('register', project='test-project', name=self.owned[0]['sender'],
+            cwd=self.running.temp.name, transport='realtime')
+        self.assertEqual(self.call('bridge_inbox_list')['error']['code'], 'ROUTE_CHANGED')
+        self.register(self.owned[0]['sender'])
+        self.register(unused['sender'])
+        initialized = self.listing()
+        self.assertEqual(len(initialized['messages']), 2)
+        self.assertEqual(initialized['uninitialized_agent_session_ids'], [])
+        # Initialization does not change the bound route set or old snapshot.
+        resumed = self.listing(cursor=first['next_cursor'])
+        self.assertEqual(resumed['messages'], last['messages'])
+        self.assertEqual(resumed['uninitialized_agent_session_ids'], [])
+        self.running.call('unregister', project='test-project', name=unused['sender'])
+        self.assertEqual(self.call('bridge_inbox_list')['error']['code'], 'ROUTE_CHANGED')
+        self.assertEqual(self.running.call('show', id=message['id'])['state'], 'pending')
+
     def test_atomic_route_replacement_between_precheck_and_rpc(self):
         message = self.send('route race'); self.send('second')
         first = self.listing(limit=1); handle = first['messages'][0]['message_id']
@@ -369,9 +413,20 @@ class InboxAtomicBoundsTests(unittest.TestCase):
             last = self.rpc('inbox_list', snapshot=first['snapshot'], offset=first['offset'], limit=1)
             ids = [first['messages'][0]['id'], last['messages'][0]['id']]
             self.assertEqual(ids, sorted([a['id'], b['id']]))
+            self.assertFalse(last['has_more'])
+            # Completing traversal retains the slot until the fixed expiry.
+            with self.assertRaisesRegex(ValueError, 'CAPACITY_EXCEEDED'):
+                self.rpc('inbox_list', limit=1)
             with patch.object(broker.time, 'time', return_value=first['expires'] + 1):
                 with self.assertRaisesRegex(ValueError, 'CURSOR_EXPIRED'):
                     self.rpc('inbox_list', snapshot=first['snapshot'], offset=1, limit=1)
+        self.assertEqual(broker.INBOX_MAX_SNAPSHOTS, 16)
+        for _ in range(16):
+            page = self.rpc('inbox_list', limit=1)
+            while page['has_more']:
+                page = self.rpc('inbox_list', snapshot=page['snapshot'], offset=page['offset'], limit=1)
+        with self.assertRaisesRegex(ValueError, 'CAPACITY_EXCEEDED'):
+            self.rpc('inbox_list', limit=1)
 
     def test_dispatching_uncertain_and_correlated_not_consumable(self):
         message = self.send('a')

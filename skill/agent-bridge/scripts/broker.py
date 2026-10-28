@@ -71,6 +71,9 @@ class State:
         self.store = store
         if store is not None:
             self.endpoints, self.channels = store.load()
+        # Volatile endpoint history distinguishes unused inbox pins from removed
+        # return routes. Restored endpoints are already initialized this epoch.
+        self.inbox_initialized_routes = set(self.endpoints)
 
     def routing_change(self, collection, key, item):
         endpoints, channels = self.endpoints.copy(), self.channels.copy()
@@ -80,6 +83,8 @@ class State:
         if self.store is not None:
             self.store.save(endpoints, channels)
         self.endpoints, self.channels = endpoints, channels
+        if collection == 'endpoints':
+            self.inbox_initialized_routes.add(key)
         return item
 
     def routing_remove(self, collection, key):
@@ -222,9 +227,15 @@ class State:
                 or len(context) != 64 or not isinstance(routes, list) or len(routes) > 64):
             raise ValueError('INVALID_ARGUMENT')
         selected = {}
+        uninitialized = []
         for entry in routes:
             expected = entry['route']
-            actual = self.endpoints.get((expected['project'], expected['name']))
+            key = (expected['project'], expected['name'])
+            actual = self.endpoints.get(key)
+            if (args['op'] == 'inbox_list' and entry['slot'] in args.get('uninitialized_pins', ())
+                    and actual is None and key not in self.inbox_initialized_routes):
+                uninitialized.append(entry['slot'])
+                continue  # A configured pin need not have sent its first message.
             if actual is None or route_key(actual) != route_key(expected):
                 raise ValueError('ROUTE_CHANGED')
             selected[route_key(expected)] = entry['slot']
@@ -277,6 +288,7 @@ class State:
                 self.inbox_snapshots[snapshot_id] = snapshot
             return {'messages': page, 'snapshot': snapshot_id, 'offset': end,
                     'has_more': end < len(snapshot['items']), 'expires': snapshot['expires'],
+                    'uninitialized_agent_session_ids': uninitialized,
                     'broker_instance': self.instance}
         mid = args['id']
         receipt_key = (owner, context, mid)

@@ -737,6 +737,10 @@ class Engine:
 
     def inbox_rpc(self, op, principal, routes, instance, **fields):
         try:
+            if op == 'inbox_list':
+                # Keep existing route/token digests unchanged. Only configured
+                # pins may lack a return route before their first send.
+                fields['uninitialized_pins'] = list(pinned_sessions(self.config))
             return self.backend.rpc(op, owner=self.inbox_binding(principal),
                 context=digest([self.inbox_policy(), routes]), routes=routes, instance=instance, **fields)
         except ValueError as error:
@@ -780,6 +784,7 @@ class Engine:
             token = self.inbox_sign(principal, 'inbox', e=epoch, o=result['snapshot'], s=selector,
                 r=digest(routes), n=count, i=result['offset'], x=result['expires']) if result['has_more'] else None
             return {'messages': [self.inbox_message(m, principal, epoch, routes) for m in result['messages']],
+                    'uninitialized_agent_session_ids': result['uninitialized_agent_session_ids'],
                     'has_more': result['has_more'], 'next_cursor': token, 'broker_instance': epoch,
                     'restart_policy': 'volatile; facade reconnect requires the same broker'}
         handle = self.inbox_token(args['message_id'], principal, 'message')

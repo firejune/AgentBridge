@@ -167,6 +167,17 @@ private single-owner stdio/tunnel authorization boundary remains unchanged.
   Default limit 20, maximum 100. A byte budget may shorten the page: continue until
   `has_more` is false. New arrivals require a fresh scan. List metadata is frozen
   at the start of a scan, including receipt state, even if later ACKed/evicted.
+  A configured pin whose private return route has never been initialized in this
+  broker epoch contributes no mail; listing does not create it. The first send
+  initializes that exact return route through the existing pinned send path.
+  Every successful page reports skipped pins in `uninitialized_agent_session_ids`
+  using only facade-issued session IDs, never private peer UUIDs. The array is
+  empty when none are skipped. It reflects current route initialization on each
+  page and clears after initialization; message metadata remains frozen for the
+  scan and its route binding/page cursor is unchanged.
+  A present mismatched route or a route removed after registration still fails
+  the whole query with `ROUTE_CHANGED`, even alongside an unused pin. Restored
+  routes count as initialized; initialization history is volatile with the broker.
 - `bridge_message_get({message_id, max_chars?, cursor?})` reads exact body windows,
   default 8000, maximum 16000 Unicode code points. It returns offsets, total
   UTF-8 bytes/characters and SHA-256. Concatenate windows without normalization.
@@ -202,7 +213,10 @@ encoded metadata per scan and 16 MiB across retained snapshots; a 128 KiB encode
 list-items/body-response budget below the broker's 1 MiB frame ceiling; and 8192
 retained ACK receipts globally. A single metadata item over 64 KiB is refused.
 One-page scans do not retain a snapshot slot. Multipage snapshots and receipts
-expire one hour after creation/ACK, without sliding on retry. Capacity is reserved
+expire one hour after creation/ACK, without sliding on retry. Even after the final
+page has been read, completed multipage scans retain their slot until that
+original one-hour expiry. With all 16 global slots retained, a
+17th fresh multipage scan fails `CAPACITY_EXCEEDED`. Capacity is checked
 before a snapshot is admitted or a message ACKed; unexpired records and pending
 payloads are never silently evicted to make room. `CAPACITY_EXCEEDED` leaves the
 message unconsumed. No new inbox state is written to the facade operation ledger
