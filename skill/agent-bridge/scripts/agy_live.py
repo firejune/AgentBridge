@@ -28,6 +28,11 @@ BENIGN_WAKE_ERRORS = (
 CSRF_RE = re.compile(r'--csrf_token(?:=|\s+)([0-9a-fA-F-]+)')
 APP_DIR_RE = re.compile(r'--app_data_dir(?:=|\s+)(antigravity(?:-ide)?)(?:\s|$)')
 LSP_FLAG_RE = re.compile(r'(?:^|\s)--enable_lsp(?:\s|$)')
+HUB_FLAG_RE = re.compile(r'(?:^|\s)--hub(?:\s|$)')
+HUB_PORT_RE = re.compile(r'--hub-port(?:=|\s+)(\d+)(?:\s|$)')
+ADD_DIR_RE = re.compile(r'--add-dir(?:=|\s+)(\S+)')
+SUBCLIENT_IDE_RE = re.compile(r'--subclient_type(?:=|\s+)ide(?:\s|$)')
+AGY_BIN_RE = re.compile(r'(?:^|[\s/])agy(?:\s|$)')
 PORT_RE = re.compile(r'(?:127\.0\.0\.1|localhost|\[::1\]):(\d+)\s+\(LISTEN\)')
 ORIGIN_CHARS = re.compile(r'[^A-Za-z0-9%:_/.\-]')
 
@@ -133,7 +138,53 @@ def validate_override_url(url):
     return f'{parsed.scheme}://{parsed.hostname}:{parsed.port}'
 
 
-def _connect_candidate(pid, app_dir, csrf, timeout=5):
+def server_host(server):
+    if isinstance(server, dict):
+        host = server.get('host')
+        if host in ('desktop', 'ide'):
+            return host
+        if server.get('app_dir') == 'antigravity-ide':
+            return 'ide'
+    return 'desktop'
+
+
+def _parse_server_command(cmd):
+    if LSP_FLAG_RE.search(cmd):
+        return None
+    is_lang_server = 'language_server' in cmd
+    is_agy_hub = bool(HUB_FLAG_RE.search(cmd) and AGY_BIN_RE.search(cmd))
+    if not is_lang_server and not is_agy_hub:
+        return None
+    app_match = APP_DIR_RE.search(cmd)
+    csrf_match = CSRF_RE.search(cmd)
+    if not app_match or not csrf_match:
+        return None
+    app_dir = app_match.group(1)
+    csrf = csrf_match.group(1)
+    host = 'ide' if (is_agy_hub or app_dir == 'antigravity-ide' or SUBCLIENT_IDE_RE.search(cmd)) else 'desktop'
+    port_match = HUB_PORT_RE.search(cmd)
+    hub_port = int(port_match.group(1)) if port_match else None
+    add_dirs = []
+    for match in ADD_DIR_RE.finditer(cmd):
+        raw = match.group(1).strip()
+        if raw:
+            try:
+                resolved = str(Path(raw).expanduser().resolve())
+            except (OSError, ValueError):
+                resolved = raw
+            if resolved not in add_dirs:
+                add_dirs.append(resolved)
+    return {
+        'app_dir': app_dir,
+        'csrf': csrf,
+        'host': host,
+        'is_agy_hub': is_agy_hub,
+        'hub_port': hub_port,
+        'add_dirs': tuple(add_dirs),
+    }
+
+
+def _connect_candidate(pid, app_dir, csrf, timeout=5, host=None, add_dirs=(), hub_port=None):
     try:
         lsof_out = subprocess.check_output(
             ['lsof', '-Pan', '-p', str(pid), '-iTCP', '-sTCP:LISTEN'],
@@ -149,13 +200,17 @@ def _connect_candidate(pid, app_dir, csrf, timeout=5):
             port = int(match.group(1))
             if port not in ports:
                 ports.append(port)
+    if hub_port and hub_port not in ports:
+        ports.append(hub_port)
 
     if not ports:
         raise DeliveryError(f'Antigravity {app_dir} language_server (pid {pid}) has no loopback listening port')
 
+    resolved_host = host or ('ide' if app_dir == 'antigravity-ide' else 'desktop')
     last_error = None
     for port in ports:
-        for scheme in ('https', 'http'):
+        schemes = ('http', 'https') if port == hub_port else ('https', 'http')
+        for scheme in schemes:
             url = f'{scheme}://127.0.0.1:{port}'
             try:
                 data = rpc_call(url, csrf, 'GetAllCascadeTrajectories', {}, timeout=timeout)
@@ -164,6 +219,8 @@ def _connect_candidate(pid, app_dir, csrf, timeout=5):
                     return {
                         'pid': pid,
                         'app_dir': app_dir,
+                        'host': resolved_host,
+                        'add_dirs': tuple(add_dirs or ()),
                         'url': url,
                         'csrf': csrf,
                         'summaries': summaries,
@@ -184,7 +241,15 @@ def discover_servers(timeout=5):
         summaries = trajectory_summaries(data)
         if summaries is None:
             raise DeliveryError('Antigravity server did not return trajectorySummaries')
-        return [{'pid': os.getpid(), 'app_dir': 'antigravity', 'url': url, 'csrf': override_csrf, 'summaries': summaries}]
+        return [{
+            'pid': os.getpid(),
+            'app_dir': 'antigravity',
+            'host': 'desktop',
+            'add_dirs': (),
+            'url': url,
+            'csrf': override_csrf,
+            'summaries': summaries,
+        }]
 
     uid = os.getuid()
     try:
@@ -192,7 +257,9 @@ def discover_servers(timeout=5):
     except (OSError, subprocess.SubprocessError) as error:
         raise DeliveryError(f'Failed to inspect local processes for Antigravity: {error}') from None
 
-    by_app_dir = {}
+    desktop_items = []
+    legacy_ide_items = []
+    hub_ide_items = []
     for line in ps_out.splitlines():
         parts = line.strip().split(None, 2)
         if len(parts) < 3:
@@ -201,30 +268,40 @@ def discover_servers(timeout=5):
             pid, proc_uid = int(parts[0]), int(parts[1])
         except ValueError:
             continue
-        cmd = parts[2]
-        if proc_uid != uid or 'language_server' not in cmd or LSP_FLAG_RE.search(cmd):
+        if proc_uid != uid:
             continue
-        app_match = APP_DIR_RE.search(cmd)
-        csrf_match = CSRF_RE.search(cmd)
-        if app_match and csrf_match:
-            app_dir = app_match.group(1)
-            by_app_dir.setdefault(app_dir, []).append((pid, csrf_match.group(1)))
+        parsed = _parse_server_command(parts[2])
+        if not parsed:
+            continue
+        entry = (pid, parsed)
+        if parsed['host'] == 'desktop':
+            desktop_items.append(entry)
+        elif parsed['is_agy_hub']:
+            hub_ide_items.append(entry)
+        else:
+            legacy_ide_items.append(entry)
 
-    if not by_app_dir:
+    if not desktop_items and not legacy_ide_items and not hub_ide_items:
         raise DeliveryError('Antigravity language_server (desktop or IDE) is not running')
 
-    for app_dir, items in by_app_dir.items():
-        if len(items) > 1:
-            raise DeliveryError(f'{len(items)} Antigravity {app_dir} language_server processes found; not choosing one')
+    if len(desktop_items) > 1:
+        raise DeliveryError(f'{len(desktop_items)} Antigravity antigravity language_server processes found; not choosing one')
+    if len(legacy_ide_items) > 1:
+        raise DeliveryError(f'{len(legacy_ide_items)} Antigravity antigravity-ide language_server processes found; not choosing one')
 
     servers = []
     last_error = None
-    for app_dir in ('antigravity', 'antigravity-ide'):
-        if app_dir not in by_app_dir:
-            continue
-        pid, csrf = by_app_dir[app_dir][0]
+    for pid, info in (*desktop_items, *legacy_ide_items, *hub_ide_items):
         try:
-            servers.append(_connect_candidate(pid, app_dir, csrf, timeout=timeout))
+            servers.append(_connect_candidate(
+                pid,
+                info['app_dir'],
+                info['csrf'],
+                timeout=timeout,
+                host=info['host'],
+                add_dirs=info['add_dirs'],
+                hub_port=info['hub_port'],
+            ))
         except DeliveryError as error:
             last_error = error
 
@@ -237,20 +314,52 @@ def discover_server(timeout=5):
     return discover_servers(timeout=timeout)[0]
 
 
-# One language server per app serves every window of that app (measured on the
-# IDE with two windows open), so a host names exactly one server.
 HOST_APP_DIRS = {'desktop': 'antigravity', 'ide': 'antigravity-ide'}
 
 
-def discover_host_server(host='desktop', timeout=5):
-    app_dir = HOST_APP_DIRS.get(host)
-    if app_dir is None:
+def _server_matches_cwd(server, cwd):
+    if not cwd or not isinstance(server, dict):
+        return False
+    try:
+        target = Path(cwd).expanduser().resolve()
+    except (OSError, TypeError, ValueError):
+        return False
+    for raw in server.get('add_dirs') or ():
+        try:
+            folder = Path(raw).expanduser().resolve()
+        except (OSError, TypeError, ValueError):
+            continue
+        if target == folder or folder in target.parents:
+            return True
+    return False
+
+
+def discover_host_server(host='desktop', timeout=5, cwd=None):
+    if host not in HOST_APP_DIRS:
         raise DeliveryError(f'Unknown Antigravity host {host!r}; use desktop or ide')
-    for server in discover_servers(timeout=timeout):
-        if server.get('app_dir') == app_dir:
-            return server
-    label = 'desktop' if host == 'desktop' else 'IDE'
-    raise DeliveryError(f'Antigravity {label} language_server is not running')
+    candidates = [s for s in discover_servers(timeout=timeout) if server_host(s) == host]
+    if not candidates:
+        label = 'desktop' if host == 'desktop' else 'IDE'
+        raise DeliveryError(f'Antigravity {label} language_server is not running')
+    if host == 'ide' and cwd and len(candidates) > 1:
+        target_cwd = str(Path(cwd).expanduser().resolve())
+        exact = [s for s in candidates if target_cwd in (s.get('add_dirs') or ())]
+        if len(exact) == 1:
+            return exact[0]
+        if len(exact) > 1:
+            raise DeliveryError(f'{len(exact)} Antigravity IDE servers match workspace {target_cwd}; not choosing one')
+        matched = [s for s in candidates if _server_matches_cwd(s, target_cwd)]
+        if len(matched) == 1:
+            return matched[0]
+        if len(matched) > 1:
+            raise DeliveryError(f'{len(matched)} Antigravity IDE servers match workspace {target_cwd}; not choosing one')
+        in_summary = [
+            s for s in candidates
+            if any(_summary_cwd(item) == target_cwd for item in (s.get('summaries') or {}).values() if isinstance(item, dict))
+        ]
+        if len(in_summary) == 1:
+            return in_summary[0]
+    return candidates[0]
 
 
 def discover_desktop_server(timeout=5):
@@ -399,11 +508,44 @@ def resolve_model(server, requested_model=None, timeout=5):
     raise DeliveryError(f'Unknown Antigravity model {needle!r}{suffix}')
 
 
-def agy_row(sid, item, pid, fallback_cwd=None, app_dir='antigravity'):
+def _summary_cwd(item, fallback_cwd=None):
+    if not isinstance(item, dict):
+        return fallback_cwd
+    meta = item.get('trajectoryMetadata')
+    return (
+        extract_cwd(item.get('workspaces'))
+        or extract_cwd(meta.get('workspaces') if isinstance(meta, dict) else None)
+        or fallback_cwd
+    )
+
+
+def _workspace_affinity(server, cwd):
+    if server_host(server) == 'ide':
+        add_dirs = server.get('add_dirs') or ()
+        if add_dirs:
+            return 2 if _server_matches_cwd(server, cwd) else 0
+    return 1
+
+
+def _summary_rank(server, item, fallback_cwd=None):
+    if not isinstance(item, dict):
+        return (0, -1, '', 0)
+    is_running = 1 if normalize_status(item.get('status')) == 'running' else 0
+    try:
+        steps = int(item.get('stepCount') or 0)
+    except (TypeError, ValueError):
+        steps = 0
+    modified = str(item.get('lastModifiedTime') or '')
+    cwd = _summary_cwd(item, fallback_cwd)
+    affinity = _workspace_affinity(server, cwd)
+    return (is_running, steps, modified, affinity)
+
+
+def agy_row(sid, item, pid, fallback_cwd=None, app_dir='antigravity', host=None):
     sid = str(uuid.UUID(sid))
     raw_status = item.get('status', 'unknown') if isinstance(item, dict) else 'unknown'
-    cwd = extract_cwd(item.get('workspaces') if isinstance(item, dict) else None) or fallback_cwd
-    surface = 'IDE' if app_dir == 'antigravity-ide' else 'desktop'
+    cwd = _summary_cwd(item, fallback_cwd)
+    surface = 'IDE' if (host == 'ide' or app_dir == 'antigravity-ide') else 'desktop'
     annotations = item.get('annotations') if isinstance(item, dict) and isinstance(item.get('annotations'), dict) else {}
     title = (item.get('summary') if isinstance(item, dict) else None) or annotations.get('title') or None
     return {
@@ -424,31 +566,37 @@ def agy_row(sid, item, pid, fallback_cwd=None, app_dir='antigravity'):
 def list_agy(cwd=None, search=None, limit=100, timeout=5):
     servers = discover_servers(timeout=timeout)
     target_cwd = str(Path(cwd).expanduser().resolve()) if cwd else None
-    combined = []
+    best_by_sid = {}
     for server in servers:
         for cid, item in server['summaries'].items():
-            combined.append((server, cid, item))
-    combined.sort(
+            try:
+                sid = str(uuid.UUID(cid))
+            except ValueError:
+                continue
+            rank = _summary_rank(server, item)
+            prev = best_by_sid.get(sid)
+            if prev is None or rank > prev[0]:
+                best_by_sid[sid] = (rank, server, item)
+    combined = sorted(
+        ((server, sid, item) for sid, (_, server, item) in best_by_sid.items()),
         key=lambda entry: (entry[2].get('lastModifiedTime') or '') if isinstance(entry[2], dict) else '',
         reverse=True,
     )
     rows = []
-    seen_ids = set()
-    for server, cid, item in combined:
-        try:
-            sid = str(uuid.UUID(cid))
-        except ValueError:
-            continue
-        if sid in seen_ids:
-            continue
-        row = agy_row(sid, item, server['pid'], app_dir=server.get('app_dir', 'antigravity'))
+    for server, sid, item in combined:
+        row = agy_row(
+            sid,
+            item,
+            server['pid'],
+            app_dir=server.get('app_dir', 'antigravity'),
+            host=server.get('host'),
+        )
         if not row['cwd']:
             continue
         if target_cwd and str(Path(row['cwd']).resolve()) != target_cwd:
             continue
         if search and search.casefold() not in (row['name'] or '').casefold():
             continue
-        seen_ids.add(sid)
         rows.append(row)
     return {
         'sessions': rows[:limit],
@@ -461,45 +609,73 @@ def list_agy(cwd=None, search=None, limit=100, timeout=5):
 def resolve_agy(sid, timeout=5):
     sid = str(uuid.UUID(sid))
     servers = discover_servers(timeout=timeout)
-    prioritized = [s for s in servers if sid in s['summaries']] + [s for s in servers if sid not in s['summaries']]
+    in_summaries = [
+        (server, server['summaries'][sid])
+        for server in servers
+        if isinstance(server.get('summaries'), dict) and isinstance(server['summaries'].get(sid), dict)
+    ]
+    if in_summaries:
+        running = [pair for pair in in_summaries if normalize_status(pair[1].get('status')) == 'running']
+        if len(running) > 1:
+            raise DeliveryError(f'Antigravity session {sid} matched multiple live servers')
+        ranked = sorted(
+            in_summaries,
+            key=lambda pair: _summary_rank(pair[0], pair[1]),
+            reverse=True,
+        )
+        if len(ranked) > 1 and _summary_rank(ranked[0][0], ranked[0][1]) == _summary_rank(ranked[1][0], ranked[1][1]):
+            raise DeliveryError(f'Antigravity session {sid} matched multiple live servers')
+        candidates = ranked[:1]
+    else:
+        candidates = [(server, None) for server in servers]
+
     matches = []
     last_error = None
-    for server in prioritized:
-        summary_item = server['summaries'].get(sid)
+    for server, summary_item in candidates:
         meta = None
-        try:
-            meta_resp = rpc_call(
-                server['url'], server['csrf'], 'GetConversationMetadata',
-                {'conversationId': sid}, timeout=timeout,
-            )
-            meta = meta_resp.get('metadata')
-            if not isinstance(meta, dict):
-                nested = meta_resp.get('response', {}).get('conversationMetadata', {})
-                meta = nested.get('metadata') if isinstance(nested, dict) else None
-        except DeliveryError as error:
-            last_error = error
-            if not isinstance(summary_item, dict):
-                continue
-        if not isinstance(meta, dict) and not isinstance(summary_item, dict):
+        summary_cwd = _summary_cwd(summary_item)
+        if not summary_cwd:
+            try:
+                meta_resp = rpc_call(
+                    server['url'], server['csrf'], 'GetConversationMetadata',
+                    {'conversationId': sid}, timeout=timeout,
+                )
+                meta = meta_resp.get('metadata')
+                if not isinstance(meta, dict):
+                    nested = meta_resp.get('response', {}).get('conversationMetadata', {})
+                    meta = nested.get('metadata') if isinstance(nested, dict) else None
+            except DeliveryError as error:
+                last_error = error
+                if not isinstance(summary_item, dict):
+                    continue
+        if not isinstance(meta, dict) and not isinstance(summary_item, dict) and not summary_cwd:
             continue
         meta_cwd = extract_cwd(meta.get('workspaces') if isinstance(meta, dict) else None)
         row = agy_row(
             sid,
             summary_item or {},
             server['pid'],
-            fallback_cwd=meta_cwd,
+            fallback_cwd=summary_cwd or meta_cwd,
             app_dir=server.get('app_dir', 'antigravity'),
+            host=server.get('host'),
         )
         if not row['cwd']:
             last_error = DeliveryError(f'Antigravity session {sid} has no workspace directory')
             continue
         matches.append((server, row))
-        if sid in server['summaries']:
-            break
 
     if not matches:
         raise last_error or DeliveryError(f'Antigravity session {sid} is not found in any live desktop or IDE server')
     if len(matches) > 1:
+        ranked_matches = sorted(
+            matches,
+            key=lambda pair: _workspace_affinity(pair[0], pair[1]['cwd']),
+            reverse=True,
+        )
+        top_affinity = _workspace_affinity(ranked_matches[0][0], ranked_matches[0][1]['cwd'])
+        second_affinity = _workspace_affinity(ranked_matches[1][0], ranked_matches[1][1]['cwd'])
+        if top_affinity > second_affinity:
+            return ranked_matches[0]
         raise DeliveryError(f'Antigravity session {sid} matched multiple live servers')
     return matches[0]
 
@@ -516,7 +692,7 @@ def open_agy(cwd, title=None, model=None, timeout=5, host='desktop'):
     if not target_path.is_dir():
         raise DeliveryError(f'Workspace directory does not exist: {target_path}')
 
-    server = discover_host_server(host, timeout=timeout)
+    server = discover_host_server(host, timeout=timeout, cwd=str(target_path))
     model_info = resolve_model(server, model, timeout=timeout)
     # Desktop projects group conversations in its sidebar; the IDE takes the
     # workspace folder directly and lists every workspace's conversations.

@@ -486,6 +486,76 @@ class AgyLiveTests(unittest.TestCase):
         self.assertIsNone(agy_live.trajectory_summaries({'trajectorySummaries': []}))
         self.assertIsNone(agy_live.trajectory_summaries({'code': 'internal', 'message': 'registry unavailable'}))
 
+    def test_unified_agy_hub_ide_windows_coexist_with_desktop_and_pick_freshest_owner(self):
+        import agy_live
+
+        shared_sid = str(uuid.uuid4())
+        desktop_sid = str(uuid.uuid4())
+        win_a = self.root / 'win-a'
+        win_b = self.root / 'win-b'
+        win_a.mkdir()
+        win_b.mkdir()
+
+        with FakeAgyServer(self.root, desktop_sid) as desktop_srv, \
+                FakeAgyServer(win_a, str(uuid.uuid4())) as ide_a_srv, \
+                FakeAgyServer(win_b, shared_sid) as ide_b_srv:
+            # Desktop holds an older idle snapshot (stepCount=6) of shared_sid,
+            # while IDE window B holds the newer progress (stepCount=68).
+            desktop_srv.trajectories[shared_sid] = {
+                'summary': 'Unified Conversation',
+                'stepCount': 6,
+                'status': 'CASCADE_RUN_STATUS_IDLE',
+                'workspaces': [{'workspaceFolderAbsoluteUri': win_b.as_uri()}],
+                'lastModifiedTime': '2026-10-28T10:48:40Z',
+            }
+            ide_b_srv.trajectories[shared_sid] = {
+                'summary': 'Unified Conversation',
+                'stepCount': 68,
+                'status': 'CASCADE_RUN_STATUS_IDLE',
+                'workspaces': [{'workspaceFolderAbsoluteUri': win_b.as_uri()}],
+                'lastModifiedTime': '2026-10-28T10:55:26Z',
+            }
+            uid = os.getuid()
+            p_desk = desktop_srv.httpd.server_port
+            p_a = ide_a_srv.httpd.server_port
+            p_b = ide_b_srv.httpd.server_port
+            ps_text = (
+                f"3001 {uid} /Applications/Antigravity.app/Contents/Resources/bin/language_server "
+                f"--standalone --subclient_type hub --csrf_token {CSRF} --app_data_dir antigravity\n"
+                f"3002 {uid} /Users/test/.gemini/bin/agy --hub --hub-port={p_a} "
+                f"--app_data_dir=antigravity --csrf_token={CSRF} --add-dir={win_a}\n"
+                f"3003 {uid} /Users/test/.gemini/bin/agy --hub --hub-port={p_b} "
+                f"--app_data_dir=antigravity --csrf_token={CSRF} --add-dir={win_b}\n"
+            )
+            ports_by_pid = {'3001': p_desk, '3002': p_a, '3003': p_b}
+
+            def fake_check_output(cmd, *args, **kwargs):
+                if cmd[0] == 'ps':
+                    return ps_text
+                if cmd[0] == 'lsof':
+                    pid = cmd[cmd.index('-p') + 1]
+                    return f"agy {pid} user 10u IPv4 0x0 0t0 TCP 127.0.0.1:{ports_by_pid[pid]} (LISTEN)\n"
+                raise AssertionError(f"Unexpected command: {cmd}")
+
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop('AGENT_BRIDGE_AGY_URL', None)
+                os.environ.pop('AGENT_BRIDGE_AGY_CSRF', None)
+                with mock.patch('subprocess.check_output', side_effect=fake_check_output):
+                    listed = agy_live.list_agy()
+                    by_id = {row['id']: row for row in listed['sessions']}
+                    self.assertEqual(by_id[shared_sid]['pid'], 3003)
+                    self.assertIn('IDE', by_id[shared_sid]['scope'])
+
+                    srv, row = agy_live.resolve_agy(shared_sid)
+                    self.assertEqual((srv['pid'], srv['host'], row['pid']), (3003, 'ide', 3003))
+                    # Resolving an in-summary session must not trigger GetConversationMetadata on other servers.
+                    meta_calls_a = [p for p, _, _ in ide_a_srv.requests if p.endswith('/GetConversationMetadata')]
+                    self.assertEqual(meta_calls_a, [])
+
+                    # discover_host_server('ide', cwd=...) selects the matching window's agy --hub server.
+                    matched_srv = agy_live.discover_host_server('ide', cwd=str(win_b))
+                    self.assertEqual(matched_srv['pid'], 3003)
+
 if __name__ == '__main__':
     unittest.main()
 
