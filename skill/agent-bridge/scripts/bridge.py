@@ -363,13 +363,14 @@ def new_session_policy(args, provider):
                                      'Neither the desktop new-session link nor the IDE extension link carries a model; '
                                      'the session starts on the model its host picks.')
         return
+    host = getattr(args, 'host', 'desktop')
+    cwd = getattr(args, 'cwd', None)
+    server = agy_live.discover_host_server(host, cwd=cwd) if cwd else agy_live.discover_host_server(host)
     if model is not None:
-        server = agy_live.discover_host_server(getattr(args, 'host', 'desktop'))
         found = agy_live.resolve_model(server, model)
         models.require_allowed(policy, provider, model, found['model_id'], found['model_enum'], found.get('label'))
         args.model = found['model_id']
     else:
-        server = agy_live.discover_host_server(getattr(args, 'host', 'desktop'))
         found = agy_live.resolve_model(server, None)
         models.require_allowed(policy, provider, found['model_id'], found['model_enum'], found.get('label'))
 
