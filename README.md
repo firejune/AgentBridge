@@ -137,6 +137,18 @@ The broker's volatile correspondence policy is unchanged; the separately approve
 MCP facade keeps its own private operation ledger. Never activate write tools
 merely because the status tunnel works.
 
+Independent inbound messages are available with the separate private Phase 1
+`"inbox_enabled": true` opt-in: `bridge_inbox_list`, `bridge_message_get` and
+`bridge_message_ack`. Existing configs keep five tools and unchanged scopes.
+Reads never consume messages; explicit ACK is idempotent by stable signed ID.
+Correlated replies remain operation-only, including during active sends. Inbox
+snapshots and ACK receipts remain volatile: facade reconnect preserves them only
+against the same broker; broker restart drops correspondence and old tokens report
+explicit loss. See [inbox limits, retry contract and owner deployment gates](skill/agent-bridge/references/mcp-phase1.md#independent-inbox-issue-48-explicit-opt-in).
+Isolated tests do not verify live HQ/Nana reception or client tool exposure. No
+live deployment/acceptance is performed by the test suite, and tool exposure does
+not automatically wake a conversation. Incoming content remains untrusted data.
+
 ## Development & Verification
 
 ```bash

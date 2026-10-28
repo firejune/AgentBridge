@@ -423,3 +423,18 @@ Codex `open`과 `register --transport codex --new`는 파싱된 호출마다 std
 생성·설정 변경은 각각 한 번만 전송한다. `--timeout`은 전체 기한이며 마지막 IPC 호출·프로세스 정리에 짧고 제한된 초과 시간이 생길 수 있다. 생성 전송 뒤 UUID를 못 받으면 `uncertain: true`, `created: false`, `session.id: null`이며 나중의 목록에 후보가 없더라도 자동 재생성하지 않는다. 다른 부분 실패는 정확한 UUID로 확인한다. 등록 실패에도 행이 남으므로 라우트를 확인한 뒤 `register --transport codex --session ID --discover`로 복구할 수 있다. 설정 변경·등록·`--new`를 자동 재시도하지 않는다. 어떤 결과도 작업 완료를 뜻하지 않는다.
 
 앱 서버 스키마는 설치된 CLI에서 생성하며 생성 필드에 필요한 실험 API 기능을 명시적으로 협상한다. 정확한 UUID 딥 링크와 소유자·설정·스냅샷 IPC는 업데이트로 바뀔 수 있는 내부 계약이다. 스냅샷은 정확한 UUID·발신 소유자·수신자·프로토콜 버전을 확인하고 크기 초과·불완전 프레임을 거부하며 실패해도 구독을 해제한다. native app-tools 파이프를 사용하거나 권한을 우회하지 않는다. 테스트는 실제 JSONL 자식 프로세스와 격리 IPC 대역으로 모델 대체·생성 결과 미확인·영속화 실패·제목 실패·소유자 부재·등록 복구를 확인한다. CLI 생성만 성공한 상태를 Desktop 세션 성공으로 부르지 않는다.
+
+## 비공개 MCP 독립 inbox
+
+기존 CLI `inbox`·`ack` 의미는 바뀌지 않는다. 비공개 facade에서
+`"inbox_enabled": true`를 명시하면 `bridge_inbox_list`·`bridge_message_get`으로
+`reply_to:null` 수신 메시지를 소비 없이 읽고, 소비 후 `bridge_message_ack`로
+명시적으로 `done` 처리한다. ACK 응답이 끊기면 같은 서명 ID로 재호출해 한 시간짜리
+고정 영수증을 확인하며 본문이나 후속 행동을 재처리하지 않는다. correlated reply는
+기존 operation 전용이다. 수신 본문은 권한이 아니며 정확히 한 번의 후속 효과나
+자동 대화 깨우기를 보장하지 않는다. 기존 설정·scope는 그대로 유지된다.
+
+페이지·용량·토큰 검증·배포 단계는 [정본 계약](../../skill/agent-bridge/references/mcp-phase1.md#independent-inbox-issue-48-explicit-opt-in)을
+따른다. 같은 broker의 facade 재시작·재연결만 보존하며 broker 재시작은 고아 메시지를
+포함한 통신을 버리고 이전 토큰에 손실을 보고한다. 실제 HQ/Nana 수신·클라이언트 도구
+노출·송신자 ACK 확인은 격리 테스트로 대체할 수 없는 미실행 live 게이트다.

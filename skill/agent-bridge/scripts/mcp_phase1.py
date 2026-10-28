@@ -28,7 +28,10 @@ import sessions
 TOOLS = json.loads(Path(__file__).with_name('mcp_phase1_tools.json').read_text())['tools']
 SCOPES = {'bridge_status':'bridge:read', 'bridge_sessions_list':'bridge:read',
           'bridge_operation_get':'bridge:read', 'bridge_session_create':'bridge:session:create',
-          'bridge_message_send':'bridge:message:send'}
+          'bridge_message_send':'bridge:message:send',
+          'bridge_inbox_list':'bridge:read', 'bridge_message_get':'bridge:read',
+          'bridge_message_ack':'bridge:message:send'}
+INBOX_TOOLS = frozenset(('bridge_inbox_list', 'bridge_message_get', 'bridge_message_ack'))
 ACTIVE = ('accepted', 'running', 'unknown')
 STATES = {'pending','dispatching','submitted','received','in_progress','answered','done','failed','uncertain'}
 RETENTION = 720 * 3600  # Detailed records >=168h, full keys >=720h; tombstones never deleted.
@@ -68,12 +71,14 @@ def load_config(path):
     if not stat.S_ISREG(s.st_mode) or s.st_uid != os.getuid() or stat.S_IMODE(s.st_mode) != 0o600:
         raise ValueError('Phase 1 configuration must be owner-only (0600)')
     config = json.loads(Path(path).read_text())
-    if set(config) - {'pinned_sessions'} != {'principal','scopes','workspaces','state_dir','tunnel_id','writes_enabled'}:
+    if set(config) - {'pinned_sessions', 'inbox_enabled'} != {'principal','scopes','workspaces','state_dir','tunnel_id','writes_enabled'}:
         raise ValueError('Unexpected Phase 1 configuration fields')
     if config['writes_enabled'] is not True or not config['principal'] or not config['tunnel_id']:
         raise ValueError('An approved private tunnel owner mapping is required')
     if set(config['scopes']) != set(SCOPES.values()):
         raise ValueError('Phase 1 requires exactly the three bridge scopes')
+    if type(config.get('inbox_enabled', False)) is not bool:
+        raise ValueError('inbox_enabled must be a boolean')
     validate_workspaces(config['workspaces'])
     pinned_sessions(config)
     return config
@@ -236,6 +241,8 @@ class Engine:
     def __init__(self, config, backend, start=True):
         validate_workspaces(config['workspaces'])
         pinned_sessions(config)
+        if type(config.get('inbox_enabled', False)) is not bool:
+            raise ValueError('inbox_enabled must be a boolean')
         self.config, self.backend = config, backend
         self.principal = config['principal']
         self.scopes = frozenset(config['scopes'])
@@ -335,11 +342,13 @@ class Engine:
         return op
 
     def authorized(self, name, principal):
-        if principal != self.principal or SCOPES.get(name) not in self.scopes:
+        if (principal != self.principal or SCOPES.get(name) not in self.scopes
+                or (name in INBOX_TOOLS and not self.config.get('inbox_enabled', False))):
             raise Fault('NOT_AUTHORIZED')
 
     def tools(self):
-        return [t for t in TOOLS if SCOPES[t['name']] in self.scopes]
+        return [t for t in TOOLS if SCOPES[t['name']] in self.scopes
+                and (t['name'] not in INBOX_TOOLS or self.config.get('inbox_enabled', False))]
 
     def validate(self, name, args):
         if not isinstance(args, dict):
@@ -375,6 +384,8 @@ class Engine:
                 data = self.list_sessions(args,principal)
             elif name == 'bridge_operation_get':
                 data = self.get(args,principal)
+            elif name in INBOX_TOOLS:
+                data = self.inbox(name, args, principal)
             else:
                 raise Fault('INVALID_ARGUMENT')
             return {'ok':True,'data':data}
@@ -671,3 +682,124 @@ class Engine:
             output['result'] = {'type':'message_result','text':text[offset:end],'has_more':more,
                                 'next_cursor':self.cursor(principal,'result',op['operation_id'],end) if more else None}
         return output
+
+
+    def inbox_binding(self, principal):
+        return digest([principal, self.config['tunnel_id'], self.ledger_namespace])
+
+    def inbox_policy(self):
+        return digest([self.config['workspaces'], self.config.get('pinned_sessions', {})])
+
+    def inbox_sign(self, principal, kind, **fields):
+        doc = dict(fields, p=self.inbox_binding(principal), g=self.inbox_policy(), k=kind)
+        raw = json.dumps(doc, sort_keys=True, separators=(',', ':')).encode()
+        return base64.urlsafe_b64encode(raw + hmac.digest(self.cursor_key, raw, 'sha256')).decode().rstrip('=')
+
+    def inbox_token(self, token, principal, kind):
+        try:
+            decoded = base64.b64decode(token + '=' * (-len(token) % 4), altchars=b'-_', validate=True)
+            raw, signature = decoded[:-32], decoded[-32:]
+            if not hmac.compare_digest(signature, hmac.digest(self.cursor_key, raw, 'sha256')):
+                raise ValueError()
+            doc = json.loads(raw)
+            if (doc['p'], doc['g'], doc['k']) != (self.inbox_binding(principal), self.inbox_policy(), kind):
+                raise ValueError()
+            if doc.get('x', float('inf')) <= time.time():
+                raise Fault('CURSOR_EXPIRED')
+            return doc
+        except Fault:
+            raise
+        except Exception:
+            raise Fault('INVALID_ARGUMENT') from None
+
+    def inbox_routes(self, principal, selector=None):
+        if selector is not None:
+            owned = [self.session(selector, principal)]
+        else:
+            with self.lock:
+                owned = [json.loads(r[0]) for r in self.db.execute(
+                    'SELECT doc FROM owned_sessions WHERE principal=? ORDER BY id', (principal,))]
+            owned += list(pinned_sessions(self.config).values())
+        if len(owned) > 64:
+            raise Fault('CAPACITY_EXCEEDED')
+        routes = []
+        for session in sorted(owned, key=lambda s: s['id']):
+            self.allowed(session)
+            if not session.get('registered'):
+                continue
+            w = session['workspace']
+            routes.append({'slot': session['id'], 'route': {
+                'project': w['project'], 'name': session['sender'], 'cwd': w['cwd'],
+                'transport': 'realtime', 'session': None}})
+        if selector is not None and not routes:
+            raise Fault('NOT_FOUND')
+        return routes
+
+    def inbox_rpc(self, op, principal, routes, instance, **fields):
+        try:
+            return self.backend.rpc(op, owner=self.inbox_binding(principal),
+                context=digest([self.inbox_policy(), routes]), routes=routes, instance=instance, **fields)
+        except ValueError as error:
+            code = str(error)
+            known = {'BROKER_RESTARTED', 'ROUTE_CHANGED', 'CURSOR_EXPIRED', 'NOT_FOUND',
+                     'MESSAGE_UNAVAILABLE', 'ACK_EXPIRED', 'DELIVERY_UNKNOWN',
+                     'CAPACITY_EXCEEDED', 'INVALID_ARGUMENT', 'INBOX_ITEM_TOO_LARGE'}
+            fault = Fault(code if code in known else 'BACKEND_UNAVAILABLE')
+            if code == 'BROKER_RESTARTED':
+                fault.payload['correspondence_lost'] = True
+            raise fault from None
+        except OSError:
+            raise Fault('BACKEND_UNAVAILABLE') from None
+
+    def inbox_message(self, result, principal, epoch, routes):
+        result = dict(result)
+        mid = result.pop('id')
+        sid = result['agent_session_id']
+        own_route = [entry for entry in routes if entry['slot'] == sid]
+        result['message_id'] = self.inbox_sign(principal, 'message', e=epoch, o=mid, s=sid, r=digest(own_route))
+        return result
+
+    def inbox(self, name, args, principal):
+        if name == 'bridge_inbox_list':
+            cursor = self.inbox_token(args['cursor'], principal, 'inbox') if 'cursor' in args else None
+            selector = args.get('agent_session_id', cursor['s'] if cursor else None)
+            routes = self.inbox_routes(principal, selector)
+            count = args.get('limit', cursor['n'] if cursor else 20)
+            if cursor and (selector != cursor['s'] or digest(routes) != cursor['r'] or count != cursor['n']):
+                raise Fault('INVALID_ARGUMENT')
+            epoch = cursor['e'] if cursor else args.get('expected_broker_instance')
+            if cursor and 'expected_broker_instance' in args and args['expected_broker_instance'] != epoch:
+                raise Fault('INVALID_ARGUMENT')
+            if epoch is None:
+                try:
+                    epoch = self.backend.instance()
+                except Exception:
+                    raise Fault('BACKEND_UNAVAILABLE') from None
+            result = self.inbox_rpc('inbox_list', principal, routes, epoch, limit=count,
+                snapshot=cursor['o'] if cursor else None, offset=cursor['i'] if cursor else 0)
+            token = self.inbox_sign(principal, 'inbox', e=epoch, o=result['snapshot'], s=selector,
+                r=digest(routes), n=count, i=result['offset'], x=result['expires']) if result['has_more'] else None
+            return {'messages': [self.inbox_message(m, principal, epoch, routes) for m in result['messages']],
+                    'has_more': result['has_more'], 'next_cursor': token, 'broker_instance': epoch,
+                    'restart_policy': 'volatile; facade reconnect requires the same broker'}
+        handle = self.inbox_token(args['message_id'], principal, 'message')
+        routes = self.inbox_routes(principal, handle['s'])
+        if digest(routes) != handle['r']:
+            raise Fault('NOT_FOUND')
+        if name == 'bridge_message_ack':
+            result = self.inbox_rpc('inbox_ack', principal, routes, handle['e'], id=handle['o'])
+            result.pop('id')
+            result['message_id'] = args['message_id']
+            return result
+        cursor = self.inbox_token(args['cursor'], principal, 'body') if 'cursor' in args else None
+        count = args.get('max_chars', cursor['n'] if cursor else 8000)
+        if cursor and (cursor['h'] != digest(args['message_id']) or cursor['n'] != count
+                       or cursor['r'] != digest(routes) or cursor['e'] != handle['e']):
+            raise Fault('INVALID_ARGUMENT')
+        result = self.inbox_rpc('inbox_get', principal, routes, handle['e'], id=handle['o'],
+            offset=cursor['i'] if cursor else 0, max_chars=count)
+        result = self.inbox_message(result, principal, handle['e'], routes)
+        result['next_cursor'] = self.inbox_sign(principal, 'body', e=handle['e'], r=digest(routes),
+            h=digest(args['message_id']), n=count, i=result['end'],
+            x=cursor['x'] if cursor else time.time() + broker.INBOX_TTL) if result['has_more'] else None
+        return result
