@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import ssl
 import subprocess
 import time
@@ -248,9 +249,39 @@ def _parse_ps_line(line):
         return None
 
 
+# TODO(remove-when-upstream-fixed): Antigravity IDE's `extensions/agy` spawns
+# `~/.gemini/bin/agy --hub` with stdin bound to `/dev/null` and without
+# `--parent_pipe_path`. When the Extension Host (`Antigravity IDE Helper (Plugin)`)
+# exits before its async `deactivate()` hook finishes, `agy --hub` is reparented
+# to `launchd` (PPID == 1) and stays alive indefinitely. Remove this automatic
+# orphan reaper once upstream Antigravity binds `agy --hub` to its parent lifetime.
+def _terminate_orphaned_server(pid):
+    if not isinstance(pid, int) or pid <= 1:
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except OSError:
+        return False
+
+
+def _has_running_trajectory(summaries):
+    if not isinstance(summaries, dict):
+        return False
+    return any(
+        isinstance(info, dict) and normalize_status(info.get('status')) == 'running'
+        for info in summaries.values()
+    )
+
+
 def _drop_orphans_if_live_present(entries):
     live = [entry for entry in entries if not entry[1].get('orphaned')]
-    return live if live else entries
+    if live:
+        for pid, info in entries:
+            if info.get('orphaned'):
+                _terminate_orphaned_server(pid)
+        return live
+    return entries
 
 
 def discover_servers(timeout=5):
@@ -318,9 +349,10 @@ def discover_servers(timeout=5):
 
     servers = []
     last_error = None
+    reaped_orphan = False
     for pid, info in (*desktop_items, *legacy_ide_items, *hub_ide_items):
         try:
-            servers.append(_connect_candidate(
+            candidate = _connect_candidate(
                 pid,
                 info['app_dir'],
                 info['csrf'],
@@ -330,11 +362,23 @@ def discover_servers(timeout=5):
                 hub_port=info['hub_port'],
                 ppid=info.get('ppid'),
                 orphaned=info.get('orphaned', False),
-            ))
+            )
         except DeliveryError as error:
-            last_error = error
+            if info.get('orphaned'):
+                _terminate_orphaned_server(pid)
+                reaped_orphan = True
+            else:
+                last_error = error
+            continue
+        if candidate.get('orphaned') and not _has_running_trajectory(candidate.get('summaries')):
+            _terminate_orphaned_server(pid)
+            reaped_orphan = True
+            continue
+        servers.append(candidate)
 
     if not servers:
+        if reaped_orphan and last_error is None:
+            raise DeliveryError('Antigravity language_server (desktop or IDE) is not running')
         raise last_error or DeliveryError('Unable to connect to any Antigravity language_server')
     return servers
 

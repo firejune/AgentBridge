@@ -572,6 +572,7 @@ class AgyLiveTests(unittest.TestCase):
         with FakeAgyServer(self.root, str(uuid.uuid4())) as orphan_srv, \
                 FakeAgyServer(repo_a, str(uuid.uuid4())) as ide_a_srv, \
                 FakeAgyServer(repo_b, str(uuid.uuid4())) as ide_b_srv:
+            orphan_srv.trajectories.clear()
             # Orphan holds a higher stepCount for idle_sid, while live ide_b_srv holds a lower stepCount.
             orphan_srv.trajectories[idle_sid] = {
                 'summary': 'Idle Worker',
@@ -628,7 +629,8 @@ class AgyLiveTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {}, clear=False):
                 os.environ.pop('AGENT_BRIDGE_AGY_URL', None)
                 os.environ.pop('AGENT_BRIDGE_AGY_CSRF', None)
-                with mock.patch('subprocess.check_output', side_effect=fake_check_output):
+                with mock.patch('subprocess.check_output', side_effect=fake_check_output), \
+                        mock.patch('os.kill') as fake_kill:
                     # 1) Unmatched workspace skips orphaned pid 4000 (ppid=1) and picks first live IDE server (4001).
                     unmatched_srv = agy_live.discover_host_server('ide', cwd=str(self.root))
                     self.assertEqual(unmatched_srv['pid'], 4001)
@@ -641,9 +643,16 @@ class AgyLiveTests(unittest.TestCase):
                     srv_idle, row_idle = agy_live.resolve_agy(idle_sid)
                     self.assertEqual((srv_idle['pid'], row_idle['pid']), (4002, 4002))
 
-                    # 4) Actively running session still resolves to the running server (4000).
+                    # 4) Actively running session still resolves to the running server (4000) and is not killed.
                     srv_run, row_run = agy_live.resolve_agy(running_sid)
                     self.assertEqual((srv_run['pid'], row_run['status']), (4000, 'running'))
+                    fake_kill.assert_not_called()
+
+                    # 5) Once the orphan has no running trajectories, discover_servers() sends SIGTERM and drops it.
+                    orphan_srv.trajectories[running_sid]['status'] = 'CASCADE_RUN_STATUS_IDLE'
+                    discovered = agy_live.discover_servers()
+                    self.assertEqual([s['pid'] for s in discovered], [4001, 4002])
+                    fake_kill.assert_called_once_with(4000, agy_live.signal.SIGTERM)
 
 if __name__ == '__main__':
     unittest.main()
