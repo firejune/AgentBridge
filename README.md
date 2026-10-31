@@ -169,7 +169,7 @@ Supervision is opt-in: `install-service` installs a per-user launchd agent; `uni
 
 ## Subscription limits (Codex, Antigravity)
 
-**Antigravity (#34)**: a second collector thread reads `GetCascadeModelConfigData` from whichever Antigravity language server runs (one RPC, no tokens). Each model carries `quotaInfo { remainingFraction, resetTime }`, the figures the app shows; models of one family share them, so the buckets are `agy/gemini` and `agy/partner` (every non-Gemini model), split per model only if a family disagrees. No window length is reported. History goes to `<state-dir>/usage/agy.jsonl`; query with `usage --provider agy`.
+**Antigravity (#34)**: a second collector thread reads `GetCascadeModelConfigData` from whichever Antigravity language server runs (one RPC, no tokens). Each model carries `quotaInfo { remainingFraction, resetTime }`, the figures the app shows; models of one family share them, so the buckets are `agy/gemini` and `agy/partner` (every non-Gemini model), split per model only if a family disagrees. No window length is reported. History goes to `<state-dir>/usage/agy.jsonl`; `usage` shows all recorded providers by default (or filter with `usage --provider agy`).
 
 Each bucket line ends with a risk state (`holds until reset`, `AT RISK: empty ~T before reset`, `EXHAUSTED`, `risk unknown`), and every `send` / `ask` / `reply` to or from a `codex` or `agy` route carries the same lines as a `usage` field in the sender's output, so a command post sees them whenever it hands out work (#32).
 

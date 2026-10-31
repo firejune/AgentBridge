@@ -523,7 +523,7 @@ def main(argv=None):
                    help=f'Minutes between Codex limit reads (0 = off, minimum {usage.MIN_INTERVAL_MINUTES})')
     p.add_argument('--codex-executable',default='codex')
     p = sub.add_parser('usage',help='Recorded subscription limits; reads the history file, starts nothing')
-    p.add_argument('--provider',choices=list(usage.PROVIDERS),default='codex')
+    p.add_argument('--provider',choices=['all', *usage.PROVIDERS],default='all')
     p.add_argument('--state-dir',help='Broker state directory (default: socket path with .state suffix)')
     p.add_argument('--since',default='6h',help='Burn-rate and reset window, e.g. 90m, 6h, 2d')
     p.add_argument('--json',action='store_true',help='Full records and summary')
@@ -653,8 +653,9 @@ def main(argv=None):
                     print(usage.format_events(summary, summary['announcements']), flush=True)
             elif args.json:
                 cutoff = moment-usage.parse_since(args.since)
+                payload = {k: v for k, v in summary.items() if k != 'summaries'}
                 output(dict(records=[r for r in records if usage.parse_time(r['observed_at'])>=cutoff],
-                            **summary))
+                            **payload))
             else:
                 print(usage.format_summary(summary, moment), flush=True)
             return 0

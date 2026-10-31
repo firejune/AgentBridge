@@ -155,7 +155,9 @@ def read_agy(timeout=10):
     """One read-only RPC on whichever Antigravity language server is running."""
     import agy_live  # local: keeps Codex-only use free of the Antigravity module
     servers = agy_live.discover_servers(timeout=timeout)
-    return agy_live.rpc_call(servers[0]['url'], servers[0]['csrf'], 'GetCascadeModelConfigData', {}, timeout=timeout)
+    live = [s for s in servers if not s.get('orphaned')]
+    server = (live or servers)[0]
+    return agy_live.rpc_call(server['url'], server['csrf'], 'GetCascadeModelConfigData', {}, timeout=timeout)
 
 
 SOURCES = {'codex': SOURCE, 'agy': AGY_SOURCE}
@@ -244,7 +246,11 @@ class UsageStore:
         kept = []
         for item in new:
             previous = last.get((item['limit_id'], item['slot']))
-            same = previous is not None and same_reset(previous['resets_at'], item['resets_at']) and all(
+            same_window = (same_reset(previous['resets_at'], item['resets_at'])
+                           or (item.get('provider') == 'agy'
+                               and previous['used_percent'] == 0
+                               and item['used_percent'] == 0)) if previous is not None else False
+            same = previous is not None and same_window and all(
                 previous[field] == item[field] for field in (
                     'used_percent', 'window_mins', 'allowed', 'reset_credits', 'status'))
             if same and (now - parse_time(previous['observed_at'])).total_seconds() < DEDUP_SECONDS:
@@ -438,6 +444,12 @@ def parse_since(value):
 
 
 def is_reset(before, after):
+    if before.get('provider') == 'agy':
+        # Antigravity reports a rolling `now + 5h` resetTime while used_percent == 0,
+        # and active fractions jitter slightly within the same resetTime window.
+        return (bool(before['used_percent'])
+                and after['used_percent'] < before['used_percent']
+                and not same_reset(before['resets_at'], after['resets_at']))
     if after['used_percent'] < before['used_percent']:
         return True
     if before['resets_at'] is None or after['resets_at'] is None:
@@ -603,10 +615,21 @@ def horizons(official, guess):
                 stop_risk_horizon=official)
 
 
+def _valid_event(item, provider):
+    if provider == 'agy':
+        return (bool(item.get('used_before'))
+                and item.get('used_after') is not None
+                and item['used_after'] < item['used_before']
+                and not same_reset(item.get('resets_at_before'), item.get('resets_at_after')))
+    return True
+
+
 def all_events(store_dir, records, provider='codex'):
     """Persisted events plus those derivable from the current samples, de-duplicated."""
     merged, known = [], set()
     for item in EventStore(store_dir, provider=provider).load() + detect(records):
+        if not _valid_event(item, provider):
+            continue
         if event_key(item) not in known:
             known.add(event_key(item))
             merged.append(item)
@@ -647,6 +670,8 @@ def window_name(minutes):
 
 
 def format_summary(summary, now):
+    if 'summaries' in summary:
+        return '\n'.join(format_summary(item, now) for item in summary['summaries'])
     lines = []
     for row in summary['buckets']:
         name = f"{row['provider']}/{row['limit_id']}" + ('' if row['slot'] == 'primary' else f"/{row['slot']}")
@@ -738,17 +763,16 @@ def format_events(summary, announcements):
         stop = 'unknown' if row['stop_risk_horizon'] is None else f"{local(row['stop_risk_horizon'])} (official resets_at)"
         lines.append(f"spend horizon: {spend}")
         lines.append(f"stop risk horizon: {stop}")
-    if not summary['buckets']:
+    if 'summaries' in summary:
+        for item in summary['summaries']:
+            if not item['buckets']:
+                lines.append(f"{item.get('provider', 'codex')}: unknown (no successful read recorded)")
+    elif not summary['buckets']:
         lines.append(f"{summary.get('provider', 'codex')}: unknown (no successful read recorded)")
     return '\n'.join(lines)
 
 
-def query(state_dir, since='6h', provider='codex', now=None):
-    """Reads the history, event and announcement files; never collects or calls anything."""
-    if provider not in PROVIDERS:
-        raise ValueError(f'Collected providers are {", ".join(PROVIDERS)}')
-    now = now or datetime.now(timezone.utc)
-    directory = Path(state_dir).expanduser() / 'usage'
+def _query_one(directory, since, provider, now):
     records = UsageStore(directory, provider=provider).load()
     # Promo-reset announcements exist only for Codex.
     announcements = announced(AnnouncementStore(directory).load()) if provider == 'codex' else []
@@ -757,6 +781,34 @@ def query(state_dir, since='6h', provider='codex', now=None):
     summary['provider'] = provider
     assess(summary, records, now)
     summary['announcements'] = announcements
+    return records, summary
+
+
+def query(state_dir, since='6h', provider='codex', now=None):
+    """Reads the history, event and announcement files; never collects or calls anything."""
+    now = now or datetime.now(timezone.utc)
+    directory = Path(state_dir).expanduser() / 'usage'
+    if provider == 'all':
+        providers = [p for p in PROVIDERS if UsageStore(directory, provider=p).path.exists()] or list(PROVIDERS)
+        if len(providers) == 1:
+            records, summary = _query_one(directory, since, providers[0], now)
+            return records, summary, now
+        all_records, summaries = [], []
+        for item in providers:
+            records, summary = _query_one(directory, since, item, now)
+            all_records.extend(records)
+            summaries.append(summary)
+        combined = dict(
+            provider='all',
+            buckets=[row for item in summaries for row in item['buckets']],
+            last_failure=max((item['last_failure'] for item in summaries if item['last_failure']), default=None),
+            announcements=[a for item in summaries for a in item['announcements']],
+            summaries=summaries,
+        )
+        return all_records, combined, now
+    if provider not in PROVIDERS:
+        raise ValueError(f'Collected providers are {", ".join(PROVIDERS)}')
+    records, summary = _query_one(directory, since, provider, now)
     return records, summary, now
 
 

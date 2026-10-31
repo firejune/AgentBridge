@@ -97,7 +97,7 @@ python3 ~/.agents/skills/agent-bridge/scripts/bridge.py sessions --provider agy
 
 ## 구독 한도 (Codex, Antigravity)
 
-**Antigravity(#34)**: 두 번째 수집 스레드가 떠 있는 Antigravity language server에서 `GetCascadeModelConfigData`를 읽는다(RPC 한 번, 토큰 없음). 모델마다 앱이 보여 주는 `quotaInfo { remainingFraction, resetTime }`가 있고, 같은 계열 모델은 값을 공유하므로 버킷은 `agy/gemini`와 `agy/partner`(Gemini 아닌 모델 전부)다. 계열 안에서 값이 어긋나면 모델별로 나눈다. 창 길이는 알려 주지 않는다. 기록은 `<state-dir>/usage/agy.jsonl`, 조회는 `usage --provider agy`.
+**Antigravity(#34)**: 두 번째 수집 스레드가 떠 있는 Antigravity language server에서 `GetCascadeModelConfigData`를 읽는다(RPC 한 번, 토큰 없음). 모델마다 앱이 보여 주는 `quotaInfo { remainingFraction, resetTime }`가 있고, 같은 계열 모델은 값을 공유하므로 버킷은 `agy/gemini`와 `agy/partner`(Gemini 아닌 모델 전부)다. 계열 안에서 값이 어긋나면 모델별로 나눈다. 창 길이는 알려 주지 않는다. 기록은 `<state-dir>/usage/agy.jsonl`, `usage`는 기본으로 기록된 모든 공급자를 함께 보여 준다(`usage --provider agy`로만 필터링 가능).
 
 버킷 줄마다 위험 상태(`holds until reset`·`AT RISK: empty ~T before reset`·`EXHAUSTED`·`risk unknown`)가 붙고, `codex`·`agy` 라우트로 가거나 거기서 오는 `send`·`ask`·`reply`는 같은 줄을 보낸 쪽 출력의 `usage` 필드로 싣는다. 사령탑은 일을 맡길 때마다 그것을 보게 된다(#32).
 
