@@ -91,6 +91,12 @@ class SocketTests(unittest.TestCase):
         self.server=RunningBroker().__enter__()
         self.addCleanup(self.server.__exit__,None,None,None)
         self.server.register_pair()
+        # Native metadata is isolated too: protocol tests must never inspect the
+        # real user's Codex configuration/store after a fake owner accepts.
+        self.preview_path = patch.object(bridge.codex_preview, 'state_path',
+                                        return_value=Path(self.server.temp.name)/'missing.sqlite')
+        self.preview_path.start()
+        self.addCleanup(self.preview_path.stop)
 
     def send(self,key='socket-request'):
         return self.server.call('send',project='demo',sender_channel='beta',channel='alpha',body='Question',key=key)
@@ -206,12 +212,47 @@ class SocketTests(unittest.TestCase):
             self.assertEqual(bridge.push_if_peer(self.server.path,self.send())['state'],'submitted')
             self.assertEqual(len([c for c in desktop.calls if c.get('method')=='thread-follower-steer-turn']),1)
 
+    def test_codex_preview_runs_only_after_acceptance_and_keeps_peer_payload(self):
+        self.codex_route()
+        m=self.send()
+        def initialize(route, body):
+            self.assertEqual(self.server.call('show',id=m['id'])['state'],'submitted')
+            self.assertEqual(body,'Question')
+            return {'status':'unavailable','warning':'native store locked'}
+        with FakeDesktop() as desktop, patch.dict(os.environ, {'AGENT_BRIDGE_CODEX_IPC':desktop.path}), patch.object(bridge.codex_preview,'initialize',side_effect=initialize) as preview:
+            result=bridge.deliver(self.server.path,m['id'])
+            self.assertEqual(result['state'],'submitted')
+            self.assertEqual(result['preview']['status'],'unavailable')
+            preview.assert_called_once()
+            mutation=next(c for c in desktop.calls if c.get('method')=='thread-follower-steer-turn')
+            self.assertEqual(mutation['params']['input'],[])
+            self.assertEqual(mutation['params']['toolOutput']['name'],'agent_bridge')
+            self.assertIsNone(mutation['params']['toolOutput']['namespace'])
+            self.assertIn('Question',mutation['params']['toolOutput']['output'])
+        with patch.object(bridge.codex_preview,'initialize') as preview:
+            dry=self.send('dry')
+            with FakeDesktop() as desktop, patch.dict(os.environ, {'AGENT_BRIDGE_CODEX_IPC':desktop.path}):
+                bridge.deliver(self.server.path,dry['id'],dry_run=True)
+            preview.assert_not_called()
+
+    def test_codex_unexpected_preview_error_preserves_accepted_result(self):
+        self.codex_route()
+        m=self.send()
+        with FakeDesktop() as desktop, patch.dict(os.environ, {'AGENT_BRIDGE_CODEX_IPC':desktop.path}), patch.object(bridge.codex_preview,'initialize',side_effect=RuntimeError('SECRET_PREVIEW_ERROR')):
+            result=bridge.deliver(self.server.path,m['id'])
+            self.assertEqual(result['state'],'submitted')
+            self.assertEqual(result['preview']['status'],'unavailable')
+            self.assertNotIn('SECRET_PREVIEW_ERROR',str(result))
+            self.assertEqual(self.server.call('show',id=m['id'])['state'],'submitted')
+            self.assertEqual(len([c for c in desktop.calls if c.get('method')=='thread-follower-steer-turn']),1)
+
     def test_codex_uncertain_blocks_retry_and_other_messages_to_same_session(self):
         self.codex_route()
         m=self.send()
-        with FakeDesktop('disconnect') as desktop, patch.dict(os.environ, {'AGENT_BRIDGE_CODEX_IPC':desktop.path}):
+        with FakeDesktop('disconnect') as desktop, patch.dict(os.environ, {'AGENT_BRIDGE_CODEX_IPC':desktop.path}), patch.object(bridge.codex_preview,'initialize') as preview:
             with self.assertRaises(bridge.PushFailed) as raised:bridge.deliver(self.server.path,m['id'])
             self.assertEqual(raised.exception.message['state'],'uncertain')
+            preview.assert_not_called()
             with self.assertRaises(ValueError):bridge.deliver(self.server.path,m['id'])
             second=self.send('second')
             with self.assertRaisesRegex(ValueError,'active or uncertain'):bridge.deliver(self.server.path,second['id'])
