@@ -184,7 +184,7 @@ def _parse_server_command(cmd):
     }
 
 
-def _connect_candidate(pid, app_dir, csrf, timeout=5, host=None, add_dirs=(), hub_port=None):
+def _connect_candidate(pid, app_dir, csrf, timeout=5, host=None, add_dirs=(), hub_port=None, ppid=None, orphaned=False):
     try:
         lsof_out = subprocess.check_output(
             ['lsof', '-Pan', '-p', str(pid), '-iTCP', '-sTCP:LISTEN'],
@@ -218,6 +218,8 @@ def _connect_candidate(pid, app_dir, csrf, timeout=5, host=None, add_dirs=(), hu
                 if summaries is not None:
                     return {
                         'pid': pid,
+                        'ppid': ppid,
+                        'orphaned': bool(orphaned),
                         'app_dir': app_dir,
                         'host': resolved_host,
                         'add_dirs': tuple(add_dirs or ()),
@@ -228,6 +230,27 @@ def _connect_candidate(pid, app_dir, csrf, timeout=5, host=None, add_dirs=(), hu
             except DeliveryError as error:
                 last_error = error
     raise DeliveryError(f'Unable to connect to Antigravity {app_dir} language_server (pid {pid}): {last_error}')
+
+
+def _parse_ps_line(line):
+    parts4 = line.strip().split(None, 3)
+    if len(parts4) == 4:
+        try:
+            return int(parts4[0]), int(parts4[1]), int(parts4[2]), parts4[3]
+        except ValueError:
+            pass
+    parts3 = line.strip().split(None, 2)
+    if len(parts3) < 3:
+        return None
+    try:
+        return int(parts3[0]), None, int(parts3[1]), parts3[2]
+    except ValueError:
+        return None
+
+
+def _drop_orphans_if_live_present(entries):
+    live = [entry for entry in entries if not entry[1].get('orphaned')]
+    return live if live else entries
 
 
 def discover_servers(timeout=5):
@@ -243,6 +266,8 @@ def discover_servers(timeout=5):
             raise DeliveryError('Antigravity server did not return trajectorySummaries')
         return [{
             'pid': os.getpid(),
+            'ppid': os.getppid(),
+            'orphaned': False,
             'app_dir': 'antigravity',
             'host': 'desktop',
             'add_dirs': (),
@@ -253,7 +278,7 @@ def discover_servers(timeout=5):
 
     uid = os.getuid()
     try:
-        ps_out = subprocess.check_output(['ps', '-axo', 'pid=,uid=,command='], text=True, timeout=5)
+        ps_out = subprocess.check_output(['ps', '-axo', 'pid=,ppid=,uid=,command='], text=True, timeout=5)
     except (OSError, subprocess.SubprocessError) as error:
         raise DeliveryError(f'Failed to inspect local processes for Antigravity: {error}') from None
 
@@ -261,18 +286,17 @@ def discover_servers(timeout=5):
     legacy_ide_items = []
     hub_ide_items = []
     for line in ps_out.splitlines():
-        parts = line.strip().split(None, 2)
-        if len(parts) < 3:
+        row = _parse_ps_line(line)
+        if not row:
             continue
-        try:
-            pid, proc_uid = int(parts[0]), int(parts[1])
-        except ValueError:
-            continue
+        pid, ppid, proc_uid, cmd = row
         if proc_uid != uid:
             continue
-        parsed = _parse_server_command(parts[2])
+        parsed = _parse_server_command(cmd)
         if not parsed:
             continue
+        parsed['ppid'] = ppid
+        parsed['orphaned'] = (ppid is not None and ppid <= 1)
         entry = (pid, parsed)
         if parsed['host'] == 'desktop':
             desktop_items.append(entry)
@@ -283,6 +307,9 @@ def discover_servers(timeout=5):
 
     if not desktop_items and not legacy_ide_items and not hub_ide_items:
         raise DeliveryError('Antigravity language_server (desktop or IDE) is not running')
+
+    desktop_items = _drop_orphans_if_live_present(desktop_items)
+    legacy_ide_items = _drop_orphans_if_live_present(legacy_ide_items)
 
     if len(desktop_items) > 1:
         raise DeliveryError(f'{len(desktop_items)} Antigravity antigravity language_server processes found; not choosing one')
@@ -301,6 +328,8 @@ def discover_servers(timeout=5):
                 host=info['host'],
                 add_dirs=info['add_dirs'],
                 hub_port=info['hub_port'],
+                ppid=info.get('ppid'),
+                orphaned=info.get('orphaned', False),
             ))
         except DeliveryError as error:
             last_error = error
@@ -311,10 +340,43 @@ def discover_servers(timeout=5):
 
 
 def discover_server(timeout=5):
-    return discover_servers(timeout=timeout)[0]
+    servers = discover_servers(timeout=timeout)
+    for server in servers:
+        if not server.get('orphaned'):
+            return server
+    return servers[0]
 
 
 HOST_APP_DIRS = {'desktop': 'antigravity', 'ide': 'antigravity-ide'}
+
+
+def _git_main_worktree(cwd):
+    if not cwd:
+        return None
+    try:
+        target = Path(cwd).expanduser().resolve()
+    except (OSError, TypeError, ValueError):
+        return None
+    for candidate in (target, *target.parents):
+        git_marker = candidate / '.git'
+        try:
+            if not git_marker.is_file():
+                continue
+            first_line = git_marker.read_text(encoding='utf-8', errors='replace').splitlines()[0].strip()
+        except (OSError, IndexError):
+            continue
+        if not first_line.startswith('gitdir:'):
+            continue
+        raw_gitdir = first_line[len('gitdir:'):].strip()
+        if not raw_gitdir:
+            continue
+        try:
+            gitdir = (candidate / raw_gitdir).resolve()
+        except (OSError, ValueError):
+            continue
+        if gitdir.parent.name == 'worktrees' and gitdir.parent.parent.name == '.git':
+            return gitdir.parent.parent.parent.resolve()
+    return None
 
 
 def _server_matches_cwd(server, cwd):
@@ -324,6 +386,7 @@ def _server_matches_cwd(server, cwd):
         target = Path(cwd).expanduser().resolve()
     except (OSError, TypeError, ValueError):
         return False
+    main_repo = _git_main_worktree(target)
     for raw in server.get('add_dirs') or ():
         try:
             folder = Path(raw).expanduser().resolve()
@@ -331,13 +394,18 @@ def _server_matches_cwd(server, cwd):
             continue
         if target == folder or folder in target.parents:
             return True
+        if main_repo is not None and (main_repo == folder or folder in main_repo.parents):
+            return True
     return False
 
 
 def discover_host_server(host='desktop', timeout=5, cwd=None):
     if host not in HOST_APP_DIRS:
         raise DeliveryError(f'Unknown Antigravity host {host!r}; use desktop or ide')
-    candidates = [s for s in discover_servers(timeout=timeout) if server_host(s) == host]
+    candidates = [
+        s for s in discover_servers(timeout=timeout)
+        if server_host(s) == host and not s.get('orphaned')
+    ]
     if not candidates:
         label = 'desktop' if host == 'desktop' else 'IDE'
         raise DeliveryError(f'Antigravity {label} language_server is not running')
@@ -353,9 +421,19 @@ def discover_host_server(host='desktop', timeout=5, cwd=None):
             return matched[0]
         if len(matched) > 1:
             raise DeliveryError(f'{len(matched)} Antigravity IDE servers match workspace {target_cwd}; not choosing one')
+        main_repo = _git_main_worktree(target_cwd)
+        main_repo_str = str(main_repo) if main_repo is not None else None
         in_summary = [
             s for s in candidates
-            if any(_summary_cwd(item) == target_cwd for item in (s.get('summaries') or {}).values() if isinstance(item, dict))
+            if any(
+                _summary_cwd(item) == target_cwd
+                or (main_repo_str and (
+                    _summary_cwd(item) == main_repo_str
+                    or str(_git_main_worktree(_summary_cwd(item)) or '') == main_repo_str
+                ))
+                for item in (s.get('summaries') or {}).values()
+                if isinstance(item, dict)
+            )
         ]
         if len(in_summary) == 1:
             return in_summary[0]
@@ -529,8 +607,9 @@ def _workspace_affinity(server, cwd):
 
 def _summary_rank(server, item, fallback_cwd=None):
     if not isinstance(item, dict):
-        return (0, -1, '', 0)
+        return (0, 0, -1, '', 0)
     is_running = 1 if normalize_status(item.get('status')) == 'running' else 0
+    not_orphaned = 0 if (isinstance(server, dict) and server.get('orphaned')) else 1
     try:
         steps = int(item.get('stepCount') or 0)
     except (TypeError, ValueError):
@@ -538,7 +617,7 @@ def _summary_rank(server, item, fallback_cwd=None):
     modified = str(item.get('lastModifiedTime') or '')
     cwd = _summary_cwd(item, fallback_cwd)
     affinity = _workspace_affinity(server, cwd)
-    return (is_running, steps, modified, affinity)
+    return (is_running, not_orphaned, steps, modified, affinity)
 
 
 def agy_row(sid, item, pid, fallback_cwd=None, app_dir='antigravity', host=None):
