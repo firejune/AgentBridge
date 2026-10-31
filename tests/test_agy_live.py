@@ -556,6 +556,95 @@ class AgyLiveTests(unittest.TestCase):
                     matched_srv = agy_live.discover_host_server('ide', cwd=str(win_b))
                     self.assertEqual(matched_srv['pid'], 3003)
 
+    def test_orphaned_agy_hub_is_ignored_for_host_ide_and_worktrees_match_repo(self):
+        import agy_live
+
+        idle_sid = str(uuid.uuid4())
+        running_sid = str(uuid.uuid4())
+        repo_a = self.root / 'repo-a'
+        repo_b = self.root / 'repo-b'
+        wt_b = self.root / '.worktrees' / 'repo-b' / 'jinni-52'
+        (repo_b / '.git' / 'worktrees' / 'jinni-52').mkdir(parents=True)
+        repo_a.mkdir()
+        wt_b.mkdir(parents=True)
+        (wt_b / '.git').write_text(f"gitdir: {repo_b / '.git' / 'worktrees' / 'jinni-52'}\n", encoding='utf-8')
+
+        with FakeAgyServer(self.root, str(uuid.uuid4())) as orphan_srv, \
+                FakeAgyServer(repo_a, str(uuid.uuid4())) as ide_a_srv, \
+                FakeAgyServer(repo_b, str(uuid.uuid4())) as ide_b_srv:
+            # Orphan holds a higher stepCount for idle_sid, while live ide_b_srv holds a lower stepCount.
+            orphan_srv.trajectories[idle_sid] = {
+                'summary': 'Idle Worker',
+                'stepCount': 460,
+                'status': 'CASCADE_RUN_STATUS_IDLE',
+                'workspaces': [{'workspaceFolderAbsoluteUri': wt_b.as_uri()}],
+                'lastModifiedTime': '2026-10-31T11:03:38Z',
+            }
+            ide_b_srv.trajectories[idle_sid] = {
+                'summary': 'Idle Worker',
+                'stepCount': 448,
+                'status': 'CASCADE_RUN_STATUS_IDLE',
+                'workspaces': [{'workspaceFolderAbsoluteUri': wt_b.as_uri()}],
+                'lastModifiedTime': '2026-10-31T10:52:03Z',
+            }
+            # Orphan is still actively running running_sid.
+            orphan_srv.trajectories[running_sid] = {
+                'summary': 'Running Worker',
+                'stepCount': 633,
+                'status': 'CASCADE_RUN_STATUS_RUNNING',
+                'workspaces': [{'workspaceFolderAbsoluteUri': wt_b.as_uri()}],
+                'lastModifiedTime': '2026-10-31T11:05:07Z',
+            }
+            ide_b_srv.trajectories[running_sid] = {
+                'summary': 'Running Worker',
+                'stepCount': 592,
+                'status': 'CASCADE_RUN_STATUS_IDLE',
+                'workspaces': [{'workspaceFolderAbsoluteUri': wt_b.as_uri()}],
+                'lastModifiedTime': '2026-10-31T10:52:59Z',
+            }
+
+            uid = os.getuid()
+            p_orphan = orphan_srv.httpd.server_port
+            p_a = ide_a_srv.httpd.server_port
+            p_b = ide_b_srv.httpd.server_port
+            ps_text = (
+                f"4000 1 {uid} /Users/test/.gemini/bin/agy --hub --hub-port={p_orphan} "
+                f"--app_data_dir=antigravity --csrf_token={CSRF}\n"
+                f"4001 79989 {uid} /Users/test/.gemini/bin/agy --hub --hub-port={p_a} "
+                f"--app_data_dir=antigravity --csrf_token={CSRF} --add-dir={repo_a}\n"
+                f"4002 79990 {uid} /Users/test/.gemini/bin/agy --hub --hub-port={p_b} "
+                f"--app_data_dir=antigravity --csrf_token={CSRF} --add-dir={repo_b}\n"
+            )
+            ports_by_pid = {'4000': p_orphan, '4001': p_a, '4002': p_b}
+
+            def fake_check_output(cmd, *args, **kwargs):
+                if cmd[0] == 'ps':
+                    return ps_text
+                if cmd[0] == 'lsof':
+                    pid = cmd[cmd.index('-p') + 1]
+                    return f"agy {pid} user 10u IPv4 0x0 0t0 TCP 127.0.0.1:{ports_by_pid[pid]} (LISTEN)\n"
+                raise AssertionError(f"Unexpected command: {cmd}")
+
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop('AGENT_BRIDGE_AGY_URL', None)
+                os.environ.pop('AGENT_BRIDGE_AGY_CSRF', None)
+                with mock.patch('subprocess.check_output', side_effect=fake_check_output):
+                    # 1) Unmatched workspace skips orphaned pid 4000 (ppid=1) and picks first live IDE server (4001).
+                    unmatched_srv = agy_live.discover_host_server('ide', cwd=str(self.root))
+                    self.assertEqual(unmatched_srv['pid'], 4001)
+
+                    # 2) Worktree wt_b resolves its .git file to repo_b and selects pid 4002.
+                    wt_srv = agy_live.discover_host_server('ide', cwd=str(wt_b))
+                    self.assertEqual(wt_srv['pid'], 4002)
+
+                    # 3) Idle session prefers live server (4002) over orphaned server (4000).
+                    srv_idle, row_idle = agy_live.resolve_agy(idle_sid)
+                    self.assertEqual((srv_idle['pid'], row_idle['pid']), (4002, 4002))
+
+                    # 4) Actively running session still resolves to the running server (4000).
+                    srv_run, row_run = agy_live.resolve_agy(running_sid)
+                    self.assertEqual((srv_run['pid'], row_run['status']), (4000, 'running'))
+
 if __name__ == '__main__':
     unittest.main()
 
