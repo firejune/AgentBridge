@@ -1,189 +1,164 @@
-# Agent Bridge
+# Agent Bridge (한국어)
 
 [English](../../README.md) | **한국어**
 
-같은 머신에서 실행 중인 **Claude Code / Desktop (`claude-peer`) ↔ Codex / ChatGPT Desktop (`codex`) ↔ Antigravity IDE / Desktop (`agy`)** 및 로컬 CLI 에이전트(`realtime`/`claude`)의 세션을 조회하고, 프로젝트 채널을 통해 **기존 대화를 중단하지 않으면서 3자간(다자간) 실시간 질문·답변·진행 상황**을 주고받는 로컬 브릿지 도구다. Python 표준 라이브러리만 사용하며 메시지·전달 상태는 메모리에 유지하고, endpoint·채널 바인딩만 소유자 전용 파일에 저장한다.
+같은 머신의 **Claude Code / Desktop (`claude-peer`) ↔ Codex / ChatGPT Desktop (`codex`) ↔ Antigravity IDE / Desktop (`agy`)** 및 CLI 참가자(`realtime`/`claude`)가 실시간으로 질문·답변·진행 상황을 주고받는 로컬 브릿지다. Python 3.10+ 표준 라이브러리와 Unix 도메인 소켓만 사용하며 외부 패키지, API 키, 네트워크 포트가 필요 없다.
 
-- [스킬 진입점 (한국어)](SKILL.md) · [English](../../skill/agent-bridge/SKILL.md)
-- [명령·운영 사용법 (한국어)](usage.md) · [English](../../skill/agent-bridge/references/usage.md)
-- [Antigravity 내부 커맨드 레퍼런스](antigravity-commands.md)
-- 실행 코드 정본: [`skill/agent-bridge/scripts/`](../../skill/agent-bridge/scripts/)
+별도의 CLI 사본을 중복 실행하거나 라이브 세션을 `watch` 폴링 루프에 가두지 않고, 열려 있는 상대 세션으로 메시지를 직접 push해 진행 중인 작업을 중단하지 않으면서 다자간 협업을 수행한다.
 
-루트의 `bridge.py`, `broker.py`, `sessions.py`는 기존 명령 호환을 위한 심볼릭 링크다. 실제 코드는 `skill/agent-bridge/` 폴더 안에 한 벌만 유지한다.
+## 문서 구성
 
-## 3자간 라이브 세션 소통 구조 (v2)
+| 대상 | English | 한국어 |
+| --- | --- | --- |
+| 개요 및 빠른 시작 | [README.md](../../README.md) | [docs/ko/README.md](README.md) |
+| 에이전트 스킬 지침 | [skill/agent-bridge/SKILL.md](../../skill/agent-bridge/SKILL.md) | [docs/ko/SKILL.md](SKILL.md) |
+| 상세 CLI 및 프로토콜 레퍼런스 | [skill/agent-bridge/references/usage.md](../../skill/agent-bridge/references/usage.md) | [docs/ko/usage.md](usage.md) |
+| MCP Phase 1 명세 | [skill/agent-bridge/references/mcp-phase1.md](../../skill/agent-bridge/references/mcp-phase1.md) | — |
+| Antigravity IDE 내부 명령어 | — | [docs/ko/antigravity-commands.md](antigravity-commands.md) |
 
-초기에는 IDE 익스텐션이나 데스크톱과 별도 CLI 프로세스 간의 소켓 구독(`watch`)을 위해 시작했으나, 현재(v2)는 **Claude · Codex Desktop · Antigravity(IDE 및 Desktop) 3대 환경 모두 별도의 익스텐션, CLI 사본, 폴링 루프 없이 열려 있는 라이브 대화에 직접 push**한다.
+## 아키텍처 및 전송 방식
 
 ```mermaid
 flowchart LR
-    subgraph Live["열려 있는 라이브 세션 (Push · No Polling)"]
-        C["Claude Code / Desktop<br/>(--transport claude-peer)"]
-        X["Codex / ChatGPT Desktop<br/>(--transport codex)"]
-        A["Antigravity IDE & Desktop<br/>(--transport agy)"]
+    subgraph Live["라이브 세션 참가자 (Direct Push · No Polling)"]
+        C["Claude Code / Desktop<br/>(claude-peer)"]
+        X["Codex / ChatGPT Desktop<br/>(codex)"]
+        A["Antigravity IDE & Desktop<br/>(agy)"]
     end
-    B(("Agent Bridge Broker<br/>(Unix Socket · Memory)"))
-    R["CLI / 스크립트 참가자<br/>(--transport realtime · watch)"]
+    B(("메모리 브로커<br/>Unix socket"))
+    W["CLI 참가자<br/>(realtime · watch)"]
 
-    C <-->|"send / ask / reply<br/>peerProtocol 1 소켓 push"| B
-    X <-->|"send / ask / reply<br/>IPC steer-turn / start-turn"| B
-    A <-->|"send / ask / reply<br/>ConnectRPC SendAgentMessage + NEXT_INVOCATION"| B
-    R <-->|"send / reply / watch"| B
+    C <-->|"send / ask / reply<br/>peerProtocol 1"| B
+    X <-->|"send / ask / reply<br/>IPC steer-turn"| B
+    A <-->|"send / ask / reply<br/>SendAgentMessage + NEXT_INVOCATION"| B
+    W <-->|"send / reply / watch"| B
 ```
 
-| 대상 환경 | Transport | 세션 탐색 (`sessions`) | 전달 및 활성 턴 합류 방식 (비파괴 · No Interrupt) |
-| --- | --- | --- | --- |
-| **Claude Code / Desktop** | `claude-peer` | `~/.claude/sessions/<pid>.json` (`peerProtocol == 1`) | 수신 세션의 메시징 소켓에 `auth` + `user`(`priority: next`) 프레임을 직접 기록해 다음 스텝에 주입. 앱의 `claude://code/new` 링크로 Claude Code 데스크톱 신규 세션 열기(`open --provider claude --cwd PATH` 또는 `register --transport claude-peer --new --cwd PATH`)도 지원 — 미리 채워진 입력창에서 사람이 Enter를 누르면 세션이 시작된다. `--host ide`면 확장의 `/open` 링크로 Claude Code IDE 세션(Antigravity IDE·VS Code·Cursor)을 사람 단계 없이 연다 |
-| **Codex / ChatGPT Desktop** | `codex` | `codex app-server` 메타데이터 및 `~/.codex/ipc/ipc.sock` | 활성 턴이면 `thread-follower-steer-turn`(standalone `toolOutput`)으로 현재 턴에 합류, 유휴 상태면 `thread-follower-start-turn`으로 턴 시작 |
-| **Antigravity IDE & Desktop** | `agy` | 로컬 `language_server` ConnectRPC (`--app_data_dir antigravity-ide` 및 `antigravity`, `GetAllCascadeTrajectories`) | `--enable_lsp` LSP 워커를 자동 제외하고 Antigravity IDE(`Antigravity IDE live trajectory registry`)와 Agent Manager/Desktop(`Antigravity desktop live trajectory registry`) 세션을 동시에 탐색. Antigravity 데스크톱 신규 세션 생성(`open --cwd PATH` 또는 `register --transport agy --new --cwd PATH`)도 지원하고, `--host ide`면 아무 폴더에 Antigravity IDE 대화를 만든다. `SendAgentMessage`(`MESSAGE_PRIORITY_HIGH`)로 `<SYSTEM_MESSAGE>` 주입 후, 유휴/백그라운드 대기 시 빈 `SendUserCascadeMessage`(`NEXT_INVOCATION`)로 즉시 깨움 |
-| **전용 CLI / 실시간 소켓** | `realtime` / `claude` | 브로커 소켓 또는 `claude agents --json --all` | `realtime`은 `watch` 스트림 구독, `claude`는 유휴 전용 CLI 세션 읽기 전용 `--resume` |
-
-어느 에이전트에서든 `send`·`ask`·`reply`를 호출하면 상대방의 등록된 transport에 맞춰 해당 라이브 세션으로 즉시 들어간다. 다른 세션에서는 `bridge.py sessions --provider agy`로 열려 있는 Antigravity IDE·데스크톱 세션을 찾고, `bridge.py routes --project PROJECT`·`bridge.py channels --project PROJECT`로 등록된 라우트/채널을 확인한 뒤 `--transport agy --session UUID --discover`로 연결하거나, `bridge.py register NAME --project PROJECT --transport agy --new --cwd /path/to/workspace [--title TITLE] [--model MODEL]`로 새 Antigravity 데스크톱 세션(`--host ide`면 창이 없어도 아무 폴더의 Antigravity IDE 대화)을 즉시 생성·등록해 실시간 티키타카를 주고받는다. Claude Code 데스크톱도 `--transport claude-peer`로 같은 `--new`를 쓴다: `bridge.py register NAME --project PROJECT --transport claude-peer --new --cwd /path/to/workspace [--title 첫_메시지] [--timeout 초]`는 그 폴더의 새 세션 입력창을 첫 메시지가 채워진 채로 열고, 사람이 Enter를 누르면(앱이 묻는 경우 폴더 신뢰도) 새 라이브 세션을 등록한다. `--host ide [--ide antigravity-ide|vscode|cursor]`를 붙이면 그 폴더를 가진 IDE 창을 앞으로 가져와 확장의 새 대화 링크를 열고, 사람 단계 없이 새 라이브 세션을 등록한다.
-
-## 새 세션 열기
-
-`open --provider P --cwd PATH`는 세션을 만들고, `register NAME --project PROJECT --transport T --new --cwd PATH`는 만들어서 바로 등록한다. `--host`는 `claude`와 `agy`의 앱을 고른다(기본 `desktop`).
-
-| 공급자 | `--host` | 폴더 | 사람 단계 | 생성 시 모델 |
-| --- | --- | --- | --- | --- |
-| Claude Code (`claude-peer`) | `desktop` | 아무 폴더 (`claude://code/new?folder=`) | 채워진 입력창에서 Enter | 지정 불가 |
-| Claude Code (`claude-peer`) | `ide` (`--ide antigravity-ide\|vscode\|cursor`) | 창의 워크스페이스, 창 없는 폴더면 새 창이 뜬다 | 없음 | 지정 불가 |
-| Codex (`codex`) | — | 아무 폴더 | 없음 | `--model`, 정책, 없으면 `gpt-6.1-sol` |
-| Antigravity (`agy`) | `desktop` | 아무 폴더 (데스크톱 프로젝트가 있으면 매칭) | 없음 | `--model` 또는 정책 |
-| Antigravity (`agy`) | `ide` | 아무 폴더, 창 불필요 (IDE 서버 하나가 모든 창을 맡는다) | 없음 | `--model` 또는 정책 |
-
-자세한 내용: [SKILL.md](SKILL.md)와 [usage.md](usage.md).
-
-## 세션 닫기
-
-`close NAME --project PROJECT`는 참가자의 세션을 멈추거나 보관한 뒤 라우트를 지운다(`--keep-route`면 남긴다). 아무것도 영구 삭제하지 않는다. 영구 삭제는 소유자가 한다.
-
-| transport | `close`가 하는 일 | 되돌리기 |
+| 환경 | Transport | 전달 메커니즘 |
 | --- | --- | --- |
-| IDE 확장의 `claude-peer` | 등록된 그 CLI 프로세스에 SIGTERM. 탭에 "process exited with code 143"이 뜬다 | 그 탭에 입력하면 같은 세션이 이어진다 |
-| 데스크톱의 `claude-peer` | 등록된 그 CLI 프로세스에 SIGTERM. 앱에 「세션이 중단되었습니다」와 「다시 시도」가 뜬다 | 그 세션에 메시지를 보내면 같은 세션이 이어진다 |
-| `agy` | `{archived: true}` 주석 = 패널의 Archive 동작. `running`이면 거부 | 패널 밖에서의 복원은 미확인 |
-| `codex` | `unsupported`: 데스크톱이 스레드를 쥐고 있다 (AgentBridge #27) | — |
-| `realtime` / `claude` | 라우트만 지운다 | — |
+| **Claude Code / Desktop** | `claude-peer` | 살아 있는 세션의 메시징 소켓(`peerProtocol 1`)으로 직접 주입해 별도 CLI 프로세스를 띄우지 않고 다음 턴에 전달한다. |
+| **Codex / ChatGPT Desktop** | `codex` | `CODEX_HOME/ipc/ipc.sock`의 정확한 대화 소유자에 연결해 활성 턴이면 `thread-follower-steer-turn`(`toolOutput`)으로 합류하고, 유휴 상태면 새 턴을 시작한다. |
+| **Antigravity IDE & Desktop** | `agy` | 로컬 `language_server` / `agy --hub`의 ConnectRPC에 연결해 활성 턴에는 `<SYSTEM_MESSAGE>`(`SendAgentMessage`)로 합류하고, 유휴/대기 상태에는 빈 `SendUserCascadeMessage`(`NEXT_INVOCATION`)로 즉시 깨운다. |
+| **CLI 워커** | `realtime` / `claude` | `realtime`은 `watch`로 JSONL 이벤트를 구독한다. `claude`는 **쉬고 있는 전용 CLI 세션**만 `deliver` 시 읽기 전용 `plan` 모드로 `--resume`한다(라이브 세션에는 절대 사용하지 않는다). |
 
-호출한 Claude 세션 자신은 거부한다. 활성 채널을 가진 라우트는 지우지 않는다. 이 버전 이전에 뜬 브로커는 라우트를 지우려면 재시작이 필요하다고 알린다.
+## 글로벌 스킬 설치
 
-## 전역 스킬 연결
-
-로컬 환경에서는 아래 네 경로를 동일한 `skill/agent-bridge` 폴더로 심볼릭 링크해 공용으로 사용할 수 있다.
-
-- 공용 탐색·실행 경로: `~/.agents/skills/agent-bridge`
-- Codex: `~/.codex/skills/agent-bridge` (`$agent-bridge`)
-- Claude Code: `~/.claude/skills/agent-bridge` (`/agent-bridge`)
-- Antigravity (AGY): `~/.gemini/config/skills/agent-bridge` (`agent-bridge` 스킬)
-
-별도 실행 권한이나 자동 발신 권한을 추가하지 않는다. 스킬만 다른 곳에 설치할 때도 폴더 안의 스크립트와 참조 문서를 함께 유지한다.
+Claude Code, Codex, Antigravity가 동일한 브릿지 CLI를 참조하도록 글로벌 스킬 경로에 심볼릭 링크를 연결한다.
 
 ```bash
-python3 ~/.agents/skills/agent-bridge/scripts/bridge.py --help
-python3 ~/.agents/skills/agent-bridge/scripts/bridge.py sessions --provider all
-python3 ~/.agents/skills/agent-bridge/scripts/bridge.py sessions --provider agy
+mkdir -p ~/.agents/skills ~/.claude/skills ~/.gemini/config/skills
+ln -sfn "$(pwd)/skill/agent-bridge" ~/.agents/skills/agent-bridge
+ln -sfn "$(pwd)/skill/agent-bridge" ~/.claude/skills/agent-bridge
+ln -sfn "$(pwd)/skill/agent-bridge" ~/.gemini/config/skills/agent-bridge
 ```
 
-심볼릭 링크 설치이므로 저장소 위치를 옮기면 네 링크도 갱신해야 한다. 재시작하면 메시지·중복 방지 키·이벤트는 사라지고, endpoint·채널은 정확한 세션·작업 경로를 재검증해 복원한다. 사용할 수 없는 라이브 바인딩은 제거한다. 전역 스킬 설치가 브로커를 자동 기동하거나 AI 대화를 깨우지는 않는다.
-
-## 보존 상한·재시작·선택적 서비스
-
-`serve --max-messages 2048`은 메시지 보존 개수다. 상한에서는 보호되지 않은 `done`·`answered`·`failed` 중 가장 오래된 항목을 제거한다. `submitted`·`uncertain`은 완료가 아니며, 미처리·보호 항목만 남으면 새 전송·답변을 거부한다. 제거 시 중복 방지 키도 사라지므로 자동 재전송하지 않는다.
-
-`serve --state-dir PATH`는 소통 상태 중 endpoint·채널만 저장한다(기본: 소켓 확장자를 `.state`로 바꾼 디렉터리). 아래 한도 기록은 같은 디렉터리의 별도 파일이다. `stop`·Ctrl-C·SIGTERM은 열린 클라이언트도 닫는다. 재시작 시 진행 중 메시지 ID는 복원하지 않고 재시도도 없다.
-
-서비스는 명시적 `install-service`로 설치한다. `install-service --generate-only --plist /absolute/review/agent.plist`와 `plutil -lint /absolute/review/agent.plist`는 서비스 로드 없이 검토한다. KeepAlive는 `stop` 뒤에도 다시 기동하므로 계속 중지하려면 `uninstall-service`로 제거한다. 자세한 경로·복원·운영 계약은 [사용법](usage.md#라우팅-저장과-선택적-launchd)을 읽는다.
-
-## 구독 한도 (Codex, Antigravity)
-
-**Antigravity(#34)**: 두 번째 수집 스레드가 떠 있는 Antigravity language server에서 `GetCascadeModelConfigData`를 읽는다(RPC 한 번, 토큰 없음). 모델마다 앱이 보여 주는 `quotaInfo { remainingFraction, resetTime }`가 있고, 같은 계열 모델은 값을 공유하므로 버킷은 `agy/gemini`와 `agy/partner`(Gemini 아닌 모델 전부)다. 계열 안에서 값이 어긋나면 모델별로 나눈다. 창 길이는 알려 주지 않는다. 기록은 `<state-dir>/usage/agy.jsonl`, `usage`는 기본으로 기록된 모든 공급자를 함께 보여 준다(`usage --provider agy`로만 필터링 가능).
-
-버킷 줄마다 위험 상태(`holds until reset`·`AT RISK: empty ~T before reset`·`EXHAUSTED`·`risk unknown`)가 붙고, `codex`·`agy` 라우트로 가거나 거기서 오는 `send`·`ask`·`reply`는 같은 줄을 보낸 쪽 출력의 `usage` 필드로 싣는다. 사령탑은 일을 맡길 때마다 그것을 보게 된다(#32).
-
-브로커는 같은 프로세스의 데몬 스레드에서 Codex 구독 한도를 표본으로 읽는다. 서비스를 따로 설치하지 않는다. `serve --usage-interval 15`분마다(최소 5, `0`은 끔) 전용 `codex app-server --stdio`를 띄워 `initialize`·`initialized`·`account/rateLimits/read`만 보내고 프로세스를 끝낸다. 이 읽기는 스레드·턴을 시작하지 않고, 어느 세션에도 전달하지 않으며, 모델 토큰을 쓰지 않는다.
-
-표본은 `<state-dir>/usage/codex.jsonl`에 버킷·창마다 한 줄로 남는다: UTC의 `observed_at`·`resets_at`, `limit_id`, `slot`(`primary`/`secondary`), `used_percent`, `window_mins`, `allowed`, `reset_credits`, `source`, `status`(`ok`·`failed`, 보고된 리셋 시각이 이미 지났으면 `stale`). 계정 식별자와 플랜 이름은 쓰기 전에 버린다. 읽기 실패는 null로 저장되고 0%가 아니라 「알 수 없음」으로 표시된다. 값이 같으면(서버의 `resets_at`은 읽을 때마다 1초쯤 흔들리므로 60초 안의 차이는 같은 값으로 본다) 한 시간까지 건너뛰고, 실패는 최대 4시간까지 간격을 늘리며, 파일은 30일·5 MB 안에서 매번 원자적으로 교체된다.
+## 빠른 시작
 
 ```bash
-python3 bridge.py usage            # 버킷마다 한 줄
-python3 bridge.py usage --since 2d --json
+bridge_cli="$HOME/.agents/skills/agent-bridge/scripts/bridge.py"
+
+# 1. 브로커 상태 확인 및 기동 (기본 소켓: ~/.local/share/agent-bridge/bridge.sock)
+python3 "$bridge_cli" ping || python3 "$bridge_cli" serve
+
+# 2. 열려 있는 Claude · Codex · Antigravity 세션 조회
+python3 "$bridge_cli" sessions --cwd /path/to/workspace
+
+# 3. 기존 라이브 세션을 정확한 UUID로 등록
+python3 "$bridge_cli" register claude-main --project my-app --transport claude-peer \
+  --session CLAUDE_UUID --discover
+python3 "$bridge_cli" register codex-main --project my-app --transport codex \
+  --session CODEX_UUID --discover
+python3 "$bridge_cli" register agy-main --project my-app --transport agy \
+  --session AGY_UUID --discover
+
+# 4. 또는 새 라이브 세션을 열면서 즉시 등록
+python3 "$bridge_cli" register agy-worker --project my-app --transport agy \
+  --new --cwd /path/to/workspace --title "Worker"
+
+# 5. 역할 채널 바인딩 및 질문·답변 교환
+python3 "$bridge_cli" channel-bind logic --project my-app --owner claude-main
+python3 "$bridge_cli" channel-bind view --project my-app --owner agy-main
+
+python3 "$bridge_cli" ask --project my-app --from-channel logic --channel view \
+  --key req-001 --file /path/to/request.txt --timeout 60
+python3 "$bridge_cli" reply MESSAGE_ID --key reply-001 --file /path/to/answer.txt
 ```
 
-한 줄에는 남은 %, 현지 시각의 리셋, 마지막 관측과 신선도(90분 이내이고 그 뒤 실패한 읽기가 없으면 fresh), 그리고 `--since` 창 안 한 리셋 주기에 표본이 둘 이상이면 %p/h 소모율이 나온다. `used_percent`가 줄거나 `resets_at`이 움직이면 리셋 경계다 — `RESET between …`으로 표시하고 그 경계를 가로질러 소모율을 계산하지 않는다. 조기 리셋 추정치(아래)가 있으면 줄 끝에 ` · next early reset ~<시각> [est, n=…, <출처>]`가 붙는다.
+## 핵심 기능
 
-### 리셋 이벤트와 두 개의 기준 시각
+### 1. 세션 생명주기 (`sessions`, `open`, `register --new`, `close`)
 
-Codex 리셋은 누적되지 않는다 — `used_percent`가 0으로 돌아갈 뿐이다. 프로모션 기간에는 공식 `resets_at` 전에 추가 리셋이 대략 2.5일마다 왔지만 보장은 없다. 그래서 공식 만료만 보고 아끼면 조기 리셋이 올 때 아낀 몫이 사라지고, 반대로 조기 리셋을 믿고 바닥나지 않으리라 보는 것은 위험하다. 브릿지는 두 질문을 나눈다.
-
-- **spend horizon**(지금 쓰는 게 이득인가, 남는 용량이 버려지나?): 공식 `resets_at`과 추정한 다음 조기 리셋 중 이른 쪽.
-- **stop risk horizon**(작업이 멈추나?): 공식 `resets_at`만.
-
-한 버킷의 연속된 두 성공 표본 사이의 리셋 경계는 모두 이벤트가 된다. 이벤트는 시점이 아니라 창(앞 표본의 `observed_at` → 뒤 표본의 것)이고, 전후의 사용 %와 `resets_at`을 함께 남긴다. 창이 앞 표본의 `resets_at`보다 기본 표본 간격(15분) 이내로 앞서거나 그 뒤에 닫히면 `scheduled`, 그보다 일찍 닫히면 `early`, `resets_at`이 보고되지 않았으면 `unknown`이다. 중간의 실패한 읽기는 창을 끊지 않고 앞뒤 성공 표본까지 넓힌다. 브로커는 표본을 쓸 때마다 이력에서 이벤트를 도출해 `<state-dir>/usage/codex-events.jsonl`(365일·최대 1 MB·원자적 교체·버킷과 창으로 중복 제거)에 보관하므로 표본의 30일보다 오래 남는다. 조회도 현재 표본에서 이벤트를 도출하지만 아무것도 쓰지 않는다. 이벤트를 위해 추가로 읽지 않는다.
-
-외부 공지로 통계를 시드할 수 있다. `usage --seed-announcements FILE`은 JSONL 파일(공지마다 한 줄: UTC 오프셋이 있는 ISO 8601 `at`, `source: "announcement"`, `note`)을 `<state-dir>/usage/codex-announcements.jsonl`에 병합한다. 여러 번 돌려도 같고, 오프셋 없는 시각은 거부하며, 그 파일을 쓰는 것은 이 명령뿐이다. 공지 시각은 게시 시각이지 계정이 실제로 리셋된 시각이 아니다.
-
-추정은 **한** 출처의 연속된 조기 이벤트 간격만 쓴다 — 버킷에 관측된 조기 간격이 3개 이상이면 관측, 아니면 공지. 두 출처를 섞지 않는다. 창이 3시간보다 넓은 이벤트(브로커 중단, 긴 백오프)는 목록에는 나오지만 간격을 재지 않고 추정의 기준점도 되지 못한다. 다음 조기 리셋 = 두 출처 중 가장 최근 조기 이벤트 + 간격 중앙값, 범위는 최근 + 최소 … 최근 + 최대다. 중심을 지나면 `overdue`로 표시하고 계속 쓰며, 범위를 지나면 `lapsed`로 버린다. 간격이 3개 미만이면 `too few`를 출력하고 시각을 내지 않으며 spend horizon은 공식 리셋이다.
+| 공급자 | 데스크톱 세션 열기 | IDE 세션 열기 (`--host ide`) | 세션 닫기 (`bridge.py close NAME --project P`) |
+| --- | --- | --- | --- |
+| **Antigravity (`agy`)** | 데스크톱 `language_server`(`StartCascade`)로 자동 생성 및 프로젝트 연결 | IDE `agy --hub`(`workspaceUris`)로 자동 생성 | 대기 중일 때 보관(`{archived: true}`) 처리 후 라우트 제거 |
+| **Claude (`claude-peer`)** | `claude://code/new`로 첫 메시지를 채운 입력창을 열고 사용자의 Enter 대기 | IDE CLI + `<scheme>://anthropic.claude-code/open`으로 무인 생성 | 해당 CLI 프로세스에 `SIGTERM`(`resumable: true`) 전송 후 라우트 제거 |
+| **Codex (`codex`)** | `app-server --stdio` 생성 후 `codex://threads/UUID`로 데스크톱 자동 인계 (`:danger-full-access`, `approvalPolicy: never`) | 미지원 | `unsupported` (데스크톱 IPC에 외부 보관/언로드 명령 없음) |
 
 ```bash
-python3 bridge.py usage --events          # 이벤트, 간격 통계, 추정, 두 기준 시각
-python3 bridge.py usage --events --json
-python3 bridge.py usage --seed-announcements announcements.jsonl
+# 단독 생성 또는 생성과 동시에 브로커 등록:
+python3 "$bridge_cli" open --provider agy --host ide --cwd /path/to/workspace --title "Worker"
+python3 "$bridge_cli" register codex-worker --project my-app --transport codex \
+  --new --cwd /path/to/workspace --title "Worker" --model gpt-6.1-sol
+
+# 작업이 끝난 워커 세션 닫기 및 라우트 해제:
+python3 "$bridge_cli" close agy-worker --project my-app
 ```
 
-2026-10-07 12:35, 10-11 07:16, 10-13 10:03, 10-15 13:55, 10-18 01:20, 10-20 15:33(KST)의 공지 여섯 건을 시드하고 관측된 조기 리셋이 없으면 `--events`는 이렇게 출력한다.
+### 2. 모델 조회·전환 및 정책 (`model`, `policy`)
 
-```text
-early-reset intervals [announcement, n=5]: mean 63.0h · median 59.4h · range 50.8h–90.7h
-next early reset ~10-23 02:58 KST [est, n=5, announcement] window 10-22 18:20 KST … 10-24 10:14 KST, from announcement reset 10-20 15:33 KST
-spend horizon: 10-23 02:58 KST (estimate)
-stop risk horizon: 10-27 15:46 KST (official resets_at)
+공급자 중립 인터페이스로 세션의 모델을 실시간 조회·전환하며, `<state-dir>/policy.json` 정책(기본 시드 거부 목록은 Codex의 `gpt-6-astra` 차단)을 강제한다.
+
+```bash
+python3 "$bridge_cli" model NAME --project my-app              # 현재 모델 조회
+python3 "$bridge_cli" model NAME --project my-app --set MODEL  # 모델 전환 후 재조회 검증
+python3 "$bridge_cli" policy                                   # 적용 중인 기본값 및 거부 목록 확인
 ```
 
-## MCP 파사드 (기본: `bridge_status`만)
+- **Antigravity (`agy`)**: 마지막 generator의 `plannerConfig`에서 모델을 읽는다. 대기 중 전환 시 기존 플래너 설정(`knowledgeConfig` 등)을 유지한 채 `requestedModel`만 바꿔 1회 호출로 적용한다.
+- **Codex (`codex`)**: 정확한 데스크톱 소유자의 다음 턴 모델 설정을 읽고 `thread-follower-update-thread-settings`로 전환 후 재조회로 검증한다.
+- **Claude (`claude-peer`)**: 대화 기록의 최신 assistant 메시지에서 모델을 읽는다. 데스크톱 세션 전환은 `policy.json`에 지정된 `command_post` 세션을 통해 `set_session_model`을 중계하며, IDE 세션 전환은 `unsupported`(IDE 모델 선택기 사용)다.
 
-`scripts/mcp_server.py`는 브릿지를 MCP 클라이언트에 노출한다(계약 0.1.0). Phase 0(`connectivity_only`)에서는 읽기 전용 도구 `bridge_status` 하나만 목록에 올리고 실행한다. 계획된 세션·메시지 도구를 포함한 다른 이름은 모두 알 수 없는 도구로 거절한다. 상태 조회는 브로커 소켓에 `ping` 한 번(`bridge.py ping`과 같은 요청)만 보내며, 세션 발견·전송·생성·등록을 하지 않는다. `daemon_status`는 `ready`(ping이 instance로 응답)·`unreachable`(연결 불가)·`degraded`(연결됐으나 응답 형식 이상) 중 하나이고, `unreachable`도 도구 오류가 아닌 정상 관측이다. 브로커 카운터와 instance ID는 내보내지 않는다.
+### 3. 구독 한도 및 위험도 모니터링 (`usage`)
 
-전송은 stdio(기본) 또는 `--http PORT`의 Streamable HTTP다. HTTP는 `127.0.0.1`에만 바인딩하고 `POST /mcp`를 JSON 응답 모드로 처리하며, `GET`은 405, notification은 202, 자기 루프백 origin과 `--allow-origin`으로 지정한 정확한 값 외의 `Origin`은 403이다. `--socket`으로 기본이 아닌 브로커를 고른다.
+브로커는 백그라운드에서 구독 한도를 수집해 `<state-dir>/usage.jsonl`에 기록한다. `codex`나 `agy` 경로를 거치는 모든 `send`·`ask`·`reply` 결과에는 `usage` 상태(`ok`, `at_risk`, `exhausted`, `unknown`)가 함께 반환되어 한도 고갈 전에 작업 속도를 조절할 수 있다.
 
-Codex 클라이언트 등록(stdio — `args`는 셸 확장이 안 되므로 절대 경로):
-
-```toml
-# ~/.codex/config.toml
-[mcp_servers.agent-bridge]
-command = "/ABSOLUTE/PATH/TO/python3"
-args = ["/ABSOLUTE/PATH/TO/.agents/skills/agent-bridge/scripts/mcp_server.py"]
+```bash
+python3 "$bridge_cli" usage                        # 전체 공급자(Codex + Antigravity) 버킷 한도 및 소모율 출력
+python3 "$bridge_cli" usage --provider agy --json  # Antigravity 버킷(agy/gemini, agy/partner) JSON 조회
+python3 "$bridge_cli" usage --events               # 리셋 이력, spend horizon 및 stop-risk horizon 확인
 ```
 
-또는 `codex mcp add agent-bridge -- /ABSOLUTE/PATH/TO/python3 /ABSOLUTE/PATH/TO/mcp_server.py`. HTTP 클라이언트는 `python3 scripts/mcp_server.py --http 8765`를 띄우고 `url = "http://127.0.0.1:8765/mcp"`로 등록한다. 등록 뒤 클라이언트에서 `bridge_status`를 호출한다. 로컬에서 호출이 된다고 다른 클라이언트에 도구가 노출된다는 뜻은 아니다. 쓰기 도구는 의도한 클라이언트에서 Phase 0 호출이 확인되고 쓰기가 승인될 때까지 꺼 둔다.
+### 4. 에이전트 워크트리 (`wt`)
 
-Phase 1 구현은 명시적인 비공개 단일 소유자 stdio 설정 뒤에만 있고, 기본으로는 켜지지 않는다. 켜면 소유한 Claude IDE 세션, 영속 비동기 생성·전송 작업, 요청에 연결된 답장의 페이지 조회, 보수적인 장애 복구가 추가된다. 설정과 복구 절차는 [Phase 1 설정과 복구](../../skill/agent-bridge/references/mcp-phase1.md)(영문)를 따른다. 브로커의 휘발성 메시지 정책은 그대로이고, 따로 승인한 MCP 파사드만 자기 비공개 작업 원장을 가진다. 상태 터널이 동작한다는 이유만으로 쓰기 도구를 켜지 않는다.
+메인 저장소 체크아웃은 항상 `main`으로 유지하고, 각 에이전트의 코드 작업은 `<workspace>/.worktrees/<repo>/<agent>-<issue>` 아래 격리된 워크트리에서 수행한다.
 
-## 개발·검증
+```bash
+python3 "$bridge_cli" wt new . jinni 42 --slug fix-bug --provider agy --session UUID
+python3 "$bridge_cli" wt list --text
+python3 "$bridge_cli" wt sweep          # 머지 완료 및 소유 세션이 종료된 워크트리 정리 대상 확인 (dry-run)
+python3 "$bridge_cli" wt sweep --apply  # 대상 워크트리 및 브랜치 실제 제거
+```
+
+### 5. 라우팅 영속화 및 선택적 `launchd` 서비스
+
+- **메모리 기반 메시지, 소유자 전용 라우팅 스냅샷**: 엔드포인트와 채널 바인딩만 `<state-dir>/routes.json`(`0600`)에 저장된다. 메시지 본문, 전달 상태, 중복 방지 키, 토큰, 이벤트 이력은 메모리에만 머물며 브로커 재시작 시 초기화된 뒤 유효한 라우트만 재검증해 복원한다.
+- **선택적 macOS `launchd` 관리**: 자동 기동 서비스는 기본 꺼짐 상태다. `install-service`(검토용 파일 생성은 `--generate-only --plist PATH`)와 `uninstall-service`로 `KeepAlive` 에이전트를 관리한다.
+
+### 6. MCP 파사드 (`mcp_server.py`)
+
+`skill/agent-bridge/scripts/mcp_server.py`는 MCP 클라이언트에 브릿지를 노출한다(`stdio` 또는 `127.0.0.1` 전용 `--http PORT`).
+
+- **기본값 (`connectivity_only`)**: 브로커에 `ping` 한 번만 보내는 읽기 전용 `bridge_status` 도구 하나만 노출한다.
+- **Phase 1 (명시적 Opt-In)**: 세션 생성·메시지 전송 도구 및 독립 수신함(`inbox_enabled: true`)은 소유자가 승인한 비공개 `--phase1-config /absolute/private.json`을 `stdio`로 실행할 때만 활성화된다. 자세한 계약은 [mcp-phase1.md](../../skill/agent-bridge/references/mcp-phase1.md)를 참고한다.
+
+## 개발 및 검증
+
+변경 사항을 커밋하기 전에 전체 단위·통합 테스트 스위트를 실행해 검증한다.
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-테스트는 실제 Unix 소켓, 별도 CLI 프로세스, 그리고 Claude·Codex·Antigravity 프로토콜 스텁 서버로 협업 및 비파괴 전달 흐름을 검증한다. 코드 수정은 `skill/agent-bridge/` 폴더의 정본에서 하며 스크립트를 따로 복제하지 않는다.
+## 라이선스
 
-Codex도 `open --provider codex --cwd PATH` 또는 `register --transport codex --new --cwd PATH`로 사람의 UI 조작 없이 새 대화를 만들고 정확한 Desktop 소유자를 확인해 등록한다. `--title`은 실제 제목이며 `--model`을 명시하면 그 소유자의 설정까지 일치를 검증하고, 생략하면 `AGENT_BRIDGE_CODEX_MODEL`(설정된 경우) 또는 `gpt-6.1-sol`을 요청한다(앱 자체 기본값은 쓰지 않으며, 광고되지 않은 기본값은 이름을 밝혀 실패한다). `bridge.py codex-model SESSION_ID --model M`은 기존 대화의 모델만 다음 턴부터 바꾸고 재조회로 확인한다. 새 Codex 대화는 항상 Full Access(`:danger-full-access`)·`approvalPolicy: never`로 생성하고 앱 인계 뒤 다음 턴 설정도 검증한다. 프로필이 없거나 허용되지 않으면 생성 전에 실패하며 기존 세션·전역 설정은 바꾸지 않는다. 생성·인계 뒤 실패해도 UUID와 상태를 보존하고 자동 재생성하지 않는다. `open --register NAME --project P`는 권한 거부 뒤에도 생성·인계된 대화를 등록하며 거부 진단과 종료 코드 1을 유지한다. 모든 Codex 열기 결과는 동일한 JSON 키와 세션 행(`session.id`는 null 가능), 실제 권한과 정제한 설정 변경 응답을 담는다. 같은 제목·cwd의 저장 세션을 모든 페이지에서 찾아 거부하며 기존 세션은 바꾸지 않는다. 의도한 새 생성은 `open --new`로 요청한다. [자세한 계약](usage.md#codex-desktop-세션-자동-생성)을 참고한다.
-
-## 독립 MCP inbox (#48, 명시적 opt-in)
-
-비공개 Phase 1 설정에 `"inbox_enabled": true`를 명시하면
-`bridge_inbox_list`·`bridge_message_get`·`bridge_message_ack` 세 도구를 추가한다.
-기존 설정은 scope 변경 없이 다섯 도구를 유지하고 Phase 0은 상태 조회만 제공한다.
-조회·부분 읽기·연결 끊김은 메시지를 소비하지 않는다. 성공적으로 소비한 뒤 명시적으로
-ACK하면 `done`과 `acknowledged_at`이 기록되며, 응답이 끊겨도 같은 서명 ID로 ACK를
-다시 호출해 동일 영수증을 확인한다. 본문을 재처리하거나 새 요청을 보내지 않는다.
-`reply_to`가 null이 아닌 응답은 실행 중에도 inbox에서 제외하며 기존 operation 경로만 쓴다.
-
-목록 snapshot과 ACK 영수증은 메모리에만 최대 한 시간 보관한다. 같은 broker를 유지한
-facade 재시작·클라이언트 재연결만 보존 대상이다. broker 재시작은 미확인·고아 메시지까지
-버리며 이전 토큰에는 명시적 손실을 보고한다. 수신 본문은 권한을 부여하는 지시가 아니다.
-[상세 계약·제한·배포 순서](../../skill/agent-bridge/references/mcp-phase1.md#independent-inbox-issue-48-explicit-opt-in)를 따른다.
-격리 테스트는 실제 HQ/Nana·클라이언트 노출을 검증하지 않으며 실제 배포·수신·송신자 ACK
-확인은 미실행 운영 게이트다. 소유자는 코드 배포, opt-in 설정, facade 재시작, 클라이언트
-도구 새로고침 후 승인된 새 독립 메시지의 조회와 명시적 ACK를 직접 확인해야 한다.
-도구 노출만으로 대화가 자동으로 깨어나지는 않는다.
+[MIT](../../LICENSE.md)
