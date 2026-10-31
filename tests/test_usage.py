@@ -330,7 +330,10 @@ class BrokerTests(unittest.TestCase):
                     code = bridge.main(['--socket', server.path, 'usage', '--state-dir', server.state_dir])
                 self.assertEqual(code, 0)
                 self.assertIn('codex/codex 7d: 60% left', out.getvalue())
-                self.assertEqual(len(out.getvalue().splitlines()), 1)
+                codex_out = io.StringIO()
+                with redirect_stdout(codex_out):
+                    bridge.main(['--socket', server.path, 'usage', '--state-dir', server.state_dir, '--provider', 'codex'])
+                self.assertEqual(len(codex_out.getvalue().splitlines()), 1)
                 out = io.StringIO()
                 with redirect_stdout(out):
                     bridge.main(['--socket', server.path, 'usage', '--state-dir', server.state_dir, '--json'])
@@ -812,3 +815,85 @@ class AgyUsageTests(unittest.TestCase):
         found = usage.brief(self.root / 'state', 'agy', now=T0 + timedelta(minutes=1))
         self.assertEqual(found['provider'], 'agy')
         self.assertTrue(found['lines'][0].startswith('agy gemini: 25% left'))
+
+    def test_cli_usage_defaults_to_all_providers_and_includes_agy(self):
+        codex_store = usage.UsageStore(self.root / 'state' / 'usage', provider='codex')
+        usage.sample(codex_store, lambda: response(used=30), lambda: T0)
+        usage.sample(self.store, lambda: {'clientModelConfigs': [agy_config('gemini-z', 0.8),
+                                                                 agy_config('claude-opus', 1.0)]}, lambda: T0)
+        state = str(self.root / 'state')
+        with patch.object(usage, 'datetime', wraps=datetime) as clock:
+            clock.now.return_value = T0 + timedelta(minutes=5)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(bridge.main(['--socket', '/tmp/ab-never.sock', 'usage', '--state-dir', state]), 0)
+            text = out.getvalue()
+            self.assertIn('codex/codex 7d: 70% left', text)
+            self.assertIn('agy/gemini: 80% left', text)
+            self.assertIn('agy/partner: 100% left', text)
+            json_out = io.StringIO()
+            with redirect_stdout(json_out):
+                self.assertEqual(bridge.main(['--socket', '/tmp/ab-never.sock', 'usage', '--state-dir', state, '--json']), 0)
+            payload = json.loads(json_out.getvalue())
+            self.assertEqual(payload['provider'], 'all')
+            self.assertNotIn('summaries', payload)
+            self.assertEqual([(b['provider'], b['limit_id']) for b in payload['buckets']],
+                             [('codex', 'codex'), ('agy', 'gemini'), ('agy', 'partner')])
+
+    def test_rolling_zero_reset_time_and_same_reset_jitter_are_not_resets(self):
+        events = usage.EventStore(self.store.directory, provider='agy')
+        # Partner stays at 100% remaining (0% used) while its resetTime rolls forward every 15 minutes;
+        # Gemini has minor fraction jitter within one resetTime, then a real scheduled reset.
+        fixed_due = T0 + timedelta(hours=2)
+        next_due = fixed_due + timedelta(hours=5)
+        samples = [
+            (0, 0.773433, fixed_due, 1.0, T0 + timedelta(hours=5)),
+            (15, 0.774304, fixed_due, 1.0, T0 + timedelta(hours=5, minutes=15)),  # minor jitter on gemini; rolling 0% on partner
+            (65, 0.676136, fixed_due, 1.0, T0 + timedelta(hours=6, minutes=5)),
+            (125, 0.98178, next_due, 1.0, T0 + timedelta(hours=7, minutes=5)),    # real reset on gemini
+        ]
+        for minutes, gemini_frac, gemini_due, partner_frac, partner_due in samples:
+            moment = T0 + timedelta(minutes=minutes)
+            usage.sample(
+                self.store,
+                lambda gf=gemini_frac, gd=gemini_due, pf=partner_frac, pd=partner_due: {
+                    'clientModelConfigs': [
+                        agy_config('gemini-pro', gf, usage.utc(gd)),
+                        agy_config('claude-sonnet', pf, usage.utc(pd)),
+                    ]
+                },
+                lambda m=moment: m,
+                events,
+            )
+        partner_rows = [r for r in self.store.load() if r['limit_id'] == 'partner']
+        # 15m rolling 0% sample was deduplicated within the hour; 65m and 125m kept.
+        self.assertEqual(len(partner_rows), 3)
+        # Seed a legacy false 0%->0% event on disk and verify all_events filters it out.
+        events.save(events.load() + [dict(
+            provider='agy', limit_id='partner', slot='primary', kind='early', source='observed',
+            window_start=usage.utc(T0), window_end=usage.utc(T0 + timedelta(minutes=15)),
+            used_before=0, used_after=0,
+            resets_at_before=usage.utc(T0 + timedelta(hours=5)),
+            resets_at_after=usage.utc(T0 + timedelta(hours=5, minutes=15)),
+            note=None,
+        )], T0 + timedelta(minutes=125))
+        _, summary, _ = usage.query(self.root / 'state', '6h', 'agy', now=T0 + timedelta(minutes=126))
+        by_id = {b['limit_id']: b for b in summary['buckets']}
+        self.assertEqual(len(by_id['gemini']['resets']), 1)
+        self.assertAlmostEqual(by_id['gemini']['resets'][0]['used_before'], 32.3864, places=3)
+        self.assertAlmostEqual(by_id['gemini']['resets'][0]['used_after'], 1.822, places=3)
+        self.assertEqual(by_id['partner']['resets'], [])
+        self.assertEqual(by_id['partner']['events'], [])
+        self.assertEqual(by_id['partner']['rate']['percent_per_hour'], 0.0)
+        self.assertEqual(by_id['partner']['risk']['state'], 'holds')
+
+    def test_read_agy_prefers_non_orphaned_server(self):
+        import agy_live
+        servers = [
+            {'pid': 100, 'ppid': 1, 'orphaned': True, 'url': 'http://127.0.0.1:51001', 'csrf': 'stale'},
+            {'pid': 200, 'ppid': 99, 'orphaned': False, 'url': 'http://127.0.0.1:51002', 'csrf': 'live'},
+        ]
+        with patch.object(agy_live, 'discover_servers', return_value=servers), \
+                patch.object(agy_live, 'rpc_call', return_value={'clientModelConfigs': []}) as rpc:
+            usage.read_agy(timeout=5)
+        rpc.assert_called_once_with('http://127.0.0.1:51002', 'live', 'GetCascadeModelConfigData', {}, timeout=5)
