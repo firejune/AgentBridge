@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import agy_live
 import broker
 import codex_live
+import codex_preview
 import codex_new
 import models
 import sessions
@@ -202,8 +203,16 @@ def push_codex(path, m, timeout=10, dry_run=False):
         # Cancellation may arrive after the owner accepted the output.
         rpc('finish', state='uncertain', note='Codex delivery interrupted; check the receiving turn before resolving')
         raise
-    return rpc('finish', state='submitted', event='pushed',
-               note=f"Codex {receipt['delivery_mode']} tool output accepted by turn {receipt['turn_id']}")
+    result = rpc('finish', state='submitted', event='pushed',
+                 note=f"Codex {receipt['delivery_mode']} tool output accepted by turn {receipt['turn_id']}")
+    # Delivery is already terminally accepted before optional sidebar metadata.
+    # Keep warnings out of correspondence state and never replay a task for them.
+    try:
+        result['preview'] = codex_preview.initialize(m['route'], m['body'])
+    except Exception:
+        # Optional metadata must never obscure known delivery acceptance.
+        result['preview'] = codex_preview.unavailable('metadata initialization failed; delivery remains accepted')
+    return result
 
 
 def push_agy(path, m, timeout=10, dry_run=False):
