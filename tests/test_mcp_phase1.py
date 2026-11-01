@@ -384,12 +384,15 @@ class BrokerIntegrationTest(unittest.TestCase):
             wt_str = str(wt.resolve())
             agy_sid = str(uuid.uuid4())
             codex_sid = str(uuid.uuid4())
+            offline_codex_sid = str(uuid.uuid4())
             claude_sid = str(uuid.uuid4())
             pinned_agy_sid = str(uuid.uuid4())
             outside_sid = str(uuid.uuid4())
 
             running.call('register', project='mcp-test', name='jinni-hq',
                          cwd=root, transport='agy', session=pinned_agy_sid)
+            running.call('register', project='mcp-test', name='naru-offline',
+                         cwd=root, transport='codex', session=offline_codex_sid)
 
             config = {
                 'principal': 'test-owner',
@@ -433,23 +436,48 @@ class BrokerIntegrationTest(unittest.TestCase):
                         patch.object(phase.sessions, 'resolve_agy_peer', side_effect=lambda sid, **kw: by_agy[sid]), \
                         patch.object(phase.sessions, 'resolve_codex_peer', return_value=codex_rows[0]), \
                         patch.object(phase.sessions, 'resolve_claude_peer', return_value=claude_rows[0]):
+                    status_call = {'jsonrpc': '2.0', 'id': 99, 'method': 'tools/call',
+                                   'params': {'name': 'bridge_status', 'arguments': {}}}
+                    status_data = mcp_server.handle(status_call, running.path, engine)['result']['structuredContent']['data']
+                    self.assertEqual(status_data['supported_agent_types'], ['claude', 'agy', 'codex'])
+                    self.assertTrue(status_data['runtime_revision'])
+                    self.assertTrue(status_data['tool_schema_revision'])
+
                     listed = engine.call('bridge_sessions_list', {})['data']['sessions']
-                    self.assertEqual(len(listed), 4)
+                    time.sleep(0.01)
+                    listed_again = engine.call('bridge_sessions_list', {})['data']['sessions']
+                    self.assertEqual(len(listed), 5)
+                    for first_item, second_item in zip(listed, listed_again):
+                        self.assertEqual(first_item['agent_session_id'], second_item['agent_session_id'])
+                        self.assertEqual(first_item['created_at'], second_item['created_at'])
+                        self.assertEqual(first_item['last_activity_at'], second_item['last_activity_at'])
+                        self.assertTrue(second_item['observed_at'])
+
                     by_type = {}
                     for item in listed:
                         by_type.setdefault(item['agent_type'], []).append(item)
                     self.assertEqual(len(by_type['agy']), 2)
-                    self.assertEqual(len(by_type['codex']), 1)
+                    self.assertEqual(len(by_type['codex']), 2)
                     self.assertEqual(len(by_type['claude']), 1)
 
                     busy_agy = next(item for item in by_type['agy'] if item['state'] == 'busy')
                     pinned_agy = next(item for item in by_type['agy'] if item['workspace_alias'] == 'jinni-pin')
+                    live_codex = next(item for item in by_type['codex'] if item['state'] == 'ready')
+                    offline_codex = next(item for item in by_type['codex'] if item['state'] == 'unavailable')
                     self.assertEqual(busy_agy['title'], 'Jinni Worker Task')
                     self.assertIsNone(busy_agy['route_name'])
+                    self.assertIsNone(busy_agy['created_at'])
+                    self.assertEqual(busy_agy['last_activity_at'], '2026-11-01T00:00:00+00:00')
                     self.assertEqual(pinned_agy['title'], 'Jinni HQ Session')
                     self.assertEqual(pinned_agy['route_name'], 'jinni-hq')
-                    self.assertEqual(by_type['codex'][0]['title'], 'Naru Codex Thread')
+                    self.assertEqual(live_codex['title'], 'Naru Codex Thread')
+                    self.assertIsNone(offline_codex['title'])
+                    self.assertEqual(offline_codex['route_name'], 'naru-offline')
+                    self.assertIsNone(offline_codex['created_at'])
+                    self.assertIsNone(offline_codex['last_activity_at'])
                     self.assertEqual(by_type['claude'][0]['title'], 'Roa Claude HQ')
+                    self.assertIsNone(by_type['claude'][0]['created_at'])
+                    self.assertIsNone(by_type['claude'][0]['last_activity_at'])
                     sent = engine.call('bridge_message_send', {
                         'agent_session_id': busy_agy['agent_session_id'],
                         'message': 'ping jinni worker',

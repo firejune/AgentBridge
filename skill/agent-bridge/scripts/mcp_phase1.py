@@ -45,8 +45,8 @@ def stamp():
     return datetime.now(timezone.utc).isoformat()
 
 
-def iso_timestamp(value):
-    if isinstance(value, (int, float)) and value > 0:
+def optional_iso_timestamp(value):
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
         if value > 1e12:
             value = value / 1000.0
         return datetime.fromtimestamp(value, timezone.utc).isoformat()
@@ -55,7 +55,11 @@ def iso_timestamp(value):
             return datetime.fromisoformat(value.strip().replace('Z', '+00:00')).astimezone(timezone.utc).isoformat()
         except ValueError:
             pass
-    return stamp()
+    return None
+
+
+def iso_timestamp(value):
+    return optional_iso_timestamp(value) or stamp()
 
 
 def digest(value):
@@ -273,6 +277,7 @@ class Backend:
         candidates = {}
         route_latest = {}
         route_names = {}
+        observed = stamp()
         for project in sorted({w['project'] for w in workspaces.values()}):
             try:
                 routes = self.rpc('routes', project=project)
@@ -301,7 +306,9 @@ class Backend:
                         'workspace': dict(w),
                         'title': None,
                         'route_name': route_name,
-                        'timestamp': stamp(),
+                        'created_at': None,
+                        'last_activity_at': None,
+                        'observed_at': observed,
                     })
         for (_, agent_type), (sid_uuid, item) in route_latest.items():
             candidates[(agent_type, sid_uuid)] = item
@@ -335,7 +342,6 @@ class Backend:
                 idle_counts[(alias, agent_type)] = idle_counts.get((alias, agent_type), 0) + 1
             raw_title = row.get('name')
             title = raw_title.strip() if isinstance(raw_title, str) and raw_title.strip() else None
-            ts = iso_timestamp(row.get('updated_at') or row.get('observed_at'))
             candidates[(agent_type, sid_uuid)] = {
                 'uuid': sid_uuid,
                 'agent_type': agent_type,
@@ -345,7 +351,9 @@ class Backend:
                 'workspace': dict(w),
                 'title': title,
                 'route_name': route_names.get((agent_type, sid_uuid)),
-                'timestamp': ts,
+                'created_at': optional_iso_timestamp(row.get('created_at')),
+                'last_activity_at': optional_iso_timestamp(row.get('updated_at')),
+                'observed_at': optional_iso_timestamp(row.get('observed_at')) or observed,
             }
         result = {}
         for (agent_type, sid_uuid), item in candidates.items():
@@ -364,8 +372,9 @@ class Backend:
                 'route_name': item.get('route_name'),
                 'route': 'mcp-' + identity[32:48],
                 'sender': 'mcp-' + identity[48:64],
-                'created_at': item['timestamp'],
-                'last_activity_at': item['timestamp'],
+                'created_at': item.get('created_at'),
+                'last_activity_at': item.get('last_activity_at'),
+                'observed_at': item.get('observed_at') or observed,
                 'principal': config['principal'],
                 'registered': False,
                 'discovered': True,
@@ -900,6 +909,7 @@ class Engine:
         more = len(owned)>limit
         owned = owned[:limit]; result = []
         ops = self.rows()
+        observed_now = stamp()
         for s in owned:
             try:
                 self.allowed(s)
@@ -929,9 +939,13 @@ class Engine:
             )
             if not route_name and isinstance(s.get('route'), str) and s['route'].strip() and not s['route'].startswith('mcp-'):
                 route_name = s['route'].strip()
+            created_at = s.get('created_at') if s.get('created_at') is not None else (disc.get('created_at') if disc else None)
+            last_activity_at = s.get('last_activity_at') if s.get('last_activity_at') is not None else (disc.get('last_activity_at') if disc else None)
+            observed_at = (disc.get('observed_at') if disc else None) or s.get('observed_at') or observed_now
             result.append({'agent_session_id':s['id'],'agent_type':agent_type,'workspace_alias':s['alias'],
                            'title':title,'route_name':route_name,
-                           'state':state,'created_at':s['created_at'],'last_activity_at':s['last_activity_at']})
+                           'state':state,'created_at':created_at,'last_activity_at':last_activity_at,
+                           'observed_at':observed_at})
         return {'sessions':result,'has_more':more,'next_cursor':self.cursor(principal,'sessions','',owned[-1]['id']) if more else None}
 
     def get(self, args, principal):
