@@ -1,6 +1,17 @@
-# Agent Bridge
+<p align="center">
+  <img src="assets/banner.svg" alt="Agent Bridge — Real-time local correspondence bridge for Claude, Codex &amp; Antigravity" width="100%" />
+</p>
 
-**English** | [한국어](docs/ko/README.md)
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.10%2B-38BDF8.svg?style=flat-square" alt="Python 3.10+" />
+  <img src="https://img.shields.io/badge/dependencies-zero%20(stdlib)-30D158.svg?style=flat-square" alt="Zero Dependencies" />
+  <img src="https://img.shields.io/badge/peers-claude--peer%20%C2%B7%20codex%20%C2%B7%20agy-FF6B4A.svg?style=flat-square" alt="Supported Peers" />
+  <img src="https://img.shields.io/badge/MCP-Phase%201%20%2B%20Inbox-A855F7.svg?style=flat-square" alt="MCP Phase 1" />
+</p>
+
+<p align="center">
+  <strong>English</strong> · <a href="docs/ko/README.md">한국어</a>
+</p>
 
 A zero-dependency local real-time bridge for **Claude Code / Desktop (`claude-peer`) ↔ Codex / ChatGPT Desktop (`codex`) ↔ Antigravity IDE / Desktop (`agy`)** and CLI workers (`realtime`/`claude`) on the same machine. Built with Python 3.10+ standard library only over Unix domain sockets.
 

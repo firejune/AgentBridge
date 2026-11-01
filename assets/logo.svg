@@ -1,0 +1,132 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- Deep obsidian dark background -->
+    <radialGradient id="bg-glow" cx="50%" cy="46%" r="70%">
+      <stop offset="0%" stop-color="#141826" stop-opacity="0.96"/>
+      <stop offset="55%" stop-color="#080a12" stop-opacity="0.98"/>
+      <stop offset="100%" stop-color="#040508" stop-opacity="1"/>
+    </radialGradient>
+
+    <!-- Tri-Agent Ambient Spectrum -->
+    <linearGradient id="tri-spectrum" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#FF6B4A"/>
+      <stop offset="35%" stop-color="#FF9F0A"/>
+      <stop offset="65%" stop-color="#30D158"/>
+      <stop offset="85%" stop-color="#0A84FF"/>
+      <stop offset="100%" stop-color="#BF5AF2"/>
+    </linearGradient>
+
+    <!-- Arc 1: Claude (Bottom-Left) -> Antigravity (Top) -->
+    <linearGradient id="arc-claude-agy" x1="0%" y1="100%" x2="80%" y2="0%">
+      <stop offset="0%" stop-color="#FF6B4A"/>
+      <stop offset="45%" stop-color="#FF9F0A"/>
+      <stop offset="100%" stop-color="#651FFF"/>
+    </linearGradient>
+
+    <!-- Arc 2: Antigravity (Top) -> Codex (Bottom-Right) -->
+    <linearGradient id="arc-agy-codex" x1="20%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#BF5AF2"/>
+      <stop offset="45%" stop-color="#0A84FF"/>
+      <stop offset="100%" stop-color="#00C7BE"/>
+    </linearGradient>
+
+    <!-- Arc 3: Codex (Bottom-Right) -> Claude (Bottom-Left) -->
+    <linearGradient id="arc-codex-claude" x1="100%" y1="50%" x2="0%" y2="50%">
+      <stop offset="0%" stop-color="#30D158"/>
+      <stop offset="50%" stop-color="#FFD600"/>
+      <stop offset="100%" stop-color="#FF6B4A"/>
+    </linearGradient>
+
+    <!-- Inner Spoke Gradients to Central Broker -->
+    <linearGradient id="spoke-agy" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#BF5AF2"/>
+      <stop offset="100%" stop-color="#38BDF8"/>
+    </linearGradient>
+
+    <linearGradient id="spoke-claude" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#FF6B4A"/>
+      <stop offset="100%" stop-color="#FF9F0A"/>
+    </linearGradient>
+
+    <linearGradient id="spoke-codex" x1="100%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" stop-color="#30D158"/>
+      <stop offset="100%" stop-color="#00C7BE"/>
+    </linearGradient>
+
+    <!-- Broker Core Ring Gradient -->
+    <linearGradient id="broker-ring" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="50%" stop-color="#A855F7"/>
+      <stop offset="100%" stop-color="#FF6B4A"/>
+    </linearGradient>
+
+    <!-- Mechanical Joint Dark Void Fill -->
+    <linearGradient id="joint-void" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#05070d"/>
+      <stop offset="100%" stop-color="#121624"/>
+    </linearGradient>
+
+    <!-- Depth Shadows -->
+    <filter id="bridge-depth" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="10" stdDeviation="10" flood-color="#000000" flood-opacity="0.82"/>
+    </filter>
+
+    <!-- Soft Ambient Backlight -->
+    <filter id="ambient-blur" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="38" result="blur"/>
+    </filter>
+  </defs>
+
+  <!-- Clean dark container -->
+  <rect width="512" height="512" rx="112" fill="url(#bg-glow)" stroke="#1a202e" stroke-width="1.5" />
+
+  <!-- Ambient Tri-Spectrum Glow -->
+  <circle cx="256" cy="264" r="152" fill="url(#tri-spectrum)" opacity="0.14" filter="url(#ambient-blur)" />
+
+  <g id="tri-agent-bridge">
+    <!-- Outer Bridge Ring Arcs (Centre 256, 268, R = 136) -->
+    <!-- Top (256.0, 132.0), Bottom-Left (138.2, 336.0), Bottom-Right (373.8, 336.0) -->
+    <g filter="url(#bridge-depth)">
+      <path d="M 138.2 336.0 A 136 136 0 0 1 256.0 132.0" fill="none" stroke="url(#arc-claude-agy)" stroke-width="34" stroke-linecap="round" />
+      <path d="M 256.0 132.0 A 136 136 0 0 1 373.8 336.0" fill="none" stroke="url(#arc-agy-codex)" stroke-width="34" stroke-linecap="round" />
+      <path d="M 373.8 336.0 A 136 136 0 0 1 138.2 336.0" fill="none" stroke="url(#arc-codex-claude)" stroke-width="34" stroke-linecap="round" />
+    </g>
+
+    <!-- Inner Suspension Bridge Spans to Central Broker (256.0, 268.0) -->
+    <g filter="url(#bridge-depth)">
+      <line x1="256.0" y1="132.0" x2="256.0" y2="268.0" stroke="url(#spoke-agy)" stroke-width="26" stroke-linecap="round" />
+      <line x1="138.2" y1="336.0" x2="256.0" y2="268.0" stroke="url(#spoke-claude)" stroke-width="26" stroke-linecap="round" />
+      <line x1="373.8" y1="336.0" x2="256.0" y2="268.0" stroke="url(#spoke-codex)" stroke-width="26" stroke-linecap="round" />
+    </g>
+
+    <!-- 3 Agent Nodes -->
+    <!-- Node 1: Antigravity (Top - Violet/Blue) -->
+    <g filter="url(#bridge-depth)">
+      <circle cx="256.0" cy="132.0" r="40" fill="#A855F7" />
+      <circle cx="256.0" cy="132.0" r="16" fill="url(#joint-void)" stroke="#090b12" stroke-width="2" />
+      <circle cx="256.0" cy="132.0" r="6" fill="#38BDF8" />
+    </g>
+
+    <!-- Node 2: Claude (Bottom-Left - Coral/Amber) -->
+    <g filter="url(#bridge-depth)">
+      <circle cx="138.2" cy="336.0" r="40" fill="#FF6B4A" />
+      <circle cx="138.2" cy="336.0" r="16" fill="url(#joint-void)" stroke="#090b12" stroke-width="2" />
+      <circle cx="138.2" cy="336.0" r="6" fill="#FF9F0A" />
+    </g>
+
+    <!-- Node 3: Codex (Bottom-Right - Emerald/Teal) -->
+    <g filter="url(#bridge-depth)">
+      <circle cx="373.8" cy="336.0" r="40" fill="#30D158" />
+      <circle cx="373.8" cy="336.0" r="16" fill="url(#joint-void)" stroke="#090b12" stroke-width="2" />
+      <circle cx="373.8" cy="336.0" r="6" fill="#00C7BE" />
+    </g>
+
+    <!-- Central Broker Core Hub (256.0, 268.0) -->
+    <g filter="url(#bridge-depth)">
+      <circle cx="256.0" cy="268.0" r="52" fill="url(#broker-ring)" />
+      <circle cx="256.0" cy="268.0" r="22" fill="url(#joint-void)" stroke="#090b12" stroke-width="2.5" />
+      <circle cx="256.0" cy="268.0" r="8.5" fill="#F8FAFC" />
+    </g>
+  </g>
+</svg>
+

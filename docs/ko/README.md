@@ -1,6 +1,17 @@
-# Agent Bridge (한국어)
+<p align="center">
+  <img src="../../assets/banner.svg" alt="Agent Bridge — Claude, Codex, Antigravity를 위한 실시간 로컬 브릿지" width="100%" />
+</p>
 
-[English](../../README.md) | **한국어**
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.10%2B-38BDF8.svg?style=flat-square" alt="Python 3.10+" />
+  <img src="https://img.shields.io/badge/dependencies-zero%20(stdlib)-30D158.svg?style=flat-square" alt="Zero Dependencies" />
+  <img src="https://img.shields.io/badge/peers-claude--peer%20%C2%B7%20codex%20%C2%B7%20agy-FF6B4A.svg?style=flat-square" alt="Supported Peers" />
+  <img src="https://img.shields.io/badge/MCP-Phase%201%20%2B%20Inbox-A855F7.svg?style=flat-square" alt="MCP Phase 1" />
+</p>
+
+<p align="center">
+  <a href="../../README.md">English</a> · <strong>한국어</strong>
+</p>
 
 같은 머신의 **Claude Code / Desktop (`claude-peer`) ↔ Codex / ChatGPT Desktop (`codex`) ↔ Antigravity IDE / Desktop (`agy`)** 및 CLI 참가자(`realtime`/`claude`)가 실시간으로 질문·답변·진행 상황을 주고받는 로컬 브릿지다. Python 3.10+ 표준 라이브러리와 Unix 도메인 소켓만 사용하며 외부 패키지, API 키, 네트워크 포트가 필요 없다.
 
