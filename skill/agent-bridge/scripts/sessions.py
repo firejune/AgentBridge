@@ -375,7 +375,7 @@ def resolve_codex_peer(sid, executable='codex', mode='auto'):
     if info.get('status') in ('idle', 'ready', 'running', 'busy'):
         return info
     try:
-        with codex_live.Client(timeout=2) as client:
+        with codex_live.Client(timeout=0.5) as client:
             client.owner(info['id'])
         return dict(info, status='idle', runtime_observed=True)
     except (codex_live.DeliveryError, OSError) as error:
@@ -424,8 +424,8 @@ def list_codex_peers(limit=25, executable='codex', mode='auto'):
             candidates.append(row)
     if candidates:
         try:
-            with codex_live.Client(timeout=1.5) as client:
-                for row in candidates:
+            with codex_live.Client(timeout=0.15) as client:
+                for row in candidates[:3]:
                     try:
                         client.owner(row['id'])
                         live.append(dict(row, status='idle', runtime_observed=True))

@@ -271,6 +271,7 @@ class Backend:
     def discover(self, config):
         workspaces = config['workspaces']
         candidates = {}
+        route_latest = {}
         for project in sorted({w['project'] for w in workspaces.values()}):
             try:
                 routes = self.rpc('routes', project=project)
@@ -287,7 +288,7 @@ class Backend:
                 alias, w = match_workspace(r['cwd'], workspaces, preferred_project=project)
                 if alias is not None:
                     agent_type = TRANSPORT_AGENTS[transport]
-                    candidates[(agent_type, sid_uuid)] = {
+                    route_latest[(alias, agent_type)] = (sid_uuid, {
                         'uuid': sid_uuid,
                         'agent_type': agent_type,
                         'transport': transport,
@@ -295,7 +296,9 @@ class Backend:
                         'alias': alias,
                         'workspace': dict(w),
                         'timestamp': stamp(),
-                    }
+                    })
+        for (_, agent_type), (sid_uuid, item) in route_latest.items():
+            candidates[(agent_type, sid_uuid)] = item
         live_rows = []
         for provider_name, getter in (
             ('agy', sessions.list_agy_peers),
@@ -307,6 +310,7 @@ class Backend:
                     live_rows.append(dict(row, provider=row.get('provider') or provider_name))
             except Exception:
                 continue
+        seen_idle = set()
         for row in live_rows:
             agent_type = row.get('provider')
             if agent_type not in AGENT_TYPES or not row.get('id') or not row.get('cwd'):
@@ -318,6 +322,10 @@ class Backend:
             alias, w = match_workspace(row['cwd'], workspaces)
             if alias is None:
                 continue
+            is_busy = row.get('status') in ('running', 'busy')
+            if not is_busy and (alias, agent_type) in seen_idle and (agent_type, sid_uuid) not in candidates:
+                continue
+            seen_idle.add((alias, agent_type))
             ts = iso_timestamp(row.get('updated_at') or row.get('observed_at'))
             candidates[(agent_type, sid_uuid)] = {
                 'uuid': sid_uuid,
