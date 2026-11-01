@@ -328,7 +328,7 @@
     },
     {
       "name": "bridge_sessions_list",
-      "description": "List only the authenticated caller's dedicated adapter-owned Claude sessions. Existing HQ sessions are excluded by default; no transcript, title, or path is exposed. Not registered in Phase 0. Cursor is caller-bound; adapter-normalized state is not raw backend message state.",
+      "description": "List the authenticated caller's authorized Claude, Antigravity (agy), and Codex (codex) sessions across owned, pinned, and approved workspace live sessions. No transcript, title, or path is exposed. Not registered in Phase 0. Cursor is caller-bound; adapter-normalized state is not raw backend message state.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -373,7 +373,11 @@
                     },
                     "agent_type": {
                       "type": "string",
-                      "const": "claude"
+                      "enum": [
+                        "claude",
+                        "agy",
+                        "codex"
+                      ]
                     },
                     "workspace_alias": {
                       "type": "string",
@@ -557,7 +561,7 @@
     },
     {
       "name": "bridge_session_create",
-      "description": "Asynchronously accept creation of a dedicated Claude session in an operator-allowed workspace alias. Return only durable acceptance; poll bridge_operation_get for the session ID. Requires durable adapter idempotency and dispatch-intent ledger verified before registration; backend memory-only deduplication is insufficient. No caller, cwd, model, shell, or arguments are accepted. Absent in Phase 0; operator must explicitly enable writes after read-only integration verification.",
+      "description": "Asynchronously accept creation of a dedicated Claude, Antigravity (agy), or Codex (codex) session in an operator-allowed workspace alias. Return only durable acceptance; poll bridge_operation_get for the session ID. Requires durable adapter idempotency and dispatch-intent ledger verified before registration; backend memory-only deduplication is insufficient. No caller, cwd, model, shell, or arguments are accepted. Absent in Phase 0; operator must explicitly enable writes after read-only integration verification.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -569,6 +573,15 @@
             "not": {
               "pattern": "[^A-Za-z0-9_-]"
             }
+          },
+          "agent_type": {
+            "type": "string",
+            "enum": [
+              "claude",
+              "agy",
+              "codex"
+            ],
+            "description": "Optional agent provider to open in the workspace alias (default: workspace configuration or claude)."
           },
           "idempotency_key": {
             "type": "string",

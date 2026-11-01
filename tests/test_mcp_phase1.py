@@ -325,6 +325,22 @@ class PhaseTest(unittest.TestCase):
                 jsonschema.Draft202012Validator.check_schema(tool['inputSchema'])
                 jsonschema.Draft202012Validator.check_schema(tool['outputSchema'])
 
+    def test_create_agy_and_codex_sessions_and_list_agent_types(self):
+        self.assertEqual(self.call('bridge_session_create', workspace_alias='test',
+            agent_type='unknown', idempotency_key='bad_agent_type_01')['error']['code'], 'INVALID_ARGUMENT')
+        op_agy = self.call('bridge_session_create', workspace_alias='test',
+            agent_type='agy', idempotency_key='create_agy_000001')['data']
+        self.assertEqual(self.call('bridge_session_create', workspace_alias='test',
+            agent_type='codex', idempotency_key='create_agy_000001')['error']['code'], 'IDEMPOTENCY_CONFLICT')
+        op_codex = self.call('bridge_session_create', workspace_alias='test',
+            agent_type='codex', idempotency_key='create_codex_0001')['data']
+        self.engine.tick()
+        sid_agy = self.call('bridge_operation_get', operation_id=op_agy['operation_id'])['data']['agent_session_id']
+        sid_codex = self.call('bridge_operation_get', operation_id=op_codex['operation_id'])['data']['agent_session_id']
+        rows = {r['agent_session_id']: r for r in self.call('bridge_sessions_list')['data']['sessions']}
+        self.assertEqual(rows[sid_agy]['agent_type'], 'agy')
+        self.assertEqual(rows[sid_codex]['agent_type'], 'codex')
+
 
 def sessions_ide():
     return next(iter(phase.sessions.CLAUDE_IDES))
@@ -357,6 +373,99 @@ class BrokerIntegrationTest(unittest.TestCase):
                     engine.tick();result=engine.get({'operation_id':op['operation_id']},'test-owner')
                     self.assertEqual(result['result']['text'],'actual correlated reply')
                     self.assertEqual(result['status'],'succeeded')
+            finally:
+                engine.close()
+
+    def test_multi_provider_discovery_pinned_and_send(self):
+        with RunningBroker() as running, tempfile.TemporaryDirectory(prefix='mcp-multi-', dir='/tmp') as temp:
+            root = str(Path(temp).resolve())
+            wt = Path(root) / 'wt-jinni'
+            wt.mkdir()
+            wt_str = str(wt.resolve())
+            agy_sid = str(uuid.uuid4())
+            codex_sid = str(uuid.uuid4())
+            claude_sid = str(uuid.uuid4())
+            pinned_agy_sid = str(uuid.uuid4())
+            outside_sid = str(uuid.uuid4())
+
+            running.call('register', project='mcp-test', name='jinni-hq',
+                         cwd=root, transport='agy', session=pinned_agy_sid)
+
+            config = {
+                'principal': 'test-owner',
+                'tunnel_id': 'isolated-multi',
+                'writes_enabled': True,
+                'scopes': list(set(phase.SCOPES.values())),
+                'state_dir': root + '/state',
+                'workspaces': {
+                    'test': {'cwd': root, 'root': root, 'project': 'mcp-test', 'ide': sessions_ide()},
+                },
+                'pinned_sessions': {
+                    'jinni-pin': {
+                        'uuid': pinned_agy_sid,
+                        'cwd': root,
+                        'project': 'mcp-test',
+                        'route': 'jinni-hq',
+                        'authorized_at': phase.stamp(),
+                    },
+                },
+            }
+            backend = phase.Backend(running.path)
+            engine = phase.Engine(config, backend, start=False)
+
+            agy_rows = [
+                {'provider': 'agy', 'id': agy_sid, 'cwd': wt_str, 'status': 'running', 'updated_at': '2026-11-01T00:00:00Z'},
+                {'provider': 'agy', 'id': pinned_agy_sid, 'cwd': root, 'status': 'idle', 'updated_at': '2026-11-01T00:00:00Z'},
+                {'provider': 'agy', 'id': outside_sid, 'cwd': '/tmp', 'status': 'idle', 'updated_at': '2026-11-01T00:00:00Z'},
+            ]
+            codex_rows = [
+                {'provider': 'codex', 'id': codex_sid, 'cwd': root, 'status': 'idle', 'updated_at': 1730419200},
+            ]
+            claude_rows = [
+                {'provider': 'claude', 'id': claude_sid, 'cwd': root, 'status': 'idle'},
+            ]
+            by_agy = {r['id']: r for r in agy_rows}
+
+            try:
+                with patch.object(phase.sessions, 'list_agy_peers', return_value=agy_rows), \
+                        patch.object(phase.sessions, 'list_codex_peers', return_value=codex_rows), \
+                        patch.object(phase.sessions, 'list_claude_peers', return_value=claude_rows), \
+                        patch.object(phase.sessions, 'resolve_agy_peer', side_effect=lambda sid, **kw: by_agy[sid]), \
+                        patch.object(phase.sessions, 'resolve_codex_peer', return_value=codex_rows[0]), \
+                        patch.object(phase.sessions, 'resolve_claude_peer', return_value=claude_rows[0]):
+                    listed = engine.call('bridge_sessions_list', {})['data']['sessions']
+                    self.assertEqual(len(listed), 4)
+                    by_type = {}
+                    for item in listed:
+                        by_type.setdefault(item['agent_type'], []).append(item)
+                    self.assertEqual(len(by_type['agy']), 2)
+                    self.assertEqual(len(by_type['codex']), 1)
+                    self.assertEqual(len(by_type['claude']), 1)
+
+                    busy_agy = next(item for item in by_type['agy'] if item['state'] == 'busy')
+                    sent = engine.call('bridge_message_send', {
+                        'agent_session_id': busy_agy['agent_session_id'],
+                        'message': 'ping jinni worker',
+                        'idempotency_key': 'multi_send_agy_001',
+                    })['data']
+
+                    def mock_peer(path, m):
+                        self.assertEqual(m['route']['session'], agy_sid)
+                        self.assertEqual(m['route']['transport'], 'agy')
+                        running.call('claim', id=m['id'])
+                        return running.call('finish', id=m['id'], state='submitted', event='pushed')
+
+                    with patch.object(phase.bridge, 'push_if_peer', side_effect=mock_peer) as pushing:
+                        engine.tick()
+                        pushing.assert_called_once()
+
+                    op = engine.operation(sent['operation_id'], 'test-owner')
+                    self.assertEqual(op['status'], 'running')
+                    running.call('reply', id=op['backend_id'], body='jinni reply ok', key='jinni-reply-1')
+                    engine.tick()
+                    res = engine.get({'operation_id': op['operation_id']}, 'test-owner')
+                    self.assertEqual(res['status'], 'succeeded')
+                    self.assertEqual(res['result']['text'], 'jinni reply ok')
             finally:
                 engine.close()
 
