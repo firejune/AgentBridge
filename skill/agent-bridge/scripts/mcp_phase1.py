@@ -272,6 +272,7 @@ class Backend:
         workspaces = config['workspaces']
         candidates = {}
         route_latest = {}
+        route_names = {}
         for project in sorted({w['project'] for w in workspaces.values()}):
             try:
                 routes = self.rpc('routes', project=project)
@@ -279,7 +280,9 @@ class Backend:
                 continue
             for r in routes:
                 transport = r.get('transport')
-                if transport not in TRANSPORT_AGENTS or not r.get('session') or not r.get('cwd'):
+                route_name = r.get('name') if isinstance(r.get('name'), str) and r.get('name').strip() else None
+                if (transport not in TRANSPORT_AGENTS or not r.get('session') or not r.get('cwd')
+                        or not route_name or route_name.startswith('mcp-')):
                     continue
                 try:
                     sid_uuid = str(uuid.UUID(r['session']))
@@ -288,6 +291,7 @@ class Backend:
                 alias, w = match_workspace(r['cwd'], workspaces, preferred_project=project)
                 if alias is not None:
                     agent_type = TRANSPORT_AGENTS[transport]
+                    route_names[(agent_type, sid_uuid)] = route_name
                     route_latest[(alias, agent_type)] = (sid_uuid, {
                         'uuid': sid_uuid,
                         'agent_type': agent_type,
@@ -295,6 +299,8 @@ class Backend:
                         'cwd': str(Path(r['cwd']).resolve()),
                         'alias': alias,
                         'workspace': dict(w),
+                        'title': None,
+                        'route_name': route_name,
                         'timestamp': stamp(),
                     })
         for (_, agent_type), (sid_uuid, item) in route_latest.items():
@@ -310,7 +316,7 @@ class Backend:
                     live_rows.append(dict(row, provider=row.get('provider') or provider_name))
             except Exception:
                 continue
-        seen_idle = set()
+        idle_counts = {}
         for row in live_rows:
             agent_type = row.get('provider')
             if agent_type not in AGENT_TYPES or not row.get('id') or not row.get('cwd'):
@@ -323,9 +329,12 @@ class Backend:
             if alias is None:
                 continue
             is_busy = row.get('status') in ('running', 'busy')
-            if not is_busy and (alias, agent_type) in seen_idle and (agent_type, sid_uuid) not in candidates:
+            if not is_busy and idle_counts.get((alias, agent_type), 0) >= 3 and (agent_type, sid_uuid) not in candidates:
                 continue
-            seen_idle.add((alias, agent_type))
+            if not is_busy:
+                idle_counts[(alias, agent_type)] = idle_counts.get((alias, agent_type), 0) + 1
+            raw_title = row.get('name')
+            title = raw_title.strip() if isinstance(raw_title, str) and raw_title.strip() else None
             ts = iso_timestamp(row.get('updated_at') or row.get('observed_at'))
             candidates[(agent_type, sid_uuid)] = {
                 'uuid': sid_uuid,
@@ -334,6 +343,8 @@ class Backend:
                 'cwd': str(Path(row['cwd']).resolve()),
                 'alias': alias,
                 'workspace': dict(w),
+                'title': title,
+                'route_name': route_names.get((agent_type, sid_uuid)),
                 'timestamp': ts,
             }
         result = {}
@@ -349,6 +360,8 @@ class Backend:
                 'transport': item['transport'],
                 'cwd': item['cwd'],
                 'workspace': item['workspace'],
+                'title': item.get('title'),
+                'route_name': item.get('route_name'),
                 'route': 'mcp-' + identity[32:48],
                 'sender': 'mcp-' + identity[48:64],
                 'created_at': item['timestamp'],
@@ -866,13 +879,19 @@ class Engine:
         all_sessions = [json.loads(r[0]) for r in rows]
         seen_ids = {s['id'] for s in all_sessions}
         seen_uuids = {s['uuid'] for s in all_sessions}
+        pinned_by_uuid = {}
+        discovered_by_uuid = {}
         if principal == self.principal:
-            for s in pinned_sessions(self.config).values():
+            pinned = pinned_sessions(self.config)
+            pinned_by_uuid = {p['uuid']: p for p in pinned.values()}
+            for s in pinned.values():
                 if s['id'] not in seen_ids and s['uuid'] not in seen_uuids:
                     all_sessions.append(s)
                     seen_ids.add(s['id']); seen_uuids.add(s['uuid'])
             if hasattr(self.backend, 'discover'):
-                for s in self.backend.discover(self.config).values():
+                discovered = self.backend.discover(self.config)
+                discovered_by_uuid = {d['uuid']: d for d in discovered.values()}
+                for s in discovered.values():
                     if s['id'] not in seen_ids and s['uuid'] not in seen_uuids:
                         all_sessions.append(s)
                         seen_ids.add(s['id']); seen_uuids.add(s['uuid'])
@@ -892,7 +911,26 @@ class Engine:
             agent_type = self.backend.session_agent_type(s) if hasattr(self.backend, 'session_agent_type') else s.get('agent_type', 'claude')
             if agent_type not in AGENT_TYPES:
                 agent_type = 'claude'
+            disc = discovered_by_uuid.get(s.get('uuid'))
+            pin = pinned_by_uuid.get(s.get('uuid'))
+            title = s.get('title') or (disc.get('title') if disc else None)
+            if not title and hasattr(self.backend, 'check'):
+                try:
+                    peer_name = self.backend.check(s).get('name')
+                    if isinstance(peer_name, str) and peer_name.strip():
+                        title = peer_name.strip()
+                except Exception:
+                    pass
+            route_name = (
+                s.get('route_name')
+                or (s.get('route') if s.get('pinned') else None)
+                or (pin.get('route') if pin else None)
+                or (disc.get('route_name') if disc else None)
+            )
+            if not route_name and isinstance(s.get('route'), str) and s['route'].strip() and not s['route'].startswith('mcp-'):
+                route_name = s['route'].strip()
             result.append({'agent_session_id':s['id'],'agent_type':agent_type,'workspace_alias':s['alias'],
+                           'title':title,'route_name':route_name,
                            'state':state,'created_at':s['created_at'],'last_activity_at':s['last_activity_at']})
         return {'sessions':result,'has_more':more,'next_cursor':self.cursor(principal,'sessions','',owned[-1]['id']) if more else None}
 

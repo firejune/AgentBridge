@@ -328,7 +328,7 @@
     },
     {
       "name": "bridge_sessions_list",
-      "description": "List the authenticated caller's authorized Claude, Antigravity (agy), and Codex (codex) sessions across owned, pinned, and approved workspace live sessions. No transcript, title, or path is exposed. Not registered in Phase 0. Cursor is caller-bound; adapter-normalized state is not raw backend message state.",
+      "description": "List the authenticated caller's authorized Claude, Antigravity (agy), and Codex (codex) sessions across owned, pinned, and approved workspace live sessions, including session title and broker route_name when available. No transcript or filesystem path is exposed. Not registered in Phase 0. Cursor is caller-bound; adapter-normalized state is not raw backend message state.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -387,6 +387,28 @@
                         "pattern": "[^A-Za-z0-9_-]"
                       }
                     },
+                    "title": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Human-readable session or conversation title when available."
+                    },
+                    "route_name": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Registered broker channel name when bound to a named route."
+                    },
                     "state": {
                       "type": "string",
                       "enum": [
@@ -409,6 +431,8 @@
                     "agent_session_id",
                     "agent_type",
                     "workspace_alias",
+                    "title",
+                    "route_name",
                     "state",
                     "created_at",
                     "last_activity_at"
