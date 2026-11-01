@@ -2,7 +2,7 @@
   "tools": [
     {
       "name": "bridge_status",
-      "description": "Read adapter connectivity, runtime exposure, configured alias names, and limits. Phase 0 exposes ONLY this tool. Does not prove Dot custom-MCP compatibility. Caller identity and authorization come exclusively from the connection. Annotations are advisory, never authorization.",
+      "description": "Read adapter connectivity, runtime/schema revisions, supported agent provider types, runtime exposure, configured alias names, and limits. Phase 0 exposes ONLY this tool. Server revisions and supported_agent_types reflect server-side contract support only, neither live provider process availability nor client-side cached tool catalog state. Caller identity and authorization come exclusively from the connection. Annotations are advisory, never authorization.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -23,6 +23,31 @@
               "contract_version": {
                 "type": "string",
                 "const": "0.1.0"
+              },
+              "runtime_revision": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "description": "Server runtime revision or digest currently executing on the host. Reflects server code only, not client-cached tool schemas."
+              },
+              "tool_schema_revision": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "description": "Deterministic digest of the server's currently exposed tools/list schema catalog. Does not prove the client has refreshed its cached catalog."
+              },
+              "supported_agent_types": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "claude",
+                    "agy",
+                    "codex"
+                  ]
+                },
+                "uniqueItems": true,
+                "description": "Agent providers supported by the server contract in this phase; indicates adapter capability, not live runtime availability of individual provider processes."
               },
               "server_time": {
                 "type": "string",
@@ -55,11 +80,14 @@
                     "bridge_sessions_list",
                     "bridge_session_create",
                     "bridge_message_send",
-                    "bridge_operation_get"
+                    "bridge_operation_get",
+                    "bridge_inbox_list",
+                    "bridge_message_get",
+                    "bridge_message_ack"
                   ]
                 },
                 "minItems": 1,
-                "maxItems": 5,
+                "maxItems": 8,
                 "uniqueItems": true,
                 "contains": {
                   "const": "bridge_status"
@@ -133,6 +161,9 @@
             },
             "required": [
               "contract_version",
+              "runtime_revision",
+              "tool_schema_revision",
+              "supported_agent_types",
               "server_time",
               "phase",
               "daemon_status",

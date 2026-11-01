@@ -54,6 +54,9 @@ class StatusTest(unittest.TestCase):
         self.assertIs(data['writes_enabled'],False)
         self.assertEqual(data['enabled_tools'],['bridge_status'])
         self.assertEqual(data['allowed_workspace_aliases'],[])
+        self.assertEqual(data['supported_agent_types'],[])
+        self.assertTrue(isinstance(data['runtime_revision'],str) and data['runtime_revision'])
+        self.assertTrue(isinstance(data['tool_schema_revision'],str) and data['tool_schema_revision'])
         self.assertEqual(set(data['capabilities'].values()),{False})
         self.assertRegex(data['server_time'],r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
         if jsonschema:

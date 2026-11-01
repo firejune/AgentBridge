@@ -7,9 +7,11 @@ directly. The status read is a single broker ping and never discovers, sends or 
 """
 import argparse
 from datetime import datetime, timezone
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
+import re
 import socket
 import sys
 
@@ -28,6 +30,29 @@ MAX_BODY = 1024 * 1024
 TOOLS = json.loads(Path(__file__).resolve().with_name('mcp_tools.json').read_text(encoding='utf-8'))['tools']
 if [t['name'] for t in TOOLS] != list(ENABLED_TOOLS):
     raise RuntimeError('mcp_tools.json must list exactly the enabled tools')
+
+
+def _compute_runtime_revision():
+    here = Path(__file__).resolve()
+    parts = here.parts
+    if 'releases' in parts:
+        idx = parts.index('releases')
+        if idx + 1 < len(parts) and re.fullmatch(r'[A-Za-z0-9._-]{7,64}', parts[idx + 1]):
+            return parts[idx + 1]
+    h = hashlib.sha256()
+    for name in ('mcp_server.py', 'mcp_phase1.py'):
+        candidate = here.with_name(name)
+        if candidate.is_file():
+            h.update(candidate.read_bytes())
+    return 'sha256:' + h.hexdigest()[:16]
+
+
+def schema_revision(tools):
+    raw = json.dumps(tools, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    return 'sha256:' + hashlib.sha256(raw).hexdigest()[:16]
+
+
+RUNTIME_REVISION = _compute_runtime_revision()
 
 
 def daemon_status(path, timeout=PING_TIMEOUT):
@@ -55,6 +80,9 @@ def daemon_status(path, timeout=PING_TIMEOUT):
 
 def status(path):
     return {'contract_version': CONTRACT_VERSION,
+            'runtime_revision': RUNTIME_REVISION,
+            'tool_schema_revision': schema_revision(TOOLS),
+            'supported_agent_types': [],
             'server_time': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
             'phase': PHASE, 'daemon_status': daemon_status(path), 'writes_enabled': False,
             'enabled_tools': list(ENABLED_TOOLS), 'allowed_workspace_aliases': [],
@@ -101,14 +129,17 @@ def handle(message, path, engine=None):
             return error(mid, -32602, f'Unknown tool: {name}')
         arguments = params.get('arguments')
         if engine is not None:
-            from mcp_phase1 import Fault
+            from mcp_phase1 import AGENT_TYPES, Fault
             if name == 'bridge_status':
                 try:
                     engine.authorized(name, engine.principal)
                     engine.validate(name, {} if arguments is None else arguments)
                     data = status(path)
+                    enabled_defs = engine.tools()
                     data.update(phase='enabled', writes_enabled=True,
-                                enabled_tools=[t['name'] for t in engine.tools()],
+                                tool_schema_revision=schema_revision(enabled_defs),
+                                supported_agent_types=list(AGENT_TYPES),
+                                enabled_tools=[t['name'] for t in enabled_defs],
                                 allowed_workspace_aliases=sorted(engine.config['workspaces']),
                                 capabilities=dict.fromkeys(data['capabilities'], True))
                     payload = {'ok': True, 'data': data}
