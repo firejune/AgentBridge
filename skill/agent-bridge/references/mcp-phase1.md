@@ -1,15 +1,10 @@
 # MCP Phase 1 (contract 0.1.0)
 
-The default remains `connectivity_only`: only `bridge_status` is loaded and callable.
-The existing tunnel profile is not changed by installing this code. Phase 1 must
-be explicitly authorized and enabled using `--phase1-config /absolute/private.json`.
-The opt-in process is **stdio only**, behind a verified private single-owner tunnel.
-`--http` plus Phase 1 is refused: loopback alone is not authentication. No API key,
-principal, workspace path, model, route, or existing Claude UUID is a tool argument.
+Local agents (Claude Code, Codex, Antigravity) invoke `bridge.py` directly via the Python CLI and do not register a local MCP server. `mcp_server.py` is dedicated to a single remote connector behind a verified private single-owner tunnel, enabled via `--phase1-config /absolute/private.json` over **stdio only**. (If invoked without `--phase1-config`, the server falls back to `connectivity_only`, exposing only `bridge_status`; `--http` plus Phase 1 is refused because loopback alone is not authentication.) No API key, principal, workspace path, model, route, or existing session UUID is a tool argument.
 
 ## Activation boundary
 
-Before launching the opted-in process, verify the tunnel/plugin's allowed user,
+Before launching the tunnel process, verify the tunnel/plugin's allowed user,
 and approve the workspace paths and create/send scopes. Config is an owner-only
 0600 regular JSON file. Its fields are:
 
@@ -40,9 +35,7 @@ another binding. Workspaces must already exist, be canonical absolute paths,
 fall within their root, and retain their accepted mapping. Approve any alias
 changes separately. This config does not change the receiving agent's permissions.
 
-Reconnect/re-discover the plugin after an approved activation; it will list the
-five default tools (eight only with explicit inbox opt-in) in
-`mcp_phase1_tools.json`. Keep the old status-only profile until then.
+Register only a single remote connector (`Agent Bridge`) pointing to this tunnel; do not maintain a duplicate status-only connector or local MCP entry. It exposes the five default tools (eight when `inbox_enabled: true` is set) defined in `mcp_phase1_tools.json`.
 No launch agent, key rotation, public listener, model override, or shared plugin is
 installed by this implementation.
 
