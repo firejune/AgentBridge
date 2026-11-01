@@ -155,12 +155,9 @@ python3 "$bridge_cli" wt sweep --apply  # Remove eligible worktrees and branches
 - **In-memory correspondence, persistent routing**: Only endpoints and channel bindings are saved to `<state-dir>/routes.json` (`0600`). Messages, delivery state, idempotency keys, credentials, and events remain strictly in memory. On restart, the broker re-verifies saved routes before restoring them.
 - **Optional macOS launchd service**: Supervision is off by default. Use `install-service` (or `--generate-only --plist PATH` to inspect without loading) and `uninstall-service` to manage a `KeepAlive` launch agent.
 
-### 6. MCP Facade (`mcp_server.py`)
+### 6. Remote MCP Facade (`mcp_server.py`)
 
-`skill/agent-bridge/scripts/mcp_server.py` exposes the bridge to MCP clients over `stdio` or loopback `--http PORT`:
-
-- **Default (`connectivity_only`)**: Exposes only the read-only `bridge_status` tool, which sends a single `ping` to the broker.
-- **Phase 1 (Explicit Opt-In)**: Write tools (`bridge_session_create`, `bridge_message_send`, etc.) and the optional independent inbox (`inbox_enabled: true`) require an owner-approved `--phase1-config /absolute/private.json` over `stdio`. See [mcp-phase1.md](skill/agent-bridge/references/mcp-phase1.md) for the full contract.
+Local agents (Claude Code, Codex, Antigravity) invoke `bridge.py` directly via the Python CLI and do not register a local MCP server. `skill/agent-bridge/scripts/mcp_server.py` is dedicated to remote MCP clients connecting through a private single-owner tunnel (`--phase1-config /absolute/private.json` over `stdio`), exposing session discovery/creation, message dispatch, and the optional independent inbox (`inbox_enabled: true`). Without `--phase1-config`, the server falls back to read-only `connectivity_only` (`bridge_status`). See [mcp-phase1.md](skill/agent-bridge/references/mcp-phase1.md) for the full contract.
 
 ## Development & Verification
 

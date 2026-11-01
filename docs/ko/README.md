@@ -155,12 +155,9 @@ python3 "$bridge_cli" wt sweep --apply  # 대상 워크트리 및 브랜치 실�
 - **메모리 기반 메시지, 소유자 전용 라우팅 스냅샷**: 엔드포인트와 채널 바인딩만 `<state-dir>/routes.json`(`0600`)에 저장된다. 메시지 본문, 전달 상태, 중복 방지 키, 토큰, 이벤트 이력은 메모리에만 머물며 브로커 재시작 시 초기화된 뒤 유효한 라우트만 재검증해 복원한다.
 - **선택적 macOS `launchd` 관리**: 자동 기동 서비스는 기본 꺼짐 상태다. `install-service`(검토용 파일 생성은 `--generate-only --plist PATH`)와 `uninstall-service`로 `KeepAlive` 에이전트를 관리한다.
 
-### 6. MCP 파사드 (`mcp_server.py`)
+### 6. 원격 MCP 파사드 (`mcp_server.py`)
 
-`skill/agent-bridge/scripts/mcp_server.py`는 MCP 클라이언트에 브릿지를 노출한다(`stdio` 또는 `127.0.0.1` 전용 `--http PORT`).
-
-- **기본값 (`connectivity_only`)**: 브로커에 `ping` 한 번만 보내는 읽기 전용 `bridge_status` 도구 하나만 노출한다.
-- **Phase 1 (명시적 Opt-In)**: 세션 생성·메시지 전송 도구 및 독립 수신함(`inbox_enabled: true`)은 소유자가 승인한 비공개 `--phase1-config /absolute/private.json`을 `stdio`로 실행할 때만 활성화된다. 자세한 계약은 [mcp-phase1.md](../../skill/agent-bridge/references/mcp-phase1.md)를 참고한다.
+로컬 에이전트(Claude Code, Codex, Antigravity)는 로컬 MCP를 등록하지 않고 `bridge.py` 파이썬 CLI를 직접 사용한다. `skill/agent-bridge/scripts/mcp_server.py`는 비공개 단일 소유자 원격 터널(`stdio` 기반 `--phase1-config /absolute/private.json`) 전용 인터페이스로, 세션 조회·생성, 메시지 전송, 독립 수신함(`inbox_enabled: true`)을 단일 커넥터로 노출한다(`--phase1-config` 생략 시 읽기 전용 `bridge_status`만 응답). 자세한 계약은 [mcp-phase1.md](../../skill/agent-bridge/references/mcp-phase1.md)를 참고한다.
 
 ## 개발 및 검증
 

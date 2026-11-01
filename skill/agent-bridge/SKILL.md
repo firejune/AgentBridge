@@ -151,10 +151,10 @@ python3 "$bridge_cli" usage --events
 - Create with `bridge.py wt new REPO AGENT ISSUE [--slug SLUG]` (or `--detach REF` for a read-only pin).
 - Inspect with `bridge.py wt list --text` and preview cleanup with `bridge.py wt sweep` (run `--apply` only when the owner asks). Remove your own worktree right after merge with `git worktree remove PATH` and `git branch -D BRANCH`.
 
-## MCP Facade
+## Remote MCP Facade
 
-- `scripts/mcp_server.py` serves the bridge to MCP clients (`stdio` or `127.0.0.1`-only `--http PORT`). By default only the read-only `bridge_status` tool is exposed.
-- Write tools and the optional independent inbox (`inbox_enabled: true`) load only with an owner-approved `--phase1-config` over `stdio`: see [mcp-phase1.md](references/mcp-phase1.md).
+- Local agents always use `scripts/bridge.py` directly via the Python CLI; do not register `mcp_server.py` as a local MCP server.
+- `scripts/mcp_server.py` is for a single private remote tunnel (`--phase1-config` over `stdio`): see [mcp-phase1.md](references/mcp-phase1.md).
 
 ## Operational Boundaries
 

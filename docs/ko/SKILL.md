@@ -151,10 +151,10 @@ python3 "$bridge_cli" usage --events
 - `bridge.py wt new REPO AGENT ISSUE [--slug SLUG]`(읽기 전용 고정은 `--detach REF`)로 생성한다.
 - `bridge.py wt list --text`로 소유자·PR·상태를 확인하고, `bridge.py wt sweep`으로 정리 대상을 미리 본다(`--apply`는 소유자 요청 시에만 실행). 내가 작업한 워크트리는 머지 직후 `git worktree remove PATH`와 `git branch -D BRANCH`로 직접 정리한다.
 
-## MCP 파사드
+## 원격 MCP 파사드
 
-- `scripts/mcp_server.py`가 브릿지를 MCP 클라이언트에 노출한다(`stdio` 또는 `127.0.0.1` 전용 `--http PORT`). 기본으로는 읽기 전용 `bridge_status` 도구 하나만 활성화된다.
-- 쓰기 도구와 독립 수신함(`inbox_enabled: true`)은 소유자가 승인한 비공개 `--phase1-config`를 `stdio`로 줄 때만 올라온다: [mcp-phase1.md](../../skill/agent-bridge/references/mcp-phase1.md).
+- 로컬 에이전트는 항상 `scripts/bridge.py` 파이썬 CLI를 직접 사용하며, 로컬 MCP 서버로 중복 등록하지 않는다.
+- `scripts/mcp_server.py`는 비공개 원격 터널(`stdio` 기반 `--phase1-config`) 단일 커넥터 전용이다: [mcp-phase1.md](../../skill/agent-bridge/references/mcp-phase1.md).
 
 ## 실행 경계
 
