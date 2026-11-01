@@ -71,8 +71,9 @@ or `"codex"`, defaulting to the workspace's configured `agent_type` or `"claude"
 and opens new sessions through the corresponding provider adapter (`claude-peer`,
 `agy-live`, or `codex-live`). `bridge_sessions_list` exposes owned sessions,
 pinned sessions, and live `claude`/`agy`/`codex` sessions discovered within the
-approved workspace roots (`cwd`/`root`) using opaque `as_` IDs only (never raw
-UUIDs or paths). Unknown backend availability is `unavailable`, never guessed
+approved workspace roots (`cwd`/`root`) using opaque `as_` IDs (never raw
+UUIDs or paths), along with each session's human-readable `title` and broker
+`route_name` when available. Unknown backend availability is `unavailable`, never guessed
 ready. Delivery acceptance is not completion.
 
 Only exact `reply_to` responses form a success; the first observed nonempty bundle

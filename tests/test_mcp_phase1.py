@@ -414,15 +414,15 @@ class BrokerIntegrationTest(unittest.TestCase):
             engine = phase.Engine(config, backend, start=False)
 
             agy_rows = [
-                {'provider': 'agy', 'id': agy_sid, 'cwd': wt_str, 'status': 'running', 'updated_at': '2026-11-01T00:00:00Z'},
-                {'provider': 'agy', 'id': pinned_agy_sid, 'cwd': root, 'status': 'idle', 'updated_at': '2026-11-01T00:00:00Z'},
-                {'provider': 'agy', 'id': outside_sid, 'cwd': '/tmp', 'status': 'idle', 'updated_at': '2026-11-01T00:00:00Z'},
+                {'provider': 'agy', 'id': agy_sid, 'name': 'Jinni Worker Task', 'cwd': wt_str, 'status': 'running', 'updated_at': '2026-11-01T00:00:00Z'},
+                {'provider': 'agy', 'id': pinned_agy_sid, 'name': 'Jinni HQ Session', 'cwd': root, 'status': 'idle', 'updated_at': '2026-11-01T00:00:00Z'},
+                {'provider': 'agy', 'id': outside_sid, 'name': 'Outside Session', 'cwd': '/tmp', 'status': 'idle', 'updated_at': '2026-11-01T00:00:00Z'},
             ]
             codex_rows = [
-                {'provider': 'codex', 'id': codex_sid, 'cwd': root, 'status': 'idle', 'updated_at': 1730419200},
+                {'provider': 'codex', 'id': codex_sid, 'name': 'Naru Codex Thread', 'cwd': root, 'status': 'idle', 'updated_at': 1730419200},
             ]
             claude_rows = [
-                {'provider': 'claude', 'id': claude_sid, 'cwd': root, 'status': 'idle'},
+                {'provider': 'claude', 'id': claude_sid, 'name': 'Roa Claude HQ', 'cwd': root, 'status': 'idle'},
             ]
             by_agy = {r['id']: r for r in agy_rows}
 
@@ -443,6 +443,13 @@ class BrokerIntegrationTest(unittest.TestCase):
                     self.assertEqual(len(by_type['claude']), 1)
 
                     busy_agy = next(item for item in by_type['agy'] if item['state'] == 'busy')
+                    pinned_agy = next(item for item in by_type['agy'] if item['workspace_alias'] == 'jinni-pin')
+                    self.assertEqual(busy_agy['title'], 'Jinni Worker Task')
+                    self.assertIsNone(busy_agy['route_name'])
+                    self.assertEqual(pinned_agy['title'], 'Jinni HQ Session')
+                    self.assertEqual(pinned_agy['route_name'], 'jinni-hq')
+                    self.assertEqual(by_type['codex'][0]['title'], 'Naru Codex Thread')
+                    self.assertEqual(by_type['claude'][0]['title'], 'Roa Claude HQ')
                     sent = engine.call('bridge_message_send', {
                         'agent_session_id': busy_agy['agent_session_id'],
                         'message': 'ping jinni worker',
