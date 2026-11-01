@@ -1,0 +1,154 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 240" width="100%" height="100%">
+  <defs>
+    <!-- Background dark obsidian gradient -->
+    <linearGradient id="banner-bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0c0f1b"/>
+      <stop offset="50%" stop-color="#070912"/>
+      <stop offset="100%" stop-color="#040508"/>
+    </linearGradient>
+
+    <!-- Tri-Agent Spectrum for Glow & Typography -->
+    <linearGradient id="tri-spectrum" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FF6B4A"/>
+      <stop offset="28%" stop-color="#FF9F0A"/>
+      <stop offset="55%" stop-color="#30D158"/>
+      <stop offset="80%" stop-color="#0A84FF"/>
+      <stop offset="100%" stop-color="#BF5AF2"/>
+    </linearGradient>
+
+    <!-- Arc 1: Claude -> Antigravity -->
+    <linearGradient id="arc-claude-agy" x1="0%" y1="100%" x2="80%" y2="0%">
+      <stop offset="0%" stop-color="#FF6B4A"/>
+      <stop offset="45%" stop-color="#FF9F0A"/>
+      <stop offset="100%" stop-color="#651FFF"/>
+    </linearGradient>
+
+    <!-- Arc 2: Antigravity -> Codex -->
+    <linearGradient id="arc-agy-codex" x1="20%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#BF5AF2"/>
+      <stop offset="45%" stop-color="#0A84FF"/>
+      <stop offset="100%" stop-color="#00C7BE"/>
+    </linearGradient>
+
+    <!-- Arc 3: Codex -> Claude -->
+    <linearGradient id="arc-codex-claude" x1="100%" y1="50%" x2="0%" y2="50%">
+      <stop offset="0%" stop-color="#30D158"/>
+      <stop offset="50%" stop-color="#FFD600"/>
+      <stop offset="100%" stop-color="#FF6B4A"/>
+    </linearGradient>
+
+    <!-- Inner Spoke Gradients -->
+    <linearGradient id="spoke-agy" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#BF5AF2"/>
+      <stop offset="100%" stop-color="#38BDF8"/>
+    </linearGradient>
+
+    <linearGradient id="spoke-claude" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#FF6B4A"/>
+      <stop offset="100%" stop-color="#FF9F0A"/>
+    </linearGradient>
+
+    <linearGradient id="spoke-codex" x1="100%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" stop-color="#30D158"/>
+      <stop offset="100%" stop-color="#00C7BE"/>
+    </linearGradient>
+
+    <!-- Broker Core Ring Gradient -->
+    <linearGradient id="broker-ring" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="50%" stop-color="#A855F7"/>
+      <stop offset="100%" stop-color="#FF6B4A"/>
+    </linearGradient>
+
+    <!-- Joint Void Fill -->
+    <linearGradient id="joint-void" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#05070d"/>
+      <stop offset="100%" stop-color="#121624"/>
+    </linearGradient>
+
+    <!-- Typography Gradient -->
+    <linearGradient id="text-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="65%" stop-color="#F1F5F9"/>
+      <stop offset="100%" stop-color="#94A3B8"/>
+    </linearGradient>
+
+    <!-- Depth Shadow -->
+    <filter id="bridge-depth" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="8" stdDeviation="9" flood-color="#000000" flood-opacity="0.82"/>
+    </filter>
+
+    <!-- Soft Ambient Backlight -->
+    <filter id="ambient-blur" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="30" result="blur"/>
+    </filter>
+  </defs>
+
+  <!-- Clean dark container with subtle border -->
+  <rect width="880" height="240" rx="20" fill="url(#banner-bg)" stroke="#1a202c" stroke-width="1.5" />
+
+  <!-- Ambient Spectrum Glow behind Emblem -->
+  <circle cx="142" cy="122" r="66" fill="url(#tri-spectrum)" opacity="0.14" filter="url(#ambient-blur)" />
+
+  <!-- Left 3-Way Tri-Agent Bridge Emblem -->
+  <g transform="translate(34, 12) scale(0.42)">
+    <g filter="url(#bridge-depth)">
+      <path d="M 138.2 336.0 A 136 136 0 0 1 256.0 132.0" fill="none" stroke="url(#arc-claude-agy)" stroke-width="34" stroke-linecap="round" />
+      <path d="M 256.0 132.0 A 136 136 0 0 1 373.8 336.0" fill="none" stroke="url(#arc-agy-codex)" stroke-width="34" stroke-linecap="round" />
+      <path d="M 373.8 336.0 A 136 136 0 0 1 138.2 336.0" fill="none" stroke="url(#arc-codex-claude)" stroke-width="34" stroke-linecap="round" />
+    </g>
+
+    <g filter="url(#bridge-depth)">
+      <line x1="256.0" y1="132.0" x2="256.0" y2="268.0" stroke="url(#spoke-agy)" stroke-width="26" stroke-linecap="round" />
+      <line x1="138.2" y1="336.0" x2="256.0" y2="268.0" stroke="url(#spoke-claude)" stroke-width="26" stroke-linecap="round" />
+      <line x1="373.8" y1="336.0" x2="256.0" y2="268.0" stroke="url(#spoke-codex)" stroke-width="26" stroke-linecap="round" />
+    </g>
+
+    <g filter="url(#bridge-depth)">
+      <circle cx="256.0" cy="132.0" r="40" fill="#A855F7" />
+      <circle cx="256.0" cy="132.0" r="16" fill="url(#joint-void)" stroke="#090b12" stroke-width="2" />
+      <circle cx="256.0" cy="132.0" r="6" fill="#38BDF8" />
+
+      <circle cx="138.2" cy="336.0" r="40" fill="#FF6B4A" />
+      <circle cx="138.2" cy="336.0" r="16" fill="url(#joint-void)" stroke="#090b12" stroke-width="2" />
+      <circle cx="138.2" cy="336.0" r="6" fill="#FF9F0A" />
+
+      <circle cx="373.8" cy="336.0" r="40" fill="#30D158" />
+      <circle cx="373.8" cy="336.0" r="16" fill="url(#joint-void)" stroke="#090b12" stroke-width="2" />
+      <circle cx="373.8" cy="336.0" r="6" fill="#00C7BE" />
+
+      <circle cx="256.0" cy="268.0" r="52" fill="url(#broker-ring)" />
+      <circle cx="256.0" cy="268.0" r="22" fill="url(#joint-void)" stroke="#090b12" stroke-width="2.5" />
+      <circle cx="256.0" cy="268.0" r="8.5" fill="#F8FAFC" />
+    </g>
+  </g>
+
+  <!-- Typography & Feature Badges -->
+  <g transform="translate(262, 0)">
+    <!-- Main Title -->
+    <text x="0" y="103" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="52" font-weight="800" letter-spacing="-1.5">
+      <tspan fill="url(#text-grad)">Agent </tspan><tspan fill="url(#tri-spectrum)">Bridge</tspan>
+    </text>
+
+    <!-- Subtitle / Tagline -->
+    <text x="2" y="143" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="15.5" font-weight="500" fill="#94A3B8" letter-spacing="-0.2">
+      Real-time local correspondence bridge for Claude, Codex &amp; Antigravity
+    </text>
+
+    <!-- Clean Feature Badges -->
+    <g transform="translate(2, 168)">
+      <!-- Badge 1: Direct Live Push -->
+      <rect x="0" y="0" width="154" height="26" rx="6" fill="#151926" stroke="#1e293b" stroke-width="1" />
+      <text x="77" y="17" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#FF9500" text-anchor="middle">⚡ DIRECT LIVE PUSH</text>
+
+      <!-- Badge 2: 3-Way Providers -->
+      <rect x="162" y="0" width="174" height="26" rx="6" fill="#151926" stroke="#1e293b" stroke-width="1" />
+      <text x="249" y="17" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#30D158" text-anchor="middle">🔀 CLAUDE · CODEX · AGY</text>
+
+      <!-- Badge 3: Zero-Dep Unix Socket -->
+      <rect x="344" y="0" width="176" height="26" rx="6" fill="#151926" stroke="#1e293b" stroke-width="1" />
+      <text x="432" y="17" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#38BDF8" text-anchor="middle">🛡️ STDLIB UNIX SOCKET</text>
+    </g>
+  </g>
+</svg>
+
