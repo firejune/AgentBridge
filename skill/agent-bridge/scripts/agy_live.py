@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import ssl
 import subprocess
@@ -185,14 +186,25 @@ def _parse_server_command(cmd):
     }
 
 
+def _resolve_lsof():
+    if shutil.which('lsof'):
+        return 'lsof'
+    for candidate in ('/usr/sbin/lsof', '/usr/bin/lsof'):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return 'lsof'
+
+
 def _connect_candidate(pid, app_dir, csrf, timeout=5, host=None, add_dirs=(), hub_port=None, ppid=None, orphaned=False):
+    lsof_out = ''
     try:
         lsof_out = subprocess.check_output(
-            ['lsof', '-Pan', '-p', str(pid), '-iTCP', '-sTCP:LISTEN'],
+            [_resolve_lsof(), '-Pan', '-p', str(pid), '-iTCP', '-sTCP:LISTEN'],
             text=True, stderr=subprocess.DEVNULL, timeout=5,
         )
     except (OSError, subprocess.SubprocessError) as error:
-        raise DeliveryError(f'Failed to inspect listening ports for Antigravity pid {pid}: {error}') from None
+        if not hub_port:
+            raise DeliveryError(f'Failed to inspect listening ports for Antigravity pid {pid}: {error}') from None
 
     ports = []
     for line in lsof_out.splitlines():
@@ -446,14 +458,17 @@ def _server_matches_cwd(server, cwd):
 def discover_host_server(host='desktop', timeout=5, cwd=None):
     if host not in HOST_APP_DIRS:
         raise DeliveryError(f'Unknown Antigravity host {host!r}; use desktop or ide')
-    candidates = [
-        s for s in discover_servers(timeout=timeout)
-        if server_host(s) == host and not s.get('orphaned')
-    ]
+    servers = [s for s in discover_servers(timeout=timeout) if not s.get('orphaned')]
+    candidates = [s for s in servers if server_host(s) == host]
+    if not candidates and host == 'desktop':
+        # Unified agy --hub servers run with --app_data_dir=antigravity and
+        # serve both Agent Manager (desktop) and IDE when no separate desktop
+        # language_server is running.
+        candidates = [s for s in servers if s.get('app_dir') == 'antigravity']
     if not candidates:
         label = 'desktop' if host == 'desktop' else 'IDE'
         raise DeliveryError(f'Antigravity {label} language_server is not running')
-    if host == 'ide' and cwd and len(candidates) > 1:
+    if cwd and len(candidates) > 1:
         target_cwd = str(Path(cwd).expanduser().resolve())
         exact = [s for s in candidates if target_cwd in (s.get('add_dirs') or ())]
         if len(exact) == 1:

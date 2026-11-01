@@ -654,6 +654,34 @@ class AgyLiveTests(unittest.TestCase):
                     self.assertEqual([s['pid'] for s in discovered], [4001, 4002])
                     fake_kill.assert_called_once_with(4000, agy_live.signal.SIGTERM)
 
+    def test_lsof_missing_falls_back_to_hub_port_and_desktop_host_uses_unified_hub(self):
+        import agy_live
+
+        sid = str(uuid.uuid4())
+        with FakeAgyServer(self.root, sid) as hub_srv:
+            uid = os.getuid()
+            port = hub_srv.httpd.server_port
+            ps_text = (
+                f"5001 79990 {uid} /Users/test/.gemini/bin/agy --hub --hub-port={port} "
+                f"--app_data_dir=antigravity --csrf_token={CSRF} --add-dir={self.root}\n"
+            )
+
+            def fake_check_output(cmd, *args, **kwargs):
+                if cmd[0] == 'ps':
+                    return ps_text
+                raise FileNotFoundError(2, 'No such file or directory', cmd[0])
+
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop('AGENT_BRIDGE_AGY_URL', None)
+                os.environ.pop('AGENT_BRIDGE_AGY_CSRF', None)
+                with mock.patch('shutil.which', return_value=None), \
+                        mock.patch('subprocess.check_output', side_effect=fake_check_output):
+                    listed = agy_live.list_agy(cwd=str(self.root))
+                    self.assertEqual([row['id'] for row in listed['sessions']], [sid])
+                    desktop_srv = agy_live.discover_host_server('desktop', cwd=str(self.root))
+                    self.assertEqual(desktop_srv['pid'], 5001)
+
+
 if __name__ == '__main__':
     unittest.main()
 

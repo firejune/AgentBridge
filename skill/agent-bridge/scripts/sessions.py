@@ -14,6 +14,7 @@ from urllib.parse import urlencode
 import uuid
 
 import agy_live
+import codex_live
 import codex_new
 
 
@@ -360,6 +361,79 @@ def resolve_claude_peer(sid, sessions_dir=None):
             'status':record.get('status','unknown'),'pid':record['pid'],'socket':sock,
             'peer_protocol':record['peerProtocol'],'version':record.get('version'),
             'registry':str(path),'observed_at':observed_now(),'scope':'Claude live-session registry'}
+
+
+def resolve_agy_peer(sid, timeout=5):
+    """Return the live trajectory row of one exact Antigravity conversationId, or raise."""
+    _, row = agy_live.resolve_agy(sid, timeout=timeout)
+    return row
+
+
+def resolve_codex_peer(sid, executable='codex', mode='auto'):
+    """Return the live Codex Desktop thread row for one exact thread UUID, or raise."""
+    info = read_codex(sid, executable=executable, mode=mode)['session']
+    if info.get('status') in ('idle', 'ready', 'running', 'busy'):
+        return info
+    try:
+        with codex_live.Client(timeout=2) as client:
+            client.owner(info['id'])
+        return dict(info, status='idle', runtime_observed=True)
+    except (codex_live.DeliveryError, OSError) as error:
+        raise DiscoveryError(f'Codex session {sid} has no live Desktop owner: {error}') from None
+
+
+def list_agy_peers(limit=25):
+    """Return live Antigravity trajectory rows (idle or running) across local servers."""
+    listing = agy_live.list_agy(limit=limit)
+    return [dict(r, provider='agy') for r in listing.get('sessions', [])
+            if r.get('status') in ('idle', 'ready', 'running', 'busy')]
+
+
+def list_claude_peers(sessions_dir=None):
+    """Return live Claude peer sessions from the local session directory without spawning a CLI."""
+    root = Path(sessions_dir) if sessions_dir else claude_sessions_dir()
+    rows = []
+    for record in claude_live_records(root):
+        sock = record.get('messagingSocketPath')
+        if record.get('peerProtocol') != PEER_PROTOCOL or not isinstance(sock, str) or not sock.startswith('/'):
+            continue
+        try:
+            sid = str(uuid.UUID(record['sessionId']))
+        except (ValueError, KeyError, TypeError):
+            continue
+        if record.get('cwd'):
+            rows.append({'provider': 'claude', 'id': sid, 'name': record.get('name'),
+                         'cwd': record['cwd'], 'status': record.get('status', 'idle'),
+                         'pid': record['pid'], 'observed_at': observed_now()})
+    return rows
+
+
+def list_codex_peers(limit=25, executable='codex', mode='auto'):
+    """Return Codex threads that are actively owned by Codex Desktop (or active in shared server)."""
+    if mode != 'shared' and not os.environ.get('AGENT_BRIDGE_CODEX_URL'):
+        try:
+            codex_live.validate_endpoint(codex_live.endpoint())
+        except (codex_live.DeliveryError, OSError):
+            return []
+    listing = list_codex(executable=executable, limit=limit, mode=mode)
+    live, candidates = [], []
+    for row in listing['sessions']:
+        if row.get('status') in ('idle', 'ready', 'running', 'busy'):
+            live.append(row)
+        else:
+            candidates.append(row)
+    if candidates:
+        try:
+            with codex_live.Client(timeout=1.5) as client:
+                for row in candidates:
+                    try:
+                        client.owner(row['id'])
+                        live.append(dict(row, status='idle', runtime_observed=True))
+                    except (codex_live.DeliveryError, OSError):
+                        continue
+        except (codex_live.DeliveryError, OSError):
+            pass
+    return live
 
 
 # --- Opening a new Claude Code desktop session ------------------------------

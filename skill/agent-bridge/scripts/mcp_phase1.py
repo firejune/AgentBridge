@@ -32,6 +32,9 @@ SCOPES = {'bridge_status':'bridge:read', 'bridge_sessions_list':'bridge:read',
           'bridge_inbox_list':'bridge:read', 'bridge_message_get':'bridge:read',
           'bridge_message_ack':'bridge:message:send'}
 INBOX_TOOLS = frozenset(('bridge_inbox_list', 'bridge_message_get', 'bridge_message_ack'))
+AGENT_TYPES = ('claude', 'agy', 'codex')
+AGENT_TRANSPORTS = {'claude': 'claude-peer', 'agy': 'agy', 'codex': 'codex'}
+TRANSPORT_AGENTS = {'claude-peer': 'claude', 'agy': 'agy', 'codex': 'codex'}
 ACTIVE = ('accepted', 'running', 'unknown')
 STATES = {'pending','dispatching','submitted','received','in_progress','answered','done','failed','uncertain'}
 RETENTION = 720 * 3600  # Detailed records >=168h, full keys >=720h; tombstones never deleted.
@@ -40,6 +43,19 @@ MAX_RESULT = 1024 * 1024
 
 def stamp():
     return datetime.now(timezone.utc).isoformat()
+
+
+def iso_timestamp(value):
+    if isinstance(value, (int, float)) and value > 0:
+        if value > 1e12:
+            value = value / 1000.0
+        return datetime.fromtimestamp(value, timezone.utc).isoformat()
+    if isinstance(value, str) and value.strip():
+        try:
+            return datetime.fromisoformat(value.strip().replace('Z', '+00:00')).astimezone(timezone.utc).isoformat()
+        except ValueError:
+            pass
+    return stamp()
 
 
 def digest(value):
@@ -88,17 +104,48 @@ def validate_workspaces(workspaces):
     if not isinstance(workspaces, dict) or not workspaces:
         raise ValueError('At least one approved workspace alias is required')
     for alias, w in workspaces.items():
-        if not re.fullmatch(r'[a-z][a-z0-9_-]{0,31}', alias) or set(w) != {'cwd','root','project','ide'}:
+        if (not re.fullmatch(r'[a-z][a-z0-9_-]{0,31}', alias) or not isinstance(w, dict)
+                or not {'cwd', 'root', 'project'}.issubset(w)
+                or set(w) - {'cwd', 'root', 'project', 'ide', 'agent_type', 'host'}):
             raise ValueError('Invalid workspace configuration')
         broker.identifier(w['project'])
-        if w['ide'] not in sessions.CLAUDE_IDES:
-            raise ValueError('Unsupported IDE')
+        agent_type = w.get('agent_type', 'claude')
+        if agent_type not in AGENT_TYPES:
+            raise ValueError('Unsupported workspace agent_type')
+        if 'host' in w and w['host'] not in ('desktop', 'ide'):
+            raise ValueError('Unsupported workspace host')
+        if agent_type == 'claude' or 'ide' in w:
+            if w.get('ide') not in sessions.CLAUDE_IDES:
+                raise ValueError('Unsupported IDE')
         for key in ('cwd','root'):
             p = Path(w[key])
             if not p.is_absolute() or not p.is_dir() or str(p.resolve()) != str(p):
                 raise ValueError('Workspace paths must be existing canonical absolute directories')
         if not Path(w['cwd']).is_relative_to(w['root']):
             raise ValueError('Workspace is outside its allowed root')
+
+
+def match_workspace(cwd, workspaces, preferred_project=None):
+    if not cwd:
+        return None, None
+    try:
+        target = Path(cwd).expanduser().resolve()
+    except (OSError, TypeError, ValueError):
+        return None, None
+    main_repo = sessions.agy_live._git_main_worktree(target)
+    best = None
+    for alias, w in sorted(workspaces.items()):
+        root = Path(w['root']).resolve()
+        ws_cwd = Path(w['cwd']).resolve()
+        exact = (target == ws_cwd) or (main_repo is not None and main_repo == ws_cwd)
+        in_root = target.is_relative_to(root) or (main_repo is not None and main_repo.is_relative_to(root))
+        if not exact and not in_root:
+            continue
+        proj_match = 1 if (preferred_project and w['project'] == preferred_project) else 0
+        rank = (1 if exact else 0, proj_match, len(str(ws_cwd)) if exact else len(str(root)))
+        if best is None or rank > best[0]:
+            best = (rank, alias, w)
+    return (best[1], best[2]) if best else (None, None)
 
 
 def pinned_sessions(config):
@@ -110,8 +157,18 @@ def pinned_sessions(config):
     for alias, g in grants.items():
         if (not re.fullmatch(r'[a-z][a-z0-9_-]{0,31}', alias)
                 or alias in config['workspaces']
-                or set(g) != {'uuid','cwd','project','route','authorized_at'}):
+                or not isinstance(g, dict)
+                or set(g) - {'agent_type', 'transport'} != {'uuid','cwd','project','route','authorized_at'}):
             raise ValueError('Invalid pinned session grant')
+        if 'agent_type' in g and g['agent_type'] not in AGENT_TYPES:
+            raise ValueError('Invalid pinned session agent_type')
+        if 'transport' in g and g['transport'] not in TRANSPORT_AGENTS:
+            raise ValueError('Invalid pinned session transport')
+        if 'agent_type' in g and 'transport' in g and AGENT_TRANSPORTS[g['agent_type']] != g['transport']:
+            raise ValueError('Conflicting pinned session agent_type and transport')
+        explicit_type = 'agent_type' in g or 'transport' in g
+        agent_type = g.get('agent_type') or TRANSPORT_AGENTS.get(g.get('transport'), 'claude')
+        transport = AGENT_TRANSPORTS[agent_type]
         if str(uuid.UUID(g['uuid'])) != g['uuid']:
             raise ValueError('Canonical session UUID required')
         cwd = Path(g['cwd'])
@@ -122,6 +179,7 @@ def pinned_sessions(config):
         identity = digest([config['principal'], config['tunnel_id'], alias, g])
         sid = 'as_' + identity[:32]
         result[sid] = {'id':sid, 'uuid':g['uuid'], 'alias':alias,
+            'agent_type':agent_type, 'transport':transport, 'explicit_type':explicit_type,
             'workspace':{'cwd':g['cwd'], 'root':g['cwd'], 'project':g['project'], 'ide':'antigravity-ide'},
             'route':g['route'], 'sender':'mcp-' + identity[32:],
             'created_at':g['authorized_at'], 'last_activity_at':g['authorized_at'],
@@ -142,26 +200,64 @@ class Backend:
             raise ValueError('Invalid instance')
         return value
 
+    def session_transport(self, session):
+        if session.get('pinned') and not session.get('explicit_type'):
+            try:
+                rows = self.rpc('routes', project=session['workspace']['project'])
+                route = next((r for r in rows if r['name'] == session['route']), None)
+                if route and route.get('transport') in TRANSPORT_AGENTS:
+                    return route['transport']
+            except Exception:
+                pass
+        if session.get('transport') in TRANSPORT_AGENTS:
+            return session['transport']
+        return AGENT_TRANSPORTS.get(session.get('agent_type', 'claude'), 'claude-peer')
+
+    def session_agent_type(self, session):
+        return TRANSPORT_AGENTS.get(self.session_transport(session), session.get('agent_type', 'claude'))
+
     def create(self, workspace):
-        # Same policy and supported IDE opening path as bridge register --new.
+        # Same policy and supported opening path as bridge register --new.
         from types import SimpleNamespace
-        args = SimpleNamespace(socket=self.path, model=None)
-        bridge.new_session_policy(args, 'claude')
-        row = sessions.open_session('claude', cwd=workspace['cwd'], host='ide',
-                                    ide=workspace['ide'], timeout=180)['session']
+        agent_type = workspace.get('agent_type', 'claude')
+        if agent_type not in AGENT_TYPES:
+            raise ValueError('Unsupported agent type')
+        host = workspace.get('host', 'ide' if agent_type == 'claude' else 'desktop')
+        args = SimpleNamespace(socket=self.path, model=None, host=host, cwd=workspace['cwd'])
+        bridge.new_session_policy(args, agent_type)
+        if agent_type == 'claude':
+            row = sessions.open_session('claude', cwd=workspace['cwd'], host=host,
+                                        ide=workspace.get('ide') or sessions.DEFAULT_IDE, timeout=180)['session']
+        elif agent_type == 'agy':
+            row = sessions.open_session('agy', cwd=workspace['cwd'], model=args.model,
+                                        host=host, timeout=180)['session']
+        else:
+            row = sessions.open_session('codex', cwd=workspace['cwd'], model=args.model,
+                                        host='desktop', timeout=180)['session']
         sid = str(uuid.UUID(row['id']))
         # Return the acquired UUID immediately; registration rechecks exact cwd after it is durable.
         return sid
 
     def check(self, session):
-        row = sessions.resolve_claude_peer(session['uuid'])
-        if row['id'] != session['uuid'] or Path(row['cwd']).resolve() != Path(session['workspace']['cwd']):
+        expected_cwd = Path(session.get('cwd') or session['workspace']['cwd']).resolve()
+        transport = self.session_transport(session)
+        agent_type = TRANSPORT_AGENTS[transport]
+        if agent_type == 'claude':
+            row = sessions.resolve_claude_peer(session['uuid'])
+        elif agent_type == 'agy':
+            row = sessions.resolve_agy_peer(session['uuid'])
+        elif agent_type == 'codex':
+            row = sessions.resolve_codex_peer(session['uuid'])
+        else:
+            raise ValueError('Unsupported agent type')
+        if row['id'] != session['uuid'] or Path(row['cwd']).resolve() != expected_cwd:
             raise ValueError('Session identity changed')
         if session.get('pinned'):
             rows = self.rpc('routes', project=session['workspace']['project'])
             route = next((r for r in rows if r['name'] == session['route']), {})
-            if (route.get('transport'),route.get('session'),route.get('cwd')) != (
-                    'claude-peer',session['uuid'],session['workspace']['cwd']):
+            route_cwd = Path(route['cwd']).resolve() if route.get('cwd') else None
+            if (route.get('transport'),route.get('session'),route_cwd) != (
+                    transport,session['uuid'],expected_cwd):
                 raise ValueError('Pinned route changed')
         return row
 
@@ -172,12 +268,97 @@ class Backend:
         except (ValueError, OSError):
             return 'unavailable'
 
+    def discover(self, config):
+        workspaces = config['workspaces']
+        candidates = {}
+        for project in sorted({w['project'] for w in workspaces.values()}):
+            try:
+                routes = self.rpc('routes', project=project)
+            except Exception:
+                continue
+            for r in routes:
+                transport = r.get('transport')
+                if transport not in TRANSPORT_AGENTS or not r.get('session') or not r.get('cwd'):
+                    continue
+                try:
+                    sid_uuid = str(uuid.UUID(r['session']))
+                except (ValueError, TypeError):
+                    continue
+                alias, w = match_workspace(r['cwd'], workspaces, preferred_project=project)
+                if alias is not None:
+                    agent_type = TRANSPORT_AGENTS[transport]
+                    candidates[(agent_type, sid_uuid)] = {
+                        'uuid': sid_uuid,
+                        'agent_type': agent_type,
+                        'transport': transport,
+                        'cwd': str(Path(r['cwd']).resolve()),
+                        'alias': alias,
+                        'workspace': dict(w),
+                        'timestamp': stamp(),
+                    }
+        live_rows = []
+        for provider_name, getter in (
+            ('agy', sessions.list_agy_peers),
+            ('claude', sessions.list_claude_peers),
+            ('codex', sessions.list_codex_peers),
+        ):
+            try:
+                for row in getter():
+                    live_rows.append(dict(row, provider=row.get('provider') or provider_name))
+            except Exception:
+                continue
+        for row in live_rows:
+            agent_type = row.get('provider')
+            if agent_type not in AGENT_TYPES or not row.get('id') or not row.get('cwd'):
+                continue
+            try:
+                sid_uuid = str(uuid.UUID(row['id']))
+            except (ValueError, TypeError):
+                continue
+            alias, w = match_workspace(row['cwd'], workspaces)
+            if alias is None:
+                continue
+            ts = iso_timestamp(row.get('updated_at') or row.get('observed_at'))
+            candidates[(agent_type, sid_uuid)] = {
+                'uuid': sid_uuid,
+                'agent_type': agent_type,
+                'transport': AGENT_TRANSPORTS[agent_type],
+                'cwd': str(Path(row['cwd']).resolve()),
+                'alias': alias,
+                'workspace': dict(w),
+                'timestamp': ts,
+            }
+        result = {}
+        for (agent_type, sid_uuid), item in candidates.items():
+            identity = digest([config['principal'], config['tunnel_id'], 'discovered',
+                               item['alias'], agent_type, sid_uuid])
+            sid = 'as_' + identity[:32]
+            result[sid] = {
+                'id': sid,
+                'uuid': sid_uuid,
+                'alias': item['alias'],
+                'agent_type': agent_type,
+                'transport': item['transport'],
+                'cwd': item['cwd'],
+                'workspace': item['workspace'],
+                'route': 'mcp-' + identity[32:48],
+                'sender': 'mcp-' + identity[48:64],
+                'created_at': item['timestamp'],
+                'last_activity_at': item['timestamp'],
+                'principal': config['principal'],
+                'registered': False,
+                'discovered': True,
+            }
+        return result
+
     def register(self, session):
         self.check(session)
         w = session['workspace']
-        expected = {'project':w['project'], 'name':session['route'], 'cwd':w['cwd'],
-                    'transport':'claude-peer','session':session['uuid']}
-        sender = dict(project=w['project'], name=session['sender'], cwd=w['cwd'], transport='realtime',session=None)
+        cwd = str(Path(session.get('cwd') or w['cwd']).resolve())
+        transport = self.session_transport(session)
+        expected = {'project':w['project'], 'name':session['route'], 'cwd':cwd,
+                    'transport':transport,'session':session['uuid']}
+        sender = dict(project=w['project'], name=session['sender'], cwd=cwd, transport='realtime',session=None)
         rows = self.rpc('routes', project=w['project'])
         for fields in (expected, sender):
             existing = next((r for r in rows if r['name'] == fields['name']), None)
@@ -192,21 +373,24 @@ class Backend:
 
     def verify_routes(self, session):
         self.check(session)
+        cwd = str(Path(session.get('cwd') or session['workspace']['cwd']).resolve())
+        transport = self.session_transport(session)
         rows = self.rpc('routes', project=session['workspace']['project'])
-        for name, transport, sid in ((session['route'],'claude-peer',session['uuid']),
-                                      (session['sender'],'realtime',None)):
+        for name, expected_transport, sid in ((session['route'],transport,session['uuid']),
+                                              (session['sender'],'realtime',None)):
             row = next((r for r in rows if r['name'] == name), {})
-            if (row.get('transport'),row.get('session'),row.get('cwd')) != (transport,sid,session['workspace']['cwd']):
+            if (row.get('transport'),row.get('session'),row.get('cwd')) != (expected_transport,sid,cwd):
                 raise ValueError('Route changed')
 
     def post(self, op, session):
-        if session.get('pinned'):
-            self.register(session)  # Only the private return route may be created.
+        if session.get('pinned') or session.get('discovered'):
+            self.register(session)  # Ensure routes exist before sending.
         self.verify_routes(session)
+        transport = self.session_transport(session)
         m = self.rpc('send', project=session['workspace']['project'],sender=session['sender'],
                      recipient=session['route'],body=op['message'],key=op.get('downstream_key',op['key_hash']))
         # Validate broker snapshot before handing it to push; never route by name again.
-        if m['route']['session'] != session['uuid'] or m['route']['transport'] != 'claude-peer':
+        if m['route']['session'] != session['uuid'] or m['route']['transport'] != transport:
             raise ValueError('Unexpected message route')
         return m
 
@@ -327,9 +511,14 @@ class Engine:
             return pinned_sessions(self.config)[sid]
         with self.lock:
             row = self.db.execute('SELECT doc FROM owned_sessions WHERE id=? AND principal=?',(sid,principal)).fetchone()
-        if row is None:
-            raise Fault('NOT_FOUND')
-        return json.loads(row[0])
+        if row is not None:
+            return json.loads(row[0])
+        if principal == self.principal and hasattr(self.backend, 'discover'):
+            discovered = self.backend.discover(self.config).get(sid)
+            if discovered is not None:
+                discovered = dict(discovered, principal=principal)
+                return discovered
+        raise Fault('NOT_FOUND')
 
     def operation(self, oid, principal):
         with self.lock:
@@ -364,6 +553,8 @@ class Engine:
                 valid = isinstance(v,str) and p.get('minLength',0) <= len(v) <= p.get('maxLength',100000)
                 if valid and 'pattern' in p:
                     valid = re.fullmatch(p['pattern'],v) is not None
+                if valid and 'enum' in p:
+                    valid = v in p['enum']
             if not valid:
                 raise Fault('INVALID_ARGUMENT')
         if 'message' in args:
@@ -408,7 +599,10 @@ class Engine:
         if creating:
             if args['workspace_alias'] not in self.config['workspaces']:
                 raise Fault('WORKSPACE_NOT_ALLOWED')
-            payload = {'contract_version':'0.1.0','workspace_alias':args['workspace_alias'],'agent_type':'claude'}
+            agent_type = args.get('agent_type') or self.config['workspaces'][args['workspace_alias']].get('agent_type', 'claude')
+            if agent_type not in AGENT_TYPES:
+                raise Fault('INVALID_ARGUMENT')
+            payload = {'contract_version':'0.1.0','workspace_alias':args['workspace_alias'],'agent_type':agent_type}
         else:
             session = self.session(args['agent_session_id'],principal)
             self.allowed(session)
@@ -434,10 +628,14 @@ class Engine:
                 raise Fault('CAPACITY_EXCEEDED')
             try:
                 self.backend.instance()
-                if not creating and (not session.get('registered') or self.backend.availability(session) not in (('ready','busy') if session.get('pinned') else ('ready',))):
+                if not creating and (not (session.get('registered') or session.get('discovered'))
+                                     or self.backend.availability(session) not in (('ready','busy') if (session.get('pinned') or session.get('discovered')) else ('ready',))):
                     raise ValueError('Unavailable dedicated session')
             except Exception:
                 raise Fault('BACKEND_UNAVAILABLE') from None
+            if not creating and session.get('discovered'):
+                self.db.execute('INSERT OR IGNORE INTO owned_sessions VALUES (?,?,?)',
+                                (session['id'], principal, json.dumps(session)))
             when = stamp()
             op = {'operation_id':opaque('op_'),'kind':'session_create' if creating else 'message_send',
                   'status':'accepted','accepted_at':when,'updated_at':when,'accepted_epoch':time.time(),
@@ -447,7 +645,7 @@ class Engine:
                   'instance':None,'backend_id':None,
                   'downstream_key':digest([self.ledger_namespace,key_hash])}
             if creating:
-                op.update(alias=args['workspace_alias'],workspace=dict(self.config['workspaces'][args['workspace_alias']]))
+                op.update(alias=args['workspace_alias'],workspace=dict(self.config['workspaces'][args['workspace_alias']]),agent_type=agent_type)
             else:
                 op['message'] = args['message']
             self.db.execute('INSERT INTO operations VALUES (?,?,?,?,?,?)',
@@ -464,6 +662,10 @@ class Engine:
         if self.config['workspaces'].get(session['alias']) != session['workspace']:
             raise Fault('WORKSPACE_NOT_ALLOWED')
         validate_workspaces({session['alias']:session['workspace']})
+        if session.get('cwd'):
+            alias, _ = match_workspace(session['cwd'], {session['alias']: session['workspace']})
+            if alias != session['alias']:
+                raise Fault('WORKSPACE_NOT_ALLOWED')
 
     def fail(self, op, code='DELIVERY_UNKNOWN', unknown=True):
         failure = Fault(code).payload
@@ -511,7 +713,7 @@ class Engine:
                 self.allowed({'alias':op['alias'],'workspace':op['workspace']})
             else:
                 session = self.session(op['agent_session_id'],op['principal']); self.allowed(session)
-                if self.backend.availability(session) not in (('ready','busy') if session.get('pinned') else ('ready',)):
+                if self.backend.availability(session) not in (('ready','busy') if (session.get('pinned') or session.get('discovered')) else ('ready',)):
                     raise Fault('BACKEND_UNAVAILABLE')
         except Exception:
             self.fail(op,'BACKEND_UNAVAILABLE',unknown=False); return
@@ -524,9 +726,12 @@ class Engine:
                 except BlockingIOError:
                     return
                 self.update(op,status='running',stage='create_intent',instance=instance)
-                sid = self.backend.create(op['workspace'])
+                agent_type = op.get('agent_type') or op['workspace'].get('agent_type', 'claude')
+                create_ws = dict(op['workspace'], agent_type=agent_type) if agent_type != op['workspace'].get('agent_type', 'claude') else op['workspace']
+                sid = self.backend.create(create_ws)
                 self.update(op,stage='created',backend_session=sid)
                 session = {'id':opaque('as_'),'uuid':sid,'alias':op['alias'],'workspace':op['workspace'],
+                           'agent_type':agent_type,'transport':AGENT_TRANSPORTS[agent_type],
                            'route':'mcp-'+secrets.token_hex(16),'sender':'mcp-'+secrets.token_hex(16),
                            'created_at':stamp(),'last_activity_at':stamp(),'principal':op['principal'],'registered':False}
                 with self.transaction():
@@ -554,6 +759,7 @@ class Engine:
             self.update(op,stage='observing',backend_message_state=message['state'])
             with self.transaction():
                 session['last_activity_at'] = stamp()
+                session['registered'] = True
                 self.db.execute('UPDATE owned_sessions SET doc=? WHERE id=?',(json.dumps(session),session['id']))
             self.observe(op)
 
@@ -572,7 +778,9 @@ class Engine:
             raise Fault('INVALID_ARGUMENT')
         if not op['agent_session_id']:
             self.allowed({'alias':op['alias'],'workspace':op['workspace']})
+            agent_type = op.get('agent_type') or op['workspace'].get('agent_type', 'claude')
             session = {'id':opaque('as_'),'uuid':op['backend_session'],'alias':op['alias'],'workspace':op['workspace'],
+                       'agent_type':agent_type,'transport':AGENT_TRANSPORTS[agent_type],
                        'route':'mcp-'+secrets.token_hex(16),'sender':'mcp-'+secrets.token_hex(16),
                        'created_at':stamp(),'last_activity_at':stamp(),'principal':op['principal'],'registered':False}
             with self.transaction():
@@ -643,25 +851,40 @@ class Engine:
 
     def list_sessions(self, args, principal):
         last = self.offset(args['cursor'],principal,'sessions','') if 'cursor' in args else ''
+        limit = args.get('limit', 20)
         with self.lock:
-            rows = self.db.execute('SELECT doc FROM owned_sessions WHERE principal=? AND id>? ORDER BY id LIMIT ?',
-                                    (principal,last,args.get('limit',20)+1)).fetchall()
-        owned = [json.loads(r[0]) for r in rows]
+            rows = self.db.execute('SELECT doc FROM owned_sessions WHERE principal=? ORDER BY id',
+                                    (principal,)).fetchall()
+        all_sessions = [json.loads(r[0]) for r in rows]
+        seen_ids = {s['id'] for s in all_sessions}
+        seen_uuids = {s['uuid'] for s in all_sessions}
         if principal == self.principal:
-            owned += [s for s in pinned_sessions(self.config).values() if s['id'] > last]
+            for s in pinned_sessions(self.config).values():
+                if s['id'] not in seen_ids and s['uuid'] not in seen_uuids:
+                    all_sessions.append(s)
+                    seen_ids.add(s['id']); seen_uuids.add(s['uuid'])
+            if hasattr(self.backend, 'discover'):
+                for s in self.backend.discover(self.config).values():
+                    if s['id'] not in seen_ids and s['uuid'] not in seen_uuids:
+                        all_sessions.append(s)
+                        seen_ids.add(s['id']); seen_uuids.add(s['uuid'])
+        owned = [s for s in all_sessions if s['id'] > last]
         owned.sort(key=lambda s:s['id'])
-        more = len(owned)>args.get('limit',20)
-        owned = owned[:args.get('limit',20)]; result = []
+        more = len(owned)>limit
+        owned = owned[:limit]; result = []
         ops = self.rows()
         for s in owned:
             try:
                 self.allowed(s)
-                if not s.get('registered'):
+                if not (s.get('registered') or s.get('discovered')):
                     raise Fault('BACKEND_UNAVAILABLE')
                 state = 'busy' if any(o['agent_session_id']==s['id'] and o['status'] in ACTIVE for o in ops) else self.backend.availability(s)
             except Exception:
                 state = 'unavailable'
-            result.append({'agent_session_id':s['id'],'agent_type':'claude','workspace_alias':s['alias'],
+            agent_type = self.backend.session_agent_type(s) if hasattr(self.backend, 'session_agent_type') else s.get('agent_type', 'claude')
+            if agent_type not in AGENT_TYPES:
+                agent_type = 'claude'
+            result.append({'agent_session_id':s['id'],'agent_type':agent_type,'workspace_alias':s['alias'],
                            'state':state,'created_at':s['created_at'],'last_activity_at':s['last_activity_at']})
         return {'sessions':result,'has_more':more,'next_cursor':self.cursor(principal,'sessions','',owned[-1]['id']) if more else None}
 
@@ -728,8 +951,9 @@ class Engine:
             if not session.get('registered'):
                 continue
             w = session['workspace']
+            cwd = str(Path(session.get('cwd') or w['cwd']).resolve())
             routes.append({'slot': session['id'], 'route': {
-                'project': w['project'], 'name': session['sender'], 'cwd': w['cwd'],
+                'project': w['project'], 'name': session['sender'], 'cwd': cwd,
                 'transport': 'realtime', 'session': None}})
         if selector is not None and not routes:
             raise Fault('NOT_FOUND')

@@ -65,10 +65,15 @@ adapter refuses ambiguity. Create and send are separate operations.
 The worker commits intent before create/post/push, saves returned UUID/message
 IDs before the next stage, and actually calls `bridge.push_if_peer` after broker
 `send`/`State.post`. It uses dedicated random routes, verifies exact UUID/cwd,
-and never chooses an existing session or channel. New Claude sessions use the
-supported IDE opening path and current host model under the existing model policy.
-Only metadata of adapter-owned sessions is exposed. Unknown backend availability
-is `unavailable`, never guessed ready. Delivery acceptance is not completion.
+and never chooses an arbitrary workspace outside the approved config.
+`bridge_session_create` accepts an optional `agent_type` (`"claude"`, `"agy"`,
+or `"codex"`, defaulting to the workspace's configured `agent_type` or `"claude"`)
+and opens new sessions through the corresponding provider adapter (`claude-peer`,
+`agy-live`, or `codex-live`). `bridge_sessions_list` exposes owned sessions,
+pinned sessions, and live `claude`/`agy`/`codex` sessions discovered within the
+approved workspace roots (`cwd`/`root`) using opaque `as_` IDs only (never raw
+UUIDs or paths). Unknown backend availability is `unavailable`, never guessed
+ready. Delivery acceptance is not completion.
 
 Only exact `reply_to` responses form a success; the first observed nonempty bundle
 is sorted by `(created,id)` and frozen. Pagination slices Unicode code points.
