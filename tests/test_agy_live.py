@@ -28,6 +28,8 @@ class FakeAgyServer:
         self.send_behavior = send_behavior
         self.ignore_archive = False
         self.requests = []
+        self.projects = {}
+        self.environments = {}
         self.trajectories = {
             self.sid: {
                 'summary': 'Agent-Bridge Skill Verification',
@@ -86,11 +88,37 @@ class FakeAgyServer:
                             'modelOrAlias': {'model': 'MODEL_PLACEHOLDER_M418'},
                         },
                     })
+                elif self.path.endswith('/CreateProject'):
+                    proj = body.get('project') or {}
+                    pid = proj.get('id')
+                    if pid:
+                        parent.projects[pid] = proj
+                    self.respond(200, {})
+                elif self.path.endswith('/AddEnvironmentToProject'):
+                    pid = body.get('projectId')
+                    env = body.get('environment') or {}
+                    eid = env.get('id')
+                    if pid and eid:
+                        parent.environments[(pid, eid)] = env
+                    self.respond(200, {})
                 elif self.path.endswith('/StartCascade'):
                     new_id = str(uuid.uuid4())
                     uris = body.get('workspaceUris') or []
                     proj_env = body.get('projectEnvConfig') or {}
                     proj_id = proj_env.get('projectId')
+                    env_id = proj_env.get('environmentId')
+                    if proj_id and env_id and not uris:
+                        env_obj = parent.environments.get((proj_id, env_id)) or {}
+                        env_res = (env_obj.get('resources') or {}).get('resources') or []
+                        uris = [r.get('folderUri') for r in env_res if isinstance(r, dict) and r.get('folderUri')]
+                    if proj_id and not uris:
+                        proj_obj = parent.projects.get(proj_id) or {}
+                        proj_res = (proj_obj.get('projectResources') or {}).get('resources') or []
+                        for r in proj_res:
+                            if isinstance(r, dict):
+                                u = r.get('folderUri') or (r.get('gitFolder') or {}).get('folderUri')
+                                if u:
+                                    uris.append(u)
                     if proj_id and not uris:
                         uris = [parent.root.as_uri()]
                     parent.trajectories[new_id] = {
@@ -101,6 +129,10 @@ class FakeAgyServer:
                     }
                     if proj_id:
                         parent.trajectories[new_id]['annotations'] = {'projectId': proj_id}
+                        meta = {'projectId': proj_id, 'workspaces': [{'workspaceFolderAbsoluteUri': u} for u in uris]}
+                        if env_id:
+                            meta['environmentId'] = env_id
+                        parent.trajectories[new_id]['trajectoryMetadata'] = meta
                     self.respond(200, {'cascadeId': new_id})
                 elif self.path.endswith('/UpdateConversationAnnotations'):
                     cid = body.get('cascadeId')
@@ -680,6 +712,82 @@ class AgyLiveTests(unittest.TestCase):
                     self.assertEqual([row['id'] for row in listed['sessions']], [sid])
                     desktop_srv = agy_live.discover_host_server('desktop', cwd=str(self.root))
                     self.assertEqual(desktop_srv['pid'], 5001)
+
+    def test_worktree_and_unified_hub_open_associate_project_and_environment(self):
+        import agy_live
+
+        config_dir = self.root / 'gemini-config'
+        projects_dir = config_dir / 'projects'
+        projects_dir.mkdir(parents=True)
+
+        repo_a = self.root / 'repo-a'
+        wt_a = self.root / '.worktrees' / 'repo-a' / 'jinni-71'
+        (repo_a / '.git' / 'worktrees' / 'jinni-71').mkdir(parents=True)
+        wt_a.mkdir(parents=True)
+        (wt_a / '.git').write_text(f"gitdir: {repo_a / '.git' / 'worktrees' / 'jinni-71'}\n", encoding='utf-8')
+
+        proj_a = str(uuid.uuid4())
+        (projects_dir / f'{proj_a}.json').write_text(
+            json.dumps({
+                'id': proj_a,
+                'name': 'repo-a',
+                'projectResources': {
+                    'resources': [{'gitFolder': {'folderUri': repo_a.as_uri()}}],
+                },
+            }),
+            encoding='utf-8',
+        )
+
+        # Unregistered git repo and its worktree
+        repo_b = self.root / 'repo-b'
+        wt_b = self.root / '.worktrees' / 'repo-b' / 'jinni-80'
+        (repo_b / '.git' / 'worktrees' / 'jinni-80').mkdir(parents=True)
+        wt_b.mkdir(parents=True)
+        (wt_b / '.git').write_text(f"gitdir: {repo_b / '.git' / 'worktrees' / 'jinni-80'}\n", encoding='utf-8')
+
+        with FakeAgyServer(repo_a, str(uuid.uuid4())) as hub_srv:
+            unified_rows = [{
+                'pid': 6001,
+                'ppid': 6000,
+                'orphaned': False,
+                'app_dir': 'antigravity',
+                'host': 'ide',
+                'add_dirs': (str(repo_a),),
+                'url': hub_srv.url,
+                'csrf': CSRF,
+                'summaries': hub_srv.trajectories,
+            }]
+            with mock.patch.dict(os.environ, {'GEMINI_CONFIG_DIR': str(config_dir)}, clear=False), \
+                    mock.patch.object(agy_live, 'discover_servers', return_value=unified_rows):
+                # 1) Opening a worktree of registered repo_a on a unified hub (host='ide')
+                #    resolves proj_a, registers a worktree environment, and keeps wt_a as cwd.
+                opened_wt = agy_live.open_agy(str(wt_a), title='jinni-desk-71', host='ide')
+                self.assertEqual(opened_wt['project_id'], proj_a)
+                self.assertEqual(opened_wt['session']['cwd'], str(wt_a))
+                add_env_calls = [b for p, _, b in hub_srv.requests if p.endswith('/AddEnvironmentToProject')]
+                self.assertEqual(len(add_env_calls), 1)
+                self.assertEqual(add_env_calls[0]['projectId'], proj_a)
+                env_id = add_env_calls[0]['environment']['id']
+
+                start_calls = [b for p, _, b in hub_srv.requests if p.endswith('/StartCascade')]
+                self.assertEqual(
+                    start_calls[-1]['projectEnvConfig'],
+                    {'projectId': proj_a, 'environmentId': env_id},
+                )
+
+                # 2) Opening a worktree of unregistered git repo_b auto-creates a project
+                #    for repo_b and attaches the worktree environment.
+                opened_unreg = agy_live.open_agy(str(wt_b), title='jinni-desk-80', host='desktop')
+                create_proj_calls = [b for p, _, b in hub_srv.requests if p.endswith('/CreateProject')]
+                self.assertEqual(len(create_proj_calls), 1)
+                created_proj = create_proj_calls[0]['project']
+                self.assertEqual(created_proj['name'], 'repo-b')
+                self.assertEqual(
+                    created_proj['projectResources']['resources'][0]['gitFolder']['folderUri'],
+                    repo_b.as_uri(),
+                )
+                self.assertEqual(opened_unreg['project_id'], created_proj['id'])
+                self.assertEqual(opened_unreg['session']['cwd'], str(wt_b))
 
 
 if __name__ == '__main__':

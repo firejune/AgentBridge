@@ -513,8 +513,88 @@ def gemini_projects_dir():
     return Path.home() / '.gemini' / 'config' / 'projects'
 
 
+def _resource_folder_path(res):
+    if not isinstance(res, dict):
+        return None
+    uri = res.get('folderUri')
+    if not uri and isinstance(res.get('gitFolder'), dict):
+        uri = res['gitFolder'].get('folderUri')
+    return uri_to_path(uri)
+
+
+def _project_default_paths(record):
+    if not isinstance(record, dict):
+        return ()
+    paths = []
+    for raw_path in record.get('workspacePaths') or ():
+        if isinstance(raw_path, str) and raw_path.strip():
+            try:
+                folder_path = (
+                    uri_to_path(raw_path)
+                    if raw_path.startswith('file://')
+                    else str(Path(raw_path).expanduser().resolve())
+                )
+            except (OSError, ValueError):
+                folder_path = None
+            if folder_path and folder_path not in paths:
+                paths.append(folder_path)
+    resources = record.get('projectResources', {}).get('resources')
+    if isinstance(resources, list):
+        for res in resources:
+            folder_path = _resource_folder_path(res)
+            if folder_path and folder_path not in paths:
+                paths.append(folder_path)
+    return tuple(paths)
+
+
+def _find_project_environment_id(record, target_path_str):
+    if not isinstance(record, dict) or not target_path_str:
+        return None
+    envs = record.get('environments', {}).get('environments')
+    if not isinstance(envs, list):
+        return None
+    for env in envs:
+        if not isinstance(env, dict):
+            continue
+        env_id = env.get('id')
+        if not isinstance(env_id, str) or not env_id:
+            continue
+        resources = env.get('resources', {}).get('resources')
+        if not isinstance(resources, list):
+            continue
+        for res in resources:
+            if _resource_folder_path(res) == target_path_str:
+                return env_id
+    return None
+
+
+def _load_project_record(project_id, projects_dir=None):
+    if not isinstance(project_id, str) or not project_id:
+        return None
+    root = Path(projects_dir) if projects_dir else gemini_projects_dir()
+    if not root.is_dir():
+        return None
+    direct = root / f'{project_id}.json'
+    candidates = [direct] if direct.is_file() else sorted(root.glob('*.json'))
+    for path in candidates:
+        try:
+            record = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue
+        if isinstance(record, dict) and record.get('id') == project_id:
+            return record
+    return None
+
+
+IGNORED_PROJECT_IDS = ('outside-of-project', 'default-cli-project')
+
+
 def find_desktop_project_id(server, target_cwd, projects_dir=None):
     resolved_target = str(Path(target_cwd).expanduser().resolve())
+    main_repo = _git_main_worktree(resolved_target)
+    resolved_root = str(main_repo) if main_repo is not None else resolved_target
+
+    summary_root_match = None
     summaries = server.get('summaries') if isinstance(server, dict) else None
     if isinstance(summaries, dict):
         for item in summaries.values():
@@ -522,43 +602,119 @@ def find_desktop_project_id(server, target_cwd, projects_dir=None):
                 continue
             meta = item.get('trajectoryMetadata')
             project_id = meta.get('projectId') if isinstance(meta, dict) else None
-            if not isinstance(project_id, str) or not project_id:
+            if not isinstance(project_id, str) or not project_id or project_id in IGNORED_PROJECT_IDS:
                 continue
             cwd = extract_cwd(item.get('workspaces')) or extract_cwd(meta.get('workspaces'))
-            if cwd and str(Path(cwd).resolve()) == resolved_target:
+            if not cwd:
+                continue
+            resolved_cwd = str(Path(cwd).resolve())
+            if resolved_cwd == resolved_target:
                 return project_id
+            if summary_root_match is None:
+                cwd_root = _git_main_worktree(resolved_cwd)
+                if resolved_cwd == resolved_root or (cwd_root is not None and str(cwd_root) == resolved_root):
+                    summary_root_match = project_id
 
     root = Path(projects_dir) if projects_dir else gemini_projects_dir()
-    if not root.is_dir():
-        return None
-    for path in sorted(root.glob('*.json')):
-        try:
-            record = json.loads(path.read_text(encoding='utf-8'))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(record, dict):
-            continue
-        project_id = record.get('id')
-        if not isinstance(project_id, str) or not project_id:
-            continue
-        for raw_path in record.get('workspacePaths') or ():
-            if isinstance(raw_path, str) and raw_path.strip():
-                folder_path = uri_to_path(raw_path) if raw_path.startswith('file://') else str(Path(raw_path).expanduser().resolve())
-                if folder_path == resolved_target:
-                    return project_id
-        resources = record.get('projectResources', {}).get('resources')
-        if not isinstance(resources, list):
-            continue
-        for res in resources:
-            if not isinstance(res, dict):
+    worktree_match = None
+    if root.is_dir():
+        for path in sorted(root.glob('*.json')):
+            try:
+                record = json.loads(path.read_text(encoding='utf-8'))
+            except (OSError, ValueError):
                 continue
-            uri = res.get('folderUri')
-            if not uri and isinstance(res.get('gitFolder'), dict):
-                uri = res['gitFolder'].get('folderUri')
-            folder_path = uri_to_path(uri)
-            if folder_path and folder_path == resolved_target:
+            if not isinstance(record, dict):
+                continue
+            project_id = record.get('id')
+            if not isinstance(project_id, str) or not project_id or project_id in IGNORED_PROJECT_IDS:
+                continue
+            default_paths = _project_default_paths(record)
+            if resolved_target in default_paths or _find_project_environment_id(record, resolved_target):
                 return project_id
-    return None
+            if worktree_match is None and resolved_root != resolved_target and resolved_root in default_paths:
+                worktree_match = project_id
+    return worktree_match or summary_root_match
+
+
+def _create_desktop_project(server, project_root, timeout=5):
+    project_root = Path(project_root).expanduser().resolve()
+    if not (project_root / '.git').exists():
+        return None
+    project_id = str(uuid.uuid4())
+    project_name = project_root.name or str(project_root)
+    try:
+        rpc_call(
+            server['url'],
+            server['csrf'],
+            'CreateProject',
+            {
+                'project': {
+                    'id': project_id,
+                    'name': project_name,
+                    'projectResources': {
+                        'resources': [
+                            {
+                                'gitFolder': {
+                                    'folderUri': project_root.as_uri(),
+                                },
+                            },
+                        ],
+                    },
+                    'isWorkspaceOnly': False,
+                    'settings': {},
+                },
+            },
+            timeout=timeout,
+        )
+        return project_id
+    except DeliveryError:
+        return None
+
+
+def _resolve_project_env_config(server, project_id, target_path, projects_dir=None, timeout=5):
+    if not isinstance(project_id, str) or not project_id:
+        return None
+    target_path = Path(target_path).expanduser().resolve()
+    target_str = str(target_path)
+    main_repo = _git_main_worktree(target_path)
+    project_root = main_repo if main_repo is not None else target_path
+    record = _load_project_record(project_id, projects_dir=projects_dir)
+    default_paths = _project_default_paths(record) if record else ()
+
+    if target_str in default_paths or (not default_paths and target_path == project_root):
+        return {
+            'projectId': project_id,
+            'defaultProjectEnvironment': {},
+        }
+
+    env_id = _find_project_environment_id(record, target_str) if record else None
+    if not env_id:
+        env_id = str(uuid.uuid4())
+        try:
+            rpc_call(
+                server['url'],
+                server['csrf'],
+                'AddEnvironmentToProject',
+                {
+                    'projectId': project_id,
+                    'environment': {
+                        'id': env_id,
+                        'name': target_path.name or target_str,
+                        'resources': {
+                            'resources': [
+                                {'folderUri': target_path.as_uri()},
+                            ],
+                        },
+                    },
+                },
+                timeout=timeout,
+            )
+        except DeliveryError:
+            return None
+    return {
+        'projectId': project_id,
+        'environmentId': env_id,
+    }
 
 
 def build_default_agent_spec(model_enum):
@@ -832,9 +988,21 @@ def open_agy(cwd, title=None, model=None, timeout=5, host='desktop'):
 
     server = discover_host_server(host, timeout=timeout, cwd=str(target_path))
     model_info = resolve_model(server, model, timeout=timeout)
-    # Desktop projects group conversations in its sidebar; the IDE takes the
-    # workspace folder directly and lists every workspace's conversations.
-    project_id = find_desktop_project_id(server, str(target_path)) if host == 'desktop' else None
+    # Unified agy --hub (app_dir == 'antigravity') and desktop servers group
+    # conversations by projectId in the UI conversation stack; only legacy
+    # antigravity-ide language_server instances skip project association.
+    supports_projects = (host == 'desktop' or server.get('app_dir') == 'antigravity')
+    project_id = find_desktop_project_id(server, str(target_path)) if supports_projects else None
+    if supports_projects and not project_id:
+        project_root = _git_main_worktree(target_path) or target_path
+        project_id = _create_desktop_project(server, project_root, timeout=timeout)
+    project_env_config = (
+        _resolve_project_env_config(server, project_id, target_path, timeout=timeout)
+        if project_id else None
+    )
+    if project_id and not project_env_config:
+        project_id = None
+
     cid = str(uuid.uuid4())
     base_payload = {
         'cascadeId': cid,
@@ -844,7 +1012,7 @@ def open_agy(cwd, title=None, model=None, timeout=5, host='desktop'):
     }
 
     start_resp = None
-    if project_id:
+    if project_env_config:
         try:
             start_resp = rpc_call(
                 server['url'],
@@ -852,10 +1020,7 @@ def open_agy(cwd, title=None, model=None, timeout=5, host='desktop'):
                 'StartCascade',
                 {
                     **base_payload,
-                    'projectEnvConfig': {
-                        'projectId': project_id,
-                        'defaultProjectEnvironment': {},
-                    },
+                    'projectEnvConfig': project_env_config,
                 },
                 timeout=timeout,
             )
