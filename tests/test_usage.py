@@ -733,7 +733,7 @@ class MessageUsageTests(Base):
         self.assertEqual(self.usage_for('codex', 'claude-peer')['provider'], 'codex')
         self.assertEqual(self.usage_for('claude-peer', 'codex')['provider'], 'codex')
         self.assertEqual(self.usage_for('claude-peer', 'agy')['provider'], 'agy')
-        self.assertIsNone(self.usage_for('claude-peer', 'claude-peer'))
+        self.assertEqual(self.usage_for('claude-peer', 'claude-peer')['provider'], 'claude')  # #83
         self.assertIsNone(self.usage_for('realtime', 'realtime'))
 
     def test_send_output_carries_usage_only_for_codex_routes(self):
@@ -897,3 +897,181 @@ class AgyUsageTests(unittest.TestCase):
                 patch.object(agy_live, 'rpc_call', return_value={'clientModelConfigs': []}) as rpc:
             usage.read_agy(timeout=5)
         rpc.assert_called_once_with('http://127.0.0.1:51002', 'live', 'GetCascadeModelConfigData', {}, timeout=5)
+
+
+def ms(moment):
+    return int(moment.timestamp() * 1000)
+
+
+CLAUDE_UTILIZATION = {
+    'five_hour': {'utilization': 11.0, 'resets_at': '2026-10-23T07:10:00.8+00:00', 'locked_reason': None},
+    'seven_day': {'utilization': 2.0, 'resets_at': '2026-10-26T19:00:00.8+00:00', 'locked_reason': None},
+    'limits': [{'kind': 'session', 'percent': 11},
+               {'kind': 'weekly_scoped', 'percent': 3, 'resets_at': '2026-10-26T19:00:00+00:00',
+                'scope': {'model': {'display_name': 'Fable'}}}]}
+
+
+class ClaudeUsageTests(unittest.TestCase):
+    """Issue #83: Desktop history + Claude Code login; no Keychain, network or real files."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='ab-claude-', dir='/tmp')
+        self.root = Path(self.temp.name)
+        self.store = usage.UsageStore(self.root / 'state' / 'usage', provider='claude')
+        self.desktop = self.root / 'desktop'
+        self.desktop.mkdir()
+        self.config = self.root / '.claude.json'
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def history(self, *samples, org='org-a'):
+        rows = [dict(t=ms(moment), org=sample_org or org, u=values) for moment, values, sample_org in
+                [(s + (None,))[:3] for s in samples]]
+        (self.desktop / 'plan-usage-history.json').write_text(json.dumps(dict(version=2, samples=rows)))
+
+    def cache(self, fetched, login='acct-1', cached='acct-1', utilization=CLAUDE_UTILIZATION):
+        self.config.write_text(json.dumps(dict(oauthAccount=dict(accountUuid=login, emailAddress='x@y'),
+                                               cachedUsageUtilization=dict(fetchedAtMs=ms(fetched),
+                                                                           accountUuid=cached,
+                                                                           utilization=utilization))))
+
+    def read(self, live=False, token=lambda now: None, fetch=None, now=T0):
+        def no_fetch(_):
+            raise AssertionError('no live call expected')
+        return usage.read_claude(live=live, desktop_dir=self.desktop, config_path=self.config,
+                                 token=token, fetch=fetch or no_fetch, clock=lambda: now)
+
+    def collect(self, now=T0, **kw):
+        return usage.sample(self.store, lambda: self.read(now=now, **kw), lambda: now)
+
+    def test_desktop_samples_keep_their_time_and_missing_five_hour_is_unknown(self):
+        self.history((T0 - timedelta(minutes=30), {'fh': 4, 'sd': 20}), (T0 - timedelta(minutes=15), {'sd': 21}))
+        self.cache(T0 - timedelta(minutes=5))
+        records = self.collect()
+        desktop = [(r['slot'], r['used_percent'], r['observed_at']) for r in records if r['limit_id'] == 'desktop']
+        self.assertEqual(desktop, [('primary', 4, usage.utc(T0 - timedelta(minutes=30))),
+                                   ('secondary', 20, usage.utc(T0 - timedelta(minutes=30))),
+                                   ('secondary', 21, usage.utc(T0 - timedelta(minutes=15)))])
+        self.assertEqual({r['window_mins'] for r in records if r['limit_id'] == 'desktop'}, {300, 10080})
+
+    def test_only_the_current_desktop_account_and_recent_window_are_read(self):
+        self.history((T0 - timedelta(hours=5), {'sd': 9}), (T0 - timedelta(minutes=20), {'sd': 70}, 'org-old'),
+                     (T0 - timedelta(minutes=10), {'sd': 30}))
+        self.cache(T0)
+        desktop = [r['used_percent'] for r in self.collect() if r['limit_id'] == 'desktop']
+        self.assertEqual(desktop, [30])
+
+    def test_an_older_or_equal_sample_is_not_recorded_twice(self):
+        self.history((T0 - timedelta(minutes=15), {'sd': 21}))
+        self.cache(T0 - timedelta(minutes=5))
+        self.collect()
+        self.collect(now=T0 + timedelta(minutes=15))  # same source times, read again
+        self.assertEqual(len(self.store.load()), 4)
+
+    def test_ide_cache_is_used_only_for_the_login_account(self):
+        self.history((T0, {'sd': 1}))
+        self.cache(T0 - timedelta(minutes=40))
+        ide = {r['slot']: r for r in self.collect() if r['limit_id'] == 'ide'}
+        self.assertEqual(sorted(ide), ['primary', 'secondary', 'weekly:Fable'])
+        self.assertEqual((ide['primary']['used_percent'], ide['primary']['window_mins'], ide['primary']['resets_at']),
+                         (11.0, 300, '2026-10-23T07:10:00.800000+00:00'))
+        self.assertEqual(ide['primary']['observed_at'], usage.utc(T0 - timedelta(minutes=40)))
+        self.assertEqual(ide['primary']['source'], usage.CLAUDE_SOURCES['ide_cache'])
+        self.cache(T0, login='acct-1', cached='acct-2')
+        failed = [r for r in usage.normalize_claude(self.read(), T0) if r['status'] == 'failed']
+        self.assertEqual([(r['limit_id'], r['reason']) for r in failed],
+                         [('ide', 'no usage cache for the Claude Code login')])
+
+    def test_live_read_wins_and_nothing_identifying_is_stored(self):
+        self.history((T0, {'sd': 1}))
+        self.cache(T0 - timedelta(hours=3))
+        seen = []
+        def fetch(token):
+            seen.append(token)
+            return CLAUDE_UTILIZATION
+        records = self.collect(live=True, token=lambda now: 'sk-ant-oat-secret', fetch=fetch)
+        self.assertEqual(seen, ['sk-ant-oat-secret'])
+        ide = [r for r in records if r['limit_id'] == 'ide']
+        self.assertEqual({r['observed_at'] for r in ide}, {usage.utc(T0)})
+        self.assertEqual({r['source'] for r in ide}, {usage.CLAUDE_SOURCES['ide']})
+        stored = (self.root / 'state' / 'usage' / 'claude.jsonl').read_text()
+        for secret in ('sk-ant-oat-secret', 'acct-1', 'org-a', 'x@y'):
+            self.assertNotIn(secret, stored)
+
+    def test_live_failure_falls_back_to_the_cache_and_no_cache_keeps_the_live_reason(self):
+        import urllib.error
+        def limited(_):
+            raise urllib.error.HTTPError(usage.CLAUDE_USAGE_URL, 429, 'Too Many Requests', {}, None)
+        self.history((T0, {'sd': 1}))
+        self.cache(T0 - timedelta(minutes=7))
+        ide = [r for r in self.collect(live=True, token=lambda now: 'tok', fetch=limited) if r['limit_id'] == 'ide']
+        self.assertEqual({r['source'] for r in ide}, {usage.CLAUDE_SOURCES['ide_cache']})
+        self.config.unlink()
+        failed = [r for r in usage.normalize_claude(self.read(live=True, token=lambda now: 'tok', fetch=limited), T0)
+                  if r['status'] == 'failed']
+        self.assertEqual([(r['limit_id'], r['reason']) for r in failed], [('ide', 'http 429')])
+
+    def test_expired_or_missing_token_never_calls_the_endpoint(self):
+        self.history((T0, {'sd': 1}))
+        self.cache(T0)
+        with patch.object(usage.sys, 'platform', 'linux'), patch.dict(os.environ, {'HOME': str(self.root)}):
+            creds = self.root / '.claude' / '.credentials.json'
+            creds.parent.mkdir()
+            creds.write_text(json.dumps({'claudeAiOauth': {'accessToken': 'tok', 'expiresAt': ms(T0) + 30_000}}))
+            self.assertIsNone(usage.claude_token(T0))
+            creds.write_text(json.dumps({'claudeAiOauth': {'accessToken': 'tok', 'expiresAt': ms(T0) + 3_600_000}}))
+            self.assertEqual(usage.claude_token(T0), 'tok')
+            creds.unlink()
+            self.assertIsNone(usage.claude_token(T0))
+        with patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(self.root)}):
+            self.assertIsNone(usage.claude_token(T0))
+        self.assertTrue(self.collect(live=True))  # token None: the cache is read, no fetch
+
+    def test_one_surface_failing_does_not_mark_the_other(self):
+        self.history((T0 - timedelta(minutes=10), {'fh': 5, 'sd': 30}))
+        self.collect()  # no ~/.claude.json: ide fails, desktop records
+        _, summary, now = usage.query(self.root / 'state', '6h', 'claude', now=T0 + timedelta(minutes=1))
+        rows = {(b['limit_id'], b['slot']): b['freshness'] for b in summary['buckets']}
+        self.assertEqual(rows, {('desktop', 'primary'): 'fresh', ('desktop', 'secondary'): 'fresh'})
+        text = usage.format_summary(summary, now)
+        self.assertIn('claude/desktop 5h: 95% left', text)
+        self.assertIn('claude: last failed read', text)
+
+    def test_both_failing_is_one_failed_sample_with_both_reasons(self):
+        records = self.collect()
+        self.assertEqual(len(records), 1)
+        self.assertEqual((records[0]['status'], records[0]['limit_id'], records[0]['used_percent']),
+                         ('failed', None, None))
+        self.assertEqual(records[0]['reason'],
+                         'desktop: desktop history not found; ide: claude code config not found')
+
+    def test_idle_five_hour_window_opening_is_not_a_reset(self):
+        idle = dict(CLAUDE_UTILIZATION, five_hour={'utilization': 0, 'resets_at': None})
+        self.history((T0, {'sd': 1}))
+        self.cache(T0, utilization=idle)
+        self.collect()
+        self.cache(T0 + timedelta(minutes=15))
+        self.collect(now=T0 + timedelta(minutes=16))
+        events = [e for e in usage.detect(self.store.load()) if e['limit_id'] == 'ide' and e['slot'] == 'primary']
+        self.assertEqual(events, [])
+
+    def test_claude_peer_routes_carry_claude_usage(self):
+        self.history((T0 - timedelta(minutes=10), {'sd': 30}))
+        self.collect()
+        args = bridge.main.__globals__['argparse'].Namespace(socket='/tmp/ab-never.sock',
+                                                             state_dir=str(self.root / 'state'))
+        with patch.object(bridge, 'broker_state_dir', lambda a: self.root / 'state'):
+            found = bridge.message_usage(args, {'route': {'transport': 'claude-peer'}})
+            self.assertIsNone(bridge.message_usage(args, {'route': {'transport': 'local'}}))
+            mixed = bridge.message_usage(args, {'route': {'transport': 'codex'}, 'return_route': {'transport': 'claude-peer'}})
+        self.assertEqual(found['provider'], 'claude')
+        self.assertEqual(mixed['provider'], 'codex')
+
+    def test_collector_and_cli_offer_claude(self):
+        collector = usage.Collector(self.store, reader=lambda: self.read(), clock=lambda: T0)
+        self.assertEqual(collector.events.provider, 'claude')
+        self.assertIn('claude', usage.PROVIDERS)
+        out = io.StringIO()
+        with redirect_stdout(out), self.assertRaises(SystemExit):
+            bridge.main(['serve', '--help'])
+        self.assertIn('--no-claude-live', out.getvalue())

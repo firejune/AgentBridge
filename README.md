@@ -137,13 +137,20 @@ python3 "$bridge_cli" policy                                   # Show active def
 
 ### 3. Subscription Usage & Risk Monitoring (`usage`)
 
-The broker samples subscription limits in the background into `<state-dir>/usage.jsonl`. Every `send`, `ask`, and `reply` touching a `codex` or `agy` route includes a `usage` summary (`ok`, `at_risk`, `exhausted`, or `unknown`) so coordinators can pace work before hitting a wall.
+The broker samples subscription limits in the background into `<state-dir>/usage/<provider>.jsonl`. Every `send`, `ask`, and `reply` touching a `codex` or `agy` route (or one between two `claude-peer` routes) includes a `usage` summary (`ok`, `at_risk`, `exhausted`, or `unknown`) so coordinators can pace work before hitting a wall.
 
 ```bash
-python3 "$bridge_cli" usage                        # All providers (Codex + Antigravity buckets)
+python3 "$bridge_cli" usage                        # All providers (Codex + Antigravity + Claude buckets)
+python3 "$bridge_cli" usage --provider claude     # Claude Desktop and Claude Code (IDE/CLI) accounts
 python3 "$bridge_cli" usage --provider agy --json  # Antigravity buckets only (agy/gemini, agy/partner)
 python3 "$bridge_cli" usage --events               # Reset history, spend horizon & stop-risk horizon
 ```
+
+**Claude (`claude/desktop`, `claude/ide`)** — for a machine where Claude Desktop and the Claude Code IDE extension run under different accounts. No read starts a model turn:
+
+- `claude/desktop`: Desktop's own 15-minute history (`~/Library/Application Support/Claude/plan-usage-history.json`) for the account Desktop is signed in to. Used % only; no reset times.
+- `claude/ide`: the Claude Code login (IDE extension and terminal CLI), read live from the usage endpoint the CLI's `/usage` uses, with the login's access token read per call from the Keychain item `Claude Code-credentials`. The token is never stored, logged, or refreshed. If it is missing or expired, or the call fails, the CLI's own cache in `~/.claude.json` is used (written only at session start or on `/usage`, so often old — check `observed`). `serve --no-claude-live` disables the Keychain read.
+- Samples keep the time their source measured them, so `observed … ago` is the source's age, not the broker's.
 
 ### 4. Agent Worktrees (`wt`)
 

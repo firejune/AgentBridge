@@ -502,7 +502,7 @@ async def watch(state, args, reader, writer):
 
 
 async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DEFAULT_INTERVAL_MINUTES,
-                codex_executable='codex'):
+                codex_executable='codex', claude_live=True):
     path = Path(path).expanduser().absolute()
     path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
     lock = path.with_suffix('.lock').open('a')
@@ -524,7 +524,8 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
         if usage_interval:
             # Read-only limit sampling beside the broker; it never touches `state`.
             collectors = [usage.Collector(usage.UsageStore(store.directory / 'usage', provider=provider),
-                                          usage_interval, codex_executable).start()
+                                          usage_interval, codex_executable,
+                                          claude_live=claude_live).start()
                           for provider in usage.PROVIDERS]
         stopping = asyncio.Event()
         handlers = set()
