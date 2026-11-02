@@ -1,7 +1,9 @@
+from contextlib import closing
 import io
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -11,6 +13,7 @@ import uuid
 
 import agy_live
 import bridge
+import codex_preview
 import sessions
 from support import RunningBroker
 from test_agy_live import CSRF, FakeAgyServer
@@ -72,14 +75,41 @@ class CloseClaudeTests(unittest.TestCase):
         self.assertEqual(sent, [(child.pid, 15)])
         self.assertIn('code 143', closed['note'])
 
-    def test_desktop_session_is_closable_with_its_own_note(self):
+    def test_desktop_session_is_closable_with_its_own_note_and_optional_archive(self):
         child = subprocess.Popen(['sleep', '30'])
-        self.fake(pid=child.pid, extra={'entrypoint': 'claude-desktop', 'hostSessionId': 'local_x'})
+        self.fake(pid=child.pid, extra={'entrypoint': 'claude-desktop', 'hostSessionId': 'local_1234'})
         def kill(pid, sig):
             os.kill(pid, sig); child.wait()
         closed = sessions.close_claude(self.sid, sessions_dir=self.root/'sessions', killer=kill, poll=0.01)
-        self.assertEqual((closed['host'], closed['resumable']), ('claude-desktop', True))
+        self.assertEqual((closed['host'], closed['archived'], closed['resumable']), ('claude-desktop', False, True))
         self.assertIn('session interrupted', closed['note'])
+
+        # With archive=True, marks isArchived=True in the matching local_*.json metadata.
+        self.fakes.pop().close()
+        child2 = subprocess.Popen(['sleep', '30'])
+        self.fake(pid=child2.pid, extra={'entrypoint': 'claude-desktop', 'hostSessionId': 'local_5678'})
+        desktop_dir = self.root / 'claude-desktop-sessions' / 'acct' / 'org'
+        desktop_dir.mkdir(parents=True)
+        meta_file = desktop_dir / 'local_5678.json'
+        meta_file.write_text(
+            json.dumps({'sessionId': 'local_5678', 'cliSessionId': self.sid, 'isArchived': False}),
+            encoding='utf-8',
+        )
+        def kill2(pid, sig):
+            os.kill(pid, sig); child2.wait()
+        archived = sessions.close_claude(
+            self.sid,
+            sessions_dir=self.root/'sessions',
+            killer=kill2,
+            poll=0.01,
+            archive=True,
+            desktop_dir=desktop_dir,
+        )
+        self.assertEqual(
+            (archived['closed'], archived['method'], archived['archived'], archived['host']),
+            (True, 'archive', True, 'claude-desktop'),
+        )
+        self.assertIs(json.loads(meta_file.read_text(encoding='utf-8'))['isArchived'], True)
 
     def test_refuses_own_session_unknown_host_and_never_escalates(self):
         self.fake()
@@ -171,7 +201,7 @@ class ArchiveAgyTests(unittest.TestCase):
 
 
 class CloseCommandTests(unittest.TestCase):
-    def test_codex_and_agy_detach_without_archiving_and_remove_route(self):
+    def test_codex_and_agy_detach_by_default_and_archive_when_requested(self):
         with RunningBroker() as server, tempfile.TemporaryDirectory() as cwd, \
                 FakeAgyServer(cwd, str(uuid.uuid4())) as fake, \
                 mock.patch.dict(os.environ, {'AGENT_BRIDGE_AGY_URL': fake.url, 'AGENT_BRIDGE_AGY_CSRF': CSRF}):
@@ -179,20 +209,48 @@ class CloseCommandTests(unittest.TestCase):
             server.call('register', project='p', name='n', cwd=cwd, transport='codex', session=codex_sid)
             code, out = run(['--socket', server.path, 'close', 'n', '--project', 'p'])
             self.assertEqual(
-                (code, out['closed'], out['method'], out['resumable'], out['route_removed']),
-                (0, True, 'detach', True, True),
+                (code, out['closed'], out['method'], out['archived'], out['resumable'], out['route_removed']),
+                (0, True, 'detach', False, True, True),
             )
             self.assertEqual(server.call('routes', project='p'), [])
 
             server.call('register', project='p', name='j', cwd=cwd, transport='agy', session=fake.other_sid)
             code_j, out_j = run(['--socket', server.path, 'close', 'j', '--project', 'p'])
             self.assertEqual(
-                (code_j, out_j['closed'], out_j['method'], out_j['host'], out_j['resumable'], out_j['route_removed']),
-                (0, True, 'detach', 'agy', True, True),
+                (code_j, out_j['closed'], out_j['method'], out_j['archived'], out_j['host'], out_j['resumable'], out_j['route_removed']),
+                (0, True, 'detach', False, 'agy', True, True),
             )
             self.assertEqual(server.call('routes', project='p'), [])
             sent = [b for p, _, b in fake.requests if p.endswith('/UpdateConversationAnnotations')]
             self.assertEqual(sent, [])
+
+            # Passing --archive archives both Antigravity and Codex sessions.
+            server.call('register', project='p', name='j-arch', cwd=cwd, transport='agy', session=fake.other_sid)
+            code_ja, out_ja = run(['--socket', server.path, 'close', 'j-arch', '--project', 'p', '--archive'])
+            self.assertEqual(
+                (code_ja, out_ja['closed'], out_ja['method'], out_ja['archived'], out_ja['route_removed']),
+                (0, True, 'archive', True, True),
+            )
+            sent_arch = [b for p, _, b in fake.requests if p.endswith('/UpdateConversationAnnotations')]
+            self.assertEqual(sent_arch, [{'cascadeId': fake.other_sid, 'annotations': {'archived': True}, 'mergeAnnotations': True}])
+
+            state_db = Path(cwd) / 'state_5.sqlite'
+            os.chmod(cwd, 0o700)
+            with closing(sqlite3.connect(state_db)) as conn, conn:
+                conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, archived INTEGER NOT NULL DEFAULT 0, archived_at INTEGER)")
+                conn.execute('INSERT INTO threads VALUES (?, ?, 0, NULL)', (codex_sid, cwd))
+            os.chmod(state_db, 0o600)
+            server.call('register', project='p', name='n-arch', cwd=cwd, transport='codex', session=codex_sid)
+            with mock.patch.object(codex_preview, 'state_path', return_value=state_db):
+                code_na, out_na = run(['--socket', server.path, 'close', 'n-arch', '--project', 'p', '--archive'])
+            self.assertEqual(
+                (code_na, out_na['closed'], out_na['method'], out_na['archived'], out_na['route_removed']),
+                (0, True, 'archive', True, True),
+            )
+            with closing(sqlite3.connect(state_db)) as conn:
+                row = conn.execute('SELECT archived, archived_at FROM threads WHERE id=?', (codex_sid,)).fetchone()
+            self.assertEqual(row[0], 1)
+            self.assertIsNotNone(row[1])
 
     def test_realtime_route_is_removed_and_old_broker_is_reported(self):
         with RunningBroker() as server, tempfile.TemporaryDirectory() as cwd:

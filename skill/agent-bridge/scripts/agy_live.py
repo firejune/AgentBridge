@@ -1344,6 +1344,7 @@ def deliver(route, message_id, text, sender=None, project=None, timeout=10, dry_
 # Default `bridge.py close` calls close_agy(), which verifies the turn is idle
 # and detaches without setting `archived: true` so the conversation stays in the
 # active conversation stack across both IDE and Desktop, matching Claude and Codex.
+# Passing `--archive` calls archive_agy() to hide the conversation from the sidebar.
 def close_agy(sid, timeout=5):
     _, row = resolve_agy(sid, timeout=timeout)
     if row['status'] == 'running':
@@ -1351,6 +1352,7 @@ def close_agy(sid, timeout=5):
     return {
         'closed': True,
         'method': 'detach',
+        'archived': False,
         'session': row['id'],
         'host': 'agy',
         'resumable': True,
@@ -1376,7 +1378,7 @@ def archive_agy(sid, timeout=5):
         raise ArchiveUncertain(f'Archive was sent but could not be read back: {error}') from None
     if annotations.get('archived') is not True:
         raise ArchiveUncertain('Archive was sent but the conversation does not read back as archived')
-    return {'closed': True, 'method': 'archive', 'session': row['id'], 'host': server.get('app_dir'),
+    return {'closed': True, 'method': 'archive', 'archived': True, 'session': row['id'], 'host': server.get('app_dir'),
             'archived_at': annotations.get('archivalStatusTimestamp'), 'restore_confirmed': False,
             'note': 'Hidden from the agent panel. Restoring from outside the panel is not confirmed; '
                     'permanent deletion is left to the owner.'}

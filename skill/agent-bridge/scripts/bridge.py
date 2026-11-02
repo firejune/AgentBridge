@@ -433,12 +433,17 @@ def open_codex_result(args):
     return 130 if cancelled else (1 if result['error'] else 0)
 
 
-def close_session(route, timeout):
-    """Stop or detach one route's session while keeping its conversation history."""
+def close_session(route, timeout, archive=False):
+    """Stop or detach one route's session; optionally archive it out of the sidebar."""
     transport, sid = route['transport'], route.get('session')
     if transport == 'claude-peer':
         try:
-            return sessions.close_claude(sid, own_session=os.environ.get('CLAUDE_CODE_SESSION_ID'), timeout=timeout)
+            return sessions.close_claude(
+                sid,
+                own_session=os.environ.get('CLAUDE_CODE_SESSION_ID'),
+                timeout=timeout,
+                archive=archive,
+            )
         except sessions.DiscoveryError as error:
             if str(error).startswith('unsupported host '):
                 host = str(error).removeprefix('unsupported host ')
@@ -446,17 +451,22 @@ def close_session(route, timeout):
                                          'and desktop; close this session in its app') from None
             raise
     if transport == 'agy':
+        if archive:
+            return agy_live.archive_agy(sid, timeout=timeout)
         return agy_live.close_agy(sid, timeout=timeout)
     if transport == 'codex':
+        if archive:
+            return codex_preview.archive_thread(route, timeout=timeout)
         return {
             'closed': True,
             'method': 'detach',
+            'archived': False,
             'session': sid,
             'host': 'codex',
             'resumable': True,
             'note': 'The transcript is kept in the Codex sidebar; sending a message in that thread resumes the same session.',
         }
-    return {'closed': False, 'method': 'none', 'session': sid,
+    return {'closed': False, 'method': 'none', 'archived': False, 'session': sid,
             'note': f'{transport} routes have no provider session to close'}
 
 
@@ -468,7 +478,7 @@ def close_participant(args):
     if route is None:
         raise ValueError(f'No participant {args.name!r} is registered in project {args.project!r}')
     result = {'name': args.name, 'project': args.project, 'transport': route['transport'],
-              **close_session(route, args.timeout)}
+              **close_session(route, args.timeout, archive=getattr(args, 'archive', False))}
     if args.keep_route:
         result['route_removed'] = False
         return result
@@ -566,6 +576,7 @@ def main(argv=None):
     p.add_argument('--timeout',type=float,default=30);p.add_argument('--state-dir')
     p = sub.add_parser('close',help="Close a participant's session without deleting it, then remove its route")
     p.add_argument('name');p.add_argument('--project',required=True)
+    p.add_argument('--archive',action='store_true',help='Archive the finished session out of the active sidebar')
     p.add_argument('--keep-route',action='store_true',help='Close the session but keep the route registered')
     p.add_argument('--timeout',type=float,default=10)
     p = sub.add_parser('policy',help='Show the model policy (defaults, denylist) the bridge enforces; read-only')

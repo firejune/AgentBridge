@@ -99,11 +99,11 @@ python3 "$bridge_cli" reply MESSAGE_ID --key reply-001 --file /path/to/answer.tx
 
 ### 1. Session Lifecycle (`sessions`, `open`, `register --new`, `close`)
 
-| Provider | Open Desktop Session | Open IDE Session (`--host ide`) | Close (`bridge.py close NAME --project P`) |
+| Provider | Open Desktop Session | Open IDE Session (`--host ide`) | Close (`bridge.py close NAME --project P [--archive]`) |
 | --- | --- | --- | --- |
-| **Antigravity (`agy`)** | Autonomous via `language_server` / `agy --hub` (`StartCascade`), auto-linked to project & worktree environment | Identical to Desktop (`StartCascade` + project/environment association on unified hub) | Verifies conversation is idle, keeps it in the active conversation stack (`resumable: true`), and unregisters route |
-| **Claude (`claude-peer`)** | Opens `claude://code/new` composer prefilled with `--title`; waits for user Enter | Autonomous via IDE CLI + `<scheme>://anthropic.claude-code/open` | Sends `SIGTERM` to the exact CLI process (`resumable: true`) and unregisters route |
-| **Codex (`codex`)** | Autonomous via `app-server --stdio` + `codex://threads/UUID` adoption (`:danger-full-access`, `approvalPolicy: never`) | N/A | Keeps thread in the active Codex sidebar (`resumable: true`) and unregisters route |
+| **Antigravity (`agy`)** | Autonomous via `language_server` / `agy --hub` (`StartCascade`), auto-linked to project & worktree environment | Identical to Desktop (`StartCascade` + project/environment association on unified hub) | Keeps conversation in active stack by default (`--archive` sets `{archived: true}`) and unregisters route |
+| **Claude (`claude-peer`)** | Opens `claude://code/new` composer prefilled with `--title`; waits for user Enter | Autonomous via IDE CLI + `<scheme>://anthropic.claude-code/open` | Sends `SIGTERM` to CLI process; keeps in sidebar by default (`--archive` sets Desktop `isArchived: true`) and unregisters route |
+| **Codex (`codex`)** | Autonomous via `app-server --stdio` + `codex://threads/UUID` adoption (`:danger-full-access`, `approvalPolicy: never`) | N/A | Keeps thread in active sidebar by default (`--archive` marks `archived=1` in `state_5.sqlite` + IPC broadcast) and unregisters route |
 
 ```bash
 # Open without registering, or open + register in one command:
@@ -111,8 +111,8 @@ python3 "$bridge_cli" open --provider agy --host ide --cwd /path/to/workspace --
 python3 "$bridge_cli" register codex-worker --project my-app --transport codex \
   --new --cwd /path/to/workspace --title "Worker" --model gpt-6.1-sol
 
-# Close a finished worker session and remove its route:
-python3 "$bridge_cli" close agy-worker --project my-app
+# Close a finished worker session and remove its route (pass --archive to hide from sidebar):
+python3 "$bridge_cli" close agy-worker --project my-app [--archive]
 ```
 
 ### 2. Models & Policy (`model`, `policy`)
