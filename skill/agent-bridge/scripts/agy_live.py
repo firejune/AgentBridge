@@ -460,11 +460,10 @@ def discover_host_server(host='desktop', timeout=5, cwd=None):
         raise DeliveryError(f'Unknown Antigravity host {host!r}; use desktop or ide')
     servers = [s for s in discover_servers(timeout=timeout) if not s.get('orphaned')]
     candidates = [s for s in servers if server_host(s) == host]
-    if not candidates and host == 'desktop':
-        # Unified agy --hub servers run with --app_data_dir=antigravity and
-        # serve both Agent Manager (desktop) and IDE when no separate desktop
-        # language_server is running.
-        candidates = [s for s in servers if s.get('app_dir') == 'antigravity']
+    if not candidates:
+        # Unified agy --hub and desktop servers share ~/.gemini/antigravity;
+        # fall back across desktop and IDE so both hosts produce identical results.
+        candidates = [s for s in servers if s.get('app_dir') == 'antigravity'] or list(servers)
     if not candidates:
         label = 'desktop' if host == 'desktop' else 'IDE'
         raise DeliveryError(f'Antigravity {label} language_server is not running')
@@ -638,8 +637,12 @@ def find_desktop_project_id(server, target_cwd, projects_dir=None):
 
 def _create_desktop_project(server, project_root, timeout=5):
     project_root = Path(project_root).expanduser().resolve()
-    if not (project_root / '.git').exists():
-        return None
+    has_git = (project_root / '.git').exists()
+    resource = (
+        {'gitFolder': {'folderUri': project_root.as_uri()}}
+        if has_git
+        else {'folderUri': project_root.as_uri()}
+    )
     project_id = str(uuid.uuid4())
     project_name = project_root.name or str(project_root)
     try:
@@ -652,13 +655,7 @@ def _create_desktop_project(server, project_root, timeout=5):
                     'id': project_id,
                     'name': project_name,
                     'projectResources': {
-                        'resources': [
-                            {
-                                'gitFolder': {
-                                    'folderUri': project_root.as_uri(),
-                                },
-                            },
-                        ],
+                        'resources': [resource],
                     },
                     'isWorkspaceOnly': False,
                     'settings': {},
@@ -988,12 +985,8 @@ def open_agy(cwd, title=None, model=None, timeout=5, host='desktop'):
 
     server = discover_host_server(host, timeout=timeout, cwd=str(target_path))
     model_info = resolve_model(server, model, timeout=timeout)
-    # Unified agy --hub (app_dir == 'antigravity') and desktop servers group
-    # conversations by projectId in the UI conversation stack; only legacy
-    # antigravity-ide language_server instances skip project association.
-    supports_projects = (host == 'desktop' or server.get('app_dir') == 'antigravity')
-    project_id = find_desktop_project_id(server, str(target_path)) if supports_projects else None
-    if supports_projects and not project_id:
+    project_id = find_desktop_project_id(server, str(target_path))
+    if not project_id:
         project_root = _git_main_worktree(target_path) or target_path
         project_id = _create_desktop_project(server, project_root, timeout=timeout)
     project_env_config = (
@@ -1347,11 +1340,24 @@ def deliver(route, message_id, text, sender=None, project=None, timeout=10, dry_
 
 
 
-# --- Archiving (close) --------------------------------------------------------
-# The agent panel's own Archive action sends exactly this annotation; the server
-# stamps archivalStatusTimestamp itself. Measured: the conversation leaves the
-# panel. Sending archived=false afterwards did not bring it back to the panel,
-# so restore is not confirmed and the bridge never offers it.
+# --- Closing and archiving ----------------------------------------------------
+# Default `bridge.py close` calls close_agy(), which verifies the turn is idle
+# and detaches without setting `archived: true` so the conversation stays in the
+# active conversation stack across both IDE and Desktop, matching Claude and Codex.
+def close_agy(sid, timeout=5):
+    _, row = resolve_agy(sid, timeout=timeout)
+    if row['status'] == 'running':
+        raise DeliveryError(f'Antigravity session {sid} is running; close it after the turn ends')
+    return {
+        'closed': True,
+        'method': 'detach',
+        'session': row['id'],
+        'host': 'agy',
+        'resumable': True,
+        'note': 'The transcript is kept in the Antigravity sidebar; sending a message in that session resumes the same session.',
+    }
+
+
 def archive_agy(sid, timeout=5):
     server, row = resolve_agy(sid, timeout=timeout)
     if row['status'] == 'running':

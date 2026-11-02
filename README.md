@@ -101,9 +101,9 @@ python3 "$bridge_cli" reply MESSAGE_ID --key reply-001 --file /path/to/answer.tx
 
 | Provider | Open Desktop Session | Open IDE Session (`--host ide`) | Close (`bridge.py close NAME --project P`) |
 | --- | --- | --- | --- |
-| **Antigravity (`agy`)** | Autonomous via Desktop `language_server` (`StartCascade`), auto-linked to Desktop project | Autonomous via IDE `agy --hub` (`workspaceUris`) | Archives conversation (`{archived: true}`) when idle and unregisters route |
+| **Antigravity (`agy`)** | Autonomous via `language_server` / `agy --hub` (`StartCascade`), auto-linked to project & worktree environment | Identical to Desktop (`StartCascade` + project/environment association on unified hub) | Verifies conversation is idle, keeps it in the active conversation stack (`resumable: true`), and unregisters route |
 | **Claude (`claude-peer`)** | Opens `claude://code/new` composer prefilled with `--title`; waits for user Enter | Autonomous via IDE CLI + `<scheme>://anthropic.claude-code/open` | Sends `SIGTERM` to the exact CLI process (`resumable: true`) and unregisters route |
-| **Codex (`codex`)** | Autonomous via `app-server --stdio` + `codex://threads/UUID` adoption (`:danger-full-access`, `approvalPolicy: never`) | N/A | `unsupported` (Desktop IPC exposes no external archive/unload) |
+| **Codex (`codex`)** | Autonomous via `app-server --stdio` + `codex://threads/UUID` adoption (`:danger-full-access`, `approvalPolicy: never`) | N/A | Keeps thread in the active Codex sidebar (`resumable: true`) and unregisters route |
 
 ```bash
 # Open without registering, or open + register in one command:

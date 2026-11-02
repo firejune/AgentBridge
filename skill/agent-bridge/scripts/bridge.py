@@ -433,13 +433,8 @@ def open_codex_result(args):
     return 130 if cancelled else (1 if result['error'] else 0)
 
 
-CODEX_CLOSE_GAP = ('codex: Desktop holds the thread, so app-server thread/archive is refused '
-                   '("active writer") and Desktop IPC has no archive request. Tracked in AgentBridge #27; '
-                   'archive it from the Codex sidebar meanwhile.')
-
-
 def close_session(route, timeout):
-    """Archive-or-stop one route's session; never deletes anything."""
+    """Stop or detach one route's session while keeping its conversation history."""
     transport, sid = route['transport'], route.get('session')
     if transport == 'claude-peer':
         try:
@@ -451,9 +446,16 @@ def close_session(route, timeout):
                                          'and desktop; close this session in its app') from None
             raise
     if transport == 'agy':
-        return agy_live.archive_agy(sid, timeout=timeout)
+        return agy_live.close_agy(sid, timeout=timeout)
     if transport == 'codex':
-        raise models.Unsupported(CODEX_CLOSE_GAP)
+        return {
+            'closed': True,
+            'method': 'detach',
+            'session': sid,
+            'host': 'codex',
+            'resumable': True,
+            'note': 'The transcript is kept in the Codex sidebar; sending a message in that thread resumes the same session.',
+        }
     return {'closed': False, 'method': 'none', 'session': sid,
             'note': f'{transport} routes have no provider session to close'}
 
