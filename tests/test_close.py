@@ -98,6 +98,34 @@ class CloseClaudeTests(unittest.TestCase):
         kill.assert_called_once()
 
 
+class CloseAgyTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='aba-', dir='/tmp')
+        self.root = Path(self.temp.name).resolve()
+        self.sid = str(uuid.uuid4())
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def env(self, fake):
+        return mock.patch.dict(os.environ, {'AGENT_BRIDGE_AGY_URL': fake.url, 'AGENT_BRIDGE_AGY_CSRF': CSRF})
+
+    def test_close_agy_detaches_idle_conversation_without_archiving(self):
+        with FakeAgyServer(self.root, self.sid) as fake, self.env(fake):
+            closed = agy_live.close_agy(fake.other_sid)
+        self.assertEqual(
+            (closed['closed'], closed['method'], closed['host'], closed['resumable']),
+            (True, 'detach', 'agy', True),
+        )
+        sent = [b for p, _, b in fake.requests if p.endswith('/UpdateConversationAnnotations')]
+        self.assertEqual(sent, [])
+
+    def test_close_agy_refuses_running_conversation(self):
+        with FakeAgyServer(self.root, self.sid) as fake, self.env(fake):
+            with self.assertRaisesRegex(ValueError, 'is running'):
+                agy_live.close_agy(self.sid)
+
+
 class ArchiveAgyTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='aba-', dir='/tmp')
@@ -143,13 +171,28 @@ class ArchiveAgyTests(unittest.TestCase):
 
 
 class CloseCommandTests(unittest.TestCase):
-    def test_codex_is_a_named_gap_and_keeps_the_route(self):
-        with RunningBroker() as server, tempfile.TemporaryDirectory() as cwd:
-            server.call('register', project='p', name='n', cwd=cwd, transport='codex', session=str(uuid.uuid4()))
+    def test_codex_and_agy_detach_without_archiving_and_remove_route(self):
+        with RunningBroker() as server, tempfile.TemporaryDirectory() as cwd, \
+                FakeAgyServer(cwd, str(uuid.uuid4())) as fake, \
+                mock.patch.dict(os.environ, {'AGENT_BRIDGE_AGY_URL': fake.url, 'AGENT_BRIDGE_AGY_CSRF': CSRF}):
+            codex_sid = str(uuid.uuid4())
+            server.call('register', project='p', name='n', cwd=cwd, transport='codex', session=codex_sid)
             code, out = run(['--socket', server.path, 'close', 'n', '--project', 'p'])
-            self.assertEqual((code, out.get('unsupported')), (1, True))
-            self.assertIn('#27', out['error'])
-            self.assertEqual(len(server.call('routes', project='p')), 1)
+            self.assertEqual(
+                (code, out['closed'], out['method'], out['resumable'], out['route_removed']),
+                (0, True, 'detach', True, True),
+            )
+            self.assertEqual(server.call('routes', project='p'), [])
+
+            server.call('register', project='p', name='j', cwd=cwd, transport='agy', session=fake.other_sid)
+            code_j, out_j = run(['--socket', server.path, 'close', 'j', '--project', 'p'])
+            self.assertEqual(
+                (code_j, out_j['closed'], out_j['method'], out_j['host'], out_j['resumable'], out_j['route_removed']),
+                (0, True, 'detach', 'agy', True, True),
+            )
+            self.assertEqual(server.call('routes', project='p'), [])
+            sent = [b for p, _, b in fake.requests if p.endswith('/UpdateConversationAnnotations')]
+            self.assertEqual(sent, [])
 
     def test_realtime_route_is_removed_and_old_broker_is_reported(self):
         with RunningBroker() as server, tempfile.TemporaryDirectory() as cwd:

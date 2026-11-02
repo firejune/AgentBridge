@@ -480,27 +480,28 @@ class AgyLiveTests(unittest.TestCase):
             rows.insert(0, {'pid': 2001, 'app_dir': 'antigravity', 'url': 'http://127.0.0.1:1', 'csrf': CSRF, 'summaries': {}})
         return rows
 
-    def test_open_host_ide_creates_on_the_ide_server_with_workspace_uri(self):
+    def test_open_host_ide_and_desktop_create_with_identical_project_association(self):
         import agy_live
         with FakeAgyServer(self.root, self.sid) as fake, \
                 mock.patch.object(agy_live, 'discover_servers', return_value=self.ide_servers(fake, desktop=True)), \
-                mock.patch.object(agy_live, 'find_desktop_project_id') as projects:
+                mock.patch.object(agy_live, 'find_desktop_project_id', return_value=None):
             opened = sessions.open_session('agy', cwd=str(self.root), title='IDE Worker', host='ide')
-        projects.assert_not_called()
-        self.assertEqual((opened['created'], opened['host'], opened['project_id']), (True, 'ide', None))
+        self.assertEqual((opened['created'], opened['host']), (True, 'ide'))
+        self.assertIsNotNone(opened['project_id'])
         self.assertEqual((opened['session']['cwd'], opened['session']['name']), (str(self.root), 'IDE Worker'))
         start = [body for path, _, body in fake.requests if path.endswith('/StartCascade')]
         self.assertEqual(len(start), 1)
-        self.assertEqual(start[0]['workspaceUris'], [self.root.as_uri()])
-        self.assertNotIn('projectEnvConfig', start[0])
+        self.assertEqual(start[0]['projectEnvConfig']['projectId'], opened['project_id'])
 
-    def test_host_ide_without_an_ide_server_fails_by_name(self):
+    def test_host_ide_and_desktop_share_unified_server_fallback(self):
         import agy_live
         desktop_only = [{'pid': 2001, 'app_dir': 'antigravity', 'url': 'http://127.0.0.1:1', 'csrf': CSRF, 'summaries': {}}]
         with mock.patch.object(agy_live, 'discover_servers', return_value=desktop_only):
-            with self.assertRaisesRegex(ValueError, 'IDE language_server is not running'):
-                agy_live.open_agy(str(self.root), host='ide')
+            self.assertEqual(agy_live.discover_host_server('ide')['pid'], 2001)
             self.assertEqual(agy_live.discover_desktop_server()['app_dir'], 'antigravity')
+        with mock.patch.object(agy_live, 'discover_servers', return_value=[]):
+            with self.assertRaisesRegex(ValueError, 'IDE language_server is not running'):
+                agy_live.discover_host_server('ide')
         with self.assertRaisesRegex(ValueError, 'Unknown Antigravity host'):
             agy_live.discover_host_server('cloud')
 

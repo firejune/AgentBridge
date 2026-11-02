@@ -98,8 +98,7 @@ python3 "$bridge_cli" register agy-worker --project PROJECT --transport agy \
 - **Direct push**: Connects to local Antigravity `language_server` / `agy --hub` instances over ConnectRPC, covering **both Antigravity IDE side-panel sessions and Agent Manager (Desktop) sessions** without a VS Code extension. When a conversation is cached across multiple servers, the bridge selects the active (`running`) or freshest owner (`stepCount`, `lastModifiedTime`, `--add-dir` workspace affinity) and automatically reaps idle orphaned `agy --hub` processes (`ppid == 1`).
 - **Steering & wake**: Injects into the conversation's message hub (`SendAgentMessage`, `MESSAGE_PRIORITY_HIGH`). If `running`, it joins the active turn on the next step as `<SYSTEM_MESSAGE>[Message] ...` without cancelling work. If `idle` (or waiting on background tasks/subagents), it follows up with an empty `SendUserCascadeMessage` (`NEXT_INVOCATION`) to wake the session immediately. Because Antigravity's built-in `send_message` only addresses subagents, reply via `bridge.py reply` in the shell.
 - **Autonomous creation (`open` / `register --new`)**:
-  - **Desktop (default)**: Calls `StartCascade` + `UpdateConversationAnnotations` on the Desktop server, links the workspace to its matching Desktop project (`~/.gemini/config/projects/*.json`), and initializes `customAgentSpec` so the 0-step session wakes with all built-in tools on the first push.
-  - **IDE (`--host ide`)**: Creates the conversation on the IDE hub server (`agy --hub`, preferring the window whose `--add-dir` matches `--cwd`) with `workspaceUris`.
+  - **Identical across Desktop and IDE (`--host desktop` / `--host ide`)**: Calls `StartCascade` + `UpdateConversationAnnotations` on the unified Antigravity server (`~/.gemini/antigravity`), automatically links or creates the project (`~/.gemini/projects/*.json`) and worktree environment (`projectEnvConfig`), and initializes `customAgentSpec` so the 0-step session wakes with all built-in tools on the first push.
 
 ### 4. Sending, Replying & Closing Sessions
 
@@ -117,7 +116,7 @@ python3 "$bridge_cli" close NAME --project PROJECT [--keep-route] [--timeout 10]
 
 - 📬 **Always report results back on the channel the task came in on** via `bridge.py reply`, including when blocked. Issue or PR comments do not replace the bridge reply.
 - `ack` and `progress` report receipt and status, not final answers. Exit code 2 from `ask` or `wait` means the wait timed out — run `wait REQUEST_ID` again rather than resending.
-- `close` archives or stops without deleting: Claude sends `SIGTERM` (`resumable: true`), Antigravity marks `{archived: true}` while idle, and Codex returns `unsupported`. Do not close sessions you did not open unless instructed by the owner or HQ.
+- `close` stops or detaches the session while keeping it in the active conversation history (`resumable: true`) across all three providers: Claude sends `SIGTERM` to the background CLI process, Antigravity verifies the turn is idle and detaches without archiving, and Codex detaches the thread and removes the route. Do not close sessions you did not open unless instructed by the owner or HQ.
 
 ## Models: Read, Switch, Policy
 

@@ -98,8 +98,7 @@ python3 "$bridge_cli" register agy-worker --project PROJECT --transport agy \
 - **직접 Push**: 로컬 Antigravity `language_server` / `agy --hub`의 ConnectRPC에 연결해 VS Code 익스텐션 없이 **Antigravity IDE 창과 Agent Manager(Desktop) 창의 모든 라이브 세션**을 함께 커버한다. 동일 대화가 여러 서버에 캐시되어 있을 때는 실행 중(`running`)이거나 가장 최신(`stepCount`, `lastModifiedTime`, `--add-dir` 워크스페이스 친화도)인 서버를 선택하며, 유휴 고아 `agy --hub` 프로세스(`ppid == 1`)는 자동 정리한다.
 - **합류 및 깨우기**: 대화의 메시지 허브(`SendAgentMessage`, `MESSAGE_PRIORITY_HIGH`)로 직접 주입해 활성 턴(`running`)이면 기존 작업을 끊지 않고 다음 스텝에 `<SYSTEM_MESSAGE>[Message] ...`로 합류하고, 유휴/백그라운드 대기 상태면 빈 `SendUserCascadeMessage`(`NEXT_INVOCATION`)로 즉시 깨운다. AGY 내부 `send_message` 도구는 서브에이전트 전용이므로 반드시 셸에서 `bridge.py reply`로 답한다.
 - **무인 세션 생성 (`open` / `register --new`)**:
-  - **데스크톱 (기본)**: 데스크톱 서버에 `StartCascade` + `UpdateConversationAnnotations`를 호출하고, 데스크톱 프로젝트(`~/.gemini/config/projects/*.json`) 자동 매칭 및 `customAgentSpec` 초기화를 수행해 0-step 신규 세션도 첫 push 즉시 모든 빌트인 도구와 함께 깨어나게 한다.
-  - **IDE (`--host ide`)**: IDE 허브 서버(`agy --hub`, 여러 창이 열려 있으면 `--cwd`와 일치하는 `--add-dir` 창 우선)에 `workspaceUris`로 대화를 생성한다.
+  - **데스크톱과 IDE (`--host desktop` / `--host ide`) 동일 동작**: 통합 Antigravity 서버(`~/.gemini/antigravity`)에 `StartCascade` + `UpdateConversationAnnotations`를 호출하고, 프로젝트(`~/.gemini/projects/*.json`) 및 워크트리 환경(`projectEnvConfig`) 자동 매칭·생성 및 `customAgentSpec` 초기화를 수행해 0-step 신규 세션도 첫 push 즉시 모든 빌트인 도구와 함께 깨어나며 대화 스택에 동일하게 쌓인다.
 
 ### 4. 메시지 발신·응답 및 세션 닫기
 
@@ -117,7 +116,7 @@ python3 "$bridge_cli" close NAME --project PROJECT [--keep-route] [--timeout 10]
 
 - 📬 **작업이 끝나면 반드시 그 작업이 들어온 채널로 결과를 보고한다** — 브릿지로 받은 일은 그 메시지에 `bridge.py reply`로 답하며, 막혀서 멈춘 경우에도 동일하게 보고한다. 이슈·PR 코멘트가 브릿지 답장을 대신하지 않는다.
 - `ack`와 `progress`는 수신 확인·진행 보고이며 최종 답변이 아니다. `ask`/`wait`의 종료 코드 2는 대기 시간 초과이므로 요청을 다시 보내지 말고 같은 ID로 `wait`한다.
-- `close`는 세션을 삭제하지 않고 멈추거나 보관한다(Claude: `SIGTERM` `resumable: true`, Antigravity: 대기 중 `{archived: true}`, Codex: `unsupported`). 소유자나 HQ의 지시 없이 내가 열지 않은 세션을 닫지 않는다.
+- `close`는 세 공급자 모두 세션을 삭제하거나 아카이빙하지 않고 대화 스택에 그대로 남긴 채(`resumable: true`) 세션/라우트를 종료한다(Claude: 백그라운드 CLI 프로세스에 `SIGTERM` 전송, Antigravity: 대기 상태 확인 후 보관 처리 없이 분리, Codex: 스레드 분리 및 라우트 제거). 소유자나 HQ의 지시 없이 내가 열지 않은 세션을 닫지 않는다.
 
 ## 모델: 읽기 · 전환 · 정책
 
