@@ -1,0 +1,13 @@
+{
+  "name": "agent-bridge",
+  "description": "Local real-time Unix socket bridge for Claude Code/Desktop, Codex/ChatGPT Desktop, and Antigravity IDE/Desktop.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Firejune"
+  },
+  "repository": "https://github.com/firejune/AgentBridge",
+  "license": "MIT",
+  "skills": [
+    "./skill/agent-bridge"
+  ]
+}

@@ -54,7 +54,13 @@ flowchart LR
 
 ## Installation
 
-Link the skill folder into your global agent skill directories so Claude, Codex, and Antigravity use the same `bridge.py`:
+Install globally across Claude Code, Codex, and Antigravity in one command using [`skills`](https://skills.sh):
+
+```bash
+npx skills add firejune/AgentBridge -g -a claude-code codex antigravity
+```
+
+Or clone the repository and symlink the skill folder into your global agent skill directories:
 
 ```bash
 mkdir -p ~/.agents/skills ~/.claude/skills ~/.gemini/config/skills
