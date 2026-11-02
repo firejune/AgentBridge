@@ -54,7 +54,13 @@ flowchart LR
 
 ## 글로벌 스킬 설치
 
-Claude Code, Codex, Antigravity가 동일한 브릿지 CLI를 참조하도록 글로벌 스킬 경로에 심볼릭 링크를 연결한다.
+[`skills`](https://skills.sh) CLI로 Claude Code, Codex, Antigravity 글로벌 스킬 경로에 한 번에 설치할 수 있다:
+
+```bash
+npx skills add firejune/AgentBridge -g -a claude-code codex antigravity
+```
+
+또는 저장소를 클론한 뒤 글로벌 스킬 경로에 직접 심볼릭 링크를 연결한다:
 
 ```bash
 mkdir -p ~/.agents/skills ~/.claude/skills ~/.gemini/config/skills

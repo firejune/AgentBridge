@@ -1,6 +1,8 @@
 ---
 name: agent-bridge
 description: Codex(ChatGPT Desktop)·Claude Code·Antigravity(IDE 및 Desktop) 세션을 조회하고 프로젝트 채널을 연결해 실시간 질문·답변·진행 상황을 주고받는다. 사용자가 에이전트 간 협업, 채널 연결, 세션 인계 또는 브릿지 운영을 요청할 때 사용한다. 단순 언급이나 일반 코드 작업은 발신 요청이 아니다.
+metadata:
+  internal: true
 ---
 
 # Agent Bridge (한국어)
