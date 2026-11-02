@@ -1,7 +1,8 @@
-"""Subscription-limit sampling (issue #7, Codex only). Plain RPC, no model turn.
+"""Subscription-limit sampling (issue #7; Antigravity #34, Claude #83). No model turn.
 
-The collector reads `account/rateLimits/read` from a short-lived
-`codex app-server --stdio`, then stops it. It never starts a thread or a turn,
+For Codex the collector reads `account/rateLimits/read` from a short-lived
+`codex app-server --stdio`, then stops it; Antigravity and Claude are read as
+described in their sections. It never starts a thread or a turn,
 never sends to a session, and never stores account identifiers. A failed read
 is recorded as unknown (null values), never as 0%.
 """
@@ -160,7 +161,201 @@ def read_agy(timeout=10):
     return agy_live.rpc_call(server['url'], server['csrf'], 'GetCascadeModelConfigData', {}, timeout=timeout)
 
 
-SOURCES = {'codex': SOURCE, 'agy': AGY_SOURCE}
+# --- Claude (#83) ----------------------------------------------------------------
+# Two accounts can share one machine: Claude Desktop and the Claude Code login
+# that the IDE extension and terminal CLI use. Neither read starts a model turn.
+# Desktop keeps its own 15-minute history of plan usage (`fh` = 5h %, `sd` = 7d %)
+# with no reset times. The Claude Code login is read live from the usage endpoint
+# the CLI's /usage calls, with the login's access token read per call from the
+# Keychain and never stored, logged or refreshed (a refresh would rotate the CLI's
+# refresh token). Without the token, or when the call fails, the CLI's own cache in
+# ~/.claude.json is used; the CLI writes it only at session start or on /usage, and
+# only for its login account. Each surface is one limit_id; samples keep the time
+# their source measured them, not the time they were read.
+CLAUDE_SOURCES = dict(desktop='claude desktop plan-usage-history.json',
+                      ide='claude code /api/oauth/usage', ide_cache='claude code ~/.claude.json cache')
+CLAUDE_SOURCE = 'claude desktop history + claude code usage'
+CLAUDE_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
+CLAUDE_KEYCHAIN_SERVICE = 'Claude Code-credentials'
+CLAUDE_DESKTOP_DIR = Path('~/Library/Application Support/Claude')
+CLAUDE_DESKTOP_SLOTS = (('fh', 'primary', 300), ('sd', 'secondary', 10080))
+# Desktop history is backfilled this far so a first read already has a burn rate.
+CLAUDE_BACKFILL = timedelta(hours=3)
+TOKEN_MARGIN_SECONDS = 60
+
+
+def claude_config_path():
+    base = os.environ.get('CLAUDE_CONFIG_DIR')
+    return Path(base).expanduser() / '.claude.json' if base else Path('~/.claude.json').expanduser()
+
+
+def claude_token(now):
+    """The Claude Code login's access token, or None. Never refreshed."""
+    if os.environ.get('CLAUDE_CONFIG_DIR'):
+        return None  # A custom config dir uses a differently named Keychain item.
+    if sys.platform == 'darwin':
+        found = subprocess.run(['security', 'find-generic-password', '-s', CLAUDE_KEYCHAIN_SERVICE, '-w'],
+                               capture_output=True, text=True, timeout=10)
+        if found.returncode:
+            return None
+        raw = found.stdout
+    else:
+        path = Path('~/.claude/.credentials.json').expanduser()
+        if not path.exists():
+            return None
+        raw = path.read_text()
+    oauth = json.loads(raw).get('claudeAiOauth') or {}
+    token, expires = oauth.get('accessToken'), number(oauth.get('expiresAt'))
+    if not isinstance(token, str) or expires is None or expires / 1000 <= now.timestamp() + TOKEN_MARGIN_SECONDS:
+        return None
+    return token
+
+
+def claude_live(token, timeout=10):
+    import urllib.request
+    request = urllib.request.Request(CLAUDE_USAGE_URL, headers={
+        'Authorization': f'Bearer {token}', 'anthropic-beta': 'oauth-2025-04-20', 'User-Agent': 'agent-bridge'})
+    with urllib.request.urlopen(request, timeout=timeout) as reply:
+        return json.load(reply)
+
+
+def read_claude(live=True, desktop_dir=None, config_path=None, token=claude_token, fetch=claude_live, clock=None):
+    """Raw per-surface readings; a surface that cannot be read carries its error category."""
+    now = (clock or (lambda: datetime.now(timezone.utc)))()
+    result = {}
+    path = Path(desktop_dir or CLAUDE_DESKTOP_DIR).expanduser() / 'plan-usage-history.json'
+    try:
+        result['desktop'] = json.loads(path.read_text())
+    except FileNotFoundError:
+        result['desktop'] = dict(error='desktop history not found')
+    except (OSError, ValueError):
+        result['desktop'] = dict(error='desktop history unreadable')
+    if live:
+        try:
+            found = token(now)
+            if found:
+                result['ide'] = dict(observed=utc(now), utilization=fetch(found), source=CLAUDE_SOURCES['ide'])
+        except Exception as error:  # noqa: BLE001 - the token or reply must never reach a log.
+            result['ide_live_error'] = claude_failure(error)
+    if 'ide' not in result:
+        try:
+            config = json.loads(Path(config_path or claude_config_path()).read_text())
+            cache = config.get('cachedUsageUtilization') or {}
+            login = (config.get('oauthAccount') or {}).get('accountUuid')
+            if not cache or cache.get('accountUuid') != login or number(cache.get('fetchedAtMs')) is None:
+                raise ValueError('no usage cache for the Claude Code login')
+            observed = datetime.fromtimestamp(cache['fetchedAtMs'] / 1000, timezone.utc)
+            result['ide'] = dict(observed=utc(observed), utilization=cache.get('utilization'),
+                                 source=CLAUDE_SOURCES['ide_cache'])
+        except FileNotFoundError:
+            result['ide'] = dict(error=result.get('ide_live_error') or 'claude code config not found')
+        except ValueError as error:
+            reason = str(error) if str(error) == 'no usage cache for the Claude Code login' else 'invalid claude code config'
+            result['ide'] = dict(error=result.get('ide_live_error') or reason)
+        except (OSError, TypeError):
+            result['ide'] = dict(error=result.get('ide_live_error') or 'invalid claude code config')
+    return result
+
+
+def claude_failure(error):
+    import urllib.error
+    if isinstance(error, urllib.error.HTTPError):
+        return f'http {error.code}'
+    if isinstance(error, (urllib.error.URLError, OSError)) and not isinstance(error, FileNotFoundError):
+        return 'usage endpoint unavailable'
+    if isinstance(error, FileNotFoundError):
+        return 'claude code config not found'
+    if isinstance(error, subprocess.TimeoutExpired) or 'timed out' in str(error):
+        return 'timeout'
+    return 'invalid or failed response'
+
+
+def claude_record(observed, limit_id, slot, used, window, resets_at, source, allowed=None):
+    status = 'stale' if resets_at is not None and parse_time(resets_at) <= observed else 'ok'
+    return dict(observed_at=utc(observed), provider='claude', limit_id=limit_id, slot=slot,
+                used_percent=used, window_mins=window, resets_at=resets_at, allowed=allowed,
+                reset_credits=None, source=source, status=status, reason=None)
+
+
+def claude_time(value):
+    return utc(parse_time(value.replace('Z', '+00:00'))) if isinstance(value, str) else None
+
+
+def normalize_claude_desktop(history, now):
+    samples = history.get('samples') if isinstance(history, dict) else None
+    if not isinstance(samples, list):
+        raise ValueError('desktop history has no samples')
+    samples = [s for s in samples if isinstance(s, dict) and number(s.get('t')) is not None
+               and isinstance(s.get('u'), dict)]
+    if not samples:
+        raise ValueError('desktop history is empty')
+    samples.sort(key=lambda s: s['t'])
+    org = samples[-1].get('org')  # The account Desktop is signed in to now; never stored.
+    cutoff = now - CLAUDE_BACKFILL
+    records = []
+    for item in samples:
+        observed = datetime.fromtimestamp(item['t'] / 1000, timezone.utc)
+        if item.get('org') != org or observed < cutoff or observed > now + timedelta(minutes=5):
+            continue
+        for key, slot, window in CLAUDE_DESKTOP_SLOTS:
+            used = number(item['u'].get(key))
+            if used is not None:  # A missing field is unknown, never 0.
+                records.append(claude_record(observed, 'desktop', slot, used, window, None,
+                                             CLAUDE_SOURCES['desktop']))
+    if not records:
+        raise ValueError('no recent desktop sample')
+    return records
+
+
+def normalize_claude_ide(reading):
+    utilization = reading.get('utilization')
+    if not isinstance(utilization, dict):
+        raise ValueError('claude code usage has no utilization')
+    observed, source = parse_time(reading['observed']), reading['source']
+    records = []
+    for key, slot, window in (('five_hour', 'primary', 300), ('seven_day', 'secondary', 10080)):
+        bucket = utilization.get(key)
+        if isinstance(bucket, dict) and number(bucket.get('utilization')) is not None:
+            allowed = False if bucket.get('locked_reason') else None
+            records.append(claude_record(observed, 'ide', slot, bucket['utilization'], window,
+                                         claude_time(bucket.get('resets_at')), source, allowed))
+    for limit in utilization.get('limits') or []:
+        if not isinstance(limit, dict) or limit.get('kind') != 'weekly_scoped':
+            continue
+        model = ((limit.get('scope') or {}).get('model') or {}).get('display_name')
+        if isinstance(model, str) and number(limit.get('percent')) is not None:
+            records.append(claude_record(observed, 'ide', f'weekly:{model}', limit['percent'], 10080,
+                                         claude_time(limit.get('resets_at')), source))
+    if not records:
+        raise ValueError('claude code usage has no windows')
+    return records
+
+
+def normalize_claude(result, observed):
+    """Records for every surface that read; a surface that failed is its own failed record."""
+    if not isinstance(result, dict):
+        raise ValueError('claude usage reading is not an object')
+    records, failures = [], []
+    for surface, normalizer in (('desktop', lambda r: normalize_claude_desktop(r, observed)),
+                                ('ide', normalize_claude_ide)):
+        reading = result.get(surface)
+        try:
+            if not isinstance(reading, dict) or 'error' in reading:
+                raise ValueError((reading or {}).get('error') or f'{surface} not read')
+            records += normalizer(reading)
+        except ValueError as error:  # Our own fixed categories; never payload text.
+            failures.append((surface, str(error)))
+        except (KeyError, TypeError, OverflowError):
+            failures.append((surface, 'invalid or failed response'))
+    if not records:
+        raise ValueError('; '.join(f'{s}: {r}' for s, r in failures))
+    for surface, reason in failures:
+        records.append(dict(failed(observed, reason, 'claude'), limit_id=surface))
+    return records
+
+
+
+SOURCES = {'codex': SOURCE, 'agy': AGY_SOURCE, 'claude': CLAUDE_SOURCE}
 
 
 def read_codex(executable='codex', timeout=10):
@@ -246,6 +441,9 @@ class UsageStore:
         kept = []
         for item in new:
             previous = last.get((item['limit_id'], item['slot']))
+            if (item.get('provider') == 'claude' and previous is not None
+                    and parse_time(item['observed_at']) <= parse_time(previous['observed_at'])):
+                continue  # Claude sources carry their own time: an older or equal sample says nothing new.
             same_window = (same_reset(previous['resets_at'], item['resets_at'])
                            or (item.get('provider') == 'agy'
                                and previous['used_percent'] == 0
@@ -256,6 +454,7 @@ class UsageStore:
             if same and (now - parse_time(previous['observed_at'])).total_seconds() < DEDUP_SECONDS:
                 continue
             kept.append(item)
+            last[(item['limit_id'], item['slot'])] = item
         if kept or len(self.bound(records, now)[0]) != len(records):
             self.save(records + kept, now)
         return kept
@@ -381,7 +580,10 @@ def sample(store, reader, clock, events=None, normalizer=None):
         records = (normalizer or NORMALIZERS[store.provider])(reader(), now)
     except (ValueError, OSError, KeyError, TypeError, OverflowError,
             subprocess.TimeoutExpired) as error:
-        records = [failed(now, failure_reason(error), store.provider)]
+        # normalize_claude raises only its own per-surface categories.
+        reason = (str(error) if store.provider == 'claude' and type(error) is ValueError
+                  else failure_reason(error))
+        records = [failed(now, reason, store.provider)]
     if store.append(records, now) and events is not None:
         # Derived from the history alone, so events survive the samples' 30 days.
         events.merge(detect(store.load()), now)
@@ -391,12 +593,13 @@ def sample(store, reader, clock, events=None, normalizer=None):
 class Collector:
     """Broker-resident daemon thread. Owns no session, route or message state."""
     def __init__(self, store, interval_minutes=DEFAULT_INTERVAL_MINUTES, executable='codex',
-                 reader=None, clock=None):
+                 reader=None, clock=None, claude_live=True):
         if interval_minutes < MIN_INTERVAL_MINUTES:
             raise ValueError(f'Usage interval must be at least {MIN_INTERVAL_MINUTES} minutes')
         self.store, self.interval = store, interval_minutes * 60
         self.events = EventStore(store.directory, provider=store.provider)
-        self.reader = reader or (read_agy if store.provider == 'agy' else lambda: read_codex(executable))
+        self.reader = reader or dict(agy=read_agy, claude=lambda: read_claude(live=claude_live)).get(
+            store.provider, lambda: read_codex(executable))
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.failures = 0
         self.stopping = threading.Event()
@@ -452,6 +655,8 @@ def is_reset(before, after):
                 and not same_reset(before['resets_at'], after['resets_at']))
     if after['used_percent'] < before['used_percent']:
         return True
+    if before.get('provider') == 'claude' and before['used_percent'] == 0 and before['resets_at'] is None:
+        return False  # An idle Claude 5h window has no reset time; its first use only opens one.
     if before['resets_at'] is None or after['resets_at'] is None:
         return before['resets_at'] != after['resets_at']
     moved = abs((parse_time(after['resets_at']) - parse_time(before['resets_at'])).total_seconds())
@@ -461,8 +666,8 @@ def is_reset(before, after):
 def summarize(records, now, since):
     """Per bucket: latest values, freshness, resets and the burn rate inside one period."""
     cutoff = now - since
-    latest_failure = max((parse_time(r['observed_at']) for r in records if r['status'] == 'failed'),
-                         default=None)
+    failures = [r for r in records if r['status'] == 'failed']
+    latest_failure = max((parse_time(r['observed_at']) for r in failures), default=None)
     buckets = {}
     for item in records:
         if item['status'] != 'failed':
@@ -473,7 +678,9 @@ def summarize(records, now, since):
         last = items[-1]
         observed = parse_time(last['observed_at'])
         age = (now - observed).total_seconds()
-        failed_after = latest_failure is not None and latest_failure > observed
+        # A failure names its limit_id when only that surface failed (Claude); None is all.
+        failed_after = any(parse_time(r['observed_at']) > observed for r in failures
+                           if r['limit_id'] in (None, limit_id))
         freshness = ('failed' if failed_after else 'stale' if age > STALE_AFTER_SECONDS
                      or last['status'] == 'stale' else 'fresh')
         window = [r for r in items if parse_time(r['observed_at']) >= cutoff
@@ -846,5 +1053,5 @@ def brief(state_dir, provider='codex', now=None):
     return dict(provider=provider, state=worst, buckets=rows, lines=lines)
 
 
-NORMALIZERS = {'codex': normalize, 'agy': normalize_agy}
+NORMALIZERS = {'codex': normalize, 'agy': normalize_agy, 'claude': normalize_claude}
 PROVIDERS = tuple(NORMALIZERS)

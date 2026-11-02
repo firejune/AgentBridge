@@ -137,13 +137,20 @@ python3 "$bridge_cli" policy                                   # 적용 중인 �
 
 ### 3. 구독 한도 및 위험도 모니터링 (`usage`)
 
-브로커는 백그라운드에서 구독 한도를 수집해 `<state-dir>/usage.jsonl`에 기록한다. `codex`나 `agy` 경로를 거치는 모든 `send`·`ask`·`reply` 결과에는 `usage` 상태(`ok`, `at_risk`, `exhausted`, `unknown`)가 함께 반환되어 한도 고갈 전에 작업 속도를 조절할 수 있다.
+브로커는 백그라운드에서 구독 한도를 수집해 `<state-dir>/usage/<provider>.jsonl`에 기록한다. `codex`나 `agy` 경로(또는 `claude-peer`끼리의 경로)를 거치는 모든 `send`·`ask`·`reply` 결과에는 `usage` 상태(`ok`, `at_risk`, `exhausted`, `unknown`)가 함께 반환되어 한도 고갈 전에 작업 속도를 조절할 수 있다.
 
 ```bash
-python3 "$bridge_cli" usage                        # 전체 공급자(Codex + Antigravity) 버킷 한도 및 소모율 출력
+python3 "$bridge_cli" usage                        # 전체 공급자(Codex + Antigravity + Claude) 버킷 한도 및 소모율 출력
+python3 "$bridge_cli" usage --provider claude     # Claude 데스크톱 계정과 Claude Code(IDE/CLI) 계정
 python3 "$bridge_cli" usage --provider agy --json  # Antigravity 버킷(agy/gemini, agy/partner) JSON 조회
 python3 "$bridge_cli" usage --events               # 리셋 이력, spend horizon 및 stop-risk horizon 확인
 ```
+
+**Claude (`claude/desktop`, `claude/ide`)** — Claude 데스크톱과 Claude Code IDE 확장이 서로 다른 계정으로 도는 머신용이다. 어느 읽기도 모델 턴을 시작하지 않는다:
+
+- `claude/desktop`: 데스크톱이 스스로 15분마다 남기는 기록(`~/Library/Application Support/Claude/plan-usage-history.json`), 데스크톱에 로그인된 계정 기준. 사용률만 있고 리셋 시각은 없다.
+- `claude/ide`: Claude Code 로그인(IDE 확장 · 터미널 CLI). CLI의 `/usage`가 부르는 사용량 엔드포인트를 실시간으로 읽고, 토큰은 매번 키체인 항목 `Claude Code-credentials`에서 읽는다. 토큰은 저장 · 기록 · 갱신하지 않는다. 토큰이 없거나 만료됐거나 호출이 실패하면 CLI 자체 캐시(`~/.claude.json`)를 쓴다 — 세션 시작이나 `/usage` 때만 쓰여서 낡은 경우가 많으니 `observed`를 본다. `serve --no-claude-live`로 키체인 읽기를 끈다.
+- 표본은 원천이 잰 시각을 그대로 가진다 — `observed … ago`는 브로커가 아니라 원천의 나이다.
 
 ### 4. 에이전트 워크트리 (`wt`)
 

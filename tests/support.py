@@ -14,6 +14,7 @@ class RunningBroker:
         # Limit sampling is off unless a test names a stub app-server.
         self.max_messages = max_messages
         self.usage = ['--usage-interval', str(usage_interval)]
+        self.usage += ['--no-claude-live']  # Tests never read the Keychain.
         if codex_executable:
             self.usage += ['--codex-executable', codex_executable]
 

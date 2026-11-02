@@ -135,14 +135,15 @@ python3 "$bridge_cli" policy                                    # Show enforced 
 ## Checking Usage Limits
 
 ```bash
-python3 "$bridge_cli" usage [--provider all|codex|agy] [--since 6h] [--json]
+python3 "$bridge_cli" usage [--provider all|codex|agy|claude] [--since 6h] [--json]
 python3 "$bridge_cli" usage --events
 ```
 
 - Check your own session's built-in usage tool first when available; query `bridge.py usage` when missing/stale or when checking another provider/account or burn trend.
-- `usage` defaults to `--provider all` (Codex account buckets + Antigravity `agy/gemini` and `agy/partner` buckets) and ends each line with `holds until reset`, `AT RISK: empty ~T before reset`, `EXHAUSTED`, or `risk unknown`.
+- `usage` defaults to `--provider all` (Codex account buckets + Antigravity `agy/gemini` and `agy/partner` buckets + Claude `claude/desktop` and `claude/ide` buckets) and ends each line with `holds until reset`, `AT RISK: empty ~T before reset`, `EXHAUSTED`, or `risk unknown`.
 - `--events` prints reset events and two horizons: plan spending to the **spend horizon** (earlier of official reset and estimated early reset), and judge stopping risk by the **stop risk horizon** (official `resets_at`).
-- Every `send`, `ask`, and `reply` touching a `codex` or `agy` route includes a `usage` summary in the sender's output (`ok`, `at_risk`, `exhausted`, `unknown`). Pace or reassign work when `at_risk` or `exhausted`.
+- Claude: `claude/desktop` is the Claude Desktop account (Desktop's own history; used % only, no reset time), `claude/ide` is the Claude Code login used by the IDE extension and CLI (live usage endpoint via its Keychain token, else its `~/.claude.json` cache). A Desktop HQ reads its IDE sessions' limits here, and an IDE session reads Desktop's. Neither read starts a model turn.
+- Every `send`, `ask`, and `reply` touching a `codex` or `agy` route (or between two `claude-peer` routes) includes a `usage` summary in the sender's output (`ok`, `at_risk`, `exhausted`, `unknown`). Pace or reassign work when `at_risk` or `exhausted`.
 
 ## Agent Worktrees
 

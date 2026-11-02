@@ -494,13 +494,15 @@ def close_participant(args):
 
 USAGE_STATE_HELP = ('Broker state directory holding usage samples, when the broker runs with its own '
                     '--state-dir (default: socket path with .state suffix)')
-COLLECTED_USAGE = {'codex': 'codex', 'agy': 'agy'}  # transport -> provider the broker collects limits for
+COLLECTED_USAGE = {'codex': 'codex', 'agy': 'agy', 'claude-peer': 'claude'}  # transport -> provider the broker collects limits for
 
 
 def message_usage(args, message):
     """Usage lines for a message that involves a collected provider (#32); None otherwise."""
     transports = {(message.get(k) or {}).get('transport') for k in ('route', 'return_route')}
     providers = sorted({COLLECTED_USAGE[t] for t in transports if t in COLLECTED_USAGE})
+    if len(providers) > 1 and 'claude' in providers:
+        providers.remove('claude')  # Claude lines only between Claude sessions (#83); others keep their shape.
     if not providers:
         return None
     briefs = [usage.brief(broker_state_dir(args), p) for p in providers]
@@ -532,8 +534,10 @@ def main(argv=None):
     p.add_argument('--max-messages',type=int,default=2048,help='Retained messages; evict oldest unprotected done/answered/failed first')
     p.add_argument('--state-dir',help='Private routing snapshot directory (default: socket path with .state suffix)')
     p.add_argument('--usage-interval',type=int,default=usage.DEFAULT_INTERVAL_MINUTES,
-                   help=f'Minutes between Codex limit reads (0 = off, minimum {usage.MIN_INTERVAL_MINUTES})')
+                   help=f'Minutes between limit reads (0 = off, minimum {usage.MIN_INTERVAL_MINUTES})')
     p.add_argument('--codex-executable',default='codex')
+    p.add_argument('--no-claude-live',dest='claude_live',action='store_false',
+                   help='Read the Claude Code login from its ~/.claude.json cache only; never read its Keychain token')
     p = sub.add_parser('usage',help='Recorded subscription limits; reads the history file, starts nothing')
     p.add_argument('--provider',choices=['all', *usage.PROVIDERS],default='all')
     p.add_argument('--state-dir',help='Broker state directory (default: socket path with .state suffix)')
@@ -648,7 +652,7 @@ def main(argv=None):
             if args.usage_interval and args.usage_interval<usage.MIN_INTERVAL_MINUTES:
                 raise ValueError(f'Usage interval must be 0 (off) or at least {usage.MIN_INTERVAL_MINUTES} minutes')
             asyncio.run(broker.serve(args.socket,args.max_messages,args.state_dir,
-                                     args.usage_interval,args.codex_executable))
+                                     args.usage_interval,args.codex_executable,args.claude_live))
             return 0
         if args.cmd=='usage':
             state_dir = args.state_dir or Path(args.socket).expanduser().absolute().with_suffix('.state')
