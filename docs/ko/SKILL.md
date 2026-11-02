@@ -110,13 +110,13 @@ python3 "$bridge_cli" ask --project PROJECT --from-channel logic --channel view 
 # 원래 요청의 고정 주소로 답장:
 python3 "$bridge_cli" reply REQUEST_ID --key UNIQUE_REPLY_KEY --file /absolute/answer.txt
 
-# 작업이 끝난 워커 세션 닫기 및 라우트 해제:
-python3 "$bridge_cli" close NAME --project PROJECT [--keep-route] [--timeout 10]
+# 작업이 끝난 워커 세션 닫기 및 라우트 해제 (사이드바에서 보관 처리하려면 --archive 추가):
+python3 "$bridge_cli" close NAME --project PROJECT [--archive] [--keep-route] [--timeout 10]
 ```
 
 - 📬 **작업이 끝나면 반드시 그 작업이 들어온 채널로 결과를 보고한다** — 브릿지로 받은 일은 그 메시지에 `bridge.py reply`로 답하며, 막혀서 멈춘 경우에도 동일하게 보고한다. 이슈·PR 코멘트가 브릿지 답장을 대신하지 않는다.
 - `ack`와 `progress`는 수신 확인·진행 보고이며 최종 답변이 아니다. `ask`/`wait`의 종료 코드 2는 대기 시간 초과이므로 요청을 다시 보내지 말고 같은 ID로 `wait`한다.
-- `close`는 세 공급자 모두 세션을 삭제하거나 아카이빙하지 않고 대화 스택에 그대로 남긴 채(`resumable: true`) 세션/라우트를 종료한다(Claude: 백그라운드 CLI 프로세스에 `SIGTERM` 전송, Antigravity: 대기 상태 확인 후 보관 처리 없이 분리, Codex: 스레드 분리 및 라우트 제거). 소유자나 HQ의 지시 없이 내가 열지 않은 세션을 닫지 않는다.
+- `close`는 기본적으로 세 공급자 모두 세션을 삭제하거나 아카이빙하지 않고 대화 스택에 그대로 남긴 채(`archived: false`, `resumable: true`) 세션/라우트를 종료하며(Claude: 백그라운드 CLI 프로세스에 `SIGTERM` 전송, Antigravity: 대기 상태 확인 후 분리, Codex: 스레드 분리 및 라우트 제거), `--archive` 옵션을 주면 사이드바에서 보관 처리(`archived: true`)까지 함께 수행한다. 소유자나 HQ의 지시 없이 내가 열지 않은 세션을 닫지 않는다.
 
 ## 모델: 읽기 · 전환 · 정책
 

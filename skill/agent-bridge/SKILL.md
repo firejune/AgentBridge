@@ -110,13 +110,13 @@ python3 "$bridge_cli" ask --project PROJECT --from-channel logic --channel view 
 # Reply on the original return route:
 python3 "$bridge_cli" reply REQUEST_ID --key UNIQUE_REPLY_KEY --file /absolute/answer.txt
 
-# Close a finished worker session and remove its route:
-python3 "$bridge_cli" close NAME --project PROJECT [--keep-route] [--timeout 10]
+# Close a finished worker session and remove its route (add --archive to hide from sidebar):
+python3 "$bridge_cli" close NAME --project PROJECT [--archive] [--keep-route] [--timeout 10]
 ```
 
 - 📬 **Always report results back on the channel the task came in on** via `bridge.py reply`, including when blocked. Issue or PR comments do not replace the bridge reply.
 - `ack` and `progress` report receipt and status, not final answers. Exit code 2 from `ask` or `wait` means the wait timed out — run `wait REQUEST_ID` again rather than resending.
-- `close` stops or detaches the session while keeping it in the active conversation history (`resumable: true`) across all three providers: Claude sends `SIGTERM` to the background CLI process, Antigravity verifies the turn is idle and detaches without archiving, and Codex detaches the thread and removes the route. Do not close sessions you did not open unless instructed by the owner or HQ.
+- `close` stops or detaches the session while keeping it in the active conversation history (`archived: false`, `resumable: true`) by default across all three providers (Claude sends `SIGTERM` to the background CLI process, Antigravity verifies the turn is idle and detaches, and Codex detaches the thread). Pass `--archive` to also archive the conversation out of the active sidebar (`archived: true`). Do not close sessions you did not open unless instructed by the owner or HQ.
 
 ## Models: Read, Switch, Policy
 

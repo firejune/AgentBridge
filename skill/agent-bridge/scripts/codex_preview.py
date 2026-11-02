@@ -102,3 +102,69 @@ def initialize(route, text):
     except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, sessions.DiscoveryError):
         # Raw config/SQLite errors may contain private paths or task content.
         return unavailable('configuration or native store could not be updated; delivery remains accepted')
+
+
+def _resolve_archive_state_path(executable=None):
+    try:
+        return state_path(executable)
+    except (OSError, ValueError, TypeError, KeyError, sessions.DiscoveryError):
+        root = Path(
+            os.environ.get('CODEX_SQLITE_HOME')
+            or os.environ.get('CODEX_HOME')
+            or Path.home() / '.codex'
+        ).expanduser()
+        candidate = root / STATE_FILE
+        if candidate.is_file():
+            return candidate
+        raise ValueError(f'Codex state database is not found at {candidate}') from None
+
+
+def archive_thread(route, timeout=10):
+    """Archive a Codex thread in state_5.sqlite and notify Codex Desktop over IPC."""
+    import codex_live
+
+    thread = str(uuid.UUID(route['session']))
+    path = _resolve_archive_state_path(route.get('executable'))
+    info, parent = path.lstat(), path.parent.lstat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or
+            not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid() or
+            info.st_mode & 0o022 or parent.st_mode & 0o022):
+        raise ValueError('Codex native store is not owned and protected')
+
+    archived_at = int(time.time())
+    with closing(sqlite3.connect(path.as_uri() + '?mode=rw', uri=True,
+                                 timeout=max(LOCK_TIMEOUT, min(timeout, 5.0)))) as connection, connection:
+        row = connection.execute('SELECT cwd FROM threads WHERE id=?', (thread,)).fetchone()
+        if row is None:
+            raise ValueError(f'Codex thread {thread} is absent from state_5.sqlite')
+        row_cwd = row[0] or route.get('cwd') or ''
+        connection.execute(
+            'UPDATE threads SET archived=1, archived_at=? WHERE id=?',
+            (archived_at, thread),
+        )
+        verify = connection.execute('SELECT archived, archived_at FROM threads WHERE id=?', (thread,)).fetchone()
+        if not verify or int(verify[0]) != 1:
+            raise ValueError(f'Codex thread {thread} did not read back as archived in state_5.sqlite')
+
+    try:
+        with codex_live.Client(timeout=min(timeout, 2.0)) as client:
+            client.write({
+                'type': 'broadcast',
+                'method': 'thread-archived',
+                'sourceClientId': client.client_id,
+                'version': 2,
+                'params': {'hostId': 'local', 'conversationId': thread, 'cwd': row_cwd},
+            })
+    except (codex_live.DeliveryError, OSError):
+        pass
+
+    return {
+        'closed': True,
+        'method': 'archive',
+        'archived': True,
+        'session': thread,
+        'host': 'codex',
+        'archived_at': archived_at,
+        'resumable': True,
+        'note': 'Archived in state_5.sqlite and notified Codex Desktop.',
+    }

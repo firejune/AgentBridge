@@ -654,7 +654,57 @@ CLOSABLE_CLAUDE_HOSTS = {
 }
 
 
-def close_claude(sid, own_session=None, timeout=10, sessions_dir=None, killer=None, poll=0.2):
+def claude_desktop_sessions_dir():
+    base = os.environ.get('CLAUDE_DESKTOP_SESSIONS_DIR')
+    if base:
+        return Path(base).expanduser()
+    return Path.home() / 'Library' / 'Application Support' / 'Claude' / 'claude-code-sessions'
+
+
+def archive_claude_desktop(host_session_id, cli_session_id=None, desktop_dir=None):
+    root = Path(desktop_dir) if desktop_dir else claude_desktop_sessions_dir()
+    if not root.is_dir():
+        raise DiscoveryError(f'Claude Desktop session directory is missing: {root}')
+    target_name = (
+        f'{host_session_id}.json'
+        if isinstance(host_session_id, str) and re.fullmatch(r'local_[0-9a-fA-F-]+', host_session_id)
+        else None
+    )
+    matched = []
+    for path in root.rglob('local_*.json'):
+        if target_name and path.name == target_name:
+            matched.append(path)
+            continue
+        if cli_session_id and not target_name:
+            try:
+                data = json.loads(path.read_text(encoding='utf-8'))
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict) and data.get('cliSessionId') == cli_session_id:
+                matched.append(path)
+    if not matched:
+        raise DiscoveryError(
+            f'Claude Desktop metadata for session {host_session_id or cli_session_id} was not found under {root}'
+        )
+    for path in matched:
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+            if not isinstance(data, dict):
+                raise DiscoveryError(f'Invalid Claude Desktop metadata in {path}')
+            data['isArchived'] = True
+            tmp = path.with_suffix('.json.tmp')
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+            os.replace(tmp, path)
+            readback = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError) as error:
+            raise DiscoveryError(f'Failed to archive Claude Desktop session {path.name}: {error}') from None
+        if not isinstance(readback, dict) or readback.get('isArchived') is not True:
+            raise DiscoveryError(f'Claude Desktop session {path.name} did not read back as archived')
+    return True
+
+
+def close_claude(sid, own_session=None, timeout=10, sessions_dir=None, killer=None, poll=0.2,
+                 archive=False, desktop_dir=None):
     row = resolve_claude_peer(sid, sessions_dir)
     if own_session and str(own_session) == row['id']:
         raise DiscoveryError('Refusing to close the calling session itself')
@@ -673,5 +723,25 @@ def close_claude(sid, own_session=None, timeout=10, sessions_dir=None, killer=No
             raise DiscoveryError(f'Claude session {sid} (pid {pid}) is still running {timeout:g}s after SIGTERM; '
                                  'not escalating. Check it before trying again.')
         time.sleep(poll)
-    return {'closed': True, 'method': 'terminate', 'session': row['id'], 'host': host, 'pid': pid,
-            'resumable': True, 'note': CLOSABLE_CLAUDE_HOSTS[host]}
+    if archive and host == 'claude-desktop':
+        archive_claude_desktop(record.get('hostSessionId'), cli_session_id=row['id'], desktop_dir=desktop_dir)
+        return {
+            'closed': True,
+            'method': 'archive',
+            'archived': True,
+            'session': row['id'],
+            'host': host,
+            'pid': pid,
+            'resumable': True,
+            'note': 'Terminated CLI process and marked isArchived=true in Claude Desktop session metadata.',
+        }
+    return {
+        'closed': True,
+        'method': 'terminate',
+        'archived': False,
+        'session': row['id'],
+        'host': host,
+        'pid': pid,
+        'resumable': True,
+        'note': CLOSABLE_CLAUDE_HOSTS[host],
+    }

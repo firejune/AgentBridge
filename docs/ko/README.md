@@ -99,11 +99,11 @@ python3 "$bridge_cli" reply MESSAGE_ID --key reply-001 --file /path/to/answer.tx
 
 ### 1. 세션 생명주기 (`sessions`, `open`, `register --new`, `close`)
 
-| 공급자 | 데스크톱 세션 열기 | IDE 세션 열기 (`--host ide`) | 세션 닫기 (`bridge.py close NAME --project P`) |
+| 공급자 | 데스크톱 세션 열기 | IDE 세션 열기 (`--host ide`) | 세션 닫기 (`bridge.py close NAME --project P [--archive]`) |
 | --- | --- | --- | --- |
-| **Antigravity (`agy`)** | `language_server` / `agy --hub`(`StartCascade`)로 무인 생성 및 프로젝트·워크트리 환경 자동 연결 | 데스크톱과 동일 (`StartCascade` + 통합 허브 프로젝트·환경 자동 연결) | 대기 상태 확인 후 대화 스택에 그대로 유지(`resumable: true`)하며 라우트 제거 |
-| **Claude (`claude-peer`)** | `claude://code/new`로 첫 메시지를 채운 입력창을 열고 사용자의 Enter 대기 | IDE CLI + `<scheme>://anthropic.claude-code/open`으로 무인 생성 | 해당 CLI 프로세스에 `SIGTERM`(`resumable: true`) 전송 후 라우트 제거 |
-| **Codex (`codex`)** | `app-server --stdio` 생성 후 `codex://threads/UUID`로 데스크톱 자동 인계 (`:danger-full-access`, `approvalPolicy: never`) | 미지원 | 대화를 Codex 사이드바에 그대로 유지(`resumable: true`)하며 라우트 제거 |
+| **Antigravity (`agy`)** | `language_server` / `agy --hub`(`StartCascade`)로 무인 생성 및 프로젝트·워크트리 환경 자동 연결 | 데스크톱과 동일 (`StartCascade` + 통합 허브 프로젝트·환경 자동 연결) | 기본은 대화 스택 유지(`--archive` 시 `{archived: true}` 보관) 후 라우트 제거 |
+| **Claude (`claude-peer`)** | `claude://code/new`로 첫 메시지를 채운 입력창을 열고 사용자의 Enter 대기 | IDE CLI + `<scheme>://anthropic.claude-code/open`으로 무인 생성 | CLI 프로세스에 `SIGTERM` 전송 후 기본은 대화 스택 유지(`--archive` 시 데스크톱 `isArchived: true` 보관) 및 라우트 제거 |
+| **Codex (`codex`)** | `app-server --stdio` 생성 후 `codex://threads/UUID`로 데스크톱 자동 인계 (`:danger-full-access`, `approvalPolicy: never`) | 미지원 | 기본은 사이드바 대화 유지(`--archive` 시 `state_5.sqlite` `archived=1` 및 IPC 알림) 후 라우트 제거 |
 
 ```bash
 # 단독 생성 또는 생성과 동시에 브로커 등록:
@@ -111,8 +111,8 @@ python3 "$bridge_cli" open --provider agy --host ide --cwd /path/to/workspace --
 python3 "$bridge_cli" register codex-worker --project my-app --transport codex \
   --new --cwd /path/to/workspace --title "Worker" --model gpt-6.1-sol
 
-# 작업이 끝난 워커 세션 닫기 및 라우트 해제:
-python3 "$bridge_cli" close agy-worker --project my-app
+# 작업이 끝난 워커 세션 닫기 및 라우트 해제 (사이드바에서 숨기려면 --archive 추가):
+python3 "$bridge_cli" close agy-worker --project my-app [--archive]
 ```
 
 ### 2. 모델 조회·전환 및 정책 (`model`, `policy`)
