@@ -169,4 +169,4 @@ python3 -m unittest discover -s tests -v
 
 ## License
 
-[MIT](LICENSE.md)
+[MIT](LICENSE)
