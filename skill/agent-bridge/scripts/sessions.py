@@ -363,6 +363,63 @@ def resolve_claude_peer(sid, sessions_dir=None):
             'registry':str(path),'observed_at':observed_now(),'scope':'Claude live-session registry'}
 
 
+TITLE_MARK = b'"custom-title"'
+
+
+def claude_title(sid, title, force=False, projects_dir=None):
+    """Write `title` as the Claude session's custom title (the record /rename writes), best-effort.
+
+    The IDE/CLI resume picker labels a session by its custom title, else by its first prompt; bridge
+    sessions all start with the same injected peer line, so an untitled dead tower cannot be told apart.
+    Never overwrites an existing custom title unless `force`. Works on dead sessions (transcript only).
+    Returns {'state': 'written'|'kept'|'skipped', ...}; never raises for an expected miss.
+    """
+    sid = str(uuid.UUID(sid))
+    if not isinstance(title, str) or not title.strip():
+        return {'state':'skipped','reason':'empty title'}
+    title = title.strip()
+    base = os.environ.get('CLAUDE_CONFIG_DIR')
+    root = Path(projects_dir) if projects_dir else (Path(base).expanduser() if base else Path.home() / '.claude') / 'projects'
+    paths = sorted(root.glob(f'*/{sid}.jsonl'))
+    if len(paths) != 1:
+        return {'state':'skipped','reason':('no transcript yet' if not paths else f'{len(paths)} transcripts') + f' for {sid}'}
+    path = paths[0]
+    try:
+        data = path.read_bytes()
+    except OSError as error:
+        return {'state':'skipped','reason':f'transcript unreadable: {error}'}
+    current = None
+    start = data.find(TITLE_MARK)
+    while start != -1:
+        lo = data.rfind(b'\n', 0, start) + 1
+        hi = data.find(b'\n', start)
+        hi = len(data) if hi == -1 else hi
+        try:
+            entry = json.loads(data[lo:hi])
+        except ValueError:
+            entry = None
+        if isinstance(entry, dict) and entry.get('type') == 'custom-title' and isinstance(entry.get('customTitle'), str):
+            current = entry['customTitle']
+        start = data.find(TITLE_MARK, hi)
+    if current == title:
+        return {'state':'kept','title':current,'transcript':str(path)}
+    if current is not None and not force:
+        return {'state':'kept','title':current,'transcript':str(path),'reason':'session already has a title'}
+    if data and not data.endswith(b'\n'):
+        return {'state':'skipped','reason':'transcript tail is mid-write; retry later','transcript':str(path)}
+    line = json.dumps({'type':'custom-title','customTitle':title,'sessionId':sid}, ensure_ascii=False) + '\n'
+    try:
+        with path.open('ab') as handle:  # one O_APPEND write, like the session's own appends
+            handle.write(line.encode('utf-8'))
+    except OSError as error:
+        return {'state':'skipped','reason':f'transcript not writable: {error}','transcript':str(path)}
+    return {'state':'written','title':title,'previous':current,'transcript':str(path)}
+
+
+def route_title(route):
+    return f"{route.get('project')}/{route.get('name')}"
+
+
 def resolve_agy_peer(sid, timeout=5):
     """Return the live trajectory row of one exact Antigravity conversationId, or raise."""
     _, row = agy_live.resolve_agy(sid, timeout=timeout)
