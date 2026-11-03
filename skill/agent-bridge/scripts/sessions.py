@@ -401,13 +401,16 @@ def claude_title(sid, title, force=False, projects_dir=None):
         if isinstance(entry, dict) and entry.get('type') == 'custom-title' and isinstance(entry.get('customTitle'), str):
             current = entry['customTitle']
         start = data.find(TITLE_MARK, hi)
-    if current == title:
+    if current == title and not force:
         return {'state':'kept','title':current,'transcript':str(path)}
     if current is not None and not force:
         return {'state':'kept','title':current,'transcript':str(path),'reason':'session already has a title'}
     if data and not data.endswith(b'\n'):
         return {'state':'skipped','reason':'transcript tail is mid-write; retry later','transcript':str(path)}
-    line = json.dumps({'type':'custom-title','customTitle':title,'sessionId':sid}, ensure_ascii=False) + '\n'
+    # Compact separators, byte-identical to the records Claude Code writes itself: its picker matches
+    # '"type":"custom-title"' literally, and a spaced record is invisible to it.
+    line = json.dumps({'type':'custom-title','customTitle':title,'sessionId':sid},
+                      ensure_ascii=False, separators=(',',':')) + '\n'
     try:
         with path.open('ab') as handle:  # one O_APPEND write, like the session's own appends
             handle.write(line.encode('utf-8'))

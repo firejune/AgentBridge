@@ -41,6 +41,8 @@ class ClaudeTitleTests(unittest.TestCase):
         self.assertEqual(self.title('rig-c/parts-tower')['state'],'written')
         self.assertEqual(self.title('rig-c/parts-tower')['state'],'kept')
         self.assertEqual(titles(self.transcript),['rig-c/parts-tower'])
+        self.assertIn('{"type":"custom-title","customTitle":"rig-c/parts-tower",', self.transcript.read_text())
+        self.assertEqual(self.title('rig-c/parts-tower',force=True)['state'],'written')
 
     def test_never_overwrites_a_user_title_unless_forced(self):
         with self.transcript.open('a') as handle:
