@@ -10,6 +10,7 @@ import shlex
 import signal
 import socket
 import subprocess
+import time
 import sys
 import os
 import uuid
@@ -148,18 +149,42 @@ def push(path, m, dry_run=False):
         raise PushFailed(problem, rpc('finish', state='uncertain', note=problem))
     result = rpc('finish', state='submitted', event='pushed',
                  note=f"pushed to Claude session {target['id']} (pid {target['pid']}, msg_id {frame['msg_id']})")
-    found = label_claude(m['route'])
+    found = label_claude(m['route'], wait=TITLE_WAIT if fresh_session(target) else 0.0)
     if found['state'] == 'written':
         result = {**result, 'title': found}
     return result
 
 
-def label_claude(route, force=False):
-    """Best-effort: put the route name on a Claude session's resume-picker label (issue #85)."""
+TITLE_WAIT = 5.0  # seconds a first push waits for a --new session to write its transcript (issue #87)
+FRESH_SESSION = 600  # only a session started this recently may still lack its transcript
+
+
+def fresh_session(target):
+    """True when the live session started within FRESH_SESSION seconds (registry startedAt, ms)."""
     try:
-        return sessions.claude_title(route['session'], sessions.route_title(route), force=force)
-    except Exception as error:  # titling never fails a registration or a delivery
-        return {'state':'skipped','reason':f'{type(error).__name__}: {error}'}
+        started = json.loads(Path(target['registry']).read_text(encoding='utf-8')).get('startedAt')
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return isinstance(started, (int, float)) and time.time() * 1000 - started < FRESH_SESSION * 1000
+
+
+def label_claude(route, force=False, wait=0.0, poll=0.25):
+    """Best-effort: put the route name on a Claude session's resume-picker label (issues #85, #87).
+
+    A --new session has no transcript until it receives its first message, and the session writes it
+    only after the push returns; `wait` polls for it instead of skipping. A live session shows the new
+    label after its next step, when the running process re-emits the title record.
+    """
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            found = sessions.claude_title(route['session'], sessions.route_title(route), force=force)
+        except Exception as error:  # titling never fails a registration or a delivery
+            return {'state':'skipped','reason':f'{type(error).__name__}: {error}'}
+        if found['state'] != 'skipped' or not found.get('reason','').startswith('no transcript yet') \
+                or time.monotonic() >= deadline:
+            return found
+        time.sleep(poll)
 
 
 class ModelRelay:

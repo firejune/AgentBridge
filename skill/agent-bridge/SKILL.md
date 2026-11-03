@@ -59,6 +59,7 @@ python3 "$bridge_cli" register claude-worker --project PROJECT --transport claud
   - **IDE (`--host ide`)**: Focuses/opens the workspace window via the IDE CLI, opens `<scheme>://anthropic.claude-code/open`, and binds the single new `entrypoint == "claude-vscode"` record under `--cwd` with no human step.
   - **Desktop (default)**: Opens `claude://code/new?folder=…&q=…` and waits up to `--timeout` for a new `entrypoint == "claude-desktop"` record (`hostSessionId: "local_…"`) after a person presses Enter.
   - `--model` is rejected on new Claude sessions; select the model in the UI or via `model --set` on Desktop.
+  - **Session label**: registering a claude-peer route writes `PROJECT/NAME` as the session's custom title, which the session list shows instead of the shared injected first line. It never replaces an existing title. A `--new` session is labelled on its first push, once its transcript exists. A live session shows the label after its next step. Use `title NAME --project P` for routes registered earlier. On `--host ide`, `--title` is ignored: nothing would send a pre-filled prompt.
 - ⛔ **Never use `--transport claude` (resume) on a live session.** That spawns a duplicate CLI process instead of entering the open conversation. Keep `claude` strictly for idle dedicated CLI sessions.
 
 ### 2. Codex / ChatGPT Desktop (`codex`)
