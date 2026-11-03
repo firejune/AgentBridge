@@ -146,8 +146,20 @@ def push(path, m, dry_run=False):
     if problem:
         # Bytes may already be in the receiver's queue: never resend on our own.
         raise PushFailed(problem, rpc('finish', state='uncertain', note=problem))
-    return rpc('finish', state='submitted', event='pushed',
-               note=f"pushed to Claude session {target['id']} (pid {target['pid']}, msg_id {frame['msg_id']})")
+    result = rpc('finish', state='submitted', event='pushed',
+                 note=f"pushed to Claude session {target['id']} (pid {target['pid']}, msg_id {frame['msg_id']})")
+    found = label_claude(m['route'])
+    if found['state'] == 'written':
+        result = {**result, 'title': found}
+    return result
+
+
+def label_claude(route, force=False):
+    """Best-effort: put the route name on a Claude session's resume-picker label (issue #85)."""
+    try:
+        return sessions.claude_title(route['session'], sessions.route_title(route), force=force)
+    except Exception as error:  # titling never fails a registration or a delivery
+        return {'state':'skipped','reason':f'{type(error).__name__}: {error}'}
 
 
 class ModelRelay:
@@ -583,6 +595,9 @@ def main(argv=None):
     p.add_argument('--archive',action='store_true',help='Archive the finished session out of the active sidebar')
     p.add_argument('--keep-route',action='store_true',help='Close the session but keep the route registered')
     p.add_argument('--timeout',type=float,default=10)
+    p = sub.add_parser('title',help="Label a claude-peer route's session with PROJECT/NAME in the resume picker (works on dead sessions)")
+    p.add_argument('name');p.add_argument('--project',required=True)
+    p.add_argument('--force',action='store_true',help='Replace a title the session already has')
     p = sub.add_parser('policy',help='Show the model policy (defaults, denylist) the bridge enforces; read-only')
     p.add_argument('--state-dir')
     p = sub.add_parser('codex-model',help="Deprecated UUID alias for model NAME --set; changes next-turn settings")
@@ -693,6 +708,16 @@ def main(argv=None):
         if args.cmd=='close':
             output(close_participant(args))
             return 0
+        if args.cmd=='title':
+            route = next((r for r in broker.request(args.socket,{'op':'routes','project':args.project})
+                          if r['name'] == args.name), None)
+            if route is None:
+                raise ValueError(f'No participant {args.name!r} is registered in project {args.project!r}')
+            if route['transport'] != 'claude-peer':
+                raise models.Unsupported(f"{route['transport']}: titles are set at creation; only claude-peer routes are labelled")
+            found = label_claude(route, force=args.force)
+            output({'name':args.name,'project':args.project,'session':route['session'],**found})
+            return 0 if found['state'] != 'skipped' else 1
         if args.cmd=='policy':
             output(models.load_policy(broker_state_dir(args)))
             return 0
@@ -760,6 +785,8 @@ def main(argv=None):
             with_models(result, models.load_policy(broker_state_dir(args)), 5)
         if observation:
             result['discovery'] = observation
+        if args.cmd == 'register' and args.transport == 'claude-peer' and result.get('session'):
+            result['title'] = label_claude(result)
             if args.cmd == 'register' and args.transport == 'codex' and args.new:
                 result['registered'] = True
         output(result)
