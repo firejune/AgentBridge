@@ -660,7 +660,10 @@ def open_claude_ide(cwd, title=None, model=None, timeout=180, ide=DEFAULT_IDE, s
     if not folder.is_dir():
         raise DiscoveryError(f'Workspace directory does not exist: {folder}')
     root = Path(sessions_dir) if sessions_dir else claude_sessions_dir()
-    prompt = str(title).strip() if isinstance(title, str) and title.strip() else None
+    # No one presses Enter in the IDE: a pre-filled prompt stays unsent in the composer (issue #87).
+    # The session is labelled with its route name on register instead.
+    ignored = str(title).strip() if isinstance(title, str) and title.strip() else None
+    prompt = None
     url = claude_ide_url(ide, prompt)
     (focuser or focus_ide_folder)(ide, folder)
     if settle:
@@ -691,8 +694,10 @@ def open_claude_ide(cwd, title=None, model=None, timeout=180, ide=DEFAULT_IDE, s
             except DiscoveryError:
                 row = None  # The record exists before the inbox socket is announced.
             if row:
+                warning = (f'--title {ignored!r} is ignored on --host ide (nothing would send it); '
+                           'the session is labelled with its route name') if ignored else None
                 return {'created': True, 'session': row, 'host': 'ide', 'ide': ide,
-                        'url': url, 'prompt': prompt, 'warning': None}
+                        'url': url, 'prompt': prompt, 'warning': warning}
         if time.monotonic() >= deadline:
             raise DiscoveryError(f'No new live Claude IDE session appeared under {folder} within {timeout:g}s. '
                                  f'Check that {ide} is running with the Claude Code extension enabled.')

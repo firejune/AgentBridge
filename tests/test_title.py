@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 import uuid
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
@@ -94,6 +95,27 @@ class ClaudeTitleTests(unittest.TestCase):
         finally:
             fake.close()
         self.assertEqual(titles(self.transcript),['demo/tower'])
+
+
+class LabelWaitTests(unittest.TestCase):
+    """Issue #87: the first push to a --new session lands before its transcript exists."""
+    def test_waits_for_a_transcript_written_after_the_push(self):
+        import threading
+        with tempfile.TemporaryDirectory(prefix='abw-',dir='/tmp') as root:
+            sid = str(uuid.uuid4())
+            transcript = Path(root)/'projects'/'-tmp-w'/f'{sid}.jsonl'
+            def session_writes():
+                transcript.parent.mkdir(parents=True)
+                transcript.write_text(json.dumps({'type':'queue-operation','sessionId':sid})+'\n')
+            timer = threading.Timer(0.3, session_writes)
+            route = {'project':'demo','name':'tower','session':sid}
+            with unittest.mock.patch.dict(os.environ,{'CLAUDE_CONFIG_DIR':root}):
+                self.assertIn('no transcript',bridge.label_claude(route)['reason'])
+                timer.start()
+                found = bridge.label_claude(route, wait=3, poll=0.05)
+            timer.join()
+            self.assertEqual(found['state'],'written')
+            self.assertEqual(titles(transcript),['demo/tower'])
 
 
 if __name__=='__main__':

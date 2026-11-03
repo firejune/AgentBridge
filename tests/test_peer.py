@@ -314,11 +314,14 @@ class OpenClaudeIdeTests(unittest.TestCase):
         self.assertEqual(self.urls,['antigravity-ide://anthropic.claude-code/open'])
         self.assertIsNone(opened['prompt'])
 
-    def test_title_prefills_and_ide_picks_scheme(self):
-        self.open(title='Fresh worker',ide='cursor')
+    def test_title_is_not_prefilled_in_ide_and_ide_picks_scheme(self):
+        # Issue #87: nothing sends an IDE composer prefill, so it would sit unsent.
+        opened = self.open(title='Fresh worker',ide='cursor')
         parts = urlsplit(self.urls[0])
         self.assertEqual((parts.scheme,parts.netloc,parts.path),('cursor','anthropic.claude-code','/open'))
-        self.assertEqual(parse_qs(parts.query)['prompt'],['Fresh worker'])
+        self.assertNotIn('prompt',parse_qs(parts.query))
+        self.assertIsNone(opened['prompt'])
+        self.assertIn('ignored on --host ide',opened['warning'])
 
     def test_desktop_record_and_preexisting_ide_record_are_not_taken(self):
         self.fakes.append(FakeClaude(self.temp.name,str(uuid.uuid4()),pid=os.getppid(),extra=self.IDE))
