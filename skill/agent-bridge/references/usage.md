@@ -345,25 +345,37 @@ metadata index and loss ledger use a restore ceiling based on at least 2048
 messages, independent of a reduced retention setting. For larger prior stores,
 a validated metadata index can raise the payload read ceiling to its recorded
 message count times 1 MiB plus the inbox budgets. An oversized file without a
-usable index refuses startup. Lowering `--max-messages` restores the first
-messages in checkpoint order up to the new limit, filters their idempotency keys,
-and records only excess message identities in the durable loss ledger.
+usable index refuses startup. Lowering `--max-messages` reuses the broker's
+oldest-terminal eviction policy and its parent/ancestor guards. Retained messages
+keep checkpoint order, and keys are filtered only for messages actually evicted.
+Protected and non-terminal mail survives even when the retained count exceeds the
+new limit. Startup reports `correspondence.json`, the kept count and the limit to
+stderr. `ping.correspondence_over_limit` reports that condition and
+`ping.max_messages` reports the configured limit. New sends need room for their
+message and fail with the existing message-limit error until enough mail drains.
+Only actual terminal evictions produce a loss record. A limit change that drops
+nothing leaves the loss ledger untouched. The encoded byte ceiling still applies
+to saves, including an over-limit restored set.
 
 Snapshots and ACK receipts remain valid only within the broker epoch. Startup
 validates their checkpoint records and releases them, while message ACK state
 and `acknowledged_at` remain durable. A fresh list issues new handles. Read-only
 `inbox_list` updates pagination state in memory and skips the durable write.
 Other mutations still rewrite the version-1 checkpoint, including both copies
-of the body in the message and original intent. At configured capacity, one
-macOS probe measured 137,189,539 bytes and 0.520–0.604 seconds per mutation.
-The facade instance ping now shares the bounded 3-second RPC budget so it can
-wait behind a busy broker.
+of the body in the message and original intent. The facade instance ping shares
+the bounded 3-second socket-operation timeout used by other RPCs so it can wait
+behind a busy broker.
 
 `correspondence-index.json` is an atomic metadata-only index written before each
 replacement checkpoint. The first save writes the payload before creating the
-index, preventing a failed initial payload write from creating a false loss record. It records each retained message's id, sender, recipient and created
-time. It never supplies replay data. An I/O failure or unsafe file ownership, mode or type refuses startup for owner
-repair, matching routing storage. A corrupt, truncated, missing or invalid
+index, preventing a failed initial payload write from creating a false loss record.
+It records each retained message's id, sender, recipient and created
+time. It never supplies replay data. An I/O failure or unsafe ownership, mode or
+type of the checkpoint or loss ledger refuses startup for owner repair. Raised
+read errors and unsafe-file diagnostics name the affected path. The index is
+read when needed for an oversized payload or loss diagnostics. An unsafe index
+can be ignored during loss recovery, and an otherwise intact checkpoint starts
+with a 0644 index and rewrites that index as 0600. A corrupt, truncated, missing or invalid
 checkpoint produces a stderr diagnostic naming `correspondence.json` and dropped
 IDs, and a durable `correspondence-lost.json` with those identities, original
 times, detection time and reason. Previous incident records remain in its
@@ -375,7 +387,8 @@ is intact. Invalid idempotency row shapes and excessive JSON nesting use the sam
 loss-recovery path. If the index is also unavailable, identities are explicitly
 unknown. Recovery preserves the damaged checkpoint as
 `correspondence-corrupt.json` and starts without that mail. Subsequent corrupt
-checkpoints use timestamp/UUID-suffixed names and preserve earlier files. Further recovery at
+checkpoints use timestamp/UUID-suffixed names and preserve earlier files.
+Quarantine copies have no count limit. Further recovery at
 the loss-ledger byte ceiling requires owner intervention instead of deleting
 prior loss evidence. The index can contain an unaccepted attempted write when
 its following checkpoint write failed, so corruption reports conservatively name

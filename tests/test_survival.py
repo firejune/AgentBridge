@@ -120,6 +120,15 @@ class RetentionTests(unittest.TestCase):
                 self.send('next')
                 self.assertNotIn(message['id'], self.state.messages)
 
+    def test_refused_send_after_limit_reduction_does_not_partially_evict(self):
+        messages = [self.send(str(i)) for i in range(3)]
+        self.complete(messages[0])
+        self.state.max_messages = 1
+        before = deepcopy((self.state.messages, self.state.keys))
+        with self.assertRaisesRegex(ValueError, 'message limit reached: no evictable terminal'):
+            self.send('extra')
+        self.assertEqual((self.state.messages, self.state.keys), before)
+
     def test_invalid_send_or_reply_does_not_evict(self):
         self.state.max_messages = 1
         first = self.send('first'); self.complete(first)
@@ -216,16 +225,126 @@ class CheckpointFollowupTests(unittest.TestCase):
     def send(self, key):
         return self.state.action(dict(op='send', project='demo', sender='alpha', recipient='beta', body=key, key=key))
 
-    def test_smaller_capacity_restores_prefix_and_reports_only_excess(self):
+    def test_smaller_capacity_keeps_pending_over_limit_without_loss(self):
         messages = [self.send(str(i)) for i in range(5)]
+        with redirect_stderr(io.StringIO()) as diagnostic:
+            restored = broker.State(max_messages=4, store=self.store)
+        self.assertEqual(list(restored.messages), [m['id'] for m in messages])
+        self.assertIn('correspondence.json', diagnostic.getvalue())
+        self.assertIn('"kept": 5', diagnostic.getvalue())
+        self.assertIn('"limit": 4', diagnostic.getvalue())
+        self.assertTrue(restored.action(dict(op='ping'))['correspondence_over_limit'])
+        self.assertFalse(restored.correspondence.loss)
+        self.assertFalse(self.store.directory.joinpath('correspondence-lost.json').exists())
+        self.assertEqual(len(restored.keys), 5)
+        before = restored.correspondence.path.read_bytes()
+        with self.assertRaisesRegex(ValueError, 'message limit reached: no evictable terminal'):
+            restored.action(dict(op='send', project='demo', sender='alpha', recipient='beta', body='extra', key='extra'))
+        self.assertEqual(restored.correspondence.path.read_bytes(), before)
+        with redirect_stderr(io.StringIO()):
+            again = broker.State(max_messages=4, store=self.store)
+        self.assertEqual(list(again.messages), list(restored.messages))
+        # Once enough mail drains, a send can evict terminals down to the limit.
+        for message in messages[:2]:
+            again.action(dict(op='resolve', id=message['id'], state='done', note='complete'))
+        again.action(dict(op='send', project='demo', sender='alpha', recipient='beta', body='extra', key='extra'))
+        self.assertEqual(len(again.messages), 4)
+        self.assertFalse(again.action(dict(op='ping'))['correspondence_over_limit'])
+
+    def test_reduced_limit_protects_answered_parent_of_pending_reply(self):
+        parent = self.send('parent')
+        reply = self.state.action(dict(op='reply', id=parent['id'], body='reply', key='reply'))
+        with redirect_stderr(io.StringIO()) as diagnostic:
+            restored = broker.State(max_messages=1, store=self.store)
+        self.assertEqual(list(restored.messages), [parent['id'], reply['id']])
+        self.assertEqual(restored.get(parent['id'])['state'], 'answered')
+        self.assertTrue(restored.action(dict(op='ping'))['correspondence_over_limit'])
+        self.assertIn('correspondence.json', diagnostic.getvalue())
+        self.assertFalse(restored.correspondence.loss)
+        with self.assertRaisesRegex(ValueError, 'message limit reached: no evictable terminal'):
+            restored.action(dict(op='send', project='demo', sender='alpha', recipient='beta', body='new', key='new'))
+
+    def test_reduced_limit_protects_terminal_reply_of_unfinished_ancestor(self):
+        parent = self.send('parent')
+        reply = self.state.action(dict(op='reply', id=parent['id'], body='reply', key='reply'))
+        self.state.action(dict(op='resolve', id=reply['id'], state='done', note='complete'))
+        # Planted checkpoint state exercises the existing unfinished-ancestor guard.
+        self.state.messages[parent['id']]['state'] = 'in_progress'
+        self.state.correspondence.save(self.state)
+        with redirect_stderr(io.StringIO()):
+            restored = broker.State(max_messages=1, store=self.store)
+        self.assertEqual(list(restored.messages), [parent['id'], reply['id']])
+        self.assertFalse(restored.correspondence.loss)
+
+    def test_reduced_limit_evicts_done_before_newest_pending(self):
+        messages = [self.send(str(i)) for i in range(5)]
+        for message in messages[:4]:
+            self.state.action(dict(op='resolve', id=message['id'], state='done', note='complete'))
         with redirect_stderr(io.StringIO()):
             restored = broker.State(max_messages=4, store=self.store)
-        self.assertEqual(list(restored.messages), [m['id'] for m in messages[:4]])
+        self.assertEqual(list(restored.messages), [m['id'] for m in messages[1:]])
+        self.assertEqual(restored.get(messages[-1]['id'])['state'], 'pending')
         report = json.loads(self.store.directory.joinpath('correspondence-lost.json').read_text())
-        self.assertEqual([m['id'] for m in report['lost']], [messages[4]['id']])
-        self.assertEqual(len(restored.keys), 4)
-        again = broker.State(max_messages=4, store=self.store)
-        self.assertEqual(list(again.messages), list(restored.messages))
+        self.assertEqual([m['id'] for m in report['lost']], [messages[0]['id']])
+
+    def test_reduced_limit_preserves_submitted_key_and_retry_identity(self):
+        messages = [self.send(str(i)) for i in range(5)]
+        for message in messages[:4]:
+            self.state.action(dict(op='resolve', id=message['id'], state='done', note='complete'))
+        self.state.action(dict(op='claim', id=messages[-1]['id']))
+        self.state.action(dict(op='finish', id=messages[-1]['id'], state='submitted'))
+        with redirect_stderr(io.StringIO()):
+            restored = broker.State(max_messages=4, store=self.store)
+        retry = restored.action(dict(op='send', project='demo', sender='alpha', recipient='beta', body='4', key='4'))
+        self.assertEqual(retry['id'], messages[-1]['id'])
+        self.assertEqual(retry['state'], 'submitted')
+
+    def test_startup_unsafe_errors_name_the_checkpoint_or_loss_ledger(self):
+        self.send('private')
+        for name in ('correspondence.json', 'correspondence-lost.json'):
+            with self.subTest(file=name):
+                path = self.store.directory / name
+                if name == 'correspondence-lost.json':
+                    path.write_text('{}')
+                path.chmod(0o644)
+                with self.assertRaisesRegex(message_store.UnsafeCheckpointError, name):
+                    broker.State(max_messages=5, store=self.store)
+                path.chmod(0o600)
+                if name == 'correspondence-lost.json':
+                    path.unlink()
+
+    def test_startup_io_errors_name_the_checkpoint_or_loss_ledger(self):
+        self.send('private')
+        original = message_store.os.open
+        for name in ('correspondence.json', 'correspondence-lost.json'):
+            path = self.store.directory / name
+            def fail_read(target, flags, *args, **kwargs):
+                if Path(target) == path and flags & os.O_NOFOLLOW:
+                    raise OSError(errno.EIO, 'I/O failure')
+                return original(target, flags, *args, **kwargs)
+            with self.subTest(file=name), patch.object(message_store.os, 'open', side_effect=fail_read):
+                with self.assertRaisesRegex(OSError, name):
+                    broker.State(max_messages=5, store=self.store)
+
+    def test_index_mode_is_repaired_on_startup_without_refusal(self):
+        message = self.send('private')
+        self.state.correspondence.manifest.chmod(0o644)
+        restored = broker.State(max_messages=5, store=self.store)
+        self.assertEqual(list(restored.messages), [message['id']])
+        self.assertEqual(restored.correspondence.manifest.stat().st_mode & 0o777, 0o600)
+
+    def test_oversized_checkpoint_index_read_error_names_index(self):
+        self.send('private')
+        checkpoint = self.state.correspondence
+        checkpoint.restore_bytes = checkpoint.path.stat().st_size - 1
+        original = message_store.os.open
+        def fail_read(target, flags, *args, **kwargs):
+            if Path(target) == checkpoint.manifest:
+                raise OSError(errno.EIO, 'I/O failure')
+            return original(target, flags, *args, **kwargs)
+        with patch.object(message_store.os, 'open', side_effect=fail_read):
+            with self.assertRaisesRegex(OSError, 'correspondence-index.json'):
+                checkpoint.load()
 
     def test_second_corruption_preserves_both_quarantines(self):
         self.send('first')
@@ -255,7 +374,7 @@ class CheckpointFollowupTests(unittest.TestCase):
         checkpoint.restore_bytes = checkpoint.manifest.stat().st_size + 1
         with redirect_stderr(io.StringIO()):
             loaded = checkpoint.load()
-        self.assertEqual([m['id'] for m in loaded['messages']], [m['id'] for m in messages[:4]])
+        self.assertEqual([m['id'] for m in loaded['messages']], [m['id'] for m in messages])
 
     def test_unsafe_mode_refuses_start_without_quarantine_or_overwrite(self):
         self.send('private')
@@ -324,19 +443,21 @@ class CheckpointFollowupTests(unittest.TestCase):
         report = json.loads(self.store.directory.joinpath('correspondence-lost.json').read_text())
         self.assertEqual(report['lost'][0]['id'], message['id'])
 
-    def test_interrupted_first_save_does_not_report_unaccepted_ids(self):
-        path = self.state.correspondence.path
-        path.unlink()
-        self.state.correspondence.manifest.unlink()
+    def test_failed_initial_startup_payload_write_does_not_create_false_loss(self):
+        initial_store = route_store.RouteStore(Path(self.temp.name) / 'initial')
+        self.addCleanup(initial_store.close)
+        path = initial_store.directory / 'correspondence.json'
         original = message_store.atomic_write
         def interrupt(target, data):
             if target == path:
-                raise OSError('interrupted first payload')
+                raise OSError('interrupted startup payload')
             original(target, data)
         with patch.object(message_store, 'atomic_write', side_effect=interrupt):
-            with self.assertRaises(OSError):
-                self.send('unaccepted')
-        restored = broker.State(max_messages=5, store=self.store)
+            with self.assertRaisesRegex(OSError, 'interrupted startup payload'):
+                broker.State(max_messages=5, store=initial_store)
+        self.assertFalse(path.exists())
+        self.assertFalse(path.with_name('correspondence-index.json').exists())
+        restored = broker.State(max_messages=5, store=initial_store)
         self.assertFalse(restored.correspondence.loss)
         self.assertEqual(restored.messages, {})
 
@@ -749,6 +870,27 @@ class PersistenceTests(unittest.TestCase):
 
 
 class SurvivalSocketTests(unittest.TestCase):
+    def test_lowered_limit_retains_protected_reply_over_real_socket(self):
+        with RunningBroker(max_messages=2) as server:
+            server.register_pair()
+            parent = server.call('send', project='demo', sender='alpha', recipient='beta', body='Q', key='q')
+            reply = server.call('reply', id=parent['id'], body='A', key='a')
+            server.max_messages = 1
+            server.restart()
+            ping = server.call('ping')
+            self.assertTrue(ping['correspondence_over_limit'])
+            self.assertEqual((ping['messages'], ping['max_messages']), (2, 1))
+            self.assertFalse(ping['correspondence_lost'])
+            self.assertEqual(server.call('show', id=parent['id'])['state'], 'answered')
+            self.assertEqual(server.call('show', id=reply['id'])['state'], 'pending')
+            with self.assertRaisesRegex(ValueError, 'message limit reached: no evictable terminal'):
+                server.call('send', project='demo', sender='alpha', recipient='beta', body='extra', key='extra')
+            server.call('shutdown')
+            _, diagnostic = server.process.communicate(timeout=2)
+            self.assertIn('correspondence.json', diagnostic)
+            self.assertIn('"kept": 2', diagnostic)
+            self.assertIn('"limit": 1', diagnostic)
+
     def test_past_retention_limit_and_all_pending_refusal_over_real_socket(self):
         with RunningBroker(max_messages=3) as server:
             server.register_pair()

@@ -137,43 +137,49 @@ class MessageStore:
         self.manifest = self.path.with_name('correspondence-index.json')
         self.loss = self.path.with_name('correspondence-lost.json').exists()
         self.max_messages = max_messages
+        self.retained_limit = max_messages
         self.max_bytes = max_messages * FRAME_BYTES + SNAPSHOT_BYTES + MAX_RECEIPTS * 1024
         self.restore_bytes = max(max_messages, RESTORE_MESSAGES) * FRAME_BYTES + SNAPSHOT_BYTES + MAX_RECEIPTS * 1024
 
     def read(self, path):
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        with os.fdopen(fd, 'rb') as source:
-            info = os.fstat(source.fileno())
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                    or info.st_mode & 0o077):
-                raise UnsafeCheckpointError('Correspondence file must be owner-private and regular')
-            ceiling = self.restore_bytes
-            if info.st_size > ceiling and path == self.path:
-                # A larger prior configuration may exceed the default restore
-                # floor. Its metadata index bounds the old payload independently
-                # of the new retention setting. Never replay the index as mail.
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, 'rb') as source:
+                info = os.fstat(source.fileno())
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                        or info.st_mode & 0o077):
+                    raise UnsafeCheckpointError(f'{path}: must be owner-private and regular')
+                ceiling = self.restore_bytes
+                if info.st_size > ceiling and path == self.path:
+                    # A larger prior configuration may exceed the default restore
+                    # floor. Its metadata index bounds the old payload independently
+                    # of the new retention setting. Never replay the index as mail.
+                    try:
+                        index = self.read(self.manifest)
+                    except (FileNotFoundError, *MALFORMED_CONTENT, UnicodeError) as error:
+                        raise UnsafeCheckpointError(f'{path}: oversized checkpoint requires valid index {self.manifest}') from error
+                    if not isinstance(index, dict) or index.get('version') != 1 or not isinstance(index.get('messages'), list):
+                        raise UnsafeCheckpointError(f'{path}: oversized checkpoint requires valid index {self.manifest}')
+                    try:
+                        for item in index['messages']:
+                            loss_identity(item)
+                    except MALFORMED_CONTENT as error:
+                        raise UnsafeCheckpointError(f'{self.manifest}: invalid metadata identities for {path}') from error
+                    ceiling = max(ceiling, len(index['messages']) * FRAME_BYTES + SNAPSHOT_BYTES + MAX_RECEIPTS * 1024)
+                if info.st_size > ceiling:
+                    raise UnsafeCheckpointError(f'{path}: exceeds restoration byte ceiling')
                 try:
-                    index = self.read(self.manifest)
-                except (FileNotFoundError, *MALFORMED_CONTENT, UnicodeError) as error:
-                    raise UnsafeCheckpointError('Oversized checkpoint requires a valid metadata index') from error
-                if not isinstance(index, dict) or index.get('version') != 1 or not isinstance(index.get('messages'), list):
-                    raise UnsafeCheckpointError('Oversized checkpoint requires a valid metadata index')
-                try:
-                    for item in index['messages']:
-                        loss_identity(item)
-                except MALFORMED_CONTENT as error:
-                    raise UnsafeCheckpointError('Oversized checkpoint requires valid metadata identities') from error
-                ceiling = max(ceiling, len(index['messages']) * FRAME_BYTES + SNAPSHOT_BYTES + MAX_RECEIPTS * 1024)
-            if info.st_size > ceiling:
-                raise UnsafeCheckpointError('Correspondence file exceeds restoration byte ceiling')
-            try:
-                return json.load(source)
-            except RecursionError:
-                raise ValueError('Correspondence JSON nesting limit exceeded') from None
+                    return json.load(source)
+                except RecursionError:
+                    raise ValueError('Correspondence JSON nesting limit exceeded') from None
+        except OSError as error:
+            if error.filename is not None:
+                raise
+            raise OSError(error.errno, error.strerror or str(error), str(path)) from error
 
     def save(self, state):
         messages = [message_record(m) for m in state.messages.values()]
-        if len(messages) > self.max_messages:
+        if len(messages) > self.retained_limit:
             raise ValueError('Correspondence message count limit reached')
         current = time.time()
         receipts = [receipt_record(key, value) for key, value in state.inbox_receipts.items()
@@ -200,6 +206,7 @@ class MessageStore:
         else:
             atomic_write(self.manifest, encoded(dict(version=1, messages=index)))
             atomic_write(self.path, data)
+        self.retained_limit = max(self.max_messages, len(messages))
 
     def load(self):
         self.read_loss_reports()
@@ -245,13 +252,8 @@ class MessageStore:
             return self.lost('invalid checkpoint records; entire checkpoint dropped', empty)
         # Facade handles and cursors bind the old broker instance. Validate
         # their stored records above, then release unreachable capacity.
-        retained = messages[:self.max_messages]
-        if len(retained) < len(messages):
-            self.record_loss('message retention limit reduced',
-                             [loss_identity(m) for m in messages[self.max_messages:]])
-        retained_ids = {m['id'] for m in retained}
-        return dict(messages=retained, keys=[row for row in keys if row[2] in retained_ids],
-                    receipts=[], snapshots={})
+        self.retained_limit = max(self.max_messages, len(messages))
+        return dict(messages=messages, keys=keys, receipts=[], snapshots={})
 
     def read_loss_reports(self):
         path = self.path.with_name('correspondence-lost.json')

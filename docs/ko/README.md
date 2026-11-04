@@ -169,7 +169,7 @@ python3 "$bridge_cli" wt sweep --apply  # 대상 워크트리 및 브랜치 실�
 
 ### 5. 라우팅 영속화 및 선택적 `launchd` 서비스
 
-- **소유자 전용 메시지·라우팅 저장**. 라우트는 `<state-dir>/routes.json`, 제한된 메시지·전달 상태·중복 방지 키·인박스 스냅샷·ACK 영수증은 `correspondence.json`(`0600`)에 원자적으로 저장된다. 재시작은 전송을 재실행하지 않으며 중단된 전달은 `uncertain`으로 복원한다. 보존 한도를 줄이면 저장 순서의 앞부분을 복원하고 초과 ID만 손실로 기록한다. 읽기 오류·안전하지 않은 권한은 시작을 거부한다. 반복 손상은 별도 파일로 격리한다. 이전 epoch의 스냅샷·영수증은 해제하고 메시지 ACK 상태는 보존한다. 최초 본문 저장이 인덱스보다 앞서 허위 손실 기록을 방지한다. 자격 증명·서명 핸들·진단 문자열·이벤트 이력은 메모리에만 남는다. 저장 필드·상한·유실 기록은 [저장 계약](../../skill/agent-bridge/references/usage.md#correspondence-storage-issue-94)을 따른다.
+- **소유자 전용 메시지·라우팅 저장**. 재시작은 브로커의 종료 메시지 제거·보호 규칙에 따라 라우트와 메시지를 복원하며, 낮춘 한도를 넘는 보호 메시지는 유지하고 stderr와 `ping.correspondence_over_limit`에 표시한다. 필드·한도·손실 진단은 [저장 계약](../../skill/agent-bridge/references/usage.md#correspondence-storage-issue-94)을 따른다.
 - **선택적 macOS `launchd` 관리**: 자동 기동 서비스는 기본 꺼짐 상태다. `install-service`(검토용 파일 생성은 `--generate-only --plist PATH`)와 `uninstall-service`로 `KeepAlive` 에이전트를 관리한다.
 
 ### 6. 원격 MCP 파사드 (`mcp_server.py`)

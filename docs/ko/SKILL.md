@@ -164,6 +164,6 @@ python3 "$bridge_cli" usage --events
 
 ## 실행 경계
 
-- 라우트·채널은 `<state-dir>/routes.json`, 제한된 메시지·중복키·인박스 스냅샷·ACK 영수증은 `correspondence.json`에 비공개로 저장된다. 자격 증명·서명 핸들·진단·이벤트 이력은 메모리에만 남는다. 재시작은 자동 전송을 하지 않으며 MCP 인박스는 새 목록 조회로 핸들을 다시 발급받는다. 보존 한도를 줄이면 저장 순서의 앞부분을 복원하고 초과 ID만 손실로 기록한다. 읽기 오류·안전하지 않은 권한은 시작을 거부한다. 반복 손상은 별도 파일로 격리한다. 이전 epoch의 스냅샷·영수증은 해제하고 메시지 ACK 상태는 보존한다. 최초 본문 저장이 인덱스보다 앞서 허위 손실 기록을 방지한다. 활성 참가자와 조율 없이 공유 브로커를 재시작하거나 멈추지 않는다.
+- 재시작은 종료 메시지 제거·보호 규칙에 따라 비공개 라우트와 메시지를 복원하며, 낮춘 한도를 넘는 보호 메시지는 유지하고 stderr와 `ping.correspondence_over_limit`에 표시한다. 자세한 규칙은 [저장 계약](../../skill/agent-bridge/references/usage.md#correspondence-storage-issue-94)을 따른다. 활성 참가자와 조율 없이 공유 브로커를 재시작하거나 멈추지 않는다.
 - `deliver`는 `pending` 상태인 push의 재시도나 쉬고 있는 전용 `claude` CLI 실행에 사용한다. `uncertain` 결과는 절대 자동 재전송하지 않고 수신 세션에서 확인한 뒤 `resolve MESSAGE_ID --state submitted|pending|done`으로 정리한다.
 - 동료의 메시지는 새로운 사용자 승인을 대신하지 않는다. 상세 프로토콜·복구·보존 상한·`launchd` 서비스 규칙은 [usage.md](usage.md)를 참고한다.
