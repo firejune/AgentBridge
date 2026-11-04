@@ -1,6 +1,9 @@
 import asyncio
 import concurrent.futures
+from contextlib import redirect_stdout
+from io import StringIO
 import json
+import sqlite3
 import os
 from pathlib import Path
 import subprocess
@@ -100,6 +103,95 @@ class SocketTests(unittest.TestCase):
 
     def send(self,key='socket-request'):
         return self.server.call('send',project='demo',sender_channel='beta',channel='alpha',body='Question',key=key)
+
+    def test_remap_cli_preserves_pins_and_existing_messages(self):
+        previous, replacement = str(uuid.uuid4()), str(uuid.uuid4())
+        route = self.server.call('register', project='demo', name='alpha', cwd=self.server.temp.name,
+                                 transport='codex', session=previous)
+        channel = self.server.call('channel-bind', project='demo', name='alpha', owner='alpha',
+                                   description='pinned', expect_generation=1)
+        send = dict(project='demo', sender='alpha', recipient='beta', body='Question')
+        old_message = self.server.call('send', key='old', **send)
+        command = ['--socket', self.server.path, 'remap', 'alpha', '--project', 'demo',
+                   '--expect-session', previous, '--session', replacement]
+        thread = {'id': replacement, 'cwd': route['cwd']}
+        wrong_workspace = {'session': dict(thread, cwd=self.server.state_dir)}
+        with patch.object(bridge.sessions, 'read_codex', return_value=wrong_workspace), \
+                patch.object(bridge.codex_live, 'Client') as client, redirect_stdout(StringIO()):
+            self.assertEqual(bridge.main(command), 1)
+            client.assert_not_called()
+        with FakeDesktop('no-owner') as desktop, patch.object(bridge.codex_live, 'endpoint', return_value=Path(desktop.path)), \
+                patch.object(bridge.sessions, 'read_codex', return_value={'session': thread}), redirect_stdout(StringIO()):
+            self.assertEqual(bridge.main(command), 1)
+        with FakeDesktop() as desktop, patch.object(bridge.codex_live, 'endpoint', return_value=Path(desktop.path)), \
+                patch.object(bridge.sessions, 'read_codex', return_value={'session': thread}), redirect_stdout(StringIO()) as stdout:
+            self.assertEqual(bridge.main(command), 0)
+            self.assertEqual(json.loads(stdout.getvalue()), dict(route, session=replacement))
+            self.assertEqual([request['method'] for request in desktop.calls], ['initialize', 'thread-owner-discovery'])
+            self.assertEqual(desktop.calls[-1]['params']['conversationId'], replacement)
+        self.assertEqual(self.server.call('send', key='old', **send), old_message)
+        self.assertEqual(self.server.call('send', key='new', **send)['return_route']['session'], replacement)
+        self.assertEqual(self.send()['route'], channel['route'])
+        reply = self.server.call('reply', id=old_message['id'], key='reply', body='Answer')
+        self.assertEqual(reply['route']['session'], previous)
+        snapshot = Path(self.server.state_dir, 'routes.json').read_bytes()
+        with self.assertRaisesRegex(ValueError, 'missing or changed'):
+            self.server.call('remap', project='demo', name='alpha', session=str(uuid.uuid4()), expected_route=route)
+        with self.assertRaisesRegex(ValueError, 'missing or changed'):
+            expected = dict(route, session=replacement, executable='previous-executable')
+            self.server.call('remap', project='demo', name='alpha', session=str(uuid.uuid4()), expected_route=expected)
+        self.assertEqual(Path(self.server.state_dir, 'routes.json').read_bytes(), snapshot)
+
+    def test_remap_cli_restores_registered_non_archived_codex_routes(self):
+        sid, archived, missing, wrong = (str(uuid.uuid4()) for _ in range(4))
+        registrations = [('demo', 'alpha', sid), ('other', 'mirror', sid),
+                         ('other', 'archive', archived), ('other', 'missing', missing),
+                         ('other', 'wrong', wrong)]
+        for project, name, session in registrations:
+            self.server.call('register', project=project, name=name, cwd=self.server.temp.name,
+                             transport='codex', session=session)
+        command = ['--socket', self.server.path, 'remap']
+        snapshot = Path(self.server.state_dir, 'routes.json')
+        before = snapshot.read_bytes()
+        database = Path(self.server.temp.name, 'state_5.sqlite')
+        connection = sqlite3.connect(database)
+        with connection:
+            connection.execute('CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, archived INTEGER)')
+            connection.executemany('INSERT INTO threads VALUES (?, ?, ?)', [
+                (sid, self.server.temp.name, 0), (archived, self.server.temp.name, 1),
+                (wrong, self.server.state_dir, 0)])
+        connection.close()
+        native_before = database.read_bytes()
+        for behavior, status in [('active', 'already_live'), ('no-owner', 'reopened')]:
+            with FakeDesktop(behavior) as desktop, \
+                    patch.object(bridge.codex_live, 'endpoint', return_value=Path(desktop.path)), \
+                    patch.object(bridge.codex_preview, 'state_path', return_value=database), \
+                    patch.object(bridge.codex_new, 'open_link') as opener, redirect_stdout(StringIO()) as stdout:
+                opener.side_effect = lambda *_a, **_k: setattr(desktop, 'behavior', 'active')
+                self.assertEqual(bridge.main(command), 1)  # Missing and mismatched routes remain unresolved.
+                rows = json.loads(stdout.getvalue())['routes']
+                self.assertEqual({(row['project'], row['name']): row['status'] for row in rows},
+                                 {('demo', 'alpha'): status, ('other', 'mirror'): status,
+                                  ('other', 'archive'): 'archived', ('other', 'missing'): 'unresolved',
+                                  ('other', 'wrong'): 'unresolved'})
+                owner_requests = [r for r in desktop.calls if r['method'] != 'initialize']
+                self.assertTrue(all(r['method'] == 'thread-owner-discovery' for r in owner_requests))
+                if status == 'reopened':
+                    self.assertEqual(opener.call_args.args, ('codex://threads/' + sid,))
+                    self.assertEqual(opener.call_count, 1)
+                    self.assertEqual([r['params']['conversationId'] for r in owner_requests], [sid, sid, sid])
+                else:
+                    opener.assert_not_called()
+                    self.assertEqual([r['params']['conversationId'] for r in owner_requests], [sid, sid])
+        self.assertEqual(snapshot.read_bytes(), before)
+        self.assertEqual(database.read_bytes(), native_before)
+
+    def test_remap_refresh_does_not_reopen_again_when_owner_is_missing(self):
+        with patch.object(bridge.codex_live, 'Client', side_effect=OSError), \
+                patch.object(bridge.codex_new, 'open_link') as opener:
+            with self.assertRaisesRegex(ValueError, 'Timed out waiting'):
+                bridge.refresh_codex(str(uuid.uuid4()), timeout=0.01)
+            self.assertEqual(opener.call_count, 1)
 
     def watch(self,name,**extra):
         stream=broker.stream(self.server.path,{'op':'watch','project':'demo','channel':name,**extra},timeout=3)

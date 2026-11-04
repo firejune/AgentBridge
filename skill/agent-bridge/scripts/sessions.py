@@ -22,6 +22,13 @@ class DiscoveryError(ValueError):
     pass
 
 
+class CodexRpcError(DiscoveryError):
+    def __init__(self, method, error):
+        super().__init__(f'Codex {method}: {error}')
+        self.code = error.get('code') if isinstance(error, dict) else None
+        self.message = error.get('message') if isinstance(error, dict) else None
+
+
 def resolve_codex_executable(executable):
     if executable != 'codex' or shutil.which('codex'):
         return executable
@@ -131,7 +138,7 @@ class CodexClient:
                 if obj.get('id') != request_id:
                     continue  # Notifications are not replies to our request.
                 if 'error' in obj:
-                    raise DiscoveryError(f'Codex {method}: {obj["error"]}')
+                    raise CodexRpcError(method, obj['error'])
                 if not isinstance(obj.get('result'),dict):
                     raise DiscoveryError(f'Codex {method}: missing result')
                 return obj['result']

@@ -25,6 +25,10 @@ If installed elsewhere, use the sibling `scripts/bridge.py` next to the `SKILL.m
 1. **Discover and verify sessions**: Run `sessions` to list live sessions and `session` to verify the exact UUID, title, and working directory (`cwd`). When multiple candidates exist, disambiguate using the current task and user instructions. Never pick a target by recency or fuzzy title matching alone. **If multiple candidates remain ambiguous, ask the user which session to use before sending.**
 2. **Check the broker**: Run `ping`. Reuse an existing broker if running. If no broker is running and bridge operation is within scope, start `serve` and confirm the `ready` output.
 3. **Register routes and channels**: Inspect `routes` and `channels` first so you do not overwrite another active session's binding. Register live sessions with `claude-peer`, `codex`, or `agy`, and bind project channels via `channel-bind`.
+   Run `bridge.py remap` to reopen non-archived Codex sessions registered across all broker projects. The command checks the saved workspace, skips sessions that already have a Desktop owner, and reports the result for each endpoint. Reopening can bring Codex Desktop to the foreground. The command preserves UUIDs and leaves messages queued.
+
+   Use `bridge.py remap NAME --project PROJECT --expect-session OLD_UUID --session NEW_UUID` to replace a registered Codex endpoint. The replacement must have a live Desktop owner and the same workspace. New messages addressed directly to the participant use the replacement UUID. Channel bindings and existing messages keep their original routes.
+
 4. **Push directly (no polling loops)**: Only `realtime` CLI workers use `watch`. **`claude-peer`, `codex`, and `agy` push directly into open live sessions without a `watch` polling loop or spawning duplicate CLI processes.**
 
 ```bash
