@@ -364,6 +364,10 @@ def resolve_claude_peer(sid, sessions_dir=None):
 
 
 TITLE_MARK = b'"custom-title"'
+# The IDE session list reads only the first and last 64 KiB of a transcript, and a running CLI adopts a
+# title another process wrote only when it reads its own tail (after ~32 KB of its writes). A record
+# outside the tail is invisible to both, so it is appended again until the session re-emits it (#89).
+TITLE_TAIL = 65536
 
 
 def claude_title(sid, title, force=False, projects_dir=None):
@@ -388,7 +392,7 @@ def claude_title(sid, title, force=False, projects_dir=None):
         data = path.read_bytes()
     except OSError as error:
         return {'state':'skipped','reason':f'transcript unreadable: {error}'}
-    current = None
+    current, at = None, -1
     start = data.find(TITLE_MARK)
     while start != -1:
         lo = data.rfind(b'\n', 0, start) + 1
@@ -399,16 +403,16 @@ def claude_title(sid, title, force=False, projects_dir=None):
         except ValueError:
             entry = None
         if isinstance(entry, dict) and entry.get('type') == 'custom-title' and isinstance(entry.get('customTitle'), str):
-            current = entry['customTitle']
+            current, at = entry['customTitle'], lo
         start = data.find(TITLE_MARK, hi)
-    if current == title and not force:
+    in_tail = at >= len(data) - TITLE_TAIL
+    if current == title and in_tail and not force:
         return {'state':'kept','title':current,'transcript':str(path)}
-    if current is not None and not force:
+    if current is not None and current != title and not force:
         return {'state':'kept','title':current,'transcript':str(path),'reason':'session already has a title'}
     if data and not data.endswith(b'\n'):
         return {'state':'skipped','reason':'transcript tail is mid-write; retry later','transcript':str(path)}
-    # Compact separators, byte-identical to the records Claude Code writes itself: its picker matches
-    # '"type":"custom-title"' literally, and a spaced record is invisible to it.
+    # Compact separators, byte-identical to the records Claude Code writes itself.
     line = json.dumps({'type':'custom-title','customTitle':title,'sessionId':sid},
                       ensure_ascii=False, separators=(',',':')) + '\n'
     try:
@@ -416,7 +420,10 @@ def claude_title(sid, title, force=False, projects_dir=None):
             handle.write(line.encode('utf-8'))
     except OSError as error:
         return {'state':'skipped','reason':f'transcript not writable: {error}','transcript':str(path)}
-    return {'state':'written','title':title,'previous':current,'transcript':str(path)}
+    found = {'state':'written','title':title,'previous':current,'transcript':str(path)}
+    if current == title:
+        found['reason'] = 'refreshed into the transcript tail'
+    return found
 
 
 def route_title(route):

@@ -45,6 +45,22 @@ class ClaudeTitleTests(unittest.TestCase):
         self.assertIn('{"type":"custom-title","customTitle":"rig-c/parts-tower",', self.transcript.read_text())
         self.assertEqual(self.title('rig-c/parts-tower',force=True)['state'],'written')
 
+    def test_a_title_buried_outside_the_tail_is_appended_again(self):
+        self.assertEqual(self.title('p/n')['state'],'written')
+        with self.transcript.open('a') as handle:  # the session keeps writing past the 64 KiB tail
+            handle.write((json.dumps({'type':'assistant','pad':'x'*1000})+'\n')*70)
+        again = self.title('p/n')
+        self.assertEqual((again['state'],again['reason']),('written','refreshed into the transcript tail'))
+        self.assertEqual(self.title('p/n')['state'],'kept')
+        self.assertEqual(titles(self.transcript),['p/n','p/n'])
+
+    def test_a_buried_user_title_is_still_never_replaced(self):
+        with self.transcript.open('a') as handle:
+            handle.write(json.dumps({'type':'custom-title','customTitle':'mine','sessionId':self.sid})+'\n')
+            handle.write((json.dumps({'type':'assistant','pad':'x'*1000})+'\n')*70)
+        self.assertEqual(self.title('p/n')['state'],'kept')
+        self.assertEqual(titles(self.transcript),['mine'])
+
     def test_never_overwrites_a_user_title_unless_forced(self):
         with self.transcript.open('a') as handle:
             handle.write(json.dumps({'type':'custom-title','customTitle':'mine','sessionId':self.sid})+'\n')
