@@ -119,18 +119,36 @@ def _resolve_archive_state_path(executable=None):
         raise ValueError(f'Codex state database is not found at {candidate}') from None
 
 
-def archive_thread(route, timeout=10):
-    """Archive a Codex thread in state_5.sqlite and notify Codex Desktop over IPC."""
-    import codex_live
-
-    thread = str(uuid.UUID(route['session']))
-    path = _resolve_archive_state_path(route.get('executable'))
+def require_owned_store(path):
     info, parent = path.lstat(), path.parent.lstat()
     if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or
             not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid() or
             info.st_mode & 0o022 or parent.st_mode & 0o022):
         raise ValueError('Codex native store is not owned and protected')
 
+
+def saved_thread(route):
+    """Read exact workspace and archive status without changing the native store."""
+    path = state_path(route.get('executable'))
+    require_owned_store(path)
+    sid = str(uuid.UUID(route['session']))
+    try:
+        with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=LOCK_TIMEOUT)) as connection:
+            row = connection.execute('SELECT cwd, archived FROM threads WHERE id=?', (sid,)).fetchone()
+    except sqlite3.Error as error:
+        raise ValueError('Codex native thread metadata unavailable') from error
+    if row is None or not isinstance(row[0], str) or row[1] not in (0, 1):
+        raise ValueError('Codex native thread identity or archive status unavailable')
+    return row[0], bool(row[1])
+
+
+def archive_thread(route, timeout=10):
+    """Archive a Codex thread in state_5.sqlite and notify Codex Desktop over IPC."""
+    import codex_live
+
+    thread = str(uuid.UUID(route['session']))
+    path = _resolve_archive_state_path(route.get('executable'))
+    require_owned_store(path)
     archived_at = int(time.time())
     with closing(sqlite3.connect(path.as_uri() + '?mode=rw', uri=True,
                                  timeout=max(LOCK_TIMEOUT, min(timeout, 5.0)))) as connection, connection:

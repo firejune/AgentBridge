@@ -27,6 +27,10 @@ python3 "$bridge_cli" --help
 1. **세션 조회 및 검증**: `sessions`로 실제 세션을 찾고 `session`으로 정확한 UUID·제목·작업 경로(`cwd`)를 확인한다. 제목 유사성이나 최신순만으로 상대를 고르지 않는다. **후보가 하나로 좁혀지지 않으면 임의로 보내지 말고 사용자에게 어느 세션인지 확인한다.**
 2. **브로커 확인**: `ping`으로 브로커를 확인하고 이미 실행 중이면 재사용한다. 실행 중이 아니고 브릿지 운영이 요청 범위라면 `serve`를 실행해 `ready`를 확인한다.
 3. **라우트 및 채널 등록**: 등록 전에 `routes`와 `channels`를 확인해 다른 세션의 연결을 덮어쓰지 않는다. 라이브 세션은 `claude-peer`, `codex`, `agy`로 등록하고 `channel-bind`로 역할 채널을 연결한다.
+   `bridge.py remap`은 브로커의 모든 프로젝트에서 보관되지 않은 등록 Codex 세션을 다시 연다. 저장된 작업 디렉터리를 확인하고 Desktop 소유자가 이미 붙은 세션은 건너뛴다. 결과는 엔드포인트별로 출력한다. 세션을 다시 열 때 Codex Desktop이 화면 앞으로 올 수 있다. UUID와 대기 중인 메시지는 그대로 유지한다.
+
+   `bridge.py remap NAME --project PROJECT --expect-session OLD_UUID --session NEW_UUID`로 등록된 Codex 엔드포인트의 UUID를 교체할 수 있다. 새 세션에는 라이브 데스크톱 소유자가 있어야 하며 작업 디렉터리는 기존과 같아야 한다. 참가자 이름으로 직접 보내는 새 메시지에 교체된 UUID를 사용한다. 채널 바인딩과 기존 메시지는 원래 라우트를 유지한다.
+
 4. **직접 Push (폴링 루프 금지)**: `watch`는 `realtime` CLI 워커 전용이다. **`claude-peer`, `codex`, `agy`는 별도의 `watch` 폴링 루프나 새 CLI 프로세스 없이 기존 라이브 세션에 직접 push한다.**
 
 ```bash

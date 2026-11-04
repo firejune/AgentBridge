@@ -349,8 +349,21 @@ class State:
             item = dict(project=project,name=name,transport=transport,cwd=cwd,
                         session=sid,executable=args.get('executable'))
             return self.routing_change('endpoints', (project,name), item)
+        if op == 'remap':
+            key = (identifier(args['project']), identifier(args['name']))
+            current = self.endpoints.get(key)
+            if current is None or current != args['expected_route']:
+                raise ValueError('Endpoint is missing or changed')
+            if current['transport'] != 'codex':
+                raise ValueError('Remap requires a Codex endpoint')
+            sid = str(uuid.UUID(args['session']))
+            if sid == current['session']:
+                raise ValueError('Replacement UUID must differ from the current UUID')
+            return self.routing_change('endpoints', key, dict(current, session=sid))
         if op == 'routes':
             return [x for (p,_),x in self.endpoints.items() if p==args['project']]
+        if op == 'codex-routes':
+            return [route for route in self.endpoints.values() if route['transport'] == 'codex']
         if op == 'unregister':
             key = (args['project'], args['name'])
             if key not in self.endpoints:
