@@ -277,6 +277,14 @@ python3 "$bridge_cli" close NAME --project PROJECT [--keep-route] [--timeout 10]
 
 기존 CLI `inbox`·`ack` 의미는 그대로 유지된다. 비공개 MCP 파사드(`scripts/mcp_server.py`)에서 `--phase1-config`에 `"inbox_enabled": true`를 명시하면 `bridge_inbox_list`·`bridge_message_get`으로 독립(`reply_to: null`) 수신 메시지를 소비 없이 읽고, 처리 후 `bridge_message_ack`로 명시적으로 `done` 처리할 수 있다. 질문에 대한 답장(correlated reply)은 기존 `bridge_operation_get` 전용이다. 페이지네이션·용량·토큰 검증·배포 게이트는 [mcp-phase1.md](../../skill/agent-bridge/references/mcp-phase1.md#independent-inbox-issue-48-explicit-opt-in)를 따른다.
 
+## 메시지 체크포인트 복원
+
+소유자 전용 `correspondence.json`의 버전은 1이며 메시지·전달 상태·중복키·ACK 시각을 보존한다. 재시작은 메시지를 자동 전송하지 않는다. `--max-messages`를 줄이면 체크포인트 순서대로 한도까지 복원하고 초과 메시지의 ID만 `correspondence-lost.json`에 남긴다. 쓰기 상한은 `max_messages * 1 MiB + 16 MiB + 8192 * 1024`바이트다. 읽기 상한은 최소 2048건 기준을 유지하며, 더 큰 이전 저장본은 검증된 메타데이터 인덱스의 건수로 본문 읽기 상한을 높인다. 상한을 넘고 인덱스를 사용할 수 없으면 시작을 거부한다.
+
+읽기 I/O 오류·소유권·파일 유형·권한 오류는 라우팅 저장소와 마찬가지로 시작을 거부하고 소유자의 수리를 기다린다. 손상된 JSON·레코드는 손실 ID를 기록하고 원본을 `correspondence-corrupt.json`에 격리한다. 후속 격리에는 시각·UUID 접미사를 붙여 이전 파일을 보존한다. 손실 원장 자체의 손상도 `correspondence-lost-corrupt.json`과 같은 접미사 규칙을 따른다. 최초 저장은 본문을 먼저 쓰고 인덱스를 만들어 미수락 메시지의 허위 손실 기록을 방지한다. 이후 교체 저장은 인덱스를 먼저 기록한다.
+
+이전 epoch의 인박스 스냅샷·ACK 영수증은 시작 시 검증 후 해제한다. 메시지의 소비 상태와 ACK 시각은 유지된다. 새 목록으로 핸들을 다시 발급받는다. 읽기 전용 `inbox_list`는 페이지 상태를 메모리에 두며 체크포인트 쓰기를 생략한다. 다른 mutation은 메시지와 intent 양쪽의 본문을 포함한 전체 파일을 계속 다시 쓴다. 한 macOS 용량 측정은 137,189,539바이트와 mutation당 0.520–0.604초였다. 파사드 ping은 느린 저장을 기다릴 수 있도록 기존 0.5초에서 다른 RPC와 같은 3초 상한을 사용한다. 자세한 필드·한도·복원 계약은 [영문 저장 계약](../../skill/agent-bridge/references/usage.md#correspondence-storage-issue-94)을 따른다.
+
 ## 운영 경계와 검증
 
 같은 OS 계정을 신뢰하는 로컬 도구다. 참가자 이름은 라우팅 라벨일 뿐 암호학적 신원이 아니며, 동료 메시지가 새로운 사용자 승인을 대신하지 않는다.

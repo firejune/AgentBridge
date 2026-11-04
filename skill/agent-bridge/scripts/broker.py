@@ -355,7 +355,7 @@ class State:
         # Stage mutations in isolation. A failed durable write must not acknowledge
         # an ACK, publish an event, wake a waiter or leave a half-posted reply.
         mutations = ('send', 'reply', 'ack', 'progress', 'resolve', 'claim', 'finish',
-                     'inbox_list', 'inbox_ack')
+                     'inbox_ack')
         if self.correspondence is None or args['op'] not in mutations:
             return self.apply_action(args)
         staged = copy(self)

@@ -202,6 +202,145 @@ class RetentionTests(unittest.TestCase):
         asyncio.run(check())
 
 
+class CheckpointFollowupTests(unittest.TestCase):
+    """Issue #100 planted controls, entirely disposable broker state."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='ab100-', dir='/tmp')
+        self.addCleanup(self.temp.cleanup)
+        self.store = route_store.RouteStore(Path(self.temp.name) / 'state')
+        self.addCleanup(self.store.close)
+        self.state = broker.State(max_messages=5, store=self.store)
+        for name in ('alpha', 'beta'):
+            self.state.action(dict(op='register', project='demo', name=name, cwd=self.temp.name))
+
+    def send(self, key):
+        return self.state.action(dict(op='send', project='demo', sender='alpha', recipient='beta', body=key, key=key))
+
+    def test_smaller_capacity_restores_prefix_and_reports_only_excess(self):
+        messages = [self.send(str(i)) for i in range(5)]
+        with redirect_stderr(io.StringIO()):
+            restored = broker.State(max_messages=4, store=self.store)
+        self.assertEqual(list(restored.messages), [m['id'] for m in messages[:4]])
+        report = json.loads(self.store.directory.joinpath('correspondence-lost.json').read_text())
+        self.assertEqual([m['id'] for m in report['lost']], [messages[4]['id']])
+        self.assertEqual(len(restored.keys), 4)
+        again = broker.State(max_messages=4, store=self.store)
+        self.assertEqual(list(again.messages), list(restored.messages))
+
+    def test_second_corruption_preserves_both_quarantines(self):
+        self.send('first')
+        path = self.state.correspondence.path
+        for content in ('{first', '{second'):
+            path.write_text(content)
+            with redirect_stderr(io.StringIO()):
+                self.state = broker.State(max_messages=5, store=self.store)
+        quarantines = list(path.parent.glob('correspondence-corrupt*.json'))
+        self.assertEqual(sorted(p.read_text() for p in quarantines), ['{first', '{second'])
+
+    def test_second_malformed_loss_ledger_preserves_first_quarantine(self):
+        path = self.store.directory / 'correspondence-lost.json'
+        for content in ('{first-ledger', '{second-ledger'):
+            path.write_text(content)
+            path.chmod(0o600)
+            with redirect_stderr(io.StringIO()):
+                self.state = broker.State(max_messages=5, store=self.store)
+        quarantines = list(path.parent.glob('correspondence-lost-corrupt*.json'))
+        self.assertEqual(sorted(p.read_text() for p in quarantines), ['{first-ledger', '{second-ledger'])
+
+    def test_smaller_capacity_does_not_shrink_payload_read_budget(self):
+        messages = [self.send(str(i)) for i in range(5)]
+        checkpoint = message_store.MessageStore(self.store.directory, 4)
+        # Scale only the byte budgets to exercise the oversized read path without
+        # allocating gigabytes. The metadata index stays within its own budget.
+        checkpoint.restore_bytes = checkpoint.manifest.stat().st_size + 1
+        with redirect_stderr(io.StringIO()):
+            loaded = checkpoint.load()
+        self.assertEqual([m['id'] for m in loaded['messages']], [m['id'] for m in messages[:4]])
+
+    def test_unsafe_mode_refuses_start_without_quarantine_or_overwrite(self):
+        self.send('private')
+        path = self.state.correspondence.path
+        before = path.read_bytes()
+        path.chmod(0o644)
+        with self.assertRaises(ValueError):
+            broker.State(max_messages=5, store=self.store)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse(path.with_name('correspondence-lost.json').exists())
+        path.chmod(0o600)
+        self.assertEqual(len(broker.State(max_messages=5, store=self.store).messages), 1)
+
+    def test_transient_read_error_refuses_start_without_quarantine(self):
+        self.send('private')
+        path = self.state.correspondence.path
+        before = path.read_bytes()
+        original = message_store.os.open
+        def fail_read(target, flags, *args, **kwargs):
+            if Path(target) == path and flags & os.O_NOFOLLOW:
+                raise OSError(errno.EIO, 'temporary read failure')
+            return original(target, flags, *args, **kwargs)
+        with patch.object(message_store.os, 'open', side_effect=fail_read):
+            with self.assertRaises(OSError):
+                broker.State(max_messages=5, store=self.store)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse(path.with_name('correspondence-lost.json').exists())
+
+    def test_restart_discards_old_epoch_inbox_records_but_preserves_ack(self):
+        first, second = self.send('first'), self.send('second')
+        args = dict(owner='a' * 64, context='b' * 64,
+                    routes=[dict(slot='slot', route=self.state.route('demo', name='beta'))])
+        page = self.state.action(dict(args, op='inbox_list', limit=1))
+        self.state.action(dict(args, op='inbox_ack', id=first['id']))
+        self.assertTrue(self.state.inbox_snapshots)
+        self.assertTrue(self.state.inbox_receipts)
+        old_instance = self.state.instance
+        restored = broker.State(max_messages=5, store=self.store)
+        self.assertEqual(restored.inbox_snapshots, {})
+        self.assertEqual(restored.inbox_receipts, {})
+        self.assertEqual(restored.get(first['id'])['state'], 'done')
+        self.assertEqual(restored.get(second['id'])['state'], 'pending')
+        with self.assertRaisesRegex(ValueError, 'BROKER_RESTARTED'):
+            restored.action(dict(args, op='inbox_list', instance=old_instance, snapshot=page['snapshot']))
+
+    def test_read_only_inbox_list_skips_checkpoint_but_keeps_paging(self):
+        self.send('first')
+        self.send('second')
+        args = dict(owner='a' * 64, context='b' * 64,
+                    routes=[dict(slot='slot', route=self.state.route('demo', name='beta'))])
+        before = self.state.correspondence.path.read_bytes()
+        with patch.object(self.state.correspondence, 'save', side_effect=AssertionError('read-only write')):
+            page = self.state.action(dict(args, op='inbox_list', limit=1))
+            continuation = self.state.action(dict(args, op='inbox_list', limit=1,
+                                                  snapshot=page['snapshot'], offset=page['offset']))
+        self.assertTrue(page['has_more'])
+        self.assertFalse(continuation['has_more'])
+        self.assertEqual(self.state.correspondence.path.read_bytes(), before)
+
+    def test_missing_previously_accepted_checkpoint_still_reports_loss(self):
+        message = self.send('accepted')
+        self.state.correspondence.path.unlink()
+        with redirect_stderr(io.StringIO()):
+            restored = broker.State(max_messages=5, store=self.store)
+        self.assertTrue(restored.correspondence.loss)
+        report = json.loads(self.store.directory.joinpath('correspondence-lost.json').read_text())
+        self.assertEqual(report['lost'][0]['id'], message['id'])
+
+    def test_interrupted_first_save_does_not_report_unaccepted_ids(self):
+        path = self.state.correspondence.path
+        path.unlink()
+        self.state.correspondence.manifest.unlink()
+        original = message_store.atomic_write
+        def interrupt(target, data):
+            if target == path:
+                raise OSError('interrupted first payload')
+            original(target, data)
+        with patch.object(message_store, 'atomic_write', side_effect=interrupt):
+            with self.assertRaises(OSError):
+                self.send('unaccepted')
+        restored = broker.State(max_messages=5, store=self.store)
+        self.assertFalse(restored.correspondence.loss)
+        self.assertEqual(restored.messages, {})
+
+
 class PersistenceTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='ab5-store-', dir='/tmp')
@@ -264,7 +403,7 @@ class PersistenceTests(unittest.TestCase):
                 self.assertEqual(self.state.correspondence.path.read_bytes(), checkpoint)
                 self.assertEqual(list(self.store.directory.glob('.correspondence-*')), [])
 
-    def test_inbox_receipt_and_snapshot_survive_restart_without_sliding_expiry(self):
+    def test_restart_releases_epoch_bound_receipts_and_snapshots(self):
         self.state.action(dict(op='register', project='demo', name='beta', cwd=str(self.root)))
         messages = [self.state.action(dict(op='send', project='demo', sender='alpha', recipient='beta', body=key, key=key))
                     for key in ('first', 'second')]
@@ -274,8 +413,9 @@ class PersistenceTests(unittest.TestCase):
         receipt = self.state.action(dict(args, op='inbox_ack', id=messages[0]['id']))
         for _ in range(2):
             loaded = broker.State(store=self.store)
-            self.assertEqual(loaded.action(dict(args, op='inbox_ack', id=messages[0]['id'])), receipt)
-            self.assertEqual(loaded.inbox_snapshots[page['snapshot']]['expires'], page['expires'])
+            self.assertEqual(loaded.inbox_receipts, {})
+            self.assertEqual(loaded.inbox_snapshots, {})
+            self.assertIsNotNone(loaded.get(messages[0]['id'])['acknowledged_at'])
             self.assertEqual(loaded.get(messages[0]['id'])['state'], 'done')
             self.assertEqual(loaded.get(messages[1]['id'])['state'], 'pending')
 

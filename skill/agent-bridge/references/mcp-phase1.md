@@ -228,17 +228,24 @@ or routing snapshot. Terminal payloads retain the existing broker eviction rules
 
 A facade restart or client reconnect preserves tokens against the same broker
 and unchanged private ledger and policy. A broker restart preserves bounded
-correspondence, independent unread payloads, snapshots and unexpired ACK receipts.
+correspondence and independent unread payloads. Epoch-bound snapshots and ACK
+receipts are validated and discarded on broker startup, releasing their capacity.
 It never replays a delivery. Existing signed handles/cursors and explicit old
 `expected_broker_instance` still return `BROKER_RESTARTED`. A fresh inbox list
 issues new epoch-bound handles for the surviving unread mail. Use those handles
 for get and ACK. The same newly issued handle returns the identical ACK receipt
 on retry through its original deadline, including after terminal payload eviction.
 A previously ACKed message stays consumed across restart. Old epoch handles stay
-revoked even if their ACK receipt survives. Reconciliation using an old handle
+revoked. The consumed message state and acknowledgement time survive. Reconciliation using an old handle
 across broker epochs is unavailable. A reader with an uncertain pre-restart ACK
 must reconcile its downstream actions before deciding to process any surviving
 mail. No exactly-once side-effect guarantee is added.
+
+Instance pings share the bounded 3-second RPC budget with other facade calls.
+A slow checkpoint taking over 0.5 seconds can complete before the ping is treated
+as backend loss. An unresponsive connected broker is detected within 3 seconds
+rather than the former 0.5-second budget. A refused connection fails immediately.
+This budget does not reduce the cost of whole-checkpoint mutations.
 
 `BROKER_RESTARTED.correspondence_lost` reflects the broker's durable loss ledger.
 It is false for an intact checkpoint, true after recorded corruption or when the
