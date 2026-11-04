@@ -28,7 +28,7 @@ def full_permissions():
 class ModelDesktop(FakeDesktop):
     def __init__(self, model='app-default', reject_update=False, keep_model=False, behavior='active',
                  permissions=None, refuse_permissions=False, stale_current=False, drop_update=False,
-                 update_error=False, sandbox_lag=0):
+                 update_error=False, sandbox_lag=0, lag_sandbox='readOnly'):
         super().__init__(behavior)
         self.drop_update = drop_update
         self.update_error = update_error
@@ -37,6 +37,7 @@ class ModelDesktop(FakeDesktop):
             'approvalPolicy':'on-request','sandboxPolicy':{'type':'workspaceWrite'}}
         self.refuse_permissions, self.stale_current = refuse_permissions, stale_current
         self.sandbox_lag = sandbox_lag
+        self.lag_sandbox = lag_sandbox
 
     def handle(self, sock, request):
         method = request['method']
@@ -46,7 +47,7 @@ class ModelDesktop(FakeDesktop):
                 latest = self.permissions
                 if self.sandbox_lag and codex_new.has_full_access(latest):
                     self.sandbox_lag -= 1
-                    latest = dict(latest, sandboxPolicy={'type': 'readOnly'})
+                    latest = dict(latest, sandboxPolicy={'type': self.lag_sandbox})
                 state = {'id':request['params']['conversationId'],
                          'latestThreadSettings':latest,
                          'currentPermissions':getattr(self,'current_permissions',{} if self.stale_current else self.permissions)}
@@ -336,6 +337,40 @@ class NewCodexTests(unittest.TestCase):
         self.assertEqual(caught.exception.stage, 'permissions')
         self.assertEqual(caught.exception.result['permission_settings']['sandboxPolicy'], {'type': 'readOnly'})
         self.assertEqual(sum(x['method'] == 'thread-follower-update-thread-settings' for x in desktop.calls), 1)
+
+    def test_issue96_observed_owner_shape_matches_without_update(self):
+        with ModelDesktop(model=codex_new.DEFAULT_MODEL, permissions=full_permissions()) as desktop:
+            result = self.open(desktop)
+        self.assertFalse(result['uncertain'])
+        self.assertEqual(result['stage'], 'complete')
+        self.assertEqual(result['permission_settings'], full_permissions())
+        self.assertFalse(any(x['method'] == 'thread-follower-update-thread-settings' for x in desktop.calls))
+
+    def test_issue96_workspace_sandbox_converges_after_update(self):
+        with ModelDesktop(sandbox_lag=1, lag_sandbox='workspaceWrite') as desktop:
+            result = self.open(desktop)
+        self.assertFalse(result['uncertain'])
+        self.assertEqual(result['permission_settings'], full_permissions())
+        self.assertEqual(sum(x['method'] == 'thread-follower-update-thread-settings' for x in desktop.calls), 1)
+
+    def test_issue96_persistent_mismatch_names_only_different_field(self):
+        for field, value, expected in (
+                ('approvalPolicy', 'on-request', 'approvalPolicy: found on-request, required never'),
+                ('sandboxPolicy', {'type': 'workspaceWrite'},
+                 'sandboxPolicy.type: found workspaceWrite, required dangerFullAccess'),
+                ('activePermissionProfile', {'id': ':workspace'},
+                 'activePermissionProfile.id: found :workspace, required :danger-full-access')):
+            with self.subTest(field=field):
+                permissions = full_permissions()
+                permissions[field] = value
+                with ModelDesktop(model=codex_new.DEFAULT_MODEL, permissions=permissions,
+                                  refuse_permissions=True) as desktop, \
+                        self.assertRaises(codex_new.CreationError) as caught:
+                    self.open(desktop)
+                self.assertTrue(caught.exception.uncertain)
+                self.assertEqual(caught.exception.stage, 'permissions')
+                self.assertIn('(mismatched fields: ' + expected + ')', str(caught.exception))
+                self.assertEqual(caught.exception.result['permission_settings'], permissions)
 
     def cli_open(self, desktop, *extra):
         real_open = codex_new.open_codex

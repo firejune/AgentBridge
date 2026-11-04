@@ -15,6 +15,8 @@ import codex_live
 import new_session_policy
 
 FULL_ACCESS_PROFILE = ':danger-full-access'
+PERMISSION_SETTLE_SECONDS = 2
+PERMISSION_SETTLE_ATTEMPTS = 20
 # New threads request this model when --model is omitted, so they never
 # inherit the Desktop's own default. Override per machine with MODEL_ENV.
 DEFAULT_MODEL = new_session_policy.DEFAULT_MODELS['codex']
@@ -177,16 +179,19 @@ def permission_settings(client, sid, owner):
 def settled_permissions(client, sid, owner, values, deadline, poll):
     # After a successful update, Desktop can publish the new profile and
     # approval setting before the derived sandbox policy reaches the snapshot.
-    settle_deadline = min(deadline, time.monotonic() + 2)
+    settle_deadline = min(deadline, time.monotonic() + PERMISSION_SETTLE_SECONDS)
     timeout = client.timeout
-    while ((values['activePermissionProfile'] or {}).get('id') == FULL_ACCESS_PROFILE
+    attempts = 0
+    while (attempts < PERMISSION_SETTLE_ATTEMPTS
+           and (values['activePermissionProfile'] or {}).get('id') == FULL_ACCESS_PROFILE
            and values['approvalPolicy'] == 'never'
-           and values['sandboxPolicy'] == {'type': 'readOnly'}):
+           and values['sandboxPolicy'] in ({'type': 'readOnly'}, {'type': 'workspaceWrite'})):
         time.sleep(min(poll, max(0, settle_deadline - time.monotonic())))
         left = settle_deadline - time.monotonic()
         if left <= 0:
             break
         client.timeout = min(timeout, left)
+        attempts += 1
         try:
             values = permission_settings(client, sid, owner)
         finally:
@@ -374,7 +379,20 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                         result['permission_settings'] = permissions = settled_permissions(
                             client, sid, owner, permissions, deadline, poll)
                     if not has_full_access(permissions):
-                        raise CreationError('Exact Codex Desktop owner did not confirm Full Access with approvalPolicy never')
+                        mismatches = []
+                        if (permissions['activePermissionProfile'] or {}).get('id') != FULL_ACCESS_PROFILE:
+                            mismatches.append('activePermissionProfile.id: found '
+                                              + str((permissions['activePermissionProfile'] or {}).get('id'))
+                                              + ', required ' + FULL_ACCESS_PROFILE)
+                        if permissions['approvalPolicy'] != 'never':
+                            mismatches.append('approvalPolicy: found ' + str(permissions['approvalPolicy'])
+                                              + ', required never')
+                        if permissions['sandboxPolicy'] != {'type': 'dangerFullAccess'}:
+                            mismatches.append('sandboxPolicy.type: found '
+                                              + str((permissions['sandboxPolicy'] or {}).get('type'))
+                                              + ', required dangerFullAccess')
+                        raise CreationError('Exact Codex Desktop owner did not confirm Full Access with approvalPolicy never'
+                                            + ' (mismatched fields: ' + ', '.join(mismatches) + ')')
                     break
             except (codex_live.DeliveryError, OSError):
                 if adopted:
