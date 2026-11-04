@@ -30,7 +30,8 @@ If installed elsewhere, use the sibling `scripts/bridge.py` next to the `SKILL.m
    Use `bridge.py remap NAME --project PROJECT --expect-session OLD_UUID --session NEW_UUID` to replace a registered Codex endpoint. The replacement must have a live Desktop owner and the same workspace. New messages addressed directly to the participant use the replacement UUID. Channel bindings and existing messages keep their original routes.
 
    **Give every session you open a title that identifies it.** The person reads the session list in the desktop apps and has to tell the sessions apart without opening each one. Use `PROJECT/NAME · WORK`, where NAME is the route name and WORK is the card or purpose in a few words, for example `rig-c/naru-49 · create#49 ground ask`.
-   - Codex and Antigravity: pass `--title` on every `open` and `register --new`. Codex sets the thread name only when `--title` is given, so omitting it leaves the thread untitled in the sidebar.
+   - Codex: `register NAME --project PROJECT --transport codex --new` and `open --provider codex --register NAME --project PROJECT` default to `PROJECT/NAME` when `--title` is absent. An explicit `--title` wins. Prefer an explicit `PROJECT/NAME · WORK` title to include the purpose. `open --provider codex` without `--register` has no default title, so pass `--title` to name it.
+   - Antigravity: pass `--title` on every `open` and `register --new`.
    - Claude Desktop: `--title` is the pre-filled first message, not the name. The route label `PROJECT/NAME` is written on the first push. Write the WORK part into that first message.
    - Claude IDE: `--title` is ignored, and the label `PROJECT/NAME` is written on the first push.
    - A session that was opened without a title gets one before its first brief is sent. For a claude-peer route, use `title NAME --project P`. For other providers, rename the session in its app, or ask the person to.

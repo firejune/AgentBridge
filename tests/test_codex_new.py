@@ -697,6 +697,43 @@ class NewCodexTests(unittest.TestCase):
         with self.assertRaises(codex_new.CreationError):
             codex_new.open_codex(self.root+'/absent',client_factory=self.factory,opener=self.urls.append)
 
+    def test_issue95_registered_title_reaches_creator_and_duplicate_detection(self):
+        real_open = codex_new.open_codex
+        for command in (
+                ['register', 'worker', '--project', 'demo', '--transport', 'codex', '--new'],
+                ['open', '--provider', 'codex', '--register', 'worker', '--project', 'demo']):
+            for title_args, expected in (([], 'demo/worker'), (['--title', 'T'], 'T')):
+                with self.subTest(command=command, title=expected):
+                    self.calls.clear()
+                    self.saved_pages = {None: {'data': [], 'nextCursor': None}}
+                    with ModelDesktop() as desktop, RunningBroker() as server:
+                        create = functools.partial(real_open, client_factory=self.factory,
+                            opener=self.urls.append,
+                            owner_factory=lambda **kw: codex_live.Client(desktop.path, **kw),
+                            poll=.005)
+                        with patch.object(codex_new, 'open_codex', side_effect=create), patch('sys.stdout', io.StringIO()) as out:
+                            code = bridge.main(['--socket', server.path, *command,
+                                '--cwd', self.root, '--timeout', '1', *title_args])
+                        self.assertEqual(code, 0, out.getvalue())
+                        names = [params['name'] for method, params, _ in self.calls
+                                 if method == 'thread/name/set']
+                        self.assertEqual(names, [expected])
+                        self.assertTrue(json.loads(out.getvalue())['registered'])
+                        self.saved_pages = {None: {'data': [dict(self.thread)], 'nextCursor': None}}
+                        self.calls.clear()
+                        with patch.object(codex_new, 'open_codex', side_effect=create), patch('sys.stdout', io.StringIO()) as out:
+                            code = bridge.main(['open', '--provider', 'codex', '--cwd', self.root,
+                                '--title', expected, '--timeout', '1'])
+                        self.assertEqual(code, 1, out.getvalue())
+                        self.assertEqual(json.loads(out.getvalue())['stage'], 'duplicate')
+                        self.assertFalse(any(method == 'thread/start' for method, _, _ in self.calls))
+
+    def test_issue95_unregistered_open_keeps_absent_title(self):
+        result = codex_new.open_result()
+        with patch.object(codex_new, 'open_codex', return_value=result) as create, patch('sys.stdout', io.StringIO()):
+            bridge.main(['open', '--provider', 'codex', '--cwd', self.root])
+        self.assertIsNone(create.call_args.kwargs['title'])
+
     def test_open_register_cli_and_registration_failure_preserve_identity(self):
         result = codex_new.open_result()
         result.update(created=True, adopted=True, session=sessions.codex_row(self.thread, 'saved'), stage='complete')
