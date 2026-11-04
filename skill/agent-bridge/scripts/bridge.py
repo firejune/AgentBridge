@@ -514,21 +514,30 @@ def open_codex_result(args):
     """Keep Codex creation, refusal and route recovery in one result envelope."""
     result = codex_new.open_result()
     source, cancelled = None, False
+    default_title = None
     try:
         if args.cmd == 'open':
-            if bool(args.register) != bool(args.project):
+            if (args.register is None) != (args.project is None):
                 raise codex_new.CreationError('--register NAME and --project P must be supplied together')
         elif args.session or args.discover:
             raise codex_new.CreationError('--new cannot be combined with --session or --discover')
-        source = new_session_policy(args, 'codex')
         name = args.register if args.cmd == 'open' else args.name
+        if name is not None:
+            for label, value in (('name', name), ('project', args.project)):
+                try:
+                    broker.identifier(value)
+                except ValueError:
+                    raise codex_new.CreationError(f'Codex route {label} must be a lowercase identifier') from None
+        source = new_session_policy(args, 'codex')
         title = args.title
         if title is None and name:
-            title = f'{args.project}/{name}'
+            title = default_title = f'{args.project}/{name}'
         result = sessions.open_session('codex', cwd=args.cwd, title=title, model=args.model,
             timeout=args.timeout, host=args.host, ide=args.ide, force_new=args.new)
     except codex_new.CreationError as error:
         result = error.result
+        if default_title is not None and result['stage'] == 'duplicate':
+            result['error'] = result['error'].replace('match title ', 'match default title ', 1)
         cancelled = error.cancelled
     except KeyboardInterrupt:
         result['error'] = 'Codex open interrupted before a result was available'

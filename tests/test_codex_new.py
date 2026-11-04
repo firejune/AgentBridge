@@ -10,9 +10,11 @@ import unittest
 from unittest.mock import patch
 import os
 import uuid
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skill/agent-bridge/scripts'))
 import bridge
+import broker
 import codex_live
 import codex_new
 import sessions
@@ -731,6 +733,93 @@ class NewCodexTests(unittest.TestCase):
         self.assertEqual(self.instances,[])
         with self.assertRaises(codex_new.CreationError):
             codex_new.open_codex(self.root+'/absent',client_factory=self.factory,opener=self.urls.append)
+
+    def test_issue101_invalid_route_identifiers_refused_before_open(self):
+        for command in (
+                ['register', '--transport', 'codex', '--new'],
+                ['open', '--provider', 'codex']):
+            for name, project in (('Bad Name', 'demo'), ('worker', ''),
+                                  ('worker', 'Bad Project'), ('', 'demo')):
+                route = [name] if command[0] == 'register' else ['--register', name]
+                with self.subTest(command=command, name=name, project=project), \
+                        patch.object(sessions, 'open_session', return_value=codex_new.open_result()) as create, \
+                        patch.object(broker, 'request') as register, \
+                        patch('sys.stdout', io.StringIO()) as out:
+                    code = bridge.main([*command, *route, '--project', project, '--cwd', self.root])
+                    self.assertEqual(code, 1)
+                    self.assertEqual(json.loads(out.getvalue())['stage'], 'preflight')
+                    create.assert_not_called()
+                    register.assert_not_called()
+
+    def test_issue101_default_duplicate_names_effective_title(self):
+        self.thread['name'] = 'demo/worker'
+        self.saved_pages = {None: {'data': [dict(self.thread)], 'nextCursor': None}}
+        real_open = codex_new.open_codex
+        create = functools.partial(real_open, client_factory=self.factory, opener=self.urls.append)
+        with patch.object(codex_new, 'open_codex', side_effect=create), \
+                patch('sys.stdout', io.StringIO()) as out:
+            code = bridge.main(['open', '--provider', 'codex', '--register', 'worker',
+                                '--project', 'demo', '--cwd', self.root])
+        self.assertEqual(code, 1)
+        self.assertIn("default title 'demo/worker'", json.loads(out.getvalue())['error'])
+        self.assertFalse(any(method == 'thread/start' for method, _, _ in self.calls))
+
+    def test_issue101_multiple_mismatches_have_distinct_separator(self):
+        with ModelDesktop(refuse_permissions=True) as desktop, \
+                self.assertRaises(codex_new.CreationError) as caught:
+            self.open(desktop)
+        self.assertIn('required :danger-full-access; approvalPolicy:', str(caught.exception))
+        self.assertIn('required never; sandboxPolicy.type:', str(caught.exception))
+
+    def test_issue101_settle_read_timeout_keeps_latest_mismatch(self):
+        workspace = dict(full_permissions(), sandboxPolicy={'type': 'workspaceWrite'})
+        latest = dict(full_permissions(), sandboxPolicy={'type': 'readOnly'})
+        with ModelDesktop() as desktop, \
+                patch.object(codex_new, 'permission_settings', side_effect=[
+                    {}, workspace, latest, codex_live.DeliveryError('private timeout detail')]), \
+                self.assertRaises(codex_new.CreationError) as caught:
+            self.open(desktop, timeout=1)
+        error = caught.exception
+        self.assertEqual(error.stage, 'permissions')
+        self.assertTrue(error.adopted)
+        self.assertTrue(error.uncertain)
+        self.assertIn('sandboxPolicy.type: found readOnly, required dangerFullAccess', str(error))
+        self.assertEqual(error.result['permission_settings'], latest)
+        self.assertNotIn('private timeout detail', str(error))
+        self.assertEqual(sum(x['method'] == 'thread-follower-update-thread-settings'
+                             for x in desktop.calls), 1)
+
+    def settle_with_clock(self, deadline, poll, read_seconds):
+        clock = SimpleNamespace(now=0.0)
+        client = SimpleNamespace(timeout=10)
+        values = dict(full_permissions(), sandboxPolicy={'type': 'workspaceWrite'})
+        def sleep(seconds):
+            clock.now += seconds
+        def read(*args):
+            clock.now += read_seconds
+            return values
+        with patch.object(codex_new.time, 'monotonic', side_effect=lambda: clock.now), \
+                patch.object(codex_new.time, 'sleep', side_effect=sleep), \
+                patch.object(codex_new, 'permission_settings', side_effect=read) as reads:
+            result = codex_new.settled_permissions(client, self.sid, 'fake-owner', values, deadline, poll)
+        self.assertEqual(result, values)
+        self.assertEqual(client.timeout, 10)
+        return reads.call_count, clock.now
+
+    def test_issue101_settle_attempt_cap_independent_of_time_bound(self):
+        reads, elapsed = self.settle_with_clock(deadline=10, poll=0, read_seconds=.001)
+        self.assertEqual(reads, codex_new.PERMISSION_SETTLE_ATTEMPTS)
+        self.assertLess(elapsed, codex_new.PERMISSION_SETTLE_SECONDS)
+
+    def test_issue101_settle_creation_deadline_independent_of_attempt_cap(self):
+        reads, elapsed = self.settle_with_clock(deadline=.025, poll=.01, read_seconds=0)
+        self.assertEqual(reads, 2)
+        self.assertAlmostEqual(elapsed, .025)
+
+    def test_issue101_settle_seconds_independent_of_creation_deadline(self):
+        reads, elapsed = self.settle_with_clock(deadline=10, poll=.3, read_seconds=0)
+        self.assertEqual(reads, 6)
+        self.assertEqual(elapsed, codex_new.PERMISSION_SETTLE_SECONDS)
 
     def test_issue95_registered_title_reaches_creator_and_duplicate_detection(self):
         real_open = codex_new.open_codex

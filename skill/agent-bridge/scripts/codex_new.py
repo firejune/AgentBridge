@@ -194,6 +194,9 @@ def settled_permissions(client, sid, owner, values, deadline, poll):
         attempts += 1
         try:
             values = permission_settings(client, sid, owner)
+        except (codex_live.DeliveryError, OSError):
+            # Retain the last observed mismatch without replaying the update.
+            break
         finally:
             client.timeout = timeout
     return values
@@ -287,7 +290,7 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                     if len(matches) == 1:
                         result['session'] = matches[0]
                         result['url'] = adoption_url(matches[0]['id'])
-                    raise CreationError('Saved Codex thread(s) already match --title and --cwd; '
+                    raise CreationError(f'Saved Codex thread(s) already match title {title!r} and --cwd; '
                                         'inspect their exact IDs or pass --new intentionally')
             stage = 'preflight'
             require_full_access_profile(creator, folder, remaining)
@@ -392,7 +395,7 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                                               + str((permissions['sandboxPolicy'] or {}).get('type'))
                                               + ', required dangerFullAccess')
                         raise CreationError('Exact Codex Desktop owner did not confirm Full Access with approvalPolicy never'
-                                            + ' (mismatched fields: ' + ', '.join(mismatches) + ')')
+                                            + ' (mismatched fields: ' + '; '.join(mismatches) + ')')
                     break
             except (codex_live.DeliveryError, OSError):
                 if adopted:
