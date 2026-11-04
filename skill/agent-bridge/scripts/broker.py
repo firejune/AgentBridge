@@ -81,6 +81,16 @@ class State:
             self.keys = {key: (intent, mid) for key, intent, mid in saved['keys']}
             self.inbox_receipts = {tuple(key): value for key, value in saved['receipts']}
             self.inbox_snapshots = saved['snapshots']
+            before = self.messages.copy()
+            self.make_room(restoring=True)
+            dropped = [message_store.loss_identity(m) for mid, m in before.items()
+                       if mid not in self.messages]
+            if dropped:
+                self.correspondence.record_loss('message retention limit reduced; oldest unguarded terminal messages evicted', dropped)
+            if len(self.messages) > self.max_messages:
+                print(json.dumps(dict(correspondence_over_limit=self.correspondence.path.name,
+                                      kept=len(self.messages), limit=self.max_messages)),
+                      file=sys.stderr, flush=True)
             reply_parents = {m['reply_to'] for m in self.messages.values()}
             for mid, message in self.messages.items():
                 self.answers[mid] = asyncio.Event()
@@ -113,24 +123,39 @@ class State:
         self.endpoints, self.channels = endpoints, channels
         return item
 
-    def make_room(self, parent=None):
-        if len(self.messages) < self.max_messages:
+    def make_room(self, parent=None, *, restoring=False):
+        target = self.max_messages if restoring else self.max_messages - 1
+        if len(self.messages) <= target:
             return
-        # Insertion order defines oldest. Keep a reply's parent, active waits,
-        # and replies whose unfinished parent may still need their answer.
-        for mid, message in self.messages.items():
-            ancestor = self.messages.get(message['reply_to'])
-            if (mid == parent or self.waiters.get(mid)
-                    or message['state'] not in TERMINAL_STATES
-                    or (ancestor and (ancestor['state'] not in TERMINAL_STATES
-                                      or self.waiters.get(ancestor['id'])))):
-                continue
+        # Plan evictions first. A refused send must also be atomic for an
+        # in-memory broker whose retention limit has been lowered.
+        remaining = self.messages.copy()
+        evicted = []
+        while len(remaining) > target:
+            # On restore every retained reply already exists. Protect its parent
+            # just as an incoming reply protects its parent during normal sends.
+            parents = {m['reply_to'] for m in remaining.values()} if restoring else set()
+            # Insertion order defines oldest. Keep a reply's parent, active waits,
+            # and replies whose unfinished parent may still need their answer.
+            for mid, message in remaining.items():
+                ancestor = remaining.get(message['reply_to'])
+                if (mid == parent or mid in parents or self.waiters.get(mid)
+                        or message['state'] not in TERMINAL_STATES
+                        or (ancestor and (ancestor['state'] not in TERMINAL_STATES
+                                          or self.waiters.get(ancestor['id'])))):
+                    continue
+                del remaining[mid]
+                evicted.append(mid)
+                break
+            else:
+                if restoring:
+                    break  # Lowering a setting cannot discard protected mail.
+                raise ValueError('In-memory message limit reached: no evictable terminal messages; '
+                                 'pending or protected work is retained')
+        for mid in evicted:
             del self.messages[mid]
             self.answers.pop(mid, None)
-            self.keys = {key: value for key, value in self.keys.items() if value[1] != mid}
-            return
-        raise ValueError('In-memory message limit reached: no evictable terminal messages; '
-                         'pending or protected work is retained')
+        self.keys = {key: value for key, value in self.keys.items() if value[1] in remaining}
 
     def get(self, mid):
         if mid not in self.messages:
@@ -355,7 +380,7 @@ class State:
         # Stage mutations in isolation. A failed durable write must not acknowledge
         # an ACK, publish an event, wake a waiter or leave a half-posted reply.
         mutations = ('send', 'reply', 'ack', 'progress', 'resolve', 'claim', 'finish',
-                     'inbox_list', 'inbox_ack')
+                     'inbox_ack')
         if self.correspondence is None or args['op'] not in mutations:
             return self.apply_action(args)
         staged = copy(self)
@@ -379,7 +404,9 @@ class State:
             return self.inbox_action(args)
         if op == 'ping':
             return {'instance':self.instance,'messages':len(self.messages),'subscribers':len(self.subscribers),
-                    'correspondence_lost': bool(self.correspondence and self.correspondence.loss)}
+                    'correspondence_lost': bool(self.correspondence and self.correspondence.loss),
+                    'correspondence_over_limit': len(self.messages) > self.max_messages,
+                    'max_messages': self.max_messages}
         if op == 'register':
             project, name = identifier(args['project']), identifier(args['name'])
             transport = args.get('transport','realtime')

@@ -199,7 +199,7 @@ class Backend:
         return broker.request(self.path, {'op':op, **args}, timeout=3)
 
     def instance(self):
-        value = broker.request(self.path, {'op':'ping'}, timeout=.5)['instance']
+        value = self.rpc('ping')['instance']
         if not isinstance(value, str) or not value:
             raise ValueError('Invalid instance')
         return value

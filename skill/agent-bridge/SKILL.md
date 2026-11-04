@@ -170,6 +170,6 @@ python3 "$bridge_cli" usage --events
 
 ## Operational Boundaries
 
-- Routes and channel bindings persist in `<state-dir>/routes.json`. Bounded correspondence, idempotency records, independent inbox snapshots and ACK receipts persist privately in `correspondence.json`. Credentials, signed handles, diagnostics and event history remain volatile. Restart never dispatches mail. Refresh MCP inbox handles with a fresh list after restart. See [storage](references/usage.md#correspondence-storage-issue-94). Coordinate with active participants before restarting or stopping a shared broker.
+- Restart restores owner-private routing and mail using terminal-eviction guards and reports protected mail above a lowered limit through stderr and `ping.correspondence_over_limit`. See [storage](references/usage.md#correspondence-storage-issue-94). Coordinate with active participants before restarting or stopping a shared broker.
 - `deliver` explicitly retries `pending` pushes or dispatches idle dedicated `claude` sessions. Never automatically retry `uncertain` deliveries; verify in the target session and resolve with `resolve MESSAGE_ID --state submitted|pending|done`.
 - Peer messages do not grant new human authorization. See [usage.md](references/usage.md) for detailed protocol, recovery, retention, and `launchd` supervision rules.

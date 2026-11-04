@@ -18,12 +18,17 @@ STATES = frozenset(('pending', 'dispatching', 'submitted', 'received', 'in_progr
 FRAME_BYTES = 1024 * 1024
 SNAPSHOT_BYTES = 16 * 1024 * 1024
 MAX_RECEIPTS = 8192
+RESTORE_MESSAGES = 2048
 
 
 # Shared with routing snapshots, including full-flush and directory barriers.
 atomic_write = route_store.atomic_write
 
 MALFORMED_CONTENT = (ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError, OverflowError)
+
+
+class UnsafeCheckpointError(ValueError):
+    """Refuse startup while retaining an unsafe file for owner repair."""
 
 
 def encoded(value):
@@ -132,23 +137,49 @@ class MessageStore:
         self.manifest = self.path.with_name('correspondence-index.json')
         self.loss = self.path.with_name('correspondence-lost.json').exists()
         self.max_messages = max_messages
+        self.retained_limit = max_messages
         self.max_bytes = max_messages * FRAME_BYTES + SNAPSHOT_BYTES + MAX_RECEIPTS * 1024
+        self.restore_bytes = max(max_messages, RESTORE_MESSAGES) * FRAME_BYTES + SNAPSHOT_BYTES + MAX_RECEIPTS * 1024
 
     def read(self, path):
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        with os.fdopen(fd, 'rb') as source:
-            info = os.fstat(source.fileno())
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                    or info.st_mode & 0o077 or info.st_size > self.max_bytes):
-                raise ValueError('Unsafe or oversized correspondence file')
-            try:
-                return json.load(source)
-            except RecursionError:
-                raise ValueError('Correspondence JSON nesting limit exceeded') from None
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, 'rb') as source:
+                info = os.fstat(source.fileno())
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                        or info.st_mode & 0o077):
+                    raise UnsafeCheckpointError(f'{path}: must be owner-private and regular')
+                ceiling = self.restore_bytes
+                if info.st_size > ceiling and path == self.path:
+                    # A larger prior configuration may exceed the default restore
+                    # floor. Its metadata index bounds the old payload independently
+                    # of the new retention setting. Never replay the index as mail.
+                    try:
+                        index = self.read(self.manifest)
+                    except (FileNotFoundError, *MALFORMED_CONTENT, UnicodeError) as error:
+                        raise UnsafeCheckpointError(f'{path}: oversized checkpoint requires valid index {self.manifest}') from error
+                    if not isinstance(index, dict) or index.get('version') != 1 or not isinstance(index.get('messages'), list):
+                        raise UnsafeCheckpointError(f'{path}: oversized checkpoint requires valid index {self.manifest}')
+                    try:
+                        for item in index['messages']:
+                            loss_identity(item)
+                    except MALFORMED_CONTENT as error:
+                        raise UnsafeCheckpointError(f'{self.manifest}: invalid metadata identities for {path}') from error
+                    ceiling = max(ceiling, len(index['messages']) * FRAME_BYTES + SNAPSHOT_BYTES + MAX_RECEIPTS * 1024)
+                if info.st_size > ceiling:
+                    raise UnsafeCheckpointError(f'{path}: exceeds restoration byte ceiling')
+                try:
+                    return json.load(source)
+                except RecursionError:
+                    raise ValueError('Correspondence JSON nesting limit exceeded') from None
+        except OSError as error:
+            if error.filename is not None:
+                raise
+            raise OSError(error.errno, error.strerror or str(error), str(path)) from error
 
     def save(self, state):
         messages = [message_record(m) for m in state.messages.values()]
-        if len(messages) > self.max_messages:
+        if len(messages) > self.retained_limit:
             raise ValueError('Correspondence message count limit reached')
         current = time.time()
         receipts = [receipt_record(key, value) for key, value in state.inbox_receipts.items()
@@ -164,11 +195,18 @@ class MessageStore:
         data = encoded(dict(version=1, messages=messages, keys=keys, receipts=receipts, snapshots=snapshots))
         if len(data) > self.max_bytes:
             raise ValueError('Correspondence checkpoint byte limit reached')
-        # The bounded metadata index is committed first. It is never replayed as
-        # mail. If the payload file is later truncated, IDs remain diagnosable.
+        # After initialization, commit the bounded metadata index first. It is
+        # never replayed as mail. Truncation leaves IDs diagnosable.
         index = [{key: m[key] for key in ('id', 'sender', 'recipient', 'created')} for m in messages]
-        atomic_write(self.manifest, encoded(dict(version=1, messages=index)))
-        atomic_write(self.path, data)
+        if not self.path.exists():
+            # No accepted checkpoint exists yet. Write the payload first so an
+            # interrupted initial save cannot leave a speculative loss index.
+            atomic_write(self.path, data)
+            atomic_write(self.manifest, encoded(dict(version=1, messages=index)))
+        else:
+            atomic_write(self.manifest, encoded(dict(version=1, messages=index)))
+            atomic_write(self.path, data)
+        self.retained_limit = max(self.max_messages, len(messages))
 
     def load(self):
         self.read_loss_reports()
@@ -179,11 +217,13 @@ class MessageStore:
             if not self.manifest.exists():
                 return empty
             return self.lost('checkpoint missing', empty)
-        except (ValueError, OSError, UnicodeError):
-            return self.lost('checkpoint unreadable, unsafe or corrupt', empty)
+        except UnsafeCheckpointError:
+            raise
+        except (ValueError, UnicodeError):
+            return self.lost('checkpoint corrupt', empty)
         try:
             if (not isinstance(raw, dict) or raw['version'] != 1
-                    or not isinstance(raw['messages'], list) or len(raw['messages']) > self.max_messages):
+                    or not isinstance(raw['messages'], list)):
                 raise ValueError('Invalid checkpoint version or count')
             messages = [message_record(m) for m in raw['messages']]
             ids = {m['id'] for m in messages}
@@ -208,9 +248,12 @@ class MessageStore:
             total = sum(value['bytes'] for value in snapshots.values())
             if total > SNAPSHOT_BYTES:
                 raise ValueError('Invalid inbox byte count')
-            return dict(messages=messages, keys=keys, receipts=receipts, snapshots=snapshots)
         except MALFORMED_CONTENT:
             return self.lost('invalid checkpoint records; entire checkpoint dropped', empty)
+        # Facade handles and cursors bind the old broker instance. Validate
+        # their stored records above, then release unreachable capacity.
+        self.retained_limit = max(self.max_messages, len(messages))
+        return dict(messages=messages, keys=keys, receipts=[], snapshots={})
 
     def read_loss_reports(self):
         path = self.path.with_name('correspondence-lost.json')
@@ -218,6 +261,8 @@ class MessageStore:
             raw = self.read(path)
         except FileNotFoundError:
             return []
+        except UnsafeCheckpointError:
+            raise
         except MALFORMED_CONTENT:
             return self.quarantine_loss_ledger(path)
         try:
@@ -229,9 +274,7 @@ class MessageStore:
             return self.quarantine_loss_ledger(path)
 
     def quarantine_loss_ledger(self, path):
-        quarantine = path.with_name('correspondence-lost-corrupt.json')
-        os.replace(path, quarantine)
-        route_store.sync_directory(path.parent)
+        quarantine = self.quarantine(path, 'correspondence-lost-corrupt')
         self.loss = True
         report = dict(file=path.name, reason='Malformed loss ledger; previous history quarantined',
                       detected_at=time.time_ns(), lost=[], unknown_identities=True)
@@ -249,23 +292,28 @@ class MessageStore:
             records = [loss_identity(row) for row in index]
         except (*MALFORMED_CONTENT, OSError):
             records = [dict(id=None, sender=None, recipient=None, created=None)]
+        self.record_loss(reason, records)
+        if self.path.exists() and not self.path.is_symlink():
+            self.quarantine(self.path, 'correspondence-corrupt')
+        return empty
+
+    def quarantine(self, path, stem):
+        destination = path.with_name(stem + '.json')
+        if destination.exists():
+            destination = path.with_name(f'{stem}-{time.time_ns()}-{uuid.uuid4().hex}.json')
+        os.replace(path, destination)
+        route_store.sync_directory(path.parent)
+        return destination
+
+    def record_loss(self, reason, records):
         self.loss = True
-        stamp = time.time_ns()
-        report = dict(file=self.path.name, reason=reason, detected_at=stamp, lost=records,
+        report = dict(file=self.path.name, reason=reason, detected_at=time.time_ns(), lost=records,
                       unknown_identities=any(row['id'] is None for row in records))
-        # Keep bounded, durable loss receipts. Quarantine the damaged file
-        # once, without retaining unlimited copies or ever replaying its data.
         loss_path = self.path.with_name('correspondence-lost.json')
-        reports = self.read_loss_reports()
-        # Keep earlier incidents as well. Refuse further recovery visibly at the
-        # same byte ceiling instead of silently overwriting a prior loss receipt.
-        report['previous'] = reports
+        report['previous'] = self.read_loss_reports()
         loss_data = encoded(report)
-        if len(loss_data) > self.max_bytes:
+        if len(loss_data) > self.restore_bytes:
             raise ValueError('Correspondence loss ledger byte limit reached; owner intervention required')
         atomic_write(loss_path, loss_data)
-        if self.path.exists() and not self.path.is_symlink():
-            os.replace(self.path, self.path.with_name('correspondence-corrupt.json'))
         print(json.dumps(dict(correspondence_drop=self.path.name, reason=reason,
                               lost_ids=[row['id'] for row in records])), file=sys.stderr, flush=True)
-        return empty

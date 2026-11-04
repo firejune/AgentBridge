@@ -9,6 +9,7 @@ from pathlib import Path
 import socket
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -18,12 +19,76 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skill/agent-bridge
 import broker
 import mcp_phase1 as phase
 import mcp_server
+import message_store
+import route_store
 from support import RunningBroker
 
 try:
     import jsonschema
 except ImportError:
     jsonschema = None
+
+
+class BackendPingBudgetTests(unittest.TestCase):
+    def test_slow_checkpoint_does_not_report_backend_loss(self):
+        with tempfile.TemporaryDirectory(prefix='ab100-ping-', dir='/tmp') as root:
+            store = route_store.RouteStore(Path(root) / 'state')
+            self.addCleanup(store.close)
+            state = broker.State(store=store)
+            for name in ('alpha', 'beta'):
+                state.action(dict(op='register', project='demo', name=name, cwd=root))
+            message = state.action(dict(op='send', project='demo', sender='alpha', recipient='beta', body='Q', key='q'))
+            path = str(Path(root) / 'test.sock')
+            failures = []
+            original = message_store.atomic_write
+            def slow_save(target, data):
+                if target == state.correspondence.path:
+                    time.sleep(.7)
+                original(target, data)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+                server.bind(path)
+                server.listen(1)
+                def serve():
+                    try:
+                        with server.accept()[0] as client:
+                            with client.makefile('rb') as reader:
+                                self.assertEqual(json.loads(reader.readline())['op'], 'ping')
+                            with patch.object(message_store, 'atomic_write', side_effect=slow_save):
+                                state.action(dict(op='progress', id=message['id'], note='slow write'))
+                            client.sendall(broker.wire(dict(result=state.action(dict(op='ping')))))
+                    except BaseException as error:
+                        failures.append(error)
+                worker = threading.Thread(target=serve)
+                worker.start()
+                try:
+                    self.assertEqual(phase.Backend(path).instance(), state.instance)
+                finally:
+                    worker.join(timeout=5)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(failures, [])
+
+    def test_unresponsive_broker_has_bounded_timeout(self):
+        with tempfile.TemporaryDirectory(prefix='ab100-dead-', dir='/tmp') as root:
+            path = str(Path(root) / 'test.sock')
+            release = threading.Event()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+                server.bind(path)
+                server.listen(1)
+                def serve():
+                    with server.accept()[0]:
+                        release.wait(5)
+                worker = threading.Thread(target=serve)
+                worker.start()
+                started = time.monotonic()
+                try:
+                    with self.assertRaises(TimeoutError):
+                        phase.Backend(path).instance()
+                    elapsed = time.monotonic() - started
+                    self.assertGreaterEqual(elapsed, 2.5)
+                    self.assertLess(elapsed, 4.5)
+                finally:
+                    release.set()
+                    worker.join(timeout=5)
 
 
 class InboxIntegrationTests(unittest.TestCase):
@@ -337,11 +402,12 @@ class InboxIntegrationTests(unittest.TestCase):
         self.assertEqual(self.data('bridge_message_ack', message_id=handle), receipt)
         self.assertEqual(self.running.call('show', id=remaining['id'])['state'], 'done')
         self.assertIn('durable', fresh['restart_policy'])
-        # Receipts survive even though old epoch-bound handles remain revoked.
+        # Old epoch records release their capacity while consumed messages stay done.
         self.running.restart()
         self.assertEqual(self.listing()['messages'], [])
         checkpoint = json.loads((Path(self.running.state_dir) / 'correspondence.json').read_text())
-        self.assertEqual(len(checkpoint['receipts']), 2)
+        self.assertEqual(checkpoint['receipts'], [])
+        self.assertEqual(checkpoint['snapshots'], {})
 
     def test_frame_budget_pages_full_inbox_without_unbounded_rpc(self):
         sender = 'h' + 'x' * 20000

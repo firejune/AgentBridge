@@ -169,7 +169,7 @@ python3 "$bridge_cli" wt sweep --apply  # Remove eligible worktrees and branches
 
 ### 5. Broker Persistence & Optional `launchd` Supervision
 
-- **Private durable correspondence and routing**. Routes remain in `<state-dir>/routes.json`. Bounded messages, fixed delivery states, idempotency records, independent inbox snapshots and ACK receipts checkpoint atomically to `correspondence.json` (`0600`). Restart restores mail without dispatching it. Interrupted dispatch becomes `uncertain` and needs explicit resolution. Credentials, signed handles, provider diagnostics and event history remain volatile. See [correspondence storage](skill/agent-bridge/references/usage.md#correspondence-storage-issue-94) for fields, limits and durable loss diagnostics.
+- **Private durable correspondence and routing**. Restart restores owner-private routing and mail with the broker’s terminal-eviction guards, retaining protected mail above a lowered limit and reporting that excess through stderr and `ping.correspondence_over_limit`. See [correspondence storage](skill/agent-bridge/references/usage.md#correspondence-storage-issue-94) for fields, limits and loss diagnostics.
 - **Optional macOS launchd service**: Supervision is off by default. Use `install-service` (or `--generate-only --plist PATH` to inspect without loading) and `uninstall-service` to manage a `KeepAlive` launch agent.
 
 ### 6. Remote MCP Facade (`mcp_server.py`)
