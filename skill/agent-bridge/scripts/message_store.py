@@ -1,10 +1,10 @@
 """Owner-private correspondence checkpoint. Runtime credentials never enter it."""
 import json
+import math
 import os
 from pathlib import Path
 import stat
 import sys
-import tempfile
 import time
 import uuid
 
@@ -20,19 +20,10 @@ SNAPSHOT_BYTES = 16 * 1024 * 1024
 MAX_RECEIPTS = 8192
 
 
-def atomic_write(path, data):
-    name = None
-    try:
-        fd, name = tempfile.mkstemp(prefix='.correspondence-', dir=path.parent)
-        with os.fdopen(fd, 'wb') as output:
-            output.write(data)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(name, path)
-        name = None
-    finally:
-        if name is not None:
-            Path(name).unlink(missing_ok=True)
+# Shared with routing snapshots, including full-flush and directory barriers.
+atomic_write = route_store.atomic_write
+
+MALFORMED_CONTENT = (ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError, OverflowError)
 
 
 def encoded(value):
@@ -73,6 +64,9 @@ def message_record(raw):
 
 
 def receipt_record(key, value):
+    expiry = value['expires']
+    if type(expiry) not in (int, float) or not math.isfinite(expiry) or expiry <= 0:
+        raise ValueError('Invalid receipt expiry')
     if (len(key) != 3 or any(not isinstance(k, str) for k in key)
             or len(key[0]) != 64 or len(key[1]) != 64):
         raise ValueError('Invalid receipt binding')
@@ -91,6 +85,11 @@ def receipt_record(key, value):
 
 
 def snapshot_record(value):
+    expiry = value['expires']
+    if (type(expiry) not in (int, float) or not math.isfinite(expiry) or expiry <= 0
+            or not isinstance(value['owner'], str) or len(value['owner']) != 64
+            or not isinstance(value['context'], str) or len(value['context']) != 64):
+        raise ValueError('Invalid snapshot binding or expiry')
     fields = ('id', 'agent_session_id', 'created_at', 'project', 'sender', 'recipient',
               'provenance', 'reply_to', 'state', 'acknowledged', 'acknowledged_at',
               'body_chars', 'body_bytes', 'body_sha256')
@@ -106,6 +105,23 @@ def snapshot_record(value):
         raise ValueError('Invalid inbox snapshot byte count')
     return dict(owner=value['owner'], context=value['context'], items=items,
                 expires=value['expires'], bytes=size)
+
+
+def loss_identity(raw):
+    item = {field: raw[field] for field in ('id', 'sender', 'recipient', 'created')}
+    if any(value is not None and not isinstance(value, str) for value in item.values()):
+        raise ValueError('Invalid loss identity')
+    return item
+
+
+def loss_report(raw):
+    if (not isinstance(raw, dict) or not isinstance(raw['file'], str)
+            or not isinstance(raw['reason'], str) or type(raw['detected_at']) is not int
+            or type(raw['unknown_identities']) is not bool or not isinstance(raw['lost'], list)):
+        raise ValueError('Invalid loss report')
+    report = {field: raw[field] for field in ('file', 'reason', 'detected_at', 'unknown_identities')}
+    report['lost'] = [loss_identity(item) for item in raw['lost']]
+    return report
 
 
 class MessageStore:
@@ -125,7 +141,10 @@ class MessageStore:
             if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
                     or info.st_mode & 0o077 or info.st_size > self.max_bytes):
                 raise ValueError('Unsafe or oversized correspondence file')
-            return json.load(source)
+            try:
+                return json.load(source)
+            except RecursionError:
+                raise ValueError('Correspondence JSON nesting limit exceeded') from None
 
     def save(self, state):
         messages = [message_record(m) for m in state.messages.values()]
@@ -152,6 +171,7 @@ class MessageStore:
         atomic_write(self.path, data)
 
     def load(self):
+        self.read_loss_reports()
         empty = dict(messages=[], keys=[], receipts=[], snapshots={})
         try:
             raw = self.read(self.path)
@@ -162,18 +182,23 @@ class MessageStore:
         except (ValueError, OSError, UnicodeError):
             return self.lost('checkpoint unreadable, unsafe or corrupt', empty)
         try:
-            if raw['version'] != 1 or len(raw['messages']) > self.max_messages:
+            if (not isinstance(raw, dict) or raw['version'] != 1
+                    or not isinstance(raw['messages'], list) or len(raw['messages']) > self.max_messages):
                 raise ValueError('Invalid checkpoint version or count')
             messages = [message_record(m) for m in raw['messages']]
             ids = {m['id'] for m in messages}
             if len(ids) != len(messages):
                 raise ValueError('Duplicate message')
             keys = raw['keys']
-            if len(keys) > len(messages) or len({row[0] for row in keys}) != len(keys):
+            if (not isinstance(keys, list) or len(keys) > len(messages)
+                    or any(not isinstance(row, list) or len(row) != 3 for row in keys)):
+                raise ValueError('Invalid idempotency rows')
+            if len({row[0] for row in keys}) != len(keys):
                 raise ValueError('Invalid idempotency count')
             for key, intent, mid in keys:
                 if (not isinstance(key, str) or not 1 <= len(key) <= 256 or mid not in ids
-                        or set(intent) != set(INTENT_FIELDS) or intent['key'] != key):
+                        or set(intent) != set(INTENT_FIELDS) or intent['key'] != key
+                        or any(value is not None and not isinstance(value, str) for value in intent.values())):
                     raise ValueError('Invalid idempotency record')
             receipts, snapshots = raw['receipts'], raw['snapshots']
             if len(receipts) > MAX_RECEIPTS or len(snapshots) > 16:
@@ -184,14 +209,45 @@ class MessageStore:
             if total > SNAPSHOT_BYTES:
                 raise ValueError('Invalid inbox byte count')
             return dict(messages=messages, keys=keys, receipts=receipts, snapshots=snapshots)
-        except (ValueError, KeyError, TypeError, AttributeError):
+        except MALFORMED_CONTENT:
             return self.lost('invalid checkpoint records; entire checkpoint dropped', empty)
+
+    def read_loss_reports(self):
+        path = self.path.with_name('correspondence-lost.json')
+        try:
+            raw = self.read(path)
+        except FileNotFoundError:
+            return []
+        except MALFORMED_CONTENT:
+            return self.quarantine_loss_ledger(path)
+        try:
+            previous = raw.get('previous', [])
+            if not isinstance(previous, list):
+                raise ValueError('Invalid loss history')
+            return [loss_report(item) for item in previous] + [loss_report(raw)]
+        except MALFORMED_CONTENT:
+            return self.quarantine_loss_ledger(path)
+
+    def quarantine_loss_ledger(self, path):
+        quarantine = path.with_name('correspondence-lost-corrupt.json')
+        os.replace(path, quarantine)
+        route_store.sync_directory(path.parent)
+        self.loss = True
+        report = dict(file=path.name, reason='Malformed loss ledger; previous history quarantined',
+                      detected_at=time.time_ns(), lost=[], unknown_identities=True)
+        atomic_write(path, encoded(dict(report, previous=[])))
+        print(json.dumps(dict(correspondence_drop=path.name, reason=report['reason'],
+                              quarantine=quarantine.name, lost_ids=[], unknown_identities=True)),
+              file=sys.stderr, flush=True)
+        return [report]
 
     def lost(self, reason, empty):
         try:
             index = self.read(self.manifest)['messages']
-            records = [{key: row[key] for key in ('id', 'sender', 'recipient', 'created')} for row in index]
-        except (ValueError, OSError, KeyError, TypeError, AttributeError, UnicodeError):
+            if not isinstance(index, list):
+                raise ValueError('Invalid correspondence index')
+            records = [loss_identity(row) for row in index]
+        except (*MALFORMED_CONTENT, OSError):
             records = [dict(id=None, sender=None, recipient=None, created=None)]
         self.loss = True
         stamp = time.time_ns()
@@ -200,15 +256,9 @@ class MessageStore:
         # Keep bounded, durable loss receipts. Quarantine the damaged file
         # once, without retaining unlimited copies or ever replaying its data.
         loss_path = self.path.with_name('correspondence-lost.json')
-        reports = []
-        if loss_path.exists():
-            previous = self.read(loss_path)
-            reports = previous.pop('previous', [])
-            reports.append(previous)
+        reports = self.read_loss_reports()
         # Keep earlier incidents as well. Refuse further recovery visibly at the
         # same byte ceiling instead of silently overwriting a prior loss receipt.
-        for prior in reports:
-            prior.pop('previous', None)
         report['previous'] = reports
         loss_data = encoded(report)
         if len(loss_data) > self.max_bytes:

@@ -294,9 +294,15 @@ python3 -m unittest discover -s tests -v
 ## Correspondence storage (issue #94)
 
 The existing RouteStore lock and owner-private directory cover correspondence as
-well. Files are `0600`. Checkpoints use a temporary file, flush/fsync and atomic
-replace before the broker publishes a mutation or returns acceptance. A failed
-save leaves the previous checkpoint and in-memory message state intact. There
+well. Files are `0600`. Routing and correspondence share a temporary-file writer
+that flushes/fsyncs the file, replaces the destination, then opens and fsyncs its
+parent directory. Where available, `F_FULLFSYNC` follows fsync on both descriptors.
+Unsupported full-flush operations retain the fsync fallback. These barriers finish
+before the broker publishes a mutation or returns acceptance. Tests assert the
+barrier calls and their order. They do not simulate an OS crash or power loss. A failure
+before replacement leaves the previous checkpoint intact. Failed saves reject
+the in-memory mutation. A failure after replacement leaves the disk commit
+outcome uncertain and does not return acceptance. There
 is no automatic retry or delivery on load.
 
 The checkpoint's version is 1. Its field allowlist is as follows.
@@ -345,7 +351,11 @@ time. It never supplies replay data. A corrupt, truncated, missing or invalid
 checkpoint produces a stderr diagnostic naming `correspondence.json` and dropped
 IDs, and a durable `correspondence-lost.json` with those identities, original
 times, detection time and reason. Previous incident records remain in its
-`previous` array. If the index is also unavailable, identities are explicitly
+`previous` array. A malformed loss ledger is named in stderr and preserved as
+`correspondence-lost-corrupt.json`. Its replacement records that the previous
+history is unknown. Startup validates that ledger even when the mail checkpoint
+is intact. Invalid idempotency row shapes and excessive JSON nesting use the same
+loss-recovery path. If the index is also unavailable, identities are explicitly
 unknown. Recovery preserves the damaged checkpoint as
 `correspondence-corrupt.json` and starts without that mail. Further recovery at
 the loss-ledger byte ceiling requires owner intervention instead of deleting

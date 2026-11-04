@@ -1,4 +1,5 @@
 """Owner-private, atomic routing snapshots. Never stores message/delivery data."""
+import errno
 import fcntl
 import json
 import os
@@ -15,6 +16,42 @@ import sessions
 ROUTE_FIELDS = ('project', 'name', 'transport', 'cwd', 'session', 'executable')
 CHANNEL_FIELDS = ('project', 'name', 'owner', 'description', 'generation', 'active', 'route')
 MAX_SNAPSHOT = 4 * 1024 * 1024
+
+
+def sync_descriptor(fd):
+    os.fsync(fd)
+    if hasattr(fcntl, 'F_FULLFSYNC'):
+        try:
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+        except OSError as error:
+            # macOS filesystems may support a full flush on regular files but
+            # only fsync on directories. Other I/O failures remain failures.
+            if error.errno not in (errno.EINVAL, errno.ENOTSUP, errno.ENOTTY, errno.ENOSYS):
+                raise
+
+
+def sync_directory(directory):
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        sync_descriptor(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_write(path, data, prefix='.correspondence-'):
+    name = None
+    try:
+        fd, name = tempfile.mkstemp(prefix=prefix, dir=path.parent)
+        with os.fdopen(fd, 'wb') as output:
+            output.write(data)
+            output.flush()
+            sync_descriptor(output.fileno())
+        os.replace(name, path)
+        name = None
+        sync_directory(path.parent)
+    finally:
+        if name is not None:
+            Path(name).unlink(missing_ok=True)
 
 
 class RouteCheckError(ValueError):
@@ -156,20 +193,7 @@ class RouteStore:
         data = (json.dumps(snapshot, ensure_ascii=False) + '\n').encode()
         if len(data) > MAX_SNAPSHOT:
             raise ValueError('Routing snapshot exceeds size limit')
-        name = None
-        try:
-            fd, name = tempfile.mkstemp(prefix='.routes-', dir=self.directory)
-            with os.fdopen(fd, 'wb') as output:
-                output.write(data)
-                output.flush()
-                os.fsync(output.fileno())
-            # Last fallible commit operation. Before this, the old file remains
-            # intact and the caller must not swap its in-memory routing maps.
-            os.replace(name, self.path)
-            name = None
-        finally:
-            if name is not None:
-                Path(name).unlink(missing_ok=True)
+        atomic_write(self.path, data, prefix='.routes-')
 
     def load(self):
         try:

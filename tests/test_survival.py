@@ -3,12 +3,14 @@ import asyncio
 from contextlib import redirect_stderr
 from copy import deepcopy
 import io
+import errno
 import json
 import os
 from pathlib import Path
 import plistlib
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -25,6 +27,49 @@ import message_store
 import service
 from support import RunningBroker
 from test_codex_live import FakeDesktop
+
+
+class DurabilityTests(unittest.TestCase):
+    def test_message_and_routing_writes_sync_file_then_replace_then_directory(self):
+        with tempfile.TemporaryDirectory(prefix='ab94-sync-', dir='/tmp') as root:
+            store = route_store.RouteStore(Path(root) / 'state')
+            self.addCleanup(store.close)
+            for write in (lambda: store.save({}, {}),
+                          lambda: message_store.atomic_write(store.directory / 'mail.json', b'{}')):
+                calls = []
+                def record_sync(fd):
+                    kind = 'directory' if stat.S_ISDIR(os.fstat(fd).st_mode) else 'file'
+                    calls.append(('fsync', kind))
+                def record_full_sync(fd, command):
+                    self.assertEqual(command, route_store.fcntl.F_FULLFSYNC)
+                    kind = 'directory' if stat.S_ISDIR(os.fstat(fd).st_mode) else 'file'
+                    calls.append(('fullfsync', kind))
+                replace = os.replace
+                def record_replace(source, destination):
+                    calls.append(('replace', 'file'))
+                    replace(source, destination)
+                with patch.object(route_store.os, 'fsync', side_effect=record_sync), \
+                        patch.object(route_store.fcntl, 'F_FULLFSYNC', 51, create=True), \
+                        patch.object(route_store.fcntl, 'fcntl', side_effect=record_full_sync), \
+                        patch.object(route_store.os, 'replace', side_effect=record_replace):
+                    write()
+                self.assertEqual(calls, [('fsync', 'file'), ('fullfsync', 'file'),
+                                         ('replace', 'file'), ('fsync', 'directory'),
+                                         ('fullfsync', 'directory')])
+
+    def test_unsupported_full_sync_falls_back_but_io_errors_propagate(self):
+        for failure in (errno.EINVAL, errno.ENOTSUP, errno.ENOTTY, errno.ENOSYS):
+            with self.subTest(errno=failure), \
+                    patch.object(route_store.os, 'fsync') as sync, \
+                    patch.object(route_store.fcntl, 'F_FULLFSYNC', 51, create=True), \
+                    patch.object(route_store.fcntl, 'fcntl', side_effect=OSError(failure, 'unsupported')):
+                route_store.sync_descriptor(123)
+                sync.assert_called_once_with(123)
+        with patch.object(route_store.os, 'fsync'), \
+                patch.object(route_store.fcntl, 'F_FULLFSYNC', 51, create=True), \
+                patch.object(route_store.fcntl, 'fcntl', side_effect=OSError(errno.EIO, 'I/O failure')):
+            with self.assertRaises(OSError):
+                route_store.sync_descriptor(123)
 
 
 class RetentionTests(unittest.TestCase):
@@ -233,6 +278,42 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(loaded.inbox_snapshots[page['snapshot']]['expires'], page['expires'])
             self.assertEqual(loaded.get(messages[0]['id'])['state'], 'done')
             self.assertEqual(loaded.get(messages[1]['id'])['state'], 'pending')
+
+    def test_malformed_restored_fields_recover_before_startup_resave(self):
+        self.state.action(dict(op='register', project='demo', name='beta', cwd=str(self.root)))
+        messages = [self.state.action(dict(op='send', project='demo', sender='alpha', recipient='beta', body=key, key=key))
+                    for key in ('first', 'second')]
+        args = dict(owner='a' * 64, context='b' * 64,
+                    routes=[dict(slot='slot', route=self.state.route('demo', name='beta'))])
+        self.state.action(dict(args, op='inbox_list', limit=1))
+        self.state.action(dict(args, op='inbox_ack', id=messages[0]['id']))
+        valid = json.loads(self.state.correspondence.path.read_text())
+        manifest = self.state.correspondence.manifest.read_bytes()
+        changes = []
+        for expiry in ({}, [], 'invalid', float('nan'), float('inf')):
+            receipt = deepcopy(valid)
+            receipt['receipts'][0][1]['expires'] = expiry
+            receipt['receipts'][0][1]['result']['reconcile_until'] = expiry
+            changes.append(receipt)
+            snapshot = deepcopy(valid)
+            next(iter(snapshot['snapshots'].values()))['expires'] = expiry
+            changes.append(snapshot)
+        intent = deepcopy(valid)
+        intent['keys'][0][1]['body'] = {'nested': 'invalid'}
+        changes.append(intent)
+        binding = deepcopy(valid)
+        next(iter(binding['snapshots'].values()))['owner'] = {'nested': 'invalid'}
+        changes.append(binding)
+        for index, raw in enumerate(changes):
+            with self.subTest(index=index):
+                self.state.correspondence.manifest.write_bytes(manifest)
+                self.state.correspondence.path.write_text(json.dumps(raw))
+                with redirect_stderr(io.StringIO()) as diagnostic:
+                    restored = broker.State(store=self.store)
+                self.assertEqual(restored.messages, {})
+                self.assertIn('correspondence.json', diagnostic.getvalue())
+                self.assertIn(messages[0]['id'], diagnostic.getvalue())
+                self.assertTrue((self.store.directory / 'correspondence-lost.json').exists())
 
     def test_ack_checkpoint_failure_leaves_mail_unconsumed(self):
         self.state.action(dict(op='register', project='demo', name='beta', cwd=str(self.root)))
@@ -622,6 +703,79 @@ class SurvivalSocketTests(unittest.TestCase):
                 _, diagnostic = server.process.communicate(timeout=2)
                 self.assertIn('correspondence.json', diagnostic)
                 self.assertIn(message['id'], diagnostic)
+
+    def test_malformed_idempotency_rows_start_with_named_durable_loss(self):
+        for rows in ([[]], [['key']], [None], [[[], {}, 'id']]):
+            with self.subTest(rows=rows), RunningBroker() as server:
+                server.register_pair()
+                message = server.call('send', project='demo', sender='alpha', recipient='beta', body='Q', key='lost')
+                server.call('shutdown')
+                server.process.communicate(timeout=2)
+                path = Path(server.state_dir) / 'correspondence.json'
+                data = json.loads(path.read_text())
+                data['keys'] = rows
+                content = json.dumps(data)
+                path.write_text(content)
+                server.start()
+                self.assertEqual(server.call('ping')['messages'], 0)
+                report = json.loads(path.with_name('correspondence-lost.json').read_text())
+                self.assertEqual(report['lost'][0]['id'], message['id'])
+                self.assertEqual(path.with_name('correspondence-corrupt.json').read_text(), content)
+                server.call('shutdown')
+                _, diagnostic = server.process.communicate(timeout=2)
+                self.assertIn('correspondence.json', diagnostic)
+                self.assertIn(message['id'], diagnostic)
+
+    def test_deeply_nested_checkpoint_starts_with_named_durable_loss(self):
+        with RunningBroker() as server:
+            server.register_pair()
+            message = server.call('send', project='demo', sender='alpha', recipient='beta', body='Q', key='lost')
+            server.call('shutdown')
+            server.process.communicate(timeout=2)
+            path = Path(server.state_dir) / 'correspondence.json'
+            content = '[' * 20000 + '0' + ']' * 20000
+            path.write_text(content)
+            server.start()
+            self.assertEqual(server.call('ping')['messages'], 0)
+            report = json.loads(path.with_name('correspondence-lost.json').read_text())
+            self.assertEqual(report['lost'][0]['id'], message['id'])
+            self.assertEqual(path.with_name('correspondence-corrupt.json').read_text(), content)
+            server.call('shutdown')
+            _, diagnostic = server.process.communicate(timeout=2)
+            self.assertIn('correspondence.json', diagnostic)
+            self.assertIn(message['id'], diagnostic)
+
+    def test_malformed_loss_ledgers_are_named_and_quarantined(self):
+        contents = ('{', '{"previous":{}}', '{"previous":[null]}',
+                    '[' * 20000 + '0' + ']' * 20000)
+        for content in contents:
+            for corrupt_checkpoint in (False, True):
+                with self.subTest(content=content[:30], corrupt_checkpoint=corrupt_checkpoint), RunningBroker() as server:
+                    server.register_pair()
+                    message = server.call('send', project='demo', sender='alpha', recipient='beta', body='Q', key='lost')
+                    server.call('shutdown')
+                    server.process.communicate(timeout=2)
+                    directory = Path(server.state_dir)
+                    ledger = directory / 'correspondence-lost.json'
+                    ledger.write_text(content)
+                    ledger.chmod(0o600)
+                    if corrupt_checkpoint:
+                        (directory / 'correspondence.json').write_text('{')
+                    server.start()
+                    self.assertTrue(server.call('ping')['correspondence_lost'])
+                    self.assertEqual((directory / 'correspondence-lost-corrupt.json').read_text(), content)
+                    report = json.loads(ledger.read_text())
+                    if corrupt_checkpoint:
+                        self.assertEqual(report['lost'][0]['id'], message['id'])
+                        self.assertEqual(report['previous'][0]['file'], ledger.name)
+                    else:
+                        self.assertEqual(server.call('show', id=message['id'])['state'], 'pending')
+                        self.assertEqual(report['file'], ledger.name)
+                        self.assertTrue(report['unknown_identities'])
+                    server.call('shutdown')
+                    _, diagnostic = server.process.communicate(timeout=2)
+                    self.assertIn(ledger.name, diagnostic)
+                    self.assertIn('correspondence-lost-corrupt.json', diagnostic)
 
     def test_crash_restart_reloads_committed_routing_from_stale_socket(self):
         with RunningBroker() as server:
