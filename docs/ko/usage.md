@@ -4,7 +4,7 @@
 
 에이전트끼리 실시간으로 질문과 답변을 주고받는 로컬 CLI. Python 3.10 이상, 표준 라이브러리만 사용한다. macOS/Linux의 Unix 도메인 소켓으로 연결하며 외부 패키지, API 키, 네트워크 포트가 필요 없다.
 
-**브로커 메시지를 위한 SQLite나 파일 우편함은 없다.** 엔드포인트·채널 바인딩만 소유자 전용 라우팅 파일(`routes.json`)에 저장한다. 메시지·전달 상태·대화·중복 방지 키·이벤트는 메모리에만 유지하고 재시작 시 사라진다. 라우팅은 재검증해 복원하며 메시지를 재생하지 않는다.
+브로커는 소유자 전용 라우팅 파일(`routes.json`)과 상한이 있는 우편 체크포인트(`correspondence.json`)를 쓴다. 재시작하면 받아 둔 메시지와 전달 상태를 복원하되 전달을 재생하지 않는다. 자격 증명·서명 토큰·공급자 진단·이벤트 스트림은 메모리에만 둔다. 저장 필드와 손상 복구는 [영문 usage.md의 Correspondence storage (issue #94)](../../skill/agent-bridge/references/usage.md#correspondence-storage-issue-94)를 따른다.
 
 ## 연결 구조
 
@@ -92,7 +92,7 @@ MESSAGE
 - `send`는 `ask`와 같은 인수를 받되 기다리지 않는다. 전송 후 `wait REQUEST_ID --timeout 60`으로 답변을 기다릴 수 있다.
 - `ask`/`wait`의 시간 초과는 종료 코드 2(`timed_out: true`)다. 질문 취소가 아니므로 같은 ID로 다시 `wait`하면 늦은 답변을 받을 수 있다.
 - 같은 메시지를 다시 보내야 할 때는 같은 `--key`를 사용한다. 중복 방지는 현재 브로커 실행에서 해당 메시지가 보존되는 동안만 유효하다.
-- 메모리의 메시지 목록과 대화 이력은 `inbox`, `show`, `conversation`으로 확인한다:
+- 브로커가 보존 중인 메시지 목록과 대화 이력은 `inbox`, `show`, `conversation`으로 확인한다:
 
 ```bash
 python3 "$bridge_cli" inbox --project my-app --channel modal-view
