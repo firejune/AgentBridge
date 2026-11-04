@@ -28,7 +28,7 @@ def full_permissions():
 class ModelDesktop(FakeDesktop):
     def __init__(self, model='app-default', reject_update=False, keep_model=False, behavior='active',
                  permissions=None, refuse_permissions=False, stale_current=False, drop_update=False,
-                 update_error=False):
+                 update_error=False, sandbox_lag=0):
         super().__init__(behavior)
         self.drop_update = drop_update
         self.update_error = update_error
@@ -36,14 +36,19 @@ class ModelDesktop(FakeDesktop):
         self.permissions = permissions or {'activePermissionProfile':{'id':':workspace'},
             'approvalPolicy':'on-request','sandboxPolicy':{'type':'workspaceWrite'}}
         self.refuse_permissions, self.stale_current = refuse_permissions, stale_current
+        self.sandbox_lag = sandbox_lag
 
     def handle(self, sock, request):
         method = request['method']
         if request.get('type') == 'broadcast' and method == 'thread-stream-following-changed':
             self.calls.append(request)
             if request['params']['following']:
+                latest = self.permissions
+                if self.sandbox_lag and codex_new.has_full_access(latest):
+                    self.sandbox_lag -= 1
+                    latest = dict(latest, sandboxPolicy={'type': 'readOnly'})
                 state = {'id':request['params']['conversationId'],
-                         'latestThreadSettings':self.permissions,
+                         'latestThreadSettings':latest,
                          'currentPermissions':getattr(self,'current_permissions',{} if self.stale_current else self.permissions)}
                 self.write(sock, {'type':'broadcast','method':'thread-stream-state-changed','version':11,
                     'sourceClientId':self.owner,'targetClientIds':[request['sourceClientId']],
@@ -83,6 +88,9 @@ class NewCodexTests(unittest.TestCase):
         self.thread = {'id':self.sid,'provider':'codex','cwd':self.root,'ephemeral':False,
                        'source':'vscode','status':{'type':'idle'},'name':None,'model':'requested-model'}
         self.fail_method = None
+        self.materialized = True
+        self.materialize_on_creator_read = True
+        self.creator_read_error = None
         self.reader_wrong_cwd = False
         self.substitute_model = False
         self.profiles = [{'id':codex_new.FULL_ACCESS_PROFILE,'allowed':True}]
@@ -123,8 +131,15 @@ class NewCodexTests(unittest.TestCase):
                             'activePermissionProfile':{'id':codex_new.FULL_ACCESS_PROFILE},
                             'sandbox':{'type':'dangerFullAccess' if test.creator_full_access else 'workspaceWrite'}}
                 if method == 'thread/name/set':
+                    test.materialized = True
                     test.thread['name'] = params['name'];return {}
                 if method == 'thread/read':
+                    if self.creator and params.get('includeTurns') is True:
+                        test.materialized |= test.materialize_on_creator_read
+                        if test.creator_read_error is not None:
+                            raise test.creator_read_error
+                    elif not self.creator and not test.materialized:
+                        raise sessions.DiscoveryError('thread not loaded')
                     row = dict(test.thread)
                     if test.reader_wrong_cwd:row['cwd'] = '/other'
                     return {'thread':row}
@@ -177,6 +192,52 @@ class NewCodexTests(unittest.TestCase):
         update = [x for x in desktop.calls if x['method']=='thread-follower-update-thread-settings']
         self.assertEqual([x['params']['threadSettings'] for x in update],[{'model':codex_new.DEFAULT_MODEL}])
         self.assertNotIn('prompt',result)
+
+    def test_untitled_paginated_thread_materializes_before_creator_closes(self):
+        self.thread['historyMode'] = 'paginated'
+        unsupported_turns = sessions.CodexRpcError('thread/read', {
+            'code': -32601, 'message': 'list_turns is not supported yet'})
+        for error in (None, unsupported_turns):
+            with self.subTest(error=error), ModelDesktop() as desktop:
+                self.calls.clear()
+                self.materialized = False
+                self.creator_read_error = error
+                result = self.open(desktop)
+                reads = [(params, client.creator) for method, params, client in self.calls if method == 'thread/read']
+                self.assertEqual(reads, [
+                    ({'threadId': self.sid, 'includeTurns': True}, True),
+                    ({'threadId': self.sid, 'includeTurns': False}, False),
+                    ({'threadId': self.sid, 'includeTurns': False}, False),
+                ])
+                self.assertIsNone(result['session']['name'])
+                self.assertEqual(result['stage'], 'complete')
+                self.assertFalse(any(method in ('thread/name/set', 'turn/start', 'turn/steer')
+                                     for method, _, _ in self.calls))
+
+    def test_materialization_errors_still_require_an_independent_persistence_read(self):
+        self.thread['historyMode'] = 'paginated'
+        self.materialize_on_creator_read = False
+        for error, reader_expected in (
+            (sessions.CodexRpcError('thread/read', {'code': -32601, 'message': 'list_turns is not supported yet'}), True),
+            (sessions.CodexRpcError('thread/read', {'code': -32603, 'message': 'list_turns is not supported yet'}), False),
+            (sessions.CodexRpcError('thread/read', {'code': -32601, 'message': 'unknown method'}), False),
+            (sessions.DiscoveryError('Codex thread/read timed out'), False),
+        ):
+            with self.subTest(error=error), ModelDesktop() as desktop, \
+                    self.assertRaises(codex_new.CreationError) as caught:
+                self.calls.clear()
+                self.materialized = False
+                self.creator_read_error = error
+                self.open(desktop)
+            self.assertEqual(caught.exception.stage, 'persistence')
+            self.assertTrue(caught.exception.uncertain)
+            self.assertEqual(caught.exception.session, self.sid)
+            self.assertFalse(caught.exception.adopted)
+            self.assertEqual(self.urls, [])
+            self.assertEqual(desktop.calls, [])
+            self.assertEqual(sum(method == 'thread/start' for method, _, _ in self.calls), 1)
+            self.assertEqual([client.creator for method, _, client in self.calls if method == 'thread/read'],
+                             [True, False] if reader_expected else [True])
 
     def test_owner_policy_default_reaches_creation_and_readback(self):
         policy = {'defaults': {'codex': 'requested-model'}, 'deny': {}}
@@ -259,6 +320,22 @@ class NewCodexTests(unittest.TestCase):
         self.assertTrue(caught.exception.adopted)
         self.assertEqual(caught.exception.stage,'permissions')
         self.assertEqual(sum(x['method']=='thread-follower-update-thread-settings' for x in desktop.calls),1)
+
+    def test_desktop_permission_readback_can_converge_after_ack(self):
+        with ModelDesktop(sandbox_lag=1) as desktop:
+            result = self.open(desktop)
+        self.assertEqual(result['permission_settings'], full_permissions())
+        self.assertEqual(result['stage'], 'complete')
+        self.assertEqual(sum(x['method'] == 'thread-follower-update-thread-settings' for x in desktop.calls), 1)
+        self.assertEqual(sum(x['method'] == 'thread-follower-read-model-settings' for x in desktop.calls), 2)
+
+    def test_desktop_permission_readback_still_refuses_if_sandbox_stays_read_only(self):
+        with ModelDesktop(sandbox_lag=1000) as desktop, \
+                self.assertRaisesRegex(codex_new.CreationError, 'did not confirm Full Access') as caught:
+            self.open(desktop)
+        self.assertEqual(caught.exception.stage, 'permissions')
+        self.assertEqual(caught.exception.result['permission_settings']['sandboxPolicy'], {'type': 'readOnly'})
+        self.assertEqual(sum(x['method'] == 'thread-follower-update-thread-settings' for x in desktop.calls), 1)
 
     def cli_open(self, desktop, *extra):
         real_open = codex_new.open_codex

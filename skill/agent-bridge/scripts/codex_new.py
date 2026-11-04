@@ -174,6 +174,26 @@ def permission_settings(client, sid, owner):
     return permission_diagnostics(values)
 
 
+def settled_permissions(client, sid, owner, values, deadline, poll):
+    # After a successful update, Desktop can publish the new profile and
+    # approval setting before the derived sandbox policy reaches the snapshot.
+    settle_deadline = min(deadline, time.monotonic() + 2)
+    timeout = client.timeout
+    while ((values['activePermissionProfile'] or {}).get('id') == FULL_ACCESS_PROFILE
+           and values['approvalPolicy'] == 'never'
+           and values['sandboxPolicy'] == {'type': 'readOnly'}):
+        time.sleep(min(poll, max(0, settle_deadline - time.monotonic())))
+        left = settle_deadline - time.monotonic()
+        if left <= 0:
+            break
+        client.timeout = min(timeout, left)
+        try:
+            values = permission_settings(client, sid, owner)
+        finally:
+            client.timeout = timeout
+    return values
+
+
 def matching_threads(client, folder, title, remaining):
     """Scan all saved pages; any incomplete scan refuses creation."""
     import sessions
@@ -289,6 +309,16 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                 stage = 'title'
                 creator.timeout = remaining()
                 creator.call('thread/name/set', {'threadId': sid, 'name': title})
+            elif thread.get('historyMode') == 'paginated':
+                stage = 'persistence'
+                creator.timeout = remaining()
+                # Reading history materializes a loaded paginated thread. Some
+                # app-server builds then fail to list turns on a fresh rollout.
+                try:
+                    creator.call('thread/read', {'threadId': sid, 'includeTurns': True})
+                except sessions.CodexRpcError as error:
+                    if (error.code, error.message) != (-32601, 'list_turns is not supported yet'):
+                        raise
         # Close the creator before proving persistence and exact Desktop adoption.
         stage = 'persistence'
         with factory(mode='saved', timeout=remaining()) as reader:
@@ -340,6 +370,9 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                         stage = 'model'
                         raise CreationError('Exact Codex Desktop owner substituted the requested --model')
                     stage = 'permissions'
+                    if 'permissions' in updates:
+                        result['permission_settings'] = permissions = settled_permissions(
+                            client, sid, owner, permissions, deadline, poll)
                     if not has_full_access(permissions):
                         raise CreationError('Exact Codex Desktop owner did not confirm Full Access with approvalPolicy never')
                     break
