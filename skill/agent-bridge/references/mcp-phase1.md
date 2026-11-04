@@ -42,7 +42,7 @@ installed by this implementation.
 ## Durable queue and delivery
 
 `mcp_phase1.py` owns a private 0700 state directory and 0600 SQLite ledger; the
-broker still keeps only routes durably and correspondence in memory. This
+broker separately checkpoints routing and bounded correspondence. This
 **separate, explicitly requested facade ledger** stores owned sessions, durable
 operation/key hashes, exact accepted payloads and fixed correlated replies.
 It is not a modification to the broker's persistence policy. Treat it as private
@@ -210,7 +210,8 @@ with `reply_to: null` do not complete an operation. This single consumption surf
 avoids processing the same correlated response twice; no exactly-once downstream
 side-effect guarantee is made. Consumers must guard their own downstream actions.
 
-The broker keeps inbox snapshots and ACK receipts only in memory. Limits are 64
+The broker checkpoints inbox snapshots, unacknowledged payloads and ACK receipts
+in its private correspondence store. Limits are 64
 receive routes per query; 16 concurrent multipage snapshots globally; 4 MiB of
 encoded metadata per scan and 16 MiB across retained snapshots; a 128 KiB encoded
 list-items/body-response budget below the broker's 1 MiB frame ceiling; and 8192
@@ -225,17 +226,28 @@ payloads are never silently evicted to make room. `CAPACITY_EXCEEDED` leaves the
 message unconsumed. No new inbox state is written to the facade operation ledger
 or routing snapshot. Terminal payloads retain the existing broker eviction rules.
 
-A facade restart or client reconnect preserves tokens, snapshots, unacknowledged
-payloads and receipts **only against the same broker and unchanged private ledger
-and policy**. A broker restart drops all correspondence, snapshots and receipts,
-including stray/orphan messages, with no replay or recovery spool. An old signed
-handle/cursor or explicit `expected_broker_instance` returns `BROKER_RESTARTED`
-with `correspondence_lost: true` before lookup of the lost object. A fresh client
-without a prior epoch receives the current epoch and volatile-policy disclosure;
-it cannot infer whether earlier correspondence existed. Expired cursors return
-`CURSOR_EXPIRED`; evicted payloads/absent receipts return `MESSAGE_UNAVAILABLE`, or
-`ACK_EXPIRED` if the terminal message remains. None implies that repeating a
-downstream action is safe. Uncertain/dispatching delivery cannot be ACKed here.
+A facade restart or client reconnect preserves tokens against the same broker
+and unchanged private ledger and policy. A broker restart preserves bounded
+correspondence, independent unread payloads, snapshots and unexpired ACK receipts.
+It never replays a delivery. Existing signed handles/cursors and explicit old
+`expected_broker_instance` still return `BROKER_RESTARTED`. A fresh inbox list
+issues new epoch-bound handles for the surviving unread mail. Use those handles
+for get and ACK. The same newly issued handle returns the identical ACK receipt
+on retry through its original deadline, including after terminal payload eviction.
+A previously ACKed message stays consumed across restart. Old epoch handles stay
+revoked even if their ACK receipt survives. Reconciliation using an old handle
+across broker epochs is unavailable. A reader with an uncertain pre-restart ACK
+must reconcile its downstream actions before deciding to process any surviving
+mail. No exactly-once side-effect guarantee is added.
+
+`BROKER_RESTARTED.correspondence_lost` reflects the broker's durable loss ledger.
+It is false for an intact checkpoint, true after recorded corruption or when the
+broker cannot confirm recovery. Fresh lists disclose the durable restart policy.
+See [correspondence storage](usage.md#correspondence-storage-issue-94) for the exact
+field allowlist, byte ceiling, atomic commit and durable dropped-ID diagnostics.
+Expired cursors return `CURSOR_EXPIRED`. Evicted payloads/absent receipts return
+`MESSAGE_UNAVAILABLE`, or `ACK_EXPIRED` if the terminal message remains.
+Uncertain/dispatching delivery cannot be ACKed here.
 
 ### Verification and owner deployment gates
 

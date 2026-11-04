@@ -315,8 +315,8 @@ class InboxIntegrationTests(unittest.TestCase):
             self.register(self.owned[0]['sender'])
         self.assertEqual(self.running.call('show', id=message['id'])['state'], 'pending')
 
-    def test_broker_restart_reports_loss_for_all_old_objects(self):
-        message = self.send('long body'); self.send('another')
+    def test_broker_restart_revokes_old_tokens_and_preserves_unacknowledged_mail(self):
+        message = self.send('long body'); remaining = self.send('another')
         first = self.listing(limit=1); handle = self.handle(message)
         body = self.data('bridge_message_get', message_id=handle, max_chars=1)
         self.data('bridge_message_ack', message_id=handle)
@@ -328,10 +328,20 @@ class InboxIntegrationTests(unittest.TestCase):
                            ('bridge_inbox_list', {'expected_broker_instance': first['broker_instance']})]:
             error = self.call(name, **args)['error']
             self.assertEqual(error['code'], 'BROKER_RESTARTED')
-            self.assertTrue(error['correspondence_lost'])
+            self.assertFalse(error['correspondence_lost'])
         fresh = self.listing()
-        self.assertEqual(fresh['messages'], [])
-        self.assertIn('volatile', fresh['restart_policy'])
+        self.assertEqual(len(fresh['messages']), 1)
+        handle = fresh['messages'][0]['message_id']
+        self.assertEqual(self.data('bridge_message_get', message_id=handle)['body'], 'another')
+        receipt = self.data('bridge_message_ack', message_id=handle)
+        self.assertEqual(self.data('bridge_message_ack', message_id=handle), receipt)
+        self.assertEqual(self.running.call('show', id=remaining['id'])['state'], 'done')
+        self.assertIn('durable', fresh['restart_policy'])
+        # Receipts survive even though old epoch-bound handles remain revoked.
+        self.running.restart()
+        self.assertEqual(self.listing()['messages'], [])
+        checkpoint = json.loads((Path(self.running.state_dir) / 'correspondence.json').read_text())
+        self.assertEqual(len(checkpoint['receipts']), 2)
 
     def test_frame_budget_pages_full_inbox_without_unbounded_rpc(self):
         sender = 'h' + 'x' * 20000

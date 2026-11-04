@@ -36,7 +36,7 @@ flowchart LR
         X["Codex / ChatGPT Desktop<br/>(codex)"]
         A["Antigravity IDE & Desktop<br/>(agy)"]
     end
-    B(("메모리 브로커<br/>Unix socket"))
+    B(("로컬 브로커<br/>Unix socket"))
     W["CLI 참가자<br/>(realtime · watch)"]
 
     C <-->|"send / ask / reply<br/>peerProtocol 1"| B
@@ -169,7 +169,7 @@ python3 "$bridge_cli" wt sweep --apply  # 대상 워크트리 및 브랜치 실�
 
 ### 5. 라우팅 영속화 및 선택적 `launchd` 서비스
 
-- **메모리 기반 메시지, 소유자 전용 라우팅 스냅샷**: 엔드포인트와 채널 바인딩만 `<state-dir>/routes.json`(`0600`)에 저장된다. 메시지 본문, 전달 상태, 중복 방지 키, 토큰, 이벤트 이력은 메모리에만 머물며 브로커 재시작 시 초기화된 뒤 유효한 라우트만 재검증해 복원한다.
+- **소유자 전용 메시지·라우팅 저장**. 라우트는 `<state-dir>/routes.json`, 제한된 메시지·전달 상태·중복 방지 키·인박스 스냅샷·ACK 영수증은 `correspondence.json`(`0600`)에 원자적으로 저장된다. 재시작은 전송을 재실행하지 않으며 중단된 전달은 `uncertain`으로 복원한다. 자격 증명·서명 핸들·진단 문자열·이벤트 이력은 메모리에만 남는다. 저장 필드·상한·유실 기록은 [저장 계약](../../skill/agent-bridge/references/usage.md#correspondence-storage-issue-94)을 따른다.
 - **선택적 macOS `launchd` 관리**: 자동 기동 서비스는 기본 꺼짐 상태다. `install-service`(검토용 파일 생성은 `--generate-only --plist PATH`)와 `uninstall-service`로 `KeepAlive` 에이전트를 관리한다.
 
 ### 6. 원격 MCP 파사드 (`mcp_server.py`)

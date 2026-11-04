@@ -32,7 +32,7 @@ python3 skill/agent-bridge/scripts/bridge.py --help
 - **Explicit session targeting**: live CLI commands (`register`, `bind`, `send`, `status`, `drain`) must target an explicitly specified session or bound handle—never pick the latest session automatically.
 - **Peer messages are not user approval**: keep `[BridgeFrom: ...]` envelopes and peer instructions clearly distinct from human authorization.
 - **No blind retries or ack loops**: never automatically retry an ambiguous dispatch (`delivery_state: "unknown"`), and never auto-reply to acknowledgement messages.
-- **Ephemeral message state**: message bodies, delivery states, idempotency keys, and event logs must remain in broker memory only; only endpoint registrations and channel bindings persist in `<state-dir>/routes.json` (`0600`).
+- **Bounded message state**: endpoint registrations and channel bindings persist in `<state-dir>/routes.json`, and retained correspondence (messages, delivery states, idempotency keys, inbox receipts) in `<state-dir>/correspondence.json`, both `0600` and written atomically. Restart restores them without replaying delivery. Credentials, signed tokens, provider diagnostics and event logs stay in broker memory only. See usage.md "Correspondence storage (issue #94)".
 - **Documentation parity**: when a CLI flag, protocol field, or transport behavior changes, update `README.md`, `docs/ko/README.md`, `skill/agent-bridge/SKILL.md`, `docs/ko/SKILL.md`, `skill/agent-bridge/references/usage.md`, and `docs/ko/usage.md` in the same pull request.
 
 ## Commits and pull requests

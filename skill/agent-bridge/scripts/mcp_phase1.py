@@ -1034,7 +1034,10 @@ class Engine:
                      'CAPACITY_EXCEEDED', 'INVALID_ARGUMENT', 'INBOX_ITEM_TOO_LARGE'}
             fault = Fault(code if code in known else 'BACKEND_UNAVAILABLE')
             if code == 'BROKER_RESTARTED':
-                fault.payload['correspondence_lost'] = True
+                try:
+                    fault.payload['correspondence_lost'] = self.backend.rpc('ping').get('correspondence_lost', True)
+                except (ValueError, OSError):
+                    fault.payload['correspondence_lost'] = True
             raise fault from None
         except OSError:
             raise Fault('BACKEND_UNAVAILABLE') from None
@@ -1070,7 +1073,7 @@ class Engine:
             return {'messages': [self.inbox_message(m, principal, epoch, routes) for m in result['messages']],
                     'uninitialized_agent_session_ids': result['uninitialized_agent_session_ids'],
                     'has_more': result['has_more'], 'next_cursor': token, 'broker_instance': epoch,
-                    'restart_policy': 'volatile; facade reconnect requires the same broker'}
+                    'restart_policy': 'durable correspondence; restart requires a fresh list and re-issued handles'}
         handle = self.inbox_token(args['message_id'], principal, 'message')
         routes = self.inbox_routes(principal, handle['s'])
         if digest(routes) != handle['r']:
