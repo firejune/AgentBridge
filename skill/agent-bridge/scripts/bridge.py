@@ -521,7 +521,11 @@ def open_codex_result(args):
         elif args.session or args.discover:
             raise codex_new.CreationError('--new cannot be combined with --session or --discover')
         source = new_session_policy(args, 'codex')
-        result = sessions.open_session('codex', cwd=args.cwd, title=args.title, model=args.model,
+        name = args.register if args.cmd == 'open' else args.name
+        title = args.title
+        if title is None and name:
+            title = f'{args.project}/{name}'
+        result = sessions.open_session('codex', cwd=args.cwd, title=title, model=args.model,
             timeout=args.timeout, host=args.host, ide=args.ide, force_new=args.new)
     except codex_new.CreationError as error:
         result = error.result
