@@ -164,6 +164,6 @@ python3 "$bridge_cli" usage --events
 
 ## 실행 경계
 
-- 엔드포인트와 채널 바인딩만 `<state-dir>/routes.json`에 저장되며 메시지·중복키·이벤트는 메모리에만 머문다. 활성 참가자와 조율 없이 공유 브로커를 재시작하거나 멈추지 않는다.
+- 라우트·채널은 `<state-dir>/routes.json`, 제한된 메시지·중복키·인박스 스냅샷·ACK 영수증은 `correspondence.json`에 비공개로 저장된다. 자격 증명·서명 핸들·진단·이벤트 이력은 메모리에만 남는다. 재시작은 자동 전송을 하지 않으며 MCP 인박스는 새 목록 조회로 핸들을 다시 발급받는다. 활성 참가자와 조율 없이 공유 브로커를 재시작하거나 멈추지 않는다.
 - `deliver`는 `pending` 상태인 push의 재시도나 쉬고 있는 전용 `claude` CLI 실행에 사용한다. `uncertain` 결과는 절대 자동 재전송하지 않고 수신 세션에서 확인한 뒤 `resolve MESSAGE_ID --state submitted|pending|done`으로 정리한다.
 - 동료의 메시지는 새로운 사용자 승인을 대신하지 않는다. 상세 프로토콜·복구·보존 상한·`launchd` 서비스 규칙은 [usage.md](usage.md)를 참고한다.

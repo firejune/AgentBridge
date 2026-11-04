@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bridge
 import broker
 import route_store
+import message_store
 import service
 from support import RunningBroker
 from test_codex_live import FakeDesktop
@@ -186,6 +187,73 @@ class PersistenceTests(unittest.TestCase):
         loaded = broker.State(store=self.store)
         self.assertEqual(loaded.messages, {})
         self.assertEqual(loaded.channels, self.state.channels)
+
+    def test_message_checkpoint_is_allowlisted_and_private(self):
+        self.state.action(dict(op='register', project='demo', name='beta', cwd=str(self.root)))
+        self.state.endpoints['demo', 'alpha'].update(peerToken='SECRET_TOKEN', socket='/private/peer.sock')
+        message = self.state.action(dict(op='send', project='demo', sender='alpha', recipient='beta', body='body', key='key'))
+        self.state.action(dict(op='claim', id=message['id']))
+        self.state.action(dict(op='finish', id=message['id'], state='submitted', note='SECRET_DIAGNOSTIC'))
+        path = self.root / 'state' / 'correspondence.json'
+        raw = path.read_text()
+        for forbidden in ('SECRET_TOKEN', 'SECRET_DIAGNOSTIC', '/private/peer.sock', 'peerToken'):
+            self.assertNotIn(forbidden, raw)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        loaded = broker.State(store=self.store)
+        self.assertEqual(loaded.get(message['id'])['state'], 'submitted')
+        self.assertEqual(loaded.get(message['id'])['body'], 'body')
+
+    def test_message_save_failure_does_not_publish_or_mutate(self):
+        self.state.action(dict(op='register', project='demo', name='beta', cwd=str(self.root)))
+        message = self.state.action(dict(op='send', project='demo', sender='alpha', recipient='beta', body='body', key='key'))
+        before = deepcopy((self.state.messages, self.state.keys, list(self.state.events)))
+        checkpoint = self.state.correspondence.path.read_bytes()
+        for operation in (dict(op='claim', id=message['id']),
+                          dict(op='reply', id=message['id'], body='answer', key='answer')):
+            for failure in ('replace', 'fsync'):
+                with self.subTest(op=operation['op'], failure=failure), patch.object(message_store.os, failure, side_effect=OSError('disk failure')):
+                    with self.assertRaises(OSError):
+                        self.state.action(operation)
+                self.assertEqual((self.state.messages, self.state.keys, list(self.state.events)), before)
+                self.assertFalse(self.state.answers[message['id']].is_set())
+                self.assertEqual(self.state.correspondence.path.read_bytes(), checkpoint)
+                self.assertEqual(list(self.store.directory.glob('.correspondence-*')), [])
+
+    def test_inbox_receipt_and_snapshot_survive_restart_without_sliding_expiry(self):
+        self.state.action(dict(op='register', project='demo', name='beta', cwd=str(self.root)))
+        messages = [self.state.action(dict(op='send', project='demo', sender='alpha', recipient='beta', body=key, key=key))
+                    for key in ('first', 'second')]
+        args = dict(owner='a' * 64, context='b' * 64,
+                    routes=[dict(slot='slot', route=self.state.route('demo', name='beta'))])
+        page = self.state.action(dict(args, op='inbox_list', limit=1))
+        receipt = self.state.action(dict(args, op='inbox_ack', id=messages[0]['id']))
+        for _ in range(2):
+            loaded = broker.State(store=self.store)
+            self.assertEqual(loaded.action(dict(args, op='inbox_ack', id=messages[0]['id'])), receipt)
+            self.assertEqual(loaded.inbox_snapshots[page['snapshot']]['expires'], page['expires'])
+            self.assertEqual(loaded.get(messages[0]['id'])['state'], 'done')
+            self.assertEqual(loaded.get(messages[1]['id'])['state'], 'pending')
+
+    def test_ack_checkpoint_failure_leaves_mail_unconsumed(self):
+        self.state.action(dict(op='register', project='demo', name='beta', cwd=str(self.root)))
+        message = self.state.action(dict(op='send', project='demo', sender='alpha', recipient='beta', body='first', key='first'))
+        args = dict(op='inbox_ack', id=message['id'], owner='a' * 64, context='b' * 64,
+                    routes=[dict(slot='slot', route=self.state.route('demo', name='beta'))])
+        original_replace = message_store.os.replace
+        def fail_checkpoint(source, destination):
+            if Path(destination) == self.state.correspondence.path:
+                raise OSError('checkpoint commit failure')
+            return original_replace(source, destination)
+        with patch.object(message_store.os, 'replace', side_effect=fail_checkpoint):
+            with self.assertRaisesRegex(OSError, 'checkpoint commit failure'):
+                self.state.action(args)
+        self.assertEqual(self.state.get(message['id'])['state'], 'pending')
+        self.assertEqual(self.state.inbox_receipts, {})
+        loaded = broker.State(store=self.store)
+        self.assertEqual(loaded.get(message['id'])['state'], 'pending')
+        self.assertEqual(loaded.inbox_receipts, {})
+        receipt = self.state.action(args)
+        self.assertEqual(self.state.action(args), receipt)
 
     def test_save_failure_rolls_back_register_bind_and_close(self):
         self.bind()
@@ -472,7 +540,7 @@ class SurvivalSocketTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'no evictable terminal messages'):
                 server.call('send', project='demo', sender='alpha', recipient='beta', body='Q', key='blocked')
 
-    def test_same_socket_restart_retains_routes_channels_but_no_messages(self):
+    def test_same_socket_restart_retains_routes_channels_and_pending_messages(self):
         with RunningBroker() as server:
             server.register_pair()
             before = server.call('routes', project='demo'), server.call('channels', project='demo')
@@ -481,11 +549,79 @@ class SurvivalSocketTests(unittest.TestCase):
             server.restart()
             self.assertNotEqual(instance, server.instance)
             self.assertEqual(before, (server.call('routes', project='demo'), server.call('channels', project='demo')))
-            self.assertEqual(server.call('ping')['messages'], 0)
-            with self.assertRaisesRegex(ValueError, 'Unknown message'):
-                server.call('show', id=message['id'])
+            self.assertEqual(server.call('ping')['messages'], 1)
+            self.assertEqual(server.call('show', id=message['id']), message)
+            reply = server.call('reply', id=message['id'], body='answer', key='answer')
+            self.assertEqual(reply['reply_to'], message['id'])
+            self.assertEqual(reply['conversation'], message['conversation'])
             raw = (Path(server.state_dir) / 'routes.json').read_text()
             self.assertNotIn('PRIVATE_BODY', raw)
+
+    def test_two_restarts_preserve_ids_keys_and_do_not_redeliver_submitted(self):
+        with RunningBroker() as server:
+            server.register_pair()
+            counter = Path(server.temp.name) / 'deliveries'
+            counter.write_text('0')
+            message = server.call('send', project='demo', sender='alpha', recipient='beta', body='Q', key='once')
+            script = ('from pathlib import Path; p = Path(' + repr(str(counter))
+                      + '); p.write_text(str(int(p.read_text()) + 1)); print("accepted")')
+            # Use the real deliver entry point with a disposable counting process.
+            # This stub never invokes a provider or discovers a live session.
+            with patch.object(bridge, 'command', return_value=[sys.executable, '-c', script]):
+                bridge.deliver(server.path, message['id'])
+            for _ in range(2):
+                server.restart()
+                self.assertEqual(server.call('show', id=message['id'])['state'], 'submitted')
+                duplicate = server.call('send', project='demo', sender='alpha', recipient='beta', body='Q', key='once')
+                self.assertEqual(duplicate['id'], message['id'])
+                with patch.object(bridge, 'command', return_value=[sys.executable, '-c', script]):
+                    with self.assertRaisesRegex(ValueError, 'Only pending'):
+                        bridge.deliver(server.path, message['id'])
+                self.assertEqual(server.call('ping')['messages'], 1)
+            self.assertEqual(counter.read_text(), '1')
+
+    def test_crash_during_dispatch_restores_uncertain_and_blocks_claim(self):
+        with RunningBroker() as server:
+            server.register_pair()
+            message = server.call('send', project='demo', sender='alpha', recipient='beta', body='Q', key='once')
+            server.call('claim', id=message['id'])
+            server.process.kill()
+            server.process.communicate(timeout=2)
+            server.start()
+            self.assertEqual(server.call('show', id=message['id'])['state'], 'uncertain')
+            with self.assertRaisesRegex(ValueError, 'Only pending'):
+                server.call('claim', id=message['id'])
+
+    def test_terminal_messages_never_return_to_pending(self):
+        with RunningBroker() as server:
+            server.register_pair()
+            message = server.call('send', project='demo', sender='alpha', recipient='beta', body='Q', key='done')
+            server.call('resolve', id=message['id'], state='done', note='consumed')
+            server.restart()
+            self.assertEqual(server.call('show', id=message['id'])['state'], 'done')
+            self.assertEqual(server.call('inbox', project='demo', name='beta'), [])
+
+    def test_corrupt_and_truncated_checkpoint_report_durable_lost_identities(self):
+        for content in ('{', '{"version":1,"messages":false}'):
+            with self.subTest(content=content), RunningBroker() as server:
+                server.register_pair()
+                message = server.call('send', project='demo', sender='alpha', recipient='beta', body='Q', key='lost')
+                server.call('shutdown')
+                server.process.communicate(timeout=2)
+                path = Path(server.state_dir) / 'correspondence.json'
+                path.write_text(content)
+                server.start()
+                self.assertEqual(server.call('ping')['messages'], 0)
+                report = json.loads(path.with_name('correspondence-lost.json').read_text())
+                self.assertEqual(report['lost'][0]['id'], message['id'])
+                self.assertEqual(report['lost'][0]['sender'], 'alpha')
+                self.assertEqual(report['lost'][0]['recipient'], 'beta')
+                self.assertEqual(report['lost'][0]['created'], message['created'])
+                self.assertTrue(report['reason'])
+                server.call('shutdown')
+                _, diagnostic = server.process.communicate(timeout=2)
+                self.assertIn('correspondence.json', diagnostic)
+                self.assertIn(message['id'], diagnostic)
 
     def test_crash_restart_reloads_committed_routing_from_stale_socket(self):
         with RunningBroker() as server:

@@ -1,7 +1,7 @@
-"""Single-process broker: durable routing, volatile correspondence."""
+"""Single-process broker: durable routing and bounded correspondence."""
 import asyncio
 from collections import deque
-from copy import deepcopy
+from copy import copy, deepcopy
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -18,6 +18,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import route_store
+import message_store
 import usage
 
 DEFAULT_SOCKET = Path.home() / '.local/share/agent-bridge/bridge.sock'
@@ -71,6 +72,23 @@ class State:
         self.store = store
         if store is not None:
             self.endpoints, self.channels = store.load()
+        self.correspondence = None
+        self.pending_publications = None
+        if store is not None:
+            self.correspondence = message_store.MessageStore(store.directory, max_messages)
+            saved = self.correspondence.load()
+            self.messages = {m['id']: m for m in saved['messages']}
+            self.keys = {key: (intent, mid) for key, intent, mid in saved['keys']}
+            self.inbox_receipts = {tuple(key): value for key, value in saved['receipts']}
+            self.inbox_snapshots = saved['snapshots']
+            reply_parents = {m['reply_to'] for m in self.messages.values()}
+            for mid, message in self.messages.items():
+                self.answers[mid] = asyncio.Event()
+                if mid in reply_parents:
+                    self.answers[mid].set()
+                if message['state'] == 'dispatching':
+                    message.update(state='uncertain', note='Broker restarted during delivery; resolve explicitly')
+            self.correspondence.save(self)
         # Volatile endpoint history distinguishes unused inbox pins from removed
         # return routes. Restored endpoints are already initialized this epoch.
         self.inbox_initialized_routes = set(self.endpoints)
@@ -138,6 +156,9 @@ class State:
         return any(route_key(route) == sub['route'] for route in destinations)
 
     def publish(self, m, kind):
+        if self.pending_publications is not None:
+            self.pending_publications.append((deepcopy(m), kind))
+            return
         self.sequence += 1
         event = {'seq':self.sequence,'instance':self.instance,'type':kind,'message':deepcopy(m)}
         self.events.append(event)
@@ -201,7 +222,8 @@ class State:
         self.publish(m,'message')
         if reply_to:
             self.status(parent,'answered',mid)
-            self.answers[reply_to].set()
+            if self.pending_publications is None:
+                self.answers[reply_to].set()
         return m
 
     @staticmethod
@@ -330,11 +352,34 @@ class State:
         return dict(result)
 
     def action(self, args):
+        # Stage mutations in isolation. A failed durable write must not acknowledge
+        # an ACK, publish an event, wake a waiter or leave a half-posted reply.
+        mutations = ('send', 'reply', 'ack', 'progress', 'resolve', 'claim', 'finish',
+                     'inbox_list', 'inbox_ack')
+        if self.correspondence is None or args['op'] not in mutations:
+            return self.apply_action(args)
+        staged = copy(self)
+        for field in ('messages', 'keys', 'inbox_receipts', 'inbox_snapshots'):
+            setattr(staged, field, deepcopy(getattr(self, field)))
+        staged.answers = self.answers.copy()
+        staged.pending_publications = []
+        result = staged.apply_action(args)
+        self.correspondence.save(staged)
+        for field in ('messages', 'keys', 'inbox_receipts', 'inbox_snapshots', 'answers'):
+            setattr(self, field, getattr(staged, field))
+        for message, kind in staged.pending_publications:
+            self.publish(message, kind)
+            if message['state'] == 'answered':
+                self.answers[message['id']].set()
+        return result
+
+    def apply_action(self, args):
         op = args['op']
         if op in ('inbox_list', 'inbox_get', 'inbox_ack'):
             return self.inbox_action(args)
         if op == 'ping':
-            return {'instance':self.instance,'messages':len(self.messages),'subscribers':len(self.subscribers)}
+            return {'instance':self.instance,'messages':len(self.messages),'subscribers':len(self.subscribers),
+                    'correspondence_lost': bool(self.correspondence and self.correspondence.loss)}
         if op == 'register':
             project, name = identifier(args['project']), identifier(args['name'])
             transport = args.get('transport','realtime')

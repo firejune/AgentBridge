@@ -4,7 +4,7 @@
 
 A local CLI for real-time peer-to-peer correspondence across AI coding agents. Requires Python 3.10+ and uses only the Python standard library over Unix domain sockets on macOS and Linux — no third-party packages, API keys, or network ports required.
 
-**No SQLite or file mailboxes for broker messages.** Only endpoints and channel bindings persist in an owner-private routing snapshot (`routes.json`). Messages, delivery state, conversations, idempotency keys, and events stay in memory. Restarting clears correspondence and re-verifies routing; it never replays messages.
+The broker keeps owner-private routing in `routes.json` and bounded correspondence in `correspondence.json`. Restart restores captured messages and delivery state without replaying delivery. Credentials, signed tokens, provider diagnostics and event streams remain in memory. See [correspondence storage](#correspondence-storage-issue-94).
 
 ## Architecture
 
@@ -92,7 +92,7 @@ MESSAGE
 - `send` takes the same arguments as `ask` without waiting. You can wait later with `wait REQUEST_ID --timeout 60`.
 - When `ask` or `wait` times out, it exits with code 2 (`timed_out: true`). It does not cancel the request; run `wait` again on the same ID to collect a late reply.
 - Reuse the same `--key` when retrying a send. Reusing a key with different payload parameters is rejected. Idempotency keys last only while their messages are retained in the current broker run.
-- Inspect queued or historical in-memory messages with `inbox`, `show`, and `conversation`:
+- Inspect queued or retained messages with `inbox`, `show`, and `conversation`:
 
 ```bash
 python3 "$bridge_cli" inbox --project my-app --channel modal-view
@@ -120,7 +120,7 @@ python3 "$bridge_cli" watch --project my-app --channel modal-view \
 
 `serve --state-dir PATH` stores `routes.json` beneath an owner-private directory (`0700`, file `0600`). Without this option, the socket path's suffix is replaced by `.state` (default: `~/.local/share/agent-bridge/bridge.state/`). Every registration, route removal (`unregister`, used by `close`), channel bind, and channel close atomically writes an allowlisted snapshot (`routes.json`).
 
-- **What is stored**: Only project/name, transport, session UUID, workspace, optional executable, and channel ownership/description/generation/active flag and pinned route. No message bodies, idempotency keys, delivery state, event history, provider tokens, discovered peer socket paths, or PIDs are persisted.
+- **Routing snapshot fields**. Project/name, transport, session UUID, workspace, optional executable, channel ownership/description/generation/active flag and pinned route. Correspondence has a separate checkpoint described below. Provider tokens, discovered peer sockets and PIDs are excluded from both.
 - **Startup validation**:
   - `claude-peer`: requires the exact live registry UUID/PID/protocol, owned socket, and matching workspace.
   - `agy`: requires its exact live trajectory and workspace.
@@ -289,3 +289,67 @@ Run the full test suite before committing changes:
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+
+## Correspondence storage (issue #94)
+
+The existing RouteStore lock and owner-private directory cover correspondence as
+well. Files are `0600`. Checkpoints use a temporary file, flush/fsync and atomic
+replace before the broker publishes a mutation or returns acceptance. A failed
+save leaves the previous checkpoint and in-memory message state intact. There
+is no automatic retry or delivery on load.
+
+The checkpoint's version is 1. Its field allowlist is as follows.
+
+- `messages` preserves `id`, `conversation`, `project`, `sender`, `recipient`,
+  `channel`, `sender_channel`, `body`, `reply_to`, `state`, `created`, and optional
+  `acknowledged_at`. Captured `route` and `return_route` each contain project,
+  name, transport, cwd, session, executable and optional channel/generation.
+  These are the original pinned identities, independent of current registration.
+- `keys` contains the idempotency key, message ID and exact original intent fields
+  project, sender, recipient, channel, sender_channel, body, key and reply_to.
+- `receipts` contains owner/context digests and message ID, plus result fields
+  id, acknowledged, acknowledged_at, broker_instance, reconcile_until and expiry.
+  Original receipt times and the one-hour reconciliation deadline never slide.
+- `snapshots` contains snapshot UUID, owner/context digests, frozen list metadata,
+  original expiry and encoded byte count. Metadata has the same fields as inbox
+  list output before signing. No signed handle, cursor or signing key is stored.
+
+Bodies and captured workspace/session identities are private conversation data.
+Do not commit checkpoints or attach them to diagnostic bundles. Peer tokens,
+CSRF tokens, runtime socket metadata, provider diagnostic notes and event payloads
+are excluded. After restart, message `note` is null and `events` is empty. Live
+waits, subscribers and event cursors must reconnect. New events use a new broker
+instance. Persisted message IDs and conversations remain unchanged.
+
+All retained terminal messages keep their terminal state and remain eligible for
+normal oldest-terminal eviction. `pending`, `submitted`, `received`, `in_progress`
+and `uncertain` retain their state. `dispatching` becomes `uncertain` because the
+broker cannot know whether the external recipient accepted the interrupted push.
+Resolve that outcome explicitly. No recovery path invokes a provider.
+
+The message count is the existing `--max-messages` limit (default 2048). Pending
+and protected work is never evicted to admit a new message. The existing 32768-byte
+body limit remains. A checkpoint message must fit the existing 1 MiB frame budget.
+Inbox limits remain 16 snapshots, 4 MiB per snapshot, 16 MiB total and 8192 ACK
+receipts, with the existing fixed one-hour expiry. The encoded checkpoint ceiling
+is `max_messages * 1 MiB + 16 MiB + 8192 * 1024` bytes. Capacity or write failures
+reject the mutation before publication, without consuming the message. The
+metadata index and loss ledger each use that same byte ceiling. Exceeding a
+restoration limit records the dropped checkpoint rather than partially restoring
+an incoherent conversation.
+
+`correspondence-index.json` is an atomic metadata-only index written before each
+checkpoint. It records each retained message's id, sender, recipient and created
+time. It never supplies replay data. A corrupt, truncated, missing or invalid
+checkpoint produces a stderr diagnostic naming `correspondence.json` and dropped
+IDs, and a durable `correspondence-lost.json` with those identities, original
+times, detection time and reason. Previous incident records remain in its
+`previous` array. If the index is also unavailable, identities are explicitly
+unknown. Recovery preserves the damaged checkpoint as
+`correspondence-corrupt.json` and starts without that mail. Further recovery at
+the loss-ledger byte ceiling requires owner intervention instead of deleting
+prior loss evidence. The index can contain an unaccepted attempted write when
+its following checkpoint write failed, so corruption reports conservatively name
+all potentially affected IDs. The broker's `ping.correspondence_lost` remains
+true while a loss ledger exists.
