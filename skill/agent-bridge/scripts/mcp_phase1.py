@@ -697,8 +697,8 @@ class Engine:
             if alias != session['alias']:
                 raise Fault('WORKSPACE_NOT_ALLOWED')
 
-    def fail(self, op, code='DELIVERY_UNKNOWN', unknown=True):
-        failure = Fault(code).payload
+    def fail(self, op, code='DELIVERY_UNKNOWN', unknown=True, message=None):
+        failure = Fault(code, message).payload
         failure['operation_id'] = op['operation_id']
         self.update(op,status='unknown' if unknown else 'failed',failure=failure,result=None)
 
@@ -784,7 +784,12 @@ class Engine:
                 # A recorded pre-send failure is definite; uncertain stays blocked.
                 m = e.message
                 self.update(op,backend_message_state=m['state'])
-                self.fail(op,'BACKEND_UNAVAILABLE' if m['state']=='pending' else 'DELIVERY_UNKNOWN',m['state']!='pending')
+                if m.get('reason') == bridge.ARCHIVED_REASON:
+                    self.fail(op, 'BACKEND_UNAVAILABLE', False, bridge.codex_live.ThreadArchived.MESSAGE)
+                elif m['state'] == 'pending':
+                    self.fail(op, 'BACKEND_UNAVAILABLE', False)
+                else:
+                    self.fail(op)
                 return
             self.update(op,stage='observing',backend_message_state=message['state'])
             with self.transaction():
@@ -842,7 +847,9 @@ class Engine:
                             pending_reply_cleanup=[r['id'] for r in replies])
                 self.cleanup_replies(op)
             elif state=='failed':
-                self.fail(op,'BACKEND_UNAVAILABLE',False)
+                detail = (bridge.codex_live.ThreadArchived.MESSAGE
+                          if message.get('reason') == bridge.ARCHIVED_REASON else None)
+                self.fail(op, 'BACKEND_UNAVAILABLE', False, detail)
             elif state=='uncertain' or (recovering and state in ('pending','dispatching')):
                 self.fail(op)
         except Exception:

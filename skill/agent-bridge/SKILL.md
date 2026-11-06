@@ -87,6 +87,7 @@ python3 "$bridge_cli" register codex-worker --project PROJECT --transport codex 
 ```
 
 - **Direct push**: Connects to `ipc/ipc.sock` under `CODEX_HOME` (default `~/.codex`, or `AGENT_BRIDGE_CODEX_IPC`) and verifies the exact thread owner advertising `supportsUntrustedAppInput`. Delivers peer messages as standalone `toolOutput` (`agent_bridge`), calling `thread-follower-steer-turn` first to join an active turn and falling back to `thread-follower-start-turn` only when inactive.
+- If the exact registered Codex thread is confirmed archived, the CLI reports `failed` with `reason: "archived"` and exits 1 before contacting Desktop.
 - **Sidebar preview**: After the first task is accepted (`submitted`), an empty native sidebar `preview` is initialized once in `state_5.sqlite` without altering identity or failing the delivery if unavailable.
 - **Autonomous creation (`open` / `register --new`)**:
   - Creates a persistent thread via `app-server --stdio`, sets its title via `thread/name/set`, opens `codex://threads/UUID` so Desktop adopts it, and verifies the exact Desktop owner — **no Enter or UI automation required**.

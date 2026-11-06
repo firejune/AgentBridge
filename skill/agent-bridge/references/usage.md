@@ -232,6 +232,7 @@ Handoff succeeds only when `--expect-generation` matches the current generation.
 - **Codex (`codex`)**:
   - Connects to the exact registered thread owner over `CODEX_HOME/ipc/ipc.sock` (or `AGENT_BRIDGE_CODEX_IPC`).
   - Delivers peer bodies as standalone `toolOutput` (`agent_bridge`), calling `thread-follower-steer-turn` first to join an active turn and falling back to `thread-follower-start-turn` only when inactive.
+  - If the exact saved thread is confirmed archived, `send`, `ask`, `reply` and `deliver` exit 1 and record `failed` with `reason: "archived"` before contacting Desktop. The reason is retained with the failed message across broker restarts. `deliver --dry-run` reports the reason without changing the message. If saved metadata is unavailable, ordinary IPC delivery checks still apply.
   - After the first accepted task (`submitted`), initializes an empty native sidebar `preview` in `state_5.sqlite` (100 ms SQLite lock budget; preview warnings never fail or resend an accepted delivery).
 - **Antigravity (`agy`)**:
   - Verifies the exact `conversationId` and workspace against the local `language_server` / `agy --hub` ConnectRPC (`GetAllCascadeTrajectories` / `GetConversationMetadata`).
@@ -309,7 +310,8 @@ The checkpoint's version is 1. Its field allowlist is as follows.
 
 - `messages` preserves `id`, `conversation`, `project`, `sender`, `recipient`,
   `channel`, `sender_channel`, `body`, `reply_to`, `state`, `created`, and optional
-  `acknowledged_at`. Captured `route` and `return_route` each contain project,
+  `acknowledged_at`. The only persisted delivery `reason` is `archived`
+  for failed Codex delivery. Captured `route` and `return_route` each contain project,
   name, transport, cwd, session, executable and optional channel/generation.
   These are the original pinned identities, independent of current registration.
 - `keys` contains the idempotency key, message ID and exact original intent fields

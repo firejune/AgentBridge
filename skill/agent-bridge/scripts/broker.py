@@ -200,9 +200,12 @@ class State:
                     sub['queue'].put_nowait({'error':'Subscriber fell behind; reconnect and inspect inbox'})
                     sub['overflow'] = True
 
-    def status(self, m, state, note=None, event=None):
+    def status(self, m, state, note=None, event=None, reason=None):
         m.update(state=state,note=note)
+        m.pop('reason', None)
         entry = {'state':state,'note':note,'at':now()}
+        if reason is not None:
+            m['reason'] = entry['reason'] = reason
         if event:
             entry['event'] = event
         m['events'].append(entry)
@@ -509,7 +512,11 @@ class State:
                 if args['state']=='pending' and (event!='push_failed' or not args.get('note','').strip()):
                     # A failed push stays deliverable, but never silently.
                     raise ValueError('Returning to pending requires a push_failed event and reason')
-                return self.status(m,args['state'],args.get('note'),event)
+                reason = args.get('reason')
+                if reason is not None and (reason != message_store.ARCHIVED_REASON
+                        or args['state'] != 'failed' or m['route']['transport'] != 'codex'):
+                    raise ValueError('Invalid delivery reason')
+                return self.status(m,args['state'],args.get('note'),event,reason)
             if m['state'] in ('done','answered'):
                 raise ValueError('Message is already complete')
             if op in ('ack','progress') and m['state'] in ('dispatching','uncertain'):

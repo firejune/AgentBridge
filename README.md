@@ -52,6 +52,8 @@ flowchart LR
 | **Antigravity IDE & Desktop** | `agy` | Connects to local `language_server` / `agy --hub` instances over ConnectRPC, injecting `<SYSTEM_MESSAGE>` (`SendAgentMessage`) into active turns and waking idle sessions via empty `SendUserCascadeMessage` (`NEXT_INVOCATION`). |
 | **CLI Workers** | `realtime` / `claude` | `realtime` streams JSONL events over `watch`. `claude` resumes an **idle dedicated** CLI session in read-only `plan` mode via `deliver` (never use `claude` on a live session). |
 
+When saved metadata confirms the exact Codex recipient is archived, the CLI exits 1 and reports `state: "failed"` with `reason: "archived"`. No message is sent to Desktop.
+
 ## Installation
 
 Install globally across Claude Code, Codex, and Antigravity in one command using [`skills`](https://skills.sh):

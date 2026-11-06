@@ -22,6 +22,7 @@ import broker
 import codex_live
 import codex_preview
 import codex_new
+from message_store import ARCHIVED_REASON
 import models
 import sessions
 import service
@@ -212,7 +213,7 @@ class ModelRelay:
 
 
 def push_if_peer(path, m):
-    if m['state'] == 'pending':
+    if m['state'] == 'pending' or m.get('reason') == ARCHIVED_REASON:
         if m['route']['transport'] == 'claude-peer':
             return push(path, m)
         if m['route']['transport'] == 'codex':
@@ -225,21 +226,34 @@ def push_if_peer(path, m):
 def push_codex(path, m, timeout=10, dry_run=False):
     def rpc(op, **fields):
         return broker.request(path, {'op':op, 'id':m['id'], **fields})
-    if dry_run:
-        return dict(state=m['state'], **codex_live.deliver(
-            m['route'], m['id'], peer_text(m, path, escape_peer=False), timeout, dry_run=True))
-    rpc('claim')
+    if m.get('reason') == ARCHIVED_REASON:
+        raise PushFailed(codex_live.ThreadArchived.MESSAGE, m)
+    if not dry_run:
+        if m['state'] != 'pending':
+            raise ValueError('Only pending messages may be delivered')
+        rpc('claim')
     try:
-        receipt = codex_live.deliver(m['route'], m['id'], peer_text(m, path, escape_peer=False), timeout)
+        receipt = codex_live.deliver(
+            m['route'], m['id'], peer_text(m, path, escape_peer=False), timeout, dry_run=dry_run)
+    except codex_live.ThreadArchived as error:
+        if dry_run:
+            return dict(state=m['state'], sent=False, reason=ARCHIVED_REASON, error=str(error))
+        message = rpc('finish', state='failed', reason=ARCHIVED_REASON, event='push_failed')
+        raise PushFailed(str(error), message) from None
     except codex_live.DeliveryError as error:
+        if dry_run:
+            raise
         state = 'uncertain' if error.uncertain else 'pending'
         fields = {} if error.uncertain else {'event':'push_failed'}
         message = rpc('finish', state=state, note=str(error), **fields)
         raise PushFailed(str(error), message) from None
     except BaseException:
         # Cancellation may arrive after the owner accepted the output.
-        rpc('finish', state='uncertain', note='Codex delivery interrupted; check the receiving turn before resolving')
+        if not dry_run:
+            rpc('finish', state='uncertain', note='Codex delivery interrupted; check the receiving turn before resolving')
         raise
+    if dry_run:
+        return dict(state=m['state'], **receipt)
     result = rpc('finish', state='submitted', event='pushed',
                  note=f"Codex {receipt['delivery_mode']} tool output accepted by turn {receipt['turn_id']}")
     # Delivery is already terminally accepted before optional sidebar metadata.
@@ -298,8 +312,6 @@ def deliver(path, mid, timeout=180, dry_run=False):
         return rpc("finish", state=state, note=note)
     m = rpc("show")
     if m['route']['transport'] == 'codex':
-        if m['state'] != 'pending' and not dry_run:
-            raise ValueError('Only pending messages may be delivered')
         return push_codex(path, m, timeout, dry_run)
     if m['route']['transport'] == 'claude-peer':
         if m['state'] != 'pending' and not dry_run:
@@ -899,7 +911,7 @@ def main(argv=None):
                 raise ValueError('Timeout must be positive')
             result = deliver(args.socket,args.id,args.timeout,args.dry_run)
             output(result)
-            return 1 if result['state'] in ('failed','uncertain') else 0
+            return int(result['state'] in ('failed','uncertain') or result.get('reason') == ARCHIVED_REASON)
         fields = {k:v for k,v in vars(args).items() if k not in ('cmd','socket','file','discover','new','title','model','codex_mode','state_dir','no_model') and not (k=='timeout' and args.cmd=='register')}
         fields['op'] = {'stop':'shutdown','ask':'send'}.get(args.cmd,args.cmd)
         if args.cmd in ('send','ask','reply'):
@@ -936,6 +948,8 @@ def main(argv=None):
         if message['route']['transport'] == 'codex':
             message = {k:message[k] for k in ('id','state','route')}
         result = {'error':str(error),'push_failed':True,'message':message}
+        if error.message.get('reason') == ARCHIVED_REASON:
+            message['reason'] = result['reason'] = ARCHIVED_REASON
         found = message_usage(args, error.message)
         output(result if found is None else {**result, 'usage': found})
         return 1

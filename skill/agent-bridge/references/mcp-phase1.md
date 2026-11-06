@@ -73,6 +73,11 @@ to distinguish server contract updates from live provider availability or
 client-cached tool catalogs. Unknown backend availability is `unavailable`, never guessed
 ready. Delivery acceptance is not completion.
 
+If the shared push confirms an archived Codex thread, the operation fails with
+`BACKEND_UNAVAILABLE` and a message explaining that delivery was blocked by the
+archive. The facade's existing admission check can reject an unavailable session
+before the push runs.
+
 Only exact `reply_to` responses form a success; the first observed nonempty bundle
 is sorted by `(created,id)` and frozen. Pagination slices Unicode code points.
 Cursors are signed and bound to owner, query kind, object, offset and one-hour

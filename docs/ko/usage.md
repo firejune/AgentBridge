@@ -229,6 +229,7 @@ python3 "$bridge_cli" channel-bind modal-view --project my-app --owner codex-age
 - **Codex (`codex`)**:
   - `CODEX_HOME/ipc/ipc.sock`(또는 `AGENT_BRIDGE_CODEX_IPC`)에서 정확한 대화 소유자에 연결한다.
   - 동료 본문을 standalone `toolOutput`(`agent_bridge`)로 전달하며, 활성 턴이면 `thread-follower-steer-turn`을 먼저 호출해 현재 턴에 합류하고 유휴 상태일 때만 `thread-follower-start-turn`을 호출한다.
+  - 저장된 수신 대화가 보관된 것으로 확인되면 `send`, `ask`, `reply`, `deliver`는 Desktop에 연결하기 전에 `failed`와 `reason: "archived"`를 기록하고 종료 코드 1을 반환한다. 브로커 재시작 후에도 실패한 메시지와 이유를 보존한다. `deliver --dry-run`은 메시지를 변경하지 않고 이유를 반환한다. 저장된 메타데이터를 읽을 수 없으면 기존 IPC 전달 검사를 적용한다.
   - 첫 과제가 `submitted`로 수락된 뒤 비어 있는 네이티브 사이드바 `preview`를 `state_5.sqlite`에 한 번 초기화한다(잠금 대기 100ms 제한; 미리보기 실패가 전달 성공을 뒤집거나 재전송을 유발하지 않음).
 - **Antigravity (`agy`)**:
   - 로컬 `language_server` / `agy --hub`의 ConnectRPC로 정확한 `conversationId`와 워크스페이스를 검증한다.
@@ -279,7 +280,7 @@ python3 "$bridge_cli" close NAME --project PROJECT [--keep-route] [--timeout 10]
 
 ## 메시지 체크포인트 복원
 
-소유자 전용 `correspondence.json`의 버전은 1이며 메시지·전달 상태·중복키·ACK 시각을 보존한다. 재시작은 메시지를 자동 전송하지 않는다. `--max-messages`를 줄이면 브로커의 기존 `make_room`을 재사용해 보호되지 않은 종료 메시지부터 오래된 순서로 제거한다. 부모·조상 보호 조건을 적용하고 남은 메시지는 저장 순서를 유지한다. 중복키는 실제 제거한 메시지의 것만 해제한다. 비종료 메시지와 보호된 메시지는 새 한도를 넘어도 유지한다. 시작 시 stderr에 `correspondence.json`·보존 건수·한도를 기록하고, `ping.correspondence_over_limit`과 `ping.max_messages`로 상태를 알린다. 새 메시지를 넣을 자리가 생길 때까지 전송은 기존 메시지 한도 오류로 거부된다. 실제 제거한 종료 메시지 ID만 손실 원장에 기록하며, 제거한 메시지가 없으면 원장을 새로 쓰지 않는다.
+소유자 전용 `correspondence.json`의 버전은 1이며 메시지·전달 상태·중복키·ACK 시각을 보존한다. 전달 이유는 Codex의 `failed` 상태에 해당하는 `archived`만 보존한다. 재시작은 메시지를 자동 전송하지 않는다. `--max-messages`를 줄이면 브로커의 기존 `make_room`을 재사용해 보호되지 않은 종료 메시지부터 오래된 순서로 제거한다. 부모·조상 보호 조건을 적용하고 남은 메시지는 저장 순서를 유지한다. 중복키는 실제 제거한 메시지의 것만 해제한다. 비종료 메시지와 보호된 메시지는 새 한도를 넘어도 유지한다. 시작 시 stderr에 `correspondence.json`·보존 건수·한도를 기록하고, `ping.correspondence_over_limit`과 `ping.max_messages`로 상태를 알린다. 새 메시지를 넣을 자리가 생길 때까지 전송은 기존 메시지 한도 오류로 거부된다. 실제 제거한 종료 메시지 ID만 손실 원장에 기록하며, 제거한 메시지가 없으면 원장을 새로 쓰지 않는다.
 
 쓰기 상한은 `max_messages * 1 MiB + 16 MiB + 8192 * 1024`바이트이며 건수 한도를 초과해 복원된 집합에도 적용한다. 읽기 상한은 최소 2048건 기준을 유지하며, 더 큰 이전 저장본은 검증된 메타데이터 인덱스의 건수로 본문 읽기 상한을 높인다. 상한을 넘고 인덱스를 사용할 수 없으면 시작을 거부한다.
 

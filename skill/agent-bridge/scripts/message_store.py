@@ -15,6 +15,7 @@ MESSAGE_FIELDS = ('id', 'conversation', 'project', 'sender', 'recipient', 'chann
 INTENT_FIELDS = ('project', 'sender', 'recipient', 'channel', 'sender_channel', 'body', 'key', 'reply_to')
 STATES = frozenset(('pending', 'dispatching', 'submitted', 'received', 'in_progress',
                     'uncertain', 'done', 'answered', 'failed'))
+ARCHIVED_REASON = 'archived'
 FRAME_BYTES = 1024 * 1024
 SNAPSHOT_BYTES = 16 * 1024 * 1024
 MAX_RECEIPTS = 8192
@@ -56,6 +57,11 @@ def message_record(raw):
             or result['route']['name'] != result['recipient']
             or result['return_route']['name'] != result['sender']):
         raise ValueError('Inconsistent message routes')
+    if raw.get('reason') is not None:
+        if (raw['reason'] != ARCHIVED_REASON or result['state'] != 'failed'
+                or result['route']['transport'] != 'codex'):
+            raise ValueError('Invalid delivery reason')
+        result['reason'] = ARCHIVED_REASON
     if raw.get('acknowledged_at') is not None:
         if not isinstance(raw['acknowledged_at'], str):
             raise ValueError('Invalid acknowledgement time')

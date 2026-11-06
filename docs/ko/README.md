@@ -52,6 +52,8 @@ flowchart LR
 | **Antigravity IDE & Desktop** | `agy` | 로컬 `language_server` / `agy --hub`의 ConnectRPC에 연결해 활성 턴에는 `<SYSTEM_MESSAGE>`(`SendAgentMessage`)로 합류하고, 유휴/대기 상태에는 빈 `SendUserCascadeMessage`(`NEXT_INVOCATION`)로 즉시 깨운다. |
 | **CLI 워커** | `realtime` / `claude` | `realtime`은 `watch`로 JSONL 이벤트를 구독한다. `claude`는 **쉬고 있는 전용 CLI 세션**만 `deliver` 시 읽기 전용 `plan` 모드로 `--resume`한다(라이브 세션에는 절대 사용하지 않는다). |
 
+저장된 메타데이터에서 수신 Codex 대화의 보관 상태를 확인하면 CLI는 Desktop으로 메시지를 보내지 않고 `state: "failed"`와 `reason: "archived"`를 반환한다. 종료 코드는 1이다.
+
 ## 글로벌 스킬 설치
 
 [`skills`](https://skills.sh) CLI로 Claude Code, Codex, Antigravity 글로벌 스킬 경로에 한 번에 설치할 수 있다:

@@ -233,6 +233,26 @@ class PhaseTest(unittest.TestCase):
         self.restart(); self.backend.register_error=False
         result=self.engine.recover_registration(op['operation_id'])
         self.assertEqual(result['status'],'succeeded'); self.assertEqual(self.backend.creates,1)
+    def test_archived_push_is_a_definite_failure(self):
+        sid = self.create()['agent_session_id']
+        oid = self.send(sid)['data']['operation_id']
+
+        def reject(message, session):
+            self.backend.pushes += 1
+            failure = dict(message, state='failed', reason='archived')
+            self.backend.messages[message['id']] = failure
+            raise phase.bridge.PushFailed('Codex thread is archived', failure)
+
+        self.backend.push = reject
+        self.engine.tick()
+        self.restart()
+        result = self.call('bridge_operation_get', operation_id=oid)['data']
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['backend_message_state'], 'failed')
+        self.assertEqual(result['failure']['code'], 'BACKEND_UNAVAILABLE')
+        self.assertIn('archived', result['failure']['message'])
+        self.assertEqual(self.backend.pushes, 1)
+
     def test_recovery_observes_only_and_broker_loss_blocks(self):
         sid=self.create()['agent_session_id']; oid=self.send(sid)['data']['operation_id']; self.engine.tick()
         self.restart(); self.assertEqual(self.engine.operation(oid,'owner-a')['status'],'running')
