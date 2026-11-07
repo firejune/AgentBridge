@@ -648,9 +648,9 @@ def close_participant(args):
     if args.expect_session and str(uuid.UUID(args.expect_session)) != route['session']:
         raise ValueError('Endpoint does not match --expect-session')
     if route['transport'] == 'codex':
-        if args.archive is not False:
+        if args.archive:
             if args.keep_route:
-                raise ValueError('Codex archive handoff removes the verified route; use --no-archive with --keep-route')
+                raise ValueError('Codex archive handoff removes the verified route. Use --keep-route with detach.')
             expected = {key: value for key, value in route.items() if key != 'closing'}
             prepared = broker.request(args.socket, {'op': 'close-prepare', **address, 'expected_route': expected})
             target = prepared['route']
@@ -789,13 +789,14 @@ def main(argv=None):
     p = sub.add_parser('model',help="Read a participant's model, or switch it with --set (provider-neutral)")
     p.add_argument('name');p.add_argument('--project',required=True);p.add_argument('--set',dest='target')
     p.add_argument('--timeout',type=float,default=30);p.add_argument('--state-dir')
-    p = sub.add_parser('close',help="Close a participant or prepare a native Codex archive handoff")
+    p = sub.add_parser('close',help="Close a participant or explicitly request archive",
+                       description='Codex close detaches the route by default. Use --archive for a native archive handoff.')
     p.add_argument('name');p.add_argument('--project',required=True)
     archive = p.add_mutually_exclusive_group()
-    archive.add_argument('--archive',action='store_true',default=None,
+    archive.add_argument('--archive',action='store_true',
                          help='Archive the session (Codex: prepare a native archive handoff)')
     archive.add_argument('--no-archive',dest='archive',action='store_false',
-                         help='Close without archiving the session')
+                         help='Close without archiving the session (the default)')
     archive.add_argument('--finish',metavar='CLOSE_ID',
                          help='Verify the native Codex archive and remove the prepared route')
     p.add_argument('--expect-session',metavar='UUID',help='Match the exact session (required with --finish)')

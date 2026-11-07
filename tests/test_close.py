@@ -266,7 +266,7 @@ class CloseCodexTests(unittest.TestCase):
             db.execute('UPDATE threads SET archived=1, rollout_path=? WHERE id=?', (str(rollout), self.sid))
 
     def test_close_handoff_persists_and_only_finishes_after_exact_archive(self):
-        code, prepared = self.close()
+        code, prepared = self.close('--archive')
         self.assertEqual((code, prepared['status'], prepared['closed'], prepared['route_removed']),
                          (0, 'awaiting_native_archive', False, False))
         self.assertEqual(prepared['session'], self.sid)
@@ -292,19 +292,19 @@ class CloseCodexTests(unittest.TestCase):
 
     def test_close_refuses_alias_channel_and_ambiguous_delivery(self):
         self.register('alias')
-        self.assertIn('another registered route', self.close()[1]['error'])
+        self.assertIn('another registered route', self.close('--archive')[1]['error'])
         self.server.call('unregister', project='p', name='alias')
         self.server.call('channel-bind', project='p', name='view', owner='target', description='view')
-        self.assertIn('active channels', self.close()[1]['error'])
+        self.assertIn('active channels', self.close('--archive')[1]['error'])
         self.server.call('channel-close', project='p', name='view', expect_generation=1)
         self.server.call('register', project='p', name='sender', cwd=str(self.cwd))
         pending = self.server.call('send', project='p', sender='sender', recipient='target', key='one', body='work')
         self.server.call('claim', id=pending['id'])
-        self.assertIn('unfinished correspondence', self.close()[1]['error'])
+        self.assertIn('unfinished correspondence', self.close('--archive')[1]['error'])
         self.server.call('finish', id=pending['id'], state='uncertain')
-        self.assertIn('unfinished correspondence', self.close()[1]['error'])
+        self.assertIn('unfinished correspondence', self.close('--archive')[1]['error'])
         self.server.call('resolve', id=pending['id'], state='done', note='reviewed')
-        self.assertEqual(self.close()[0], 0)
+        self.assertEqual(self.close('--archive')[0], 0)
 
     def test_closing_blocks_delivery_and_route_changes_but_preserves_history(self):
         self.server.call('register', project='p', name='sender', cwd=str(self.cwd))
@@ -312,7 +312,7 @@ class CloseCodexTests(unittest.TestCase):
         old = self.server.call('send', **fields)
         self.server.call('claim', id=old['id'])
         self.server.call('finish', id=old['id'], state='failed')
-        self.assertEqual(self.close()[0], 0)
+        self.assertEqual(self.close('--archive')[0], 0)
         self.assertEqual(self.server.call('send', **fields)['id'], old['id'])
         with self.assertRaisesRegex(ValueError, 'route is closing'):
             self.server.call('send', **{**fields, 'key': 'new'})
@@ -325,6 +325,7 @@ class CloseCodexTests(unittest.TestCase):
             self.register('alias')
         with self.assertRaisesRegex(ValueError, 'route is closing'):
             self.server.call('unregister', project='p', name='target')
+        self.assertEqual(self.close()[0], 1)
         self.assertEqual(self.close('--no-archive')[0], 1)
 
     def test_explicit_detach_preserves_original_rollout(self):
@@ -338,15 +339,15 @@ class CloseCodexTests(unittest.TestCase):
     def test_enrolled_operator_receives_one_request_and_claims_exact_close(self):
         self.enroll()
         with mock.patch.object(codex_live, 'deliver', return_value={'delivery_mode': 'idle', 'turn_id': 'test'}) as deliver:
-            code, prepared = self.close()
+            code, prepared = self.close('--archive')
             mid = prepared['operator_message_id']
             self.assertEqual((code, prepared['operator_delivery'], prepared['route_removed']),
                              (0, 'submitted', False))
             self.assertEqual(deliver.call_args.args[0]['session'], self.operator_sid)
             self.assertIn('close-operator ' + mid, deliver.call_args.args[2])
-            self.assertEqual(self.close(), (0, prepared))
+            self.assertEqual(self.close('--archive'), (0, prepared))
             self.server.restart()
-            self.assertEqual(self.close(), (0, prepared))
+            self.assertEqual(self.close('--archive'), (0, prepared))
             deliver.assert_called_once()
         with self.assertRaisesRegex(ValueError, 'reserved'):
             self.server.call('send', project='ops', sender='trigger', recipient='archive',
@@ -369,14 +370,29 @@ class CloseCodexTests(unittest.TestCase):
         status = self.server.call('wait', id=mid, timeout=1)
         self.assertEqual((status['timed_out'], status['close_status']), (False, 'done'))
 
+    def test_plain_close_detaches_without_scheduling_enrolled_operator(self):
+        self.enroll()
+        with mock.patch.object(codex_live, 'deliver') as deliver:
+            code, detached = self.close()
+            deliver.assert_not_called()
+        self.assertEqual((code, detached['method'], detached['archived'], detached['route_removed']),
+                         (0, 'detach', False, True))
+        self.assertEqual(self.server.call('ping')['messages'], 0)
+        self.assertEqual(self.server.call('routes', project='p'), [])
+        self.assertFalse(self.archive.exists())
+        self.assertEqual(self.rollout.read_text(encoding='utf-8'), 'test transcript')
+        with closing(sqlite3.connect(self.db)) as db:
+            row = db.execute('SELECT archived, rollout_path FROM threads WHERE id=?', (self.sid,)).fetchone()
+        self.assertEqual(row, (0, str(self.rollout)))
+
     def test_ambiguous_delivery_keeps_route_and_is_never_resent(self):
         self.enroll()
         with mock.patch.object(codex_live, 'deliver', side_effect=codex_live.DeliveryError('unknown', True)) as deliver:
-            code, prepared = self.close()
+            code, prepared = self.close('--archive')
             self.assertEqual((code, prepared['operator_delivery'], prepared['route_removed']),
                              (1, 'uncertain', False))
             self.server.restart()
-            self.assertEqual(self.close()[1]['operator_delivery'], 'uncertain')
+            self.assertEqual(self.close('--archive')[1]['operator_delivery'], 'uncertain')
             deliver.assert_called_once()
         with self.assertRaisesRegex(ValueError, 'Only pending'):
             self.server.call('claim', id=prepared['operator_message_id'])
@@ -385,18 +401,18 @@ class CloseCodexTests(unittest.TestCase):
     def test_operator_replacement_refuses_original_request(self):
         self.enroll()
         with mock.patch.object(codex_live, 'deliver', return_value={'delivery_mode': 'idle', 'turn_id': 'test'}) as deliver:
-            code, prepared = self.close()
+            code, prepared = self.close('--archive')
             self.assertEqual(code, 0)
             self.server.call('register', project='ops', name='archive', cwd=str(self.cwd), transport='codex',
                              session=str(uuid.uuid4()), executable=self.executable)
             self.assertEqual(self.operator(prepared['operator_message_id'], self.operator_sid)[0], 1)
-            self.assertEqual(self.close()[1]['operator_message_id'], prepared['operator_message_id'])
+            self.assertEqual(self.close('--archive')[1]['operator_message_id'], prepared['operator_message_id'])
             deliver.assert_called_once()
 
     def test_enrolled_operator_cannot_be_its_own_close_target(self):
         self.enroll(self.sid)
         with mock.patch.object(codex_live, 'deliver') as deliver:
-            code, error = self.close()
+            code, error = self.close('--archive')
             self.assertEqual(code, 1)
             self.assertIn('cannot archive itself', error['error'])
             self.assertNotIn('closing', self.server.call('routes', project='p')[0])

@@ -264,16 +264,16 @@ python3 "$bridge_cli" close NAME --project PROJECT [--archive | --no-archive] [-
 python3 "$bridge_cli" close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID [--timeout 10]
 ```
 
-Codex의 `close`와 `close --archive`는 정확히 등록된 스레드의 네이티브 보관 인계를 준비한다. 활성 채널, 같은 스레드의 다른 등록 별칭 또는 미완료 메시지가 있으면 준비를 거부한다. 종료 대기 중인 라우트는 브로커 재시작 후에도 전달, 교체, 일괄 다시 열기를 막는다. 종료가 대기 중이면 라우팅 스냅샷은 버전 2를 사용하며 이전 브로커는 이를 읽지 않는다. 준비 명령을 다시 실행하면 같은 종료 ID를 반환한다.
+Codex의 기본 `close`는 라우트를 분리한다. `close --archive`는 정확히 등록된 스레드의 네이티브 보관 인계를 준비한다. 활성 채널, 같은 스레드의 다른 등록 별칭 또는 미완료 메시지가 있으면 준비를 거부한다. 종료 대기 중인 라우트는 브로커 재시작 후에도 전달, 교체, 일괄 다시 열기를 막는다. 종료가 대기 중이면 라우팅 스냅샷은 버전 2를 사용하며 이전 브로커는 이를 읽지 않는다. `close --archive`를 다시 실행하면 같은 종료 ID를 반환한다.
 
-권한을 받은 별도 Codex Desktop 채팅의 담당자는 반환된 UUID와 작업 경로를 대조하고 스레드가 대기 중인지 확인한다. `set_thread_archived`에 정확한 `threadId`, 확인한 로컬 호스트, `source: codex`, `archived: true`를 전달한다. 사용자가 Desktop에서 직접 보관해도 된다. 이후 셸에서 반환받은 `close_id`와 UUID로 `--finish`를 실행한다. 브로커는 네이티브 보관 플래그와 보관 폴더의 읽을 수 있는 대화 파일을 확인한 뒤 일치하는 라우트를 제거한다. 검증 실패나 시간 초과 시 종료 대기 라우트를 유지한다. 앱 응답이 불명확하면 보관을 다시 호출하기 전에 `--finish`로 확인한다. 열린 라우트의 분리만 하려면 `--no-archive`를 쓰고 필요하면 `--keep-route`를 함께 쓴다.
+권한을 받은 별도 Codex Desktop 채팅의 담당자는 반환된 UUID와 작업 경로를 대조하고 스레드가 대기 중인지 확인한다. `set_thread_archived`에 정확한 `threadId`, 확인한 로컬 호스트, `source: codex`, `archived: true`를 전달한다. 사용자가 Desktop에서 직접 보관해도 된다. 이후 셸에서 반환받은 `close_id`와 UUID로 `--finish`를 실행한다. 브로커는 네이티브 보관 플래그와 보관 폴더의 읽을 수 있는 대화 파일을 확인한 뒤 일치하는 라우트를 제거한다. 검증 실패나 시간 초과 시 종료 대기 라우트를 유지한다. 앱 응답이 불명확하면 보관을 다시 호출하기 전에 `--finish`로 확인한다. 분리에는 `--no-archive`와 `--keep-route` 옵션도 쓸 수 있다.
 
 | Transport / Host | 동작 | 관찰된 결과 | 되돌리기 / 재개 |
 | --- | --- | --- | --- |
 | `claude-peer` (`claude-vscode`) | 등록된 정확한 PID에 `SIGTERM`, `--timeout`까지 대기 | 약 1초 내 종료(`resumable: true`), RSS 약 310 MB 해제, 탭에 종료 코드 143 표시 | 그 탭에 입력하면 같은 `sessionId`가 새 PID로 이어짐 |
 | `claude-peer` (`claude-desktop`) | 같음 (`SIGTERM`) | 약 3초 내 종료, 앱에 「세션이 중단되었습니다」 표시 | 그 세션에 메시지를 보내면 같은 `sessionId`로 이어짐 |
 | `agy` (데스크톱 · IDE) | 대기 중인 대화를 분리한다. `--archive`를 주면 `UpdateConversationAnnotations {archived: true}` 전송 후 재조회한다. | 보관 시 활성 목록에서 빠진다. | 보관했다면 UI 보관함에서 복원한다. |
-| `codex` | 네이티브 보관 인계를 준비하고 검증 후 정확한 라우트를 제거한다. | 네이티브 보관으로 대화가 보관함에 들어간다. | Codex 설정의 보관된 채팅에서 복원한다. |
+| `codex` | 기본은 분리다. `--archive`로 네이티브 보관 인계를 준비하고 검증 후 정확한 라우트를 제거한다. | 네이티브 보관으로 대화가 보관함에 들어간다. | Codex 설정의 보관된 채팅에서 복원한다. |
 | `realtime` / `claude` | 라우트만 제거 | — | — |
 
 ### Codex 종료 담당자 등록
@@ -284,7 +284,7 @@ Codex의 `close`와 `close --archive`는 정확히 등록된 스레드의 네이
 {"project":"ops","name":"archive","session":"OPERATOR_UUID","sender":"trigger"}
 ```
 
-새 `close NAME --project PROJECT`는 대상을 종료 대기 상태로 만들고 등록된 담당자에게 제어 요청을 한 번 보낸다. 제출되면 `operator_message_id`와 `operator_delivery`를 반환한다. `submitted`는 앱이 요청을 받았다는 뜻이다. `wait MESSAGE_ID --timeout 60`으로 검증된 완료를 기다리거나 대기 중에 `close`를 다시 실행해 상태를 볼 수 있다. 중단 또는 전달 실패 시 종료 대기 라우트는 남아 수동으로 확인할 수 있다. 결과가 불명확한 발송은 재전송하지 않는다.
+새 `close NAME --project PROJECT --archive`는 대상을 종료 대기 상태로 만들고 등록된 담당자에게 제어 요청을 한 번 보낸다. 제출되면 `operator_message_id`와 `operator_delivery`를 반환한다. `submitted`는 앱이 요청을 받았다는 뜻이다. `wait MESSAGE_ID --timeout 60`으로 검증된 완료를 기다리거나 대기 중에 `close --archive`를 다시 실행해 상태를 볼 수 있다. 중단 또는 전달 실패 시 종료 대기 라우트는 남아 수동으로 확인할 수 있다. 결과가 불명확한 발송은 재전송하지 않는다.
 
 등록된 채팅에서 전달된 `close-operator MESSAGE_ID`를 실행한다. 현재 등록 정보, 호출자 Codex 스레드 ID, 브로커의 정확한 종료 세대와 대상을 대조한다. 제어 기록은 브로커가 생성한다. 확인에 성공하면 대상이 Desktop에서 대기 중인지 확인하고 정확한 UUID, 로컬 호스트, `source: codex`, `archived: true`로 `set_thread_archived`를 한 번 호출한다. 이어서 반환된 식별자로 `close --finish`를 실행한다. 실제 보관 검증과 라우트 제거 후 제어 요청을 완료로 기록한다. 라우트를 제거한 뒤 완료 기록 저장이 실패하면 `operator_receipt: needs_reconciliation`을 반환한다. 보관과 라우트를 확인한 뒤 해당 제어 요청을 완료로 처리한다.
 

@@ -122,7 +122,7 @@ python3 "$bridge_cli" ask --project PROJECT --from-channel logic --channel view 
 # Reply on the original return route:
 python3 "$bridge_cli" reply REQUEST_ID --key UNIQUE_REPLY_KEY --file /absolute/answer.txt
 
-# Prepare a native Codex archive handoff or close another provider:
+# Close a session or request archive with --archive:
 python3 "$bridge_cli" close NAME --project PROJECT [--archive | --no-archive] [--keep-route]
 
 # Complete the Codex handoff after the operator archives the exact thread:
@@ -131,9 +131,9 @@ python3 "$bridge_cli" close NAME --project PROJECT --finish CLOSE_ID --expect-se
 
 - 📬 **Always report results back on the channel the task came in on** via `bridge.py reply`, including when blocked. Issue or PR comments do not replace the bridge reply.
 - `ack` and `progress` report receipt and status, not final answers. Exit code 2 from `ask` or `wait` means the wait timed out — run `wait REQUEST_ID` again rather than resending.
-- For Codex, `close` prepares a native archive handoff and returns the exact `session`, `cwd` and `close_id`. An authorized operator in a separate Codex Desktop chat verifies that UUID and workspace and that the target is idle, then calls `set_thread_archived` with `source: codex`, the verified local host, the explicit `threadId` and `archived: true`. A human can perform that step in Desktop. Run `--finish` with the original identifiers after native archive. If the app tool result is ambiguous, verify the result with `--finish` before any further archive action.
-- An owner can enroll one existing Codex Desktop chat in `<state-dir>/close-operator.json` as described in [usage](references/usage.md#enrolling-a-codex-close-operator). Once enrolled, a new `close` sends one handoff to that exact chat. An operator runs `close-operator MESSAGE_ID` in the enrolled chat to claim the broker record before using the app tool. The caller can use `wait MESSAGE_ID --timeout 60` for verified completion. Repeating `close` inspects the pending handoff.
-- Use `--no-archive` to detach Codex without an archive handoff. Claude still sends `SIGTERM` to the background CLI process, and Antigravity verifies the conversation is idle before detaching. Use `--archive` to request archiving for those providers. Close sessions you own or have the owner or HQ's authorization to close.
+- For Codex, `close --archive` prepares a native archive handoff and returns the exact `session`, `cwd` and `close_id`. An authorized operator in a separate Codex Desktop chat verifies that UUID and workspace and that the target is idle, then calls `set_thread_archived` with `source: codex`, the verified local host, the explicit `threadId` and `archived: true`. A human can perform that step in Desktop. Run `--finish` with the original identifiers after native archive. If the app tool result is ambiguous, verify the result with `--finish` before any further archive action.
+- An owner can enroll one existing Codex Desktop chat in `<state-dir>/close-operator.json` as described in [usage](references/usage.md#enrolling-a-codex-close-operator). Once enrolled, a new `close --archive` sends one handoff to that exact chat. An operator runs `close-operator MESSAGE_ID` in the enrolled chat to claim the broker record before using the app tool. The caller can use `wait MESSAGE_ID --timeout 60` for verified completion. Repeating `close --archive` inspects the pending handoff.
+- For Codex, plain `close` and `close --no-archive` detach the route. Claude sends `SIGTERM` to the background CLI process, and Antigravity verifies the conversation is idle before detaching. Use `--archive` to request archiving for those providers. Close sessions you own or have the owner or HQ's authorization to close.
 
 ## Models: Read, Switch, Policy
 

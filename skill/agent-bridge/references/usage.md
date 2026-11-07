@@ -267,16 +267,16 @@ python3 "$bridge_cli" close NAME --project PROJECT [--archive | --no-archive] [-
 python3 "$bridge_cli" close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID [--timeout 10]
 ```
 
-For Codex, `close` and `close --archive` prepare the exact registered thread for native archive. Prepare refuses active channels, other registered aliases for the same thread, and unfinished correspondence. The route enters a closing state that survives restart and blocks delivery, replacement and bulk reopen. Repeating prepare returns the same close ID.
+For Codex, plain `close` detaches the route. Use `--archive` to prepare the exact registered thread for native archive. Prepare refuses active channels, other registered aliases for the same thread, and unfinished correspondence. The route enters a closing state that survives restart and blocks delivery, replacement and bulk reopen. Repeating `close --archive` returns the same close ID.
 
-An authorized operator in a separate Codex Desktop chat checks the returned UUID and workspace and confirms the thread is idle. The operator calls `set_thread_archived` with the exact `threadId`, verified local host, `source: codex` and `archived: true`. A human can instead archive that exact thread in Desktop. A shell client then runs `--finish` with the returned `close_id` and UUID. The broker verifies the archive flag and the readable rollout file in the native archive directory before removing the matching route. A failed check or timeout keeps the closing route. Finish can be used to reconcile an ambiguous app response without resubmitting archive. Use `--no-archive` to detach an open route, optionally with `--keep-route`.
+An authorized operator in a separate Codex Desktop chat checks the returned UUID and workspace and confirms the thread is idle. The operator calls `set_thread_archived` with the exact `threadId`, verified local host, `source: codex` and `archived: true`. A human can instead archive that exact thread in Desktop. A shell client then runs `--finish` with the returned `close_id` and UUID. The broker verifies the archive flag and the readable rollout file in the native archive directory before removing the matching route. A failed check or timeout keeps the closing route. Finish can be used to reconcile an ambiguous app response without resubmitting archive. Detach also accepts `--no-archive` and `--keep-route`.
 
 | Transport / Host | Action | Observed Behavior | Undo / Resume |
 | --- | --- | --- | --- |
 | `claude-peer` (`claude-vscode`) | `SIGTERM` to the exact registered PID; waits up to `--timeout` | Process exits within ~1 s (`resumable: true`), freeing ~310 MB RSS; tab shows exit code 143 | Typing in the tab resumes the same `sessionId` under a new PID |
 | `claude-peer` (`claude-desktop`) | Same (`SIGTERM`) | Process exits within ~3 s; app shows "session interrupted" | Sending a message in the session resumes the same `sessionId` |
 | `agy` (Desktop & IDE) | Detaches an idle conversation. With `--archive`, sends `UpdateConversationAnnotations {archived: true}` and verifies readback. | Archiving removes the conversation from the active list. | Restore from archive in the UI if archived. |
-| `codex` | Prepares the native archive handoff. Finish removes the exact route after verification. | Native archive moves the conversation to archived chats. | Restore from archived chats in Codex settings. |
+| `codex` | Detaches by default. `--archive` prepares the native archive handoff. Finish removes the exact route after verification. | Native archive moves the conversation to archived chats. | Restore from archived chats in Codex settings. |
 | `realtime` / `claude` | Route removal only | — | — |
 
 ### Enrolling a Codex close operator
@@ -287,7 +287,7 @@ The owner authorizes an existing separate Codex Desktop chat with access to `set
 {"project":"ops","name":"archive","session":"OPERATOR_UUID","sender":"trigger"}
 ```
 
-A new `close NAME --project PROJECT` prepares the target and dispatches one control request to the enrolled operator. A successful submission returns `operator_message_id` and `operator_delivery`. `submitted` means the app accepted the message. Use `wait MESSAGE_ID --timeout 60` for verified completion, or repeat `close` to inspect a pending handoff. On interruption or delivery failure the route stays closing for manual reconciliation. An uncertain send is never replayed.
+A new `close NAME --project PROJECT --archive` prepares the target and dispatches one control request to the enrolled operator. A successful submission returns `operator_message_id` and `operator_delivery`. `submitted` means the app accepted the message. Use `wait MESSAGE_ID --timeout 60` for verified completion, or repeat `close --archive` to inspect a pending handoff. On interruption or delivery failure the route stays closing for manual reconciliation. An uncertain send is never replayed.
 
 In the enrolled chat, run the supplied `close-operator MESSAGE_ID` command. It checks the current enrollment, the caller's Codex thread ID, and the broker's exact closing generation and target. The broker issues this record through the close workflow. After a successful claim, check that the returned target is idle in Desktop and call `set_thread_archived` once with its explicit UUID, local host, `source: codex` and `archived: true`. Then run `close --finish` with the returned identifiers. Finish verifies the real archive, removes the route and marks the control request done. If receipt persistence fails after verified route removal, finish reports `operator_receipt: needs_reconciliation`. Inspect the archive and route, then resolve the control message as done.
 
