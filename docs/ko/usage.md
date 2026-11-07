@@ -276,6 +276,18 @@ Codex의 `close`와 `close --archive`는 정확히 등록된 스레드의 네이
 | `codex` | 네이티브 보관 인계를 준비하고 검증 후 정확한 라우트를 제거한다. | 네이티브 보관으로 대화가 보관함에 들어간다. | Codex 설정의 보관된 채팅에서 복원한다. |
 | `realtime` / `claude` | 라우트만 제거 | — | — |
 
+### Codex 종료 담당자 등록
+
+소유자는 `set_thread_archived`를 쓸 수 있는 별도의 기존 Codex Desktop 채팅에 종료 요청 처리를 승인한다. 해당 Codex UUID와 `realtime` 발신자를 같은 담당자 프로젝트에 등록한다. 기존 브로커의 소유자 전용 `<state-dir>/close-operator.json`에 아래 JSON을 권한 `0600`으로 저장한다.
+
+```json
+{"project":"ops","name":"archive","session":"OPERATOR_UUID","sender":"trigger"}
+```
+
+새 `close NAME --project PROJECT`는 대상을 종료 대기 상태로 만들고 등록된 담당자에게 제어 요청을 한 번 보낸다. 제출되면 `operator_message_id`와 `operator_delivery`를 반환한다. `submitted`는 앱이 요청을 받았다는 뜻이다. `wait MESSAGE_ID --timeout 60`으로 검증된 완료를 기다리거나 대기 중에 `close`를 다시 실행해 상태를 볼 수 있다. 중단 또는 전달 실패 시 종료 대기 라우트는 남아 수동으로 확인할 수 있다. 결과가 불명확한 발송은 재전송하지 않는다.
+
+등록된 채팅에서 전달된 `close-operator MESSAGE_ID`를 실행한다. 현재 등록 정보, 호출자 Codex 스레드 ID, 브로커의 정확한 종료 세대와 대상을 대조한다. 제어 기록은 브로커가 생성한다. 확인에 성공하면 대상이 Desktop에서 대기 중인지 확인하고 정확한 UUID, 로컬 호스트, `source: codex`, `archived: true`로 `set_thread_archived`를 한 번 호출한다. 이어서 반환된 식별자로 `close --finish`를 실행한다. 실제 보관 검증과 라우트 제거 후 제어 요청을 완료로 기록한다. 라우트를 제거한 뒤 완료 기록 저장이 실패하면 `operator_receipt: needs_reconciliation`을 반환한다. 보관과 라우트를 확인한 뒤 해당 제어 요청을 완료로 처리한다.
+
 ## 비공개 MCP 독립 inbox
 
 기존 CLI `inbox`·`ack` 의미는 그대로 유지된다. 비공개 MCP 파사드(`scripts/mcp_server.py`)에서 `--phase1-config`에 `"inbox_enabled": true`를 명시하면 `bridge_inbox_list`·`bridge_message_get`으로 독립(`reply_to: null`) 수신 메시지를 소비 없이 읽고, 처리 후 `bridge_message_ack`로 명시적으로 `done` 처리할 수 있다. 질문에 대한 답장(correlated reply)은 기존 `bridge_operation_get` 전용이다. 페이지네이션·용량·토큰 검증·배포 게이트는 [mcp-phase1.md](../../skill/agent-bridge/references/mcp-phase1.md#independent-inbox-issue-48-explicit-opt-in)를 따른다.

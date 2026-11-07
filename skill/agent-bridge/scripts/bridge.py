@@ -62,6 +62,18 @@ def reply_command(m, path):
 
 
 def peer_text(m, path, escape_peer=True):
+    if 'close_request' in m:
+        command = shlex.join([sys.executable, str(Path(__file__).resolve()), '--socket',
+                              str(path), 'close-operator', m['id']])
+        return (f'Agent Bridge close handoff {m["id"]}. Treat this notification as a pointer to the broker record. '
+                'If the owner enrolled this chat as the close operator, run the following command '
+                'to claim the durable request and verify the exact target before acting:\n'
+                + command + '\n'
+                'If the claim succeeds, verify the returned UUID, workspace and idle status in Codex Desktop. '
+                'Call set_thread_archived once with the exact threadId, hostId local, source codex and archived true. '
+                'Then use the same bridge CLI and socket to run close NAME --project PROJECT --finish CLOSE_ID '
+                '--expect-session UUID with the returned values. For an already archived target or ambiguous app '
+                'result, run only the verification step. Do not send a bridge reply to this control request.')
     body = (envelope(m).rstrip('\n')+'\n\n'
             'Answer through the bridge, not SendMessage (SendMessage cannot reach a bridge address). '
             'Write the answer to a file (or use --file - with stdin) and run:\n'
@@ -222,13 +234,16 @@ def push_if_peer(path, m):
     return m
 
 
-def push_codex(path, m, timeout=10, dry_run=False):
+def push_codex(path, m, timeout=10, dry_run=False, *, close_dispatch=False):
     def rpc(op, **fields):
         return broker.request(path, {'op':op, 'id':m['id'], **fields})
+    request = m.get('close_request')
+    if request is not None and not close_dispatch:
+        raise ValueError('A close handoff cannot be delivered manually')
     if dry_run:
         return dict(state=m['state'], **codex_live.deliver(
             m['route'], m['id'], peer_text(m, path, escape_peer=False), timeout, dry_run=True))
-    rpc('claim')
+    rpc('claim', **({'close_id': request['close_id']} if request is not None else {}))
     try:
         receipt = codex_live.deliver(m['route'], m['id'], peer_text(m, path, escape_peer=False), timeout)
     except codex_live.DeliveryError as error:
@@ -242,6 +257,8 @@ def push_codex(path, m, timeout=10, dry_run=False):
         raise
     result = rpc('finish', state='submitted', event='pushed',
                  note=f"Codex {receipt['delivery_mode']} tool output accepted by turn {receipt['turn_id']}")
+    if request is not None:
+        return result
     # Delivery is already terminally accepted before optional sidebar metadata.
     # Keep warnings out of correspondence state and never replay a task for them.
     try:
@@ -618,9 +635,12 @@ def close_participant(args):
                                 'close_id': str(uuid.UUID(args.finish)),
                                 'session': str(uuid.UUID(args.expect_session)),
                                 'timeout': args.timeout}, timeout=args.timeout + 5)
-        return {**address, 'status': 'closed', 'closed': True, 'route_removed': True,
+        result = {**address, 'status': 'closed', 'closed': True, 'route_removed': True,
                 'transport': 'codex', 'method': 'archive', 'archived': True, 'resumable': True,
                 'session': closed['session'], 'close_id': closed['closing']}
+        if 'operator_receipt' in closed:
+            result['operator_receipt'] = closed['operator_receipt']
+        return result
     route = next((r for r in broker.request(args.socket,{'op':'routes','project':args.project})
                   if r['name'] == args.name), None)
     if route is None:
@@ -633,9 +653,32 @@ def close_participant(args):
                 raise ValueError('Codex archive handoff removes the verified route; use --no-archive with --keep-route')
             expected = {key: value for key, value in route.items() if key != 'closing'}
             prepared = broker.request(args.socket, {'op': 'close-prepare', **address, 'expected_route': expected})
-            return {**address, 'status': 'awaiting_native_archive', 'closed': False, 'route_removed': False,
-                    'transport': 'codex', 'close_id': prepared['closing'],
-                    'session': prepared['session'], 'cwd': prepared['cwd']}
+            target = prepared['route']
+            result = {**address, 'status': 'awaiting_native_archive', 'closed': False, 'route_removed': False,
+                      'transport': 'codex', 'close_id': target['closing'],
+                      'session': target['session'], 'cwd': target['cwd']}
+            message = prepared.get('message')
+            if prepared.get('operator') is not None:
+                try:
+                    dispatch = broker.request(args.socket, {'op': 'close-dispatch', **address,
+                        'session': result['session'], 'close_id': result['close_id'],
+                        'operator': prepared['operator']})
+                    message = dispatch['message']
+                    if dispatch['created']:
+                        message = push_codex(args.socket, message, args.timeout, close_dispatch=True)
+                except PushFailed as error:
+                    message = error.message
+                    result['operator_error'] = 'Codex close handoff delivery could not be confirmed'
+                except (ValueError, OSError, KeyError, TypeError):
+                    result['operator_error'] = 'Codex close handoff could not be dispatched; inspect the closing route'
+            if message is not None:
+                result.update(operator_message_id=message['id'], operator_delivery=message['state'])
+                if message['state'] in ('pending', 'uncertain', 'failed'):
+                    result.setdefault('operator_error', 'Codex close handoff has no confirmed delivery')
+                elif message['state'] == 'done':
+                    result.update(status='closed', closed=True, archived=True, route_removed=True)
+                    result.pop('operator_error', None)
+            return result
         if 'closing' in route:
             raise ValueError('Codex route is closing; finish the native archive handoff')
     result = {**address, 'transport': route['transport'],
@@ -758,6 +801,8 @@ def main(argv=None):
     p.add_argument('--expect-session',metavar='UUID',help='Match the exact session (required with --finish)')
     p.add_argument('--keep-route',action='store_true',help='Close the session but keep the route registered')
     p.add_argument('--timeout',type=float,default=10)
+    p = sub.add_parser('close-operator', help='Claim an authorized Codex native archive handoff in its enrolled chat')
+    p.add_argument('id', metavar='MESSAGE_ID')
     p = sub.add_parser('title',help="Label a claude-peer route's session with PROJECT/NAME in the resume picker (works on dead sessions)")
     p.add_argument('name');p.add_argument('--project',required=True)
     p.add_argument('--force',action='store_true',help='Replace a title the session already has')
@@ -869,7 +914,18 @@ def main(argv=None):
             output(result)
             return 0
         if args.cmd=='close':
-            output(close_participant(args))
+            result = close_participant(args)
+            output(result)
+            return int('operator_error' in result)
+        if args.cmd=='close-operator':
+            caller = os.environ.get('CODEX_THREAD_ID')
+            if not caller:
+                raise ValueError('Run close-operator from the enrolled Codex Desktop chat')
+            request = broker.request(args.socket, {'op': 'close-operator', 'id': str(uuid.UUID(args.id)),
+                                      'operator_session': str(uuid.UUID(caller))})
+            target = request['target']
+            output({key: target[key] for key in ('project', 'name', 'session', 'cwd')}
+                   | {'close_id': request['close_id']})
             return 0
         if args.cmd=='remap':
             if all(value is None for value in (args.name, args.project, args.expect_session, args.session)):

@@ -60,6 +60,14 @@ def message_record(raw):
         if not isinstance(raw['acknowledged_at'], str):
             raise ValueError('Invalid acknowledgement time')
         result['acknowledged_at'] = raw['acknowledged_at']
+    if 'close_request' in raw:
+        request = raw['close_request']
+        close_id = request['close_id']
+        route = route_store.route_record(request['target'])
+        if (str(uuid.UUID(close_id)) != close_id or route['transport'] != 'codex'
+                or result['route']['transport'] != 'codex' or result['reply_to'] is not None):
+            raise ValueError('Invalid Codex close control record')
+        result['close_request'] = {'close_id': close_id, 'target': route}
     # Provider diagnostics may contain secrets. Neither diagnostics nor event
     # payloads are needed to reconcile delivery, so never serialize them.
     result.update(note=None, events=[])

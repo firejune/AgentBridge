@@ -279,6 +279,18 @@ An authorized operator in a separate Codex Desktop chat checks the returned UUID
 | `codex` | Prepares the native archive handoff. Finish removes the exact route after verification. | Native archive moves the conversation to archived chats. | Restore from archived chats in Codex settings. |
 | `realtime` / `claude` | Route removal only | — | — |
 
+### Enrolling a Codex close operator
+
+The owner authorizes an existing separate Codex Desktop chat with access to `set_thread_archived` to handle these close requests. Register that exact Codex UUID and a `realtime` sender in the same operator project. Use the existing broker and put this JSON in its owner-private `<state-dir>/close-operator.json` with mode `0600`.
+
+```json
+{"project":"ops","name":"archive","session":"OPERATOR_UUID","sender":"trigger"}
+```
+
+A new `close NAME --project PROJECT` prepares the target and dispatches one control request to the enrolled operator. A successful submission returns `operator_message_id` and `operator_delivery`. `submitted` means the app accepted the message. Use `wait MESSAGE_ID --timeout 60` for verified completion, or repeat `close` to inspect a pending handoff. On interruption or delivery failure the route stays closing for manual reconciliation. An uncertain send is never replayed.
+
+In the enrolled chat, run the supplied `close-operator MESSAGE_ID` command. It checks the current enrollment, the caller's Codex thread ID, and the broker's exact closing generation and target. The broker issues this record through the close workflow. After a successful claim, check that the returned target is idle in Desktop and call `set_thread_archived` once with its explicit UUID, local host, `source: codex` and `archived: true`. Then run `close --finish` with the returned identifiers. Finish verifies the real archive, removes the route and marks the control request done. If receipt persistence fails after verified route removal, finish reports `operator_receipt: needs_reconciliation`. Inspect the archive and route, then resolve the control message as done.
+
 ## Private MCP Independent Inbox
 
 The CLI `inbox`/`ack` contract above is unchanged. The private MCP facade (`scripts/mcp_server.py`) supports an explicit `"inbox_enabled": true` opt-in in `--phase1-config` for independent (`reply_to: null`) inbound messages via three tools: `bridge_inbox_list`, `bridge_message_get`, and `bridge_message_ack`. Read messages without consuming them, then explicitly ACK the stable signed ID after consumption. Correlated replies remain operation-only (`bridge_operation_get`). See [mcp-phase1.md](mcp-phase1.md#independent-inbox-issue-48-explicit-opt-in) for pagination, limits, restart semantics, and owner deployment gates.
@@ -315,6 +327,7 @@ The checkpoint's version is 1. Its field allowlist is as follows.
   `acknowledged_at`. Captured `route` and `return_route` each contain project,
   name, transport, cwd, session, executable and optional channel/generation.
   These are the original pinned identities, independent of current registration.
+  Broker-generated Codex close control messages also carry their exact target route and close generation.
 - `keys` contains the idempotency key, message ID and exact original intent fields
   project, sender, recipient, channel, sender_channel, body, key and reply_to.
 - `receipts` contains owner/context digests and message ID, plus result fields

@@ -126,6 +126,7 @@ python3 "$bridge_cli" close NAME --project PROJECT --finish CLOSE_ID --expect-se
 - 📬 **작업이 끝나면 반드시 그 작업이 들어온 채널로 결과를 보고한다** — 브릿지로 받은 일은 그 메시지에 `bridge.py reply`로 답하며, 막혀서 멈춘 경우에도 동일하게 보고한다. 이슈·PR 코멘트가 브릿지 답장을 대신하지 않는다.
 - `ack`와 `progress`는 수신 확인·진행 보고이며 최종 답변이 아니다. `ask`/`wait`의 종료 코드 2는 대기 시간 초과이므로 요청을 다시 보내지 말고 같은 ID로 `wait`한다.
 - Codex의 `close`는 네이티브 보관 인계를 준비하고 정확한 `session`, `cwd`, `close_id`를 반환한다. 권한을 받은 별도 Codex Desktop 채팅의 담당자는 UUID와 작업 경로, 대기 상태를 확인한 뒤 `set_thread_archived`에 `source: codex`, 확인한 로컬 호스트, 명시적 `threadId`, `archived: true`를 전달한다. 사용자가 Desktop에서 직접 보관해도 된다. 네이티브 보관 후 원래 식별자로 `--finish`를 실행한다. 앱 도구 결과가 불명확하면 추가 보관 작업 전에 `--finish`로 확인한다.
+- 소유자는 [종료 담당자 등록 절차](usage.md#codex-종료-담당자-등록)에 따라 기존 Codex Desktop 채팅 하나를 `<state-dir>/close-operator.json`에 지정할 수 있다. 등록 뒤 새 `close`는 그 채팅으로 인계를 한 번 보낸다. 담당자는 등록된 채팅에서 `close-operator MESSAGE_ID`로 브로커 기록을 확인하고 요청을 확보한 뒤 앱 도구를 쓴다. 호출자는 `wait MESSAGE_ID --timeout 60`으로 완료를 기다린다. `close`를 다시 실행하면 대기 중인 인계 상태를 확인할 수 있다.
 - Codex를 분리만 하려면 `--no-archive`를 사용한다. Claude는 백그라운드 CLI 프로세스에 `SIGTERM`을 보내고, Antigravity는 대기 상태를 확인한 뒤 분리한다. 두 공급자에 보관을 요청하려면 `--archive`를 사용한다. 내가 소유하거나 소유자 또는 HQ가 닫으라고 지시한 세션만 닫는다.
 
 ## 모델: 읽기 · 전환 · 정책

@@ -111,6 +111,8 @@ python3 "$bridge_cli" reply MESSAGE_ID --key reply-001 --file /path/to/answer.tx
 | **Claude (`claude-peer`)** | Opens `claude://code/new` composer prefilled with `--title`; waits for user Enter | Autonomous via IDE CLI + `<scheme>://anthropic.claude-code/open` | Sends `SIGTERM` to CLI process; keeps in sidebar by default (`--archive` sets Desktop `isArchived: true`) and unregisters route |
 | **Codex (`codex`)** | Autonomous via `app-server --stdio` + `codex://threads/UUID` adoption (`:danger-full-access`, `approvalPolicy: never`) | N/A | Prepares a native archive handoff. After the operator archives the exact thread, `--finish CLOSE_ID --expect-session UUID` verifies the archive and removes the route. `--no-archive` detaches only. |
 
+Enroll an existing Codex Desktop chat as the [close operator](skill/agent-bridge/references/usage.md#enrolling-a-codex-close-operator) to send the handoff automatically with one `close NAME --project P`. The command returns the delivery state and message ID. Use `wait MESSAGE_ID --timeout 60` for verified completion.
+
 ```bash
 # Open without registering, or open + register in one command:
 python3 "$bridge_cli" open --provider agy --host ide --cwd /path/to/workspace --title "Worker"
