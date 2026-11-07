@@ -109,7 +109,7 @@ python3 "$bridge_cli" reply MESSAGE_ID --key reply-001 --file /path/to/answer.tx
 | --- | --- | --- | --- |
 | **Antigravity (`agy`)** | Autonomous via `language_server` / `agy --hub` (`StartCascade`), auto-linked to project & worktree environment | Identical to Desktop (`StartCascade` + project/environment association on unified hub) | Keeps conversation in active stack by default (`--archive` sets `{archived: true}`) and unregisters route |
 | **Claude (`claude-peer`)** | Opens `claude://code/new` composer prefilled with `--title`; waits for user Enter | Autonomous via IDE CLI + `<scheme>://anthropic.claude-code/open` | Sends `SIGTERM` to CLI process; keeps in sidebar by default (`--archive` sets Desktop `isArchived: true`) and unregisters route |
-| **Codex (`codex`)** | Autonomous via `app-server --stdio` + `codex://threads/UUID` adoption (`:danger-full-access`, `approvalPolicy: never`) | N/A | Keeps thread in active sidebar by default (`--archive` marks `archived=1` in `state_5.sqlite` + IPC broadcast) and unregisters route |
+| **Codex (`codex`)** | Autonomous via `app-server --stdio` + `codex://threads/UUID` adoption (`:danger-full-access`, `approvalPolicy: never`) | N/A | Prepares a native archive handoff. After the operator archives the exact thread, `--finish CLOSE_ID --expect-session UUID` verifies the archive and removes the route. `--no-archive` detaches only. |
 
 ```bash
 # Open without registering, or open + register in one command:
@@ -117,7 +117,11 @@ python3 "$bridge_cli" open --provider agy --host ide --cwd /path/to/workspace --
 python3 "$bridge_cli" register codex-worker --project my-app --transport codex \
   --new --cwd /path/to/workspace --title "Worker" --model gpt-6.1-sol
 
-# Close a finished worker session and remove its route (pass --archive to hide from sidebar):
+# Prepare a finished Codex thread for native archive, then finish after the operator archives it:
+python3 "$bridge_cli" close codex-worker --project my-app
+python3 "$bridge_cli" close codex-worker --project my-app --finish CLOSE_ID --expect-session UUID
+
+# Close a finished Antigravity session and optionally archive it:
 python3 "$bridge_cli" close agy-worker --project my-app [--archive]
 ```
 

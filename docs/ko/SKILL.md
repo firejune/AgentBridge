@@ -116,13 +116,17 @@ python3 "$bridge_cli" ask --project PROJECT --from-channel logic --channel view 
 # 원래 요청의 고정 주소로 답장:
 python3 "$bridge_cli" reply REQUEST_ID --key UNIQUE_REPLY_KEY --file /absolute/answer.txt
 
-# 작업이 끝난 워커 세션 닫기 및 라우트 해제 (사이드바에서 보관 처리하려면 --archive 추가):
-python3 "$bridge_cli" close NAME --project PROJECT [--archive] [--keep-route] [--timeout 10]
+# Codex 네이티브 보관 인계 준비 또는 다른 공급자의 워커 닫기
+python3 "$bridge_cli" close NAME --project PROJECT [--archive | --no-archive] [--keep-route]
+
+# 담당자가 정확한 Codex 스레드를 보관한 뒤 인계 마무리
+python3 "$bridge_cli" close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID
 ```
 
 - 📬 **작업이 끝나면 반드시 그 작업이 들어온 채널로 결과를 보고한다** — 브릿지로 받은 일은 그 메시지에 `bridge.py reply`로 답하며, 막혀서 멈춘 경우에도 동일하게 보고한다. 이슈·PR 코멘트가 브릿지 답장을 대신하지 않는다.
 - `ack`와 `progress`는 수신 확인·진행 보고이며 최종 답변이 아니다. `ask`/`wait`의 종료 코드 2는 대기 시간 초과이므로 요청을 다시 보내지 말고 같은 ID로 `wait`한다.
-- `close`는 기본적으로 세 공급자 모두 세션을 삭제하거나 아카이빙하지 않고 대화 스택에 그대로 남긴 채(`archived: false`, `resumable: true`) 세션/라우트를 종료하며(Claude: 백그라운드 CLI 프로세스에 `SIGTERM` 전송, Antigravity: 대기 상태 확인 후 분리, Codex: 스레드 분리 및 라우트 제거), `--archive` 옵션을 주면 사이드바에서 보관 처리(`archived: true`)까지 함께 수행한다. 소유자나 HQ의 지시 없이 내가 열지 않은 세션을 닫지 않는다.
+- Codex의 `close`는 네이티브 보관 인계를 준비하고 정확한 `session`, `cwd`, `close_id`를 반환한다. 권한을 받은 별도 Codex Desktop 채팅의 담당자는 UUID와 작업 경로, 대기 상태를 확인한 뒤 `set_thread_archived`에 `source: codex`, 확인한 로컬 호스트, 명시적 `threadId`, `archived: true`를 전달한다. 사용자가 Desktop에서 직접 보관해도 된다. 네이티브 보관 후 원래 식별자로 `--finish`를 실행한다. 앱 도구 결과가 불명확하면 추가 보관 작업 전에 `--finish`로 확인한다.
+- Codex를 분리만 하려면 `--no-archive`를 사용한다. Claude는 백그라운드 CLI 프로세스에 `SIGTERM`을 보내고, Antigravity는 대기 상태를 확인한 뒤 분리한다. 두 공급자에 보관을 요청하려면 `--archive`를 사용한다. 내가 소유하거나 소유자 또는 HQ가 닫으라고 지시한 세션만 닫는다.
 
 ## 모델: 읽기 · 전환 · 정책
 

@@ -13,7 +13,6 @@ import uuid
 
 import agy_live
 import bridge
-import codex_preview
 import sessions
 from support import RunningBroker
 from test_agy_live import CSRF, FakeAgyServer
@@ -200,20 +199,133 @@ class ArchiveAgyTests(unittest.TestCase):
         self.assertEqual(len(updates), 1)
 
 
+class CloseCodexTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix='ab-close-', dir='/tmp')
+        self.addCleanup(temp.cleanup)
+        self.home = Path(temp.name).resolve()
+        self.db = self.home / 'state_5.sqlite'
+        self.cwd = self.home / 'workspace'
+        self.cwd.mkdir()
+        self.sid = str(uuid.uuid4())
+        self.rollout = self.home / 'sessions' / f'{self.sid}.jsonl'
+        self.archive = self.home / 'archived_sessions' / self.rollout.name
+        self.rollout.parent.mkdir()
+        self.archive.parent.mkdir()
+        self.rollout.write_text('test transcript', encoding='utf-8')
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute('CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, archived INTEGER, rollout_path TEXT)')
+            db.execute('INSERT INTO threads VALUES (?, ?, 0, ?)', (self.sid, str(self.cwd), str(self.rollout)))
+        executable = self.home / 'fake-codex'
+        executable.write_text(
+            '#!/usr/bin/env python3\n'
+            'import json, sys\n'
+            'for line in sys.stdin:\n'
+            '    request = json.loads(line)\n'
+            '    if "id" not in request:\n'
+            '        continue\n'
+            '    method = request["method"]\n'
+            '    result = {"initialize": {}, "config/read": {"config": {}}, '
+            '"configRequirements/read": {"requirements": None}}[method]\n'
+            '    print(json.dumps({"id": request["id"], "result": result}), flush=True)\n',
+            encoding='utf-8')
+        executable.chmod(0o700)
+        self.executable = str(executable)
+        env = mock.patch.dict(os.environ, {'CODEX_HOME': str(self.home), 'CODEX_SQLITE_HOME': str(self.home)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.server = RunningBroker()
+        self.server.__enter__()
+        self.addCleanup(self.server.__exit__, None, None, None)
+        self.register('target')
+
+    def register(self, name):
+        return self.server.call('register', project='p', name=name, cwd=str(self.cwd), transport='codex',
+                                session=self.sid, executable=self.executable)
+
+    def close(self, *flags):
+        return run(['--socket', self.server.path, 'close', 'target', '--project', 'p', *flags])
+
+    def record_archive(self, rollout):
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute('UPDATE threads SET archived=1, rollout_path=? WHERE id=?', (str(rollout), self.sid))
+
+    def test_close_handoff_persists_and_only_finishes_after_exact_archive(self):
+        code, prepared = self.close()
+        self.assertEqual((code, prepared['status'], prepared['closed'], prepared['route_removed']),
+                         (0, 'awaiting_native_archive', False, False))
+        self.assertEqual(prepared['session'], self.sid)
+        self.server.restart()
+        self.assertEqual(self.close('--archive'), (0, prepared))
+        self.assertEqual(self.server.call('codex-routes'), [])
+        finish = ('--finish', prepared['close_id'], '--expect-session')
+        for wrong in (str(uuid.uuid4()), self.sid):
+            with self.subTest(session=wrong):
+                code, result = self.close(*finish, wrong)
+                self.assertEqual(code, 1)
+                self.assertIn('error', result)
+        self.record_archive(self.rollout)  # A flag-only archive is not restorable.
+        self.assertEqual(self.close(*finish, self.sid)[0], 1)
+        self.record_archive(self.archive)  # A missing archive file is also insufficient.
+        self.assertEqual(self.close(*finish, self.sid)[0], 1)
+        self.assertEqual(self.server.call('routes', project='p')[0]['closing'], prepared['close_id'])
+        self.rollout.rename(self.archive)
+        code, result = self.close(*finish, self.sid)
+        self.assertEqual((code, result['closed'], result['archived'], result['route_removed']), (0, True, True, True))
+        self.assertEqual(self.server.call('routes', project='p'), [])
+        self.assertEqual(self.archive.read_text(encoding='utf-8'), 'test transcript')
+
+    def test_close_refuses_alias_channel_and_ambiguous_delivery(self):
+        self.register('alias')
+        self.assertIn('another registered route', self.close()[1]['error'])
+        self.server.call('unregister', project='p', name='alias')
+        self.server.call('channel-bind', project='p', name='view', owner='target', description='view')
+        self.assertIn('active channels', self.close()[1]['error'])
+        self.server.call('channel-close', project='p', name='view', expect_generation=1)
+        self.server.call('register', project='p', name='sender', cwd=str(self.cwd))
+        pending = self.server.call('send', project='p', sender='sender', recipient='target', key='one', body='work')
+        self.server.call('claim', id=pending['id'])
+        self.assertIn('unfinished correspondence', self.close()[1]['error'])
+        self.server.call('finish', id=pending['id'], state='uncertain')
+        self.assertIn('unfinished correspondence', self.close()[1]['error'])
+        self.server.call('resolve', id=pending['id'], state='done', note='reviewed')
+        self.assertEqual(self.close()[0], 0)
+
+    def test_closing_blocks_delivery_and_route_changes_but_preserves_history(self):
+        self.server.call('register', project='p', name='sender', cwd=str(self.cwd))
+        fields = dict(project='p', sender='sender', recipient='target', key='old', body='done')
+        old = self.server.call('send', **fields)
+        self.server.call('claim', id=old['id'])
+        self.server.call('finish', id=old['id'], state='failed')
+        self.assertEqual(self.close()[0], 0)
+        self.assertEqual(self.server.call('send', **fields)['id'], old['id'])
+        with self.assertRaisesRegex(ValueError, 'route is closing'):
+            self.server.call('send', **{**fields, 'key': 'new'})
+        with self.assertRaisesRegex(ValueError, 'route is closing'):
+            self.server.call('reply', id=old['id'], key='reply', body='reply')
+        with self.assertRaisesRegex(ValueError, 'route is closing'):
+            self.server.call('resolve', id=old['id'], state='pending', note='checked')
+        self.assertEqual(self.server.call('show', id=old['id'])['state'], 'failed')
+        with self.assertRaisesRegex(ValueError, 'route is closing'):
+            self.register('alias')
+        with self.assertRaisesRegex(ValueError, 'route is closing'):
+            self.server.call('unregister', project='p', name='target')
+        self.assertEqual(self.close('--no-archive')[0], 1)
+
+    def test_explicit_detach_preserves_original_rollout(self):
+        code, detached = self.close('--no-archive', '--keep-route')
+        self.assertEqual((code, detached['method'], detached['archived'], detached['route_removed']),
+                         (0, 'detach', False, False))
+        code, detached = self.close('--no-archive')
+        self.assertEqual((code, detached['route_removed']), (0, True))
+        self.assertTrue(self.rollout.is_file())
+
+
 class CloseCommandTests(unittest.TestCase):
-    def test_codex_and_agy_detach_by_default_and_archive_when_requested(self):
+    def test_agy_detaches_by_default_and_archives_when_requested(self):
         with RunningBroker() as server, tempfile.TemporaryDirectory() as cwd, \
                 FakeAgyServer(cwd, str(uuid.uuid4())) as fake, \
                 mock.patch.dict(os.environ, {'AGENT_BRIDGE_AGY_URL': fake.url, 'AGENT_BRIDGE_AGY_CSRF': CSRF}):
-            codex_sid = str(uuid.uuid4())
-            server.call('register', project='p', name='n', cwd=cwd, transport='codex', session=codex_sid)
-            code, out = run(['--socket', server.path, 'close', 'n', '--project', 'p'])
-            self.assertEqual(
-                (code, out['closed'], out['method'], out['archived'], out['resumable'], out['route_removed']),
-                (0, True, 'detach', False, True, True),
-            )
-            self.assertEqual(server.call('routes', project='p'), [])
-
             server.call('register', project='p', name='j', cwd=cwd, transport='agy', session=fake.other_sid)
             code_j, out_j = run(['--socket', server.path, 'close', 'j', '--project', 'p'])
             self.assertEqual(
@@ -224,7 +336,6 @@ class CloseCommandTests(unittest.TestCase):
             sent = [b for p, _, b in fake.requests if p.endswith('/UpdateConversationAnnotations')]
             self.assertEqual(sent, [])
 
-            # Passing --archive archives both Antigravity and Codex sessions.
             server.call('register', project='p', name='j-arch', cwd=cwd, transport='agy', session=fake.other_sid)
             code_ja, out_ja = run(['--socket', server.path, 'close', 'j-arch', '--project', 'p', '--archive'])
             self.assertEqual(
@@ -233,24 +344,6 @@ class CloseCommandTests(unittest.TestCase):
             )
             sent_arch = [b for p, _, b in fake.requests if p.endswith('/UpdateConversationAnnotations')]
             self.assertEqual(sent_arch, [{'cascadeId': fake.other_sid, 'annotations': {'archived': True}, 'mergeAnnotations': True}])
-
-            state_db = Path(cwd) / 'state_5.sqlite'
-            os.chmod(cwd, 0o700)
-            with closing(sqlite3.connect(state_db)) as conn, conn:
-                conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, archived INTEGER NOT NULL DEFAULT 0, archived_at INTEGER)")
-                conn.execute('INSERT INTO threads VALUES (?, ?, 0, NULL)', (codex_sid, cwd))
-            os.chmod(state_db, 0o600)
-            server.call('register', project='p', name='n-arch', cwd=cwd, transport='codex', session=codex_sid)
-            with mock.patch.object(codex_preview, 'state_path', return_value=state_db):
-                code_na, out_na = run(['--socket', server.path, 'close', 'n-arch', '--project', 'p', '--archive'])
-            self.assertEqual(
-                (code_na, out_na['closed'], out_na['method'], out_na['archived'], out_na['route_removed']),
-                (0, True, 'archive', True, True),
-            )
-            with closing(sqlite3.connect(state_db)) as conn:
-                row = conn.execute('SELECT archived, archived_at FROM threads WHERE id=?', (codex_sid,)).fetchone()
-            self.assertEqual(row[0], 1)
-            self.assertIsNotNone(row[1])
 
     def test_realtime_route_is_removed_and_old_broker_is_reported(self):
         with RunningBroker() as server, tempfile.TemporaryDirectory() as cwd:

@@ -594,8 +594,6 @@ def close_session(route, timeout, archive=False):
             return agy_live.archive_agy(sid, timeout=timeout)
         return agy_live.close_agy(sid, timeout=timeout)
     if transport == 'codex':
-        if archive:
-            return codex_preview.archive_thread(route, timeout=timeout)
         return {
             'closed': True,
             'method': 'detach',
@@ -612,17 +610,44 @@ def close_session(route, timeout, archive=False):
 def close_participant(args):
     if not 0 < args.timeout <= 600:
         raise ValueError('Timeout must be between 0 and 600 seconds')
+    address = {'project': args.project, 'name': args.name}
+    if args.finish:
+        if not args.expect_session or args.keep_route:
+            raise ValueError('--finish requires --expect-session and removes the verified route')
+        closed = broker.request(args.socket, {'op': 'close-finish', **address,
+                                'close_id': str(uuid.UUID(args.finish)),
+                                'session': str(uuid.UUID(args.expect_session)),
+                                'timeout': args.timeout}, timeout=args.timeout + 5)
+        return {**address, 'status': 'closed', 'closed': True, 'route_removed': True,
+                'transport': 'codex', 'method': 'archive', 'archived': True, 'resumable': True,
+                'session': closed['session'], 'close_id': closed['closing']}
     route = next((r for r in broker.request(args.socket,{'op':'routes','project':args.project})
                   if r['name'] == args.name), None)
     if route is None:
         raise ValueError(f'No participant {args.name!r} is registered in project {args.project!r}')
-    result = {'name': args.name, 'project': args.project, 'transport': route['transport'],
-              **close_session(route, args.timeout, archive=getattr(args, 'archive', False))}
+    if args.expect_session and str(uuid.UUID(args.expect_session)) != route['session']:
+        raise ValueError('Endpoint does not match --expect-session')
+    if route['transport'] == 'codex':
+        if args.archive is not False:
+            if args.keep_route:
+                raise ValueError('Codex archive handoff removes the verified route; use --no-archive with --keep-route')
+            expected = {key: value for key, value in route.items() if key != 'closing'}
+            prepared = broker.request(args.socket, {'op': 'close-prepare', **address, 'expected_route': expected})
+            return {**address, 'status': 'awaiting_native_archive', 'closed': False, 'route_removed': False,
+                    'transport': 'codex', 'close_id': prepared['closing'],
+                    'session': prepared['session'], 'cwd': prepared['cwd']}
+        if 'closing' in route:
+            raise ValueError('Codex route is closing; finish the native archive handoff')
+    result = {**address, 'transport': route['transport'],
+              **close_session(route, args.timeout, archive=bool(args.archive))}
     if args.keep_route:
         result['route_removed'] = False
         return result
     try:
-        broker.request(args.socket,{'op':'unregister','project':args.project,'name':args.name})
+        request = {'op': 'unregister', **address}
+        if route['transport'] == 'codex':
+            request.update(op='unregister-if-current', expected_route=route)
+        broker.request(args.socket, request)
         result['route_removed'] = True
     except ValueError as error:
         result['route_removed'] = False
@@ -721,9 +746,16 @@ def main(argv=None):
     p = sub.add_parser('model',help="Read a participant's model, or switch it with --set (provider-neutral)")
     p.add_argument('name');p.add_argument('--project',required=True);p.add_argument('--set',dest='target')
     p.add_argument('--timeout',type=float,default=30);p.add_argument('--state-dir')
-    p = sub.add_parser('close',help="Close a participant's session without deleting it, then remove its route")
+    p = sub.add_parser('close',help="Close a participant or prepare a native Codex archive handoff")
     p.add_argument('name');p.add_argument('--project',required=True)
-    p.add_argument('--archive',action='store_true',help='Archive the finished session out of the active sidebar')
+    archive = p.add_mutually_exclusive_group()
+    archive.add_argument('--archive',action='store_true',default=None,
+                         help='Archive the session (Codex: prepare a native archive handoff)')
+    archive.add_argument('--no-archive',dest='archive',action='store_false',
+                         help='Close without archiving the session')
+    archive.add_argument('--finish',metavar='CLOSE_ID',
+                         help='Verify the native Codex archive and remove the prepared route')
+    p.add_argument('--expect-session',metavar='UUID',help='Match the exact session (required with --finish)')
     p.add_argument('--keep-route',action='store_true',help='Close the session but keep the route registered')
     p.add_argument('--timeout',type=float,default=10)
     p = sub.add_parser('title',help="Label a claude-peer route's session with PROJECT/NAME in the resume picker (works on dead sessions)")

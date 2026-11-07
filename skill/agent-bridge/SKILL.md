@@ -122,13 +122,17 @@ python3 "$bridge_cli" ask --project PROJECT --from-channel logic --channel view 
 # Reply on the original return route:
 python3 "$bridge_cli" reply REQUEST_ID --key UNIQUE_REPLY_KEY --file /absolute/answer.txt
 
-# Close a finished worker session and remove its route (add --archive to hide from sidebar):
-python3 "$bridge_cli" close NAME --project PROJECT [--archive] [--keep-route] [--timeout 10]
+# Prepare a native Codex archive handoff or close another provider:
+python3 "$bridge_cli" close NAME --project PROJECT [--archive | --no-archive] [--keep-route]
+
+# Complete the Codex handoff after the operator archives the exact thread:
+python3 "$bridge_cli" close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID
 ```
 
 - 📬 **Always report results back on the channel the task came in on** via `bridge.py reply`, including when blocked. Issue or PR comments do not replace the bridge reply.
 - `ack` and `progress` report receipt and status, not final answers. Exit code 2 from `ask` or `wait` means the wait timed out — run `wait REQUEST_ID` again rather than resending.
-- `close` stops or detaches the session while keeping it in the active conversation history (`archived: false`, `resumable: true`) by default across all three providers (Claude sends `SIGTERM` to the background CLI process, Antigravity verifies the turn is idle and detaches, and Codex detaches the thread). Pass `--archive` to also archive the conversation out of the active sidebar (`archived: true`). Do not close sessions you did not open unless instructed by the owner or HQ.
+- For Codex, `close` prepares a native archive handoff and returns the exact `session`, `cwd` and `close_id`. An authorized operator in a separate Codex Desktop chat verifies that UUID and workspace and that the target is idle, then calls `set_thread_archived` with `source: codex`, the verified local host, the explicit `threadId` and `archived: true`. A human can perform that step in Desktop. Run `--finish` with the original identifiers after native archive. If the app tool result is ambiguous, verify the result with `--finish` before any further archive action.
+- Use `--no-archive` to detach Codex without an archive handoff. Claude still sends `SIGTERM` to the background CLI process, and Antigravity verifies the conversation is idle before detaching. Use `--archive` to request archiving for those providers. Close sessions you own or have the owner or HQ's authorization to close.
 
 ## Models: Read, Switch, Policy
 

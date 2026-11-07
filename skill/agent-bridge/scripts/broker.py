@@ -19,6 +19,7 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import route_store
 import message_store
+import codex_preview
 import usage
 
 DEFAULT_SOCKET = Path.home() / '.local/share/agent-bridge/bridge.sock'
@@ -50,6 +51,10 @@ def wire(value):
 
 def route_key(route):
     return tuple(route.get(k) for k in ('project','name','transport','session','cwd','channel','generation'))
+
+
+def same_codex_thread(left, right):
+    return left['transport'] == right['transport'] == 'codex' and left['session'] == right['session']
 
 
 TERMINAL_STATES = frozenset(('done', 'answered', 'failed'))
@@ -162,15 +167,22 @@ class State:
             raise ValueError('Unknown message; broker may have restarted')
         return self.messages[mid]
 
+    def require_open_route(self, route):
+        if route['transport'] == 'codex' and any(
+                'closing' in item and same_codex_thread(route, item) for item in self.endpoints.values()):
+            raise ValueError('Codex route is closing')
+
     def route(self, project, name=None, channel=None):
         if channel:
             item = self.channels.get((project,channel))
             if not item or not item['active']:
                 raise ValueError('Channel is missing or closed')
-            return deepcopy(item['route'])
-        item = self.endpoints.get((project,name))
-        if not item:
-            raise ValueError('Unregistered endpoint')
+            item = item['route']
+        else:
+            item = self.endpoints.get((project,name))
+            if not item:
+                raise ValueError('Unregistered endpoint')
+        self.require_open_route(item)
         return deepcopy(item)
 
     def matches(self, sub, event):
@@ -226,6 +238,8 @@ class State:
         if reply_to:
             parent = self.get(reply_to)
             destination, origin = deepcopy(parent['return_route']), deepcopy(parent['route'])
+            self.require_open_route(destination)
+            self.require_open_route(origin)
             conversation = parent['conversation']
         else:
             destination = self.route(args['project'],args.get('recipient'),args.get('channel'))
@@ -420,6 +434,9 @@ class State:
                 sid = str(uuid.UUID(sid or ''))
             item = dict(project=project,name=name,transport=transport,cwd=cwd,
                         session=sid,executable=args.get('executable'))
+            if 'closing' in self.endpoints.get((project, name), {}):
+                raise ValueError('Codex route is closing')
+            self.require_open_route(item)
             return self.routing_change('endpoints', (project,name), item)
         if op == 'remap':
             key = (identifier(args['project']), identifier(args['name']))
@@ -428,18 +445,28 @@ class State:
                 raise ValueError('Endpoint is missing or changed')
             if current['transport'] != 'codex':
                 raise ValueError('Remap requires a Codex endpoint')
+            self.require_open_route(current)
             sid = str(uuid.UUID(args['session']))
             if sid == current['session']:
                 raise ValueError('Replacement UUID must differ from the current UUID')
-            return self.routing_change('endpoints', key, dict(current, session=sid))
+            replacement = dict(current, session=sid)
+            self.require_open_route(replacement)
+            return self.routing_change('endpoints', key, replacement)
         if op == 'routes':
             return [x for (p,_),x in self.endpoints.items() if p==args['project']]
         if op == 'codex-routes':
-            return [route for route in self.endpoints.values() if route['transport'] == 'codex']
-        if op == 'unregister':
+            return [route for route in self.endpoints.values()
+                    if route['transport'] == 'codex' and 'closing' not in route]
+        if op == 'close-prepare':
+            return self.prepare_close(args)
+        if op in ('unregister', 'unregister-if-current'):
             key = (args['project'], args['name'])
             if key not in self.endpoints:
                 raise ValueError(f'No participant {args["name"]!r} is registered in project {args["project"]!r}')
+            current = self.endpoints[key]
+            self.require_open_route(current)
+            if op == 'unregister-if-current' and current != args['expected_route']:
+                raise ValueError('Endpoint changed during close; its current route was kept')
             owned = sorted(name for (project,name),item in self.channels.items()
                            if project==args['project'] and item.get('active') and item['owner']==args['name'])
             if owned:
@@ -492,6 +519,8 @@ class State:
             if op=='claim':
                 if m['state']!='pending':
                     raise ValueError('Only pending messages may be delivered')
+                self.require_open_route(m['route'])
+                self.require_open_route(m['return_route'])
                 destination = (m['route']['transport'],m['route']['session'])
                 for other in self.messages.values():
                     if other['state'] in ('dispatching','uncertain') and (
@@ -517,8 +546,42 @@ class State:
             state = {'ack':'received','progress':'in_progress'}.get(op,args.get('state'))
             if op=='resolve' and (state not in ('pending','submitted','done') or not args.get('note','').strip()):
                 raise ValueError('Recovery requires a supported state and explanation')
+            if state not in TERMINAL_STATES:
+                self.require_open_route(m['route'])
+                self.require_open_route(m['return_route'])
             return self.status(m,state,args.get('note'))
         raise ValueError('Unknown operation')
+
+    def prepare_close(self, args):
+        key = (identifier(args['project']), identifier(args['name']))
+        current = self.endpoints.get(key)
+        if not current or route_store.route_record(current) != args['expected_route']:
+            raise ValueError('Endpoint is missing or changed')
+        if current['transport'] != 'codex':
+            raise ValueError('Close handoff requires a Codex endpoint')
+        if 'closing' in current:
+            return current
+        if any(other_key != key and same_codex_thread(current, item)
+               for other_key, item in self.endpoints.items()):
+            raise ValueError('This Codex thread has another registered route; detach that alias before closing')
+        if any(channel['active'] and ((channel['project'], channel['owner']) == key
+                                     or same_codex_thread(current, channel['route']))
+               for channel in self.channels.values()):
+            raise ValueError('Close or hand off active channels before closing this Codex thread')
+        if any(message['state'] not in TERMINAL_STATES
+               and (same_codex_thread(current, message['route'])
+                    or same_codex_thread(current, message['return_route']))
+               for message in self.messages.values()):
+            raise ValueError('This Codex thread has unfinished correspondence; reconcile it before closing')
+        return self.routing_change('endpoints', key, dict(current, closing=str(uuid.uuid4())))
+
+    def closing_route(self, args):
+        key = (identifier(args['project']), identifier(args['name']))
+        current = self.endpoints.get(key)
+        if (not current or 'closing' not in current or current['closing'] != args['close_id']
+                or current['session'] != args['session']):
+            raise ValueError('Codex close generation or session does not match the closing route')
+        return current
 
 
 async def write(writer, payload):
@@ -636,6 +699,19 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
                 elif op=='shutdown':
                     await write(writer,{'result':{'stopping':True},'instance':state.instance})
                     stopping.set()
+                elif op=='close-finish':
+                    route = state.closing_route(args)
+                    timeout = args.get('timeout', 10)
+                    if not 0 < timeout <= 600:
+                        raise ValueError('Timeout must be between 0 and 600 seconds')
+                    try:
+                        await asyncio.wait_for(asyncio.to_thread(codex_preview.verify_archive, route), timeout)
+                    except asyncio.TimeoutError:
+                        raise ValueError('Codex archive verification timed out; closing route kept') from None
+                    if state.closing_route(args) != route:
+                        raise ValueError('Endpoint changed during archive verification')
+                    result = state.routing_remove('endpoints', (route['project'], route['name']))
+                    await write(writer,{'result':result,'instance':state.instance})
                 else:
                     result = state.action(args)  # No await inside mutation: one atomic event-loop turn.
                     await write(writer,{'result':result,'instance':state.instance})

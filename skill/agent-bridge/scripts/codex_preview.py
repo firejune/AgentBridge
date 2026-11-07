@@ -104,21 +104,6 @@ def initialize(route, text):
         return unavailable('configuration or native store could not be updated; delivery remains accepted')
 
 
-def _resolve_archive_state_path(executable=None):
-    try:
-        return state_path(executable)
-    except (OSError, ValueError, TypeError, KeyError, sessions.DiscoveryError):
-        root = Path(
-            os.environ.get('CODEX_SQLITE_HOME')
-            or os.environ.get('CODEX_HOME')
-            or Path.home() / '.codex'
-        ).expanduser()
-        candidate = root / STATE_FILE
-        if candidate.is_file():
-            return candidate
-        raise ValueError(f'Codex state database is not found at {candidate}') from None
-
-
 def require_owned_store(path):
     info, parent = path.lstat(), path.parent.lstat()
     if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or
@@ -127,62 +112,45 @@ def require_owned_store(path):
         raise ValueError('Codex native store is not owned and protected')
 
 
-def saved_thread(route):
-    """Read exact workspace and archive status without changing the native store."""
+def _saved_thread_row(route, include_rollout=False):
     path = state_path(route.get('executable'))
     require_owned_store(path)
     sid = str(uuid.UUID(route['session']))
+    fields = 'cwd, archived, rollout_path' if include_rollout else 'cwd, archived'
     try:
         with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=LOCK_TIMEOUT)) as connection:
-            row = connection.execute('SELECT cwd, archived FROM threads WHERE id=?', (sid,)).fetchone()
+            row = connection.execute(f'SELECT {fields} FROM threads WHERE id=?', (sid,)).fetchone()
     except sqlite3.Error as error:
         raise ValueError('Codex native thread metadata unavailable') from error
     if row is None or not isinstance(row[0], str) or row[1] not in (0, 1):
         raise ValueError('Codex native thread identity or archive status unavailable')
-    return row[0], bool(row[1])
+    return row
 
 
-def archive_thread(route, timeout=10):
-    """Archive a Codex thread in state_5.sqlite and notify Codex Desktop over IPC."""
-    import codex_live
+def saved_thread(route):
+    """Read exact workspace and archive status without changing the native store."""
+    cwd, archived = _saved_thread_row(route)
+    return cwd, bool(archived)
 
-    thread = str(uuid.UUID(route['session']))
-    path = _resolve_archive_state_path(route.get('executable'))
-    require_owned_store(path)
-    archived_at = int(time.time())
-    with closing(sqlite3.connect(path.as_uri() + '?mode=rw', uri=True,
-                                 timeout=max(LOCK_TIMEOUT, min(timeout, 5.0)))) as connection, connection:
-        row = connection.execute('SELECT cwd FROM threads WHERE id=?', (thread,)).fetchone()
-        if row is None:
-            raise ValueError(f'Codex thread {thread} is absent from state_5.sqlite')
-        row_cwd = row[0] or route.get('cwd') or ''
-        connection.execute(
-            'UPDATE threads SET archived=1, archived_at=? WHERE id=?',
-            (archived_at, thread),
-        )
-        verify = connection.execute('SELECT archived, archived_at FROM threads WHERE id=?', (thread,)).fetchone()
-        if not verify or int(verify[0]) != 1:
-            raise ValueError(f'Codex thread {thread} did not read back as archived in state_5.sqlite')
 
+def verify_archive(route):
+    """Require the native archive bit and the exact owned rollout in the archive."""
     try:
-        with codex_live.Client(timeout=min(timeout, 2.0)) as client:
-            client.write({
-                'type': 'broadcast',
-                'method': 'thread-archived',
-                'sourceClientId': client.client_id,
-                'version': 2,
-                'params': {'hostId': 'local', 'conversationId': thread, 'cwd': row_cwd},
-            })
-    except (codex_live.DeliveryError, OSError):
-        pass
-
-    return {
-        'closed': True,
-        'method': 'archive',
-        'archived': True,
-        'session': thread,
-        'host': 'codex',
-        'archived_at': archived_at,
-        'resumable': True,
-        'note': 'Archived in state_5.sqlite and notified Codex Desktop.',
-    }
+        cwd, archived, rollout_path = _saved_thread_row(route, include_rollout=True)
+        if not Path(cwd).is_absolute() or Path(cwd).resolve() != Path(route['cwd']).resolve():
+            raise ValueError('workspace differs')
+        if not archived or not isinstance(rollout_path, str):
+            raise ValueError('archive not recorded')
+        rollout = Path(rollout_path)
+        home = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex').expanduser().resolve()
+        info = rollout.lstat()
+        if (not rollout.is_absolute() or rollout.resolve().parent != home / 'archived_sessions'
+                or not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_size == 0):
+            raise ValueError('archive rollout unavailable')
+        with rollout.open('rb') as source:
+            if not source.read(1):
+                raise ValueError('archive rollout is empty')
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        # Native errors may contain local paths or app-server diagnostics.
+        raise ValueError('Native Codex archive could not be verified; closing route kept') from None

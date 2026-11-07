@@ -120,7 +120,7 @@ python3 "$bridge_cli" watch --project my-app --channel modal-view \
 
 `serve --state-dir PATH` stores `routes.json` beneath an owner-private directory (`0700`, file `0600`). Without this option, the socket path's suffix is replaced by `.state` (default: `~/.local/share/agent-bridge/bridge.state/`). Every registration, route removal (`unregister`, used by `close`), channel bind, and channel close atomically writes an allowlisted snapshot (`routes.json`).
 
-- **Routing snapshot fields**. Project/name, transport, session UUID, workspace, optional executable, channel ownership/description/generation/active flag and pinned route. Correspondence has a separate checkpoint described below. Provider tokens, discovered peer sockets and PIDs are excluded from both.
+- **Routing snapshot fields**. Project/name, transport, session UUID, workspace, optional executable, channel ownership/description/generation/active flag and pinned route. A closing Codex endpoint also records a local close generation. The snapshot uses version 2 while a close is pending so older brokers refuse to load it. Correspondence has a separate checkpoint described below. Provider tokens, discovered peer sockets and PIDs are excluded from both.
 - **Startup validation**:
   - `claude-peer`: requires the exact live registry UUID/PID/protocol, owned socket, and matching workspace.
   - `agy`: requires its exact live trajectory and workspace.
@@ -263,17 +263,20 @@ python3 "$bridge_cli" resolve MESSAGE_ID --state done --note 'Completed'
 ## Closing a Session
 
 ```bash
-python3 "$bridge_cli" close NAME --project PROJECT [--keep-route] [--timeout 10]
+python3 "$bridge_cli" close NAME --project PROJECT [--archive | --no-archive] [--keep-route] [--timeout 10]
+python3 "$bridge_cli" close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID [--timeout 10]
 ```
 
-`close` stops or archives the session behind a registered route and removes the route via `unregister` (unless `--keep-route`). It never deletes data and never retries:
+For Codex, `close` and `close --archive` prepare the exact registered thread for native archive. Prepare refuses active channels, other registered aliases for the same thread, and unfinished correspondence. The route enters a closing state that survives restart and blocks delivery, replacement and bulk reopen. Repeating prepare returns the same close ID.
+
+An authorized operator in a separate Codex Desktop chat checks the returned UUID and workspace and confirms the thread is idle. The operator calls `set_thread_archived` with the exact `threadId`, verified local host, `source: codex` and `archived: true`. A human can instead archive that exact thread in Desktop. A shell client then runs `--finish` with the returned `close_id` and UUID. The broker verifies the archive flag and the readable rollout file in the native archive directory before removing the matching route. A failed check or timeout keeps the closing route. Finish can be used to reconcile an ambiguous app response without resubmitting archive. Use `--no-archive` to detach an open route, optionally with `--keep-route`.
 
 | Transport / Host | Action | Observed Behavior | Undo / Resume |
 | --- | --- | --- | --- |
 | `claude-peer` (`claude-vscode`) | `SIGTERM` to the exact registered PID; waits up to `--timeout` | Process exits within ~1 s (`resumable: true`), freeing ~310 MB RSS; tab shows exit code 143 | Typing in the tab resumes the same `sessionId` under a new PID |
 | `claude-peer` (`claude-desktop`) | Same (`SIGTERM`) | Process exits within ~3 s; app shows "session interrupted" | Sending a message in the session resumes the same `sessionId` |
-| `agy` (Desktop & IDE) | Refused while `running`; sends `UpdateConversationAnnotations {archived: true}` and verifies readback | Conversation leaves the IDE panel / Desktop sidebar | Restore from archive in the UI |
-| `codex` | `unsupported` (nothing sent) | Desktop IPC exposes no archive/unload request | — |
+| `agy` (Desktop & IDE) | Detaches an idle conversation. With `--archive`, sends `UpdateConversationAnnotations {archived: true}` and verifies readback. | Archiving removes the conversation from the active list. | Restore from archive in the UI if archived. |
+| `codex` | Prepares the native archive handoff. Finish removes the exact route after verification. | Native archive moves the conversation to archived chats. | Restore from archived chats in Codex settings. |
 | `realtime` / `claude` | Route removal only | — | — |
 
 ## Private MCP Independent Inbox

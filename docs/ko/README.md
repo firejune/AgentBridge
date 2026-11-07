@@ -109,7 +109,7 @@ python3 "$bridge_cli" reply MESSAGE_ID --key reply-001 --file /path/to/answer.tx
 | --- | --- | --- | --- |
 | **Antigravity (`agy`)** | `language_server` / `agy --hub`(`StartCascade`)로 무인 생성 및 프로젝트·워크트리 환경 자동 연결 | 데스크톱과 동일 (`StartCascade` + 통합 허브 프로젝트·환경 자동 연결) | 기본은 대화 스택 유지(`--archive` 시 `{archived: true}` 보관) 후 라우트 제거 |
 | **Claude (`claude-peer`)** | `claude://code/new`로 첫 메시지를 채운 입력창을 열고 사용자의 Enter 대기 | IDE CLI + `<scheme>://anthropic.claude-code/open`으로 무인 생성 | CLI 프로세스에 `SIGTERM` 전송 후 기본은 대화 스택 유지(`--archive` 시 데스크톱 `isArchived: true` 보관) 및 라우트 제거 |
-| **Codex (`codex`)** | `app-server --stdio` 생성 후 `codex://threads/UUID`로 데스크톱 자동 인계 (`:danger-full-access`, `approvalPolicy: never`) | 미지원 | 기본은 사이드바 대화 유지(`--archive` 시 `state_5.sqlite` `archived=1` 및 IPC 알림) 후 라우트 제거 |
+| **Codex (`codex`)** | `app-server --stdio` 생성 후 `codex://threads/UUID`로 데스크톱 자동 인계 (`:danger-full-access`, `approvalPolicy: never`) | 미지원 | 네이티브 보관 인계를 준비한다. 담당자가 정확한 스레드를 보관한 뒤 `--finish CLOSE_ID --expect-session UUID`로 검증하고 라우트를 제거한다. 분리만 하려면 `--no-archive`를 쓴다. |
 
 ```bash
 # 단독 생성 또는 생성과 동시에 브로커 등록:
@@ -117,7 +117,11 @@ python3 "$bridge_cli" open --provider agy --host ide --cwd /path/to/workspace --
 python3 "$bridge_cli" register codex-worker --project my-app --transport codex \
   --new --cwd /path/to/workspace --title "Worker" --model gpt-6.1-sol
 
-# 작업이 끝난 워커 세션 닫기 및 라우트 해제 (사이드바에서 숨기려면 --archive 추가):
+# 작업이 끝난 Codex 스레드의 보관 인계 준비 후 담당자의 네이티브 보관을 확인해 마무리
+python3 "$bridge_cli" close codex-worker --project my-app
+python3 "$bridge_cli" close codex-worker --project my-app --finish CLOSE_ID --expect-session UUID
+
+# 작업이 끝난 Antigravity 세션 닫기 및 선택적 보관
 python3 "$bridge_cli" close agy-worker --project my-app [--archive]
 ```
 
