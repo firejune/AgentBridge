@@ -675,6 +675,12 @@ def main(argv=None):
     p.add_argument('--usage-interval',type=int,default=usage.DEFAULT_INTERVAL_MINUTES,
                    help=f'Minutes between limit reads (0 = off, minimum {usage.MIN_INTERVAL_MINUTES})')
     p.add_argument('--codex-executable',default='codex')
+    p.add_argument('--codex-failure-interval',type=int,default=broker.codex_failures.DEFAULT_INTERVAL,
+                   help='Seconds between read-only checks of registered Codex threads (0 = off)')
+    p.add_argument('--provider-retry-backoff',default=','.join(map(str,broker.provider_failures.DEFAULT_BACKOFF)),
+                   help='Comma-separated positive delays before continuation attempts, in seconds')
+    p.add_argument('--provider-retry-cap',type=int,default=broker.provider_failures.DEFAULT_CAP,
+                   help='Maximum accepted continuation attempts in a failure episode')
     p.add_argument('--no-claude-live',dest='claude_live',action='store_false',
                    help='Read the Claude Code login from its ~/.claude.json cache only; never read its Keychain token')
     p = sub.add_parser('usage',help='Recorded subscription limits; reads the history file, starts nothing')
@@ -798,7 +804,10 @@ def main(argv=None):
             if args.usage_interval and args.usage_interval<usage.MIN_INTERVAL_MINUTES:
                 raise ValueError(f'Usage interval must be 0 (off) or at least {usage.MIN_INTERVAL_MINUTES} minutes')
             asyncio.run(broker.serve(args.socket,args.max_messages,args.state_dir,
-                                     args.usage_interval,args.codex_executable,args.claude_live))
+                                     args.usage_interval,args.codex_executable,args.claude_live,
+                                     args.codex_failure_interval,
+                                     tuple(int(value) for value in args.provider_retry_backoff.split(',')),
+                                     args.provider_retry_cap))
             return 0
         if args.cmd=='usage':
             state_dir = args.state_dir or Path(args.socket).expanduser().absolute().with_suffix('.state')
