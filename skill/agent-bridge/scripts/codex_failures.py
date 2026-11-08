@@ -187,14 +187,14 @@ def last_sender_message(state, route):
 def retry_notice(state, route):
     for message in reversed(list(state.messages.values())):
         if (message.get('provider_retry') is not None
-                and message['return_route']['transport'] == 'codex'
+                and message['return_route']['transport'] == route['transport']
                 and message['return_route']['session'] == route['session']):
             return message
     return None
 
 
 def retry_event(state, notice, control, event, *, kind=None, attempt=None):
-    body = provider_failures.retry_event_body(event, provider='codex',
+    body = provider_failures.retry_event_body(event, provider=notice['return_route']['transport'],
         kind=kind or control['kind'], failed_at=control['failed_at'],
         correlation=control['turn_id'], attempt=attempt,
         cap=control['cap'] if attempt is not None else None)
@@ -220,7 +220,8 @@ def retry_action(state, args):
         body = json.loads(notice['body'])
         route = notice['return_route']
         source = last_sender_message(state, route)
-        if (body.get('event') != DETECTED_EVENT or body.get('provider') != 'codex'
+        if (body.get('event') != DETECTED_EVENT or body.get('provider') != route['transport']
+                or route['transport'] not in ('codex', 'agy')
                 or state.endpoints.get((route['project'], route['name'])) != route
                 or (source['id'] if source else None) != body['source_message_id']):
             raise RetryRefused('intervening_input_or_route_changed')
@@ -233,11 +234,14 @@ def retry_action(state, args):
         raise ValueError('Provider notice has no retry state')
     elif action == 'wait':
         failure = args['failure']
-        if control['status'] != 'accepted' or failure['turn_id'] != control['turn_id']:
+        transport = notice['return_route']['transport']
+        if (control['status'] != 'accepted'
+                or (transport == 'codex' and failure['turn_id'] != control['turn_id'])
+                or (transport == 'agy' and failure['turn_id'] == control['turn_id'])):
             raise RetryRefused('newer_turn_or_changed_reservation')
         policy = provider_failures.retry_policy(tuple(control['backoff']), control['cap'])
         delay = provider_failures.next_delay(policy, control['attempts'])
-        control.update(kind=failure['kind'], failed_at=failure['failed_at'],
+        control.update(turn_id=failure['turn_id'], kind=failure['kind'], failed_at=failure['failed_at'],
                        fingerprint=args['fingerprint'], reservation_id=None)
         if delay is None:
             control.update(status='exhausted', next_at=None)
@@ -249,7 +253,7 @@ def retry_action(state, args):
         route = notice['return_route']
         source = last_sender_message(state, route)
         provider_ids = {value[1] for key, value in state.keys.items() if key.startswith('provider_')}
-        pending_delivery = any(message['route']['transport'] == 'codex'
+        pending_delivery = any(message['route']['transport'] == route['transport']
             and message['route']['session'] == route['session']
             and message['state'] in ('pending', 'dispatching', 'uncertain')
             and message['id'] not in provider_ids for message in state.messages.values())
@@ -270,8 +274,10 @@ def retry_action(state, args):
             return notice
         if args['outcome'] == 'accepted':
             turn_id = args['turn_id']
+            transport = notice['return_route']['transport']
             if (not isinstance(turn_id, str) or not turn_id or len(turn_id) > 256
-                    or turn_id == control['turn_id']):
+                    or (transport == 'codex' and turn_id == control['turn_id'])
+                    or (transport == 'agy' and turn_id != control['turn_id'])):
                 raise ValueError('Invalid accepted continuation turn')
             control.update(status='accepted', attempts=control['attempts'] + 1, turn_id=turn_id)
         else:

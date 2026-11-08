@@ -5,6 +5,9 @@ Never spawns a separate `agy -p` CLI process, never guesses another session, and
 never logs or persists the language_server CSRF token.
 """
 from datetime import datetime, timezone
+import asyncio
+import concurrent.futures
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,11 +16,14 @@ import shutil
 import signal
 import ssl
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+
+import provider_failures
 
 SERVICE = '/exa.language_server_pb.LanguageServerService'
 NEXT_INVOCATION = 'MESSAGE_DELIVERY_STRATEGY_NEXT_INVOCATION'
@@ -1386,3 +1392,434 @@ def archive_agy(sid, timeout=5):
 
 class ArchiveUncertain(DeliveryError):
     pass
+
+
+# --- Provider failure detection and stalled-turn wake (#106) ------------------
+
+DEFAULT_FAILURE_INTERVAL = 10
+
+# Terminal shouldShowUser error substrings eligible for an automatic empty-items wake (#106).
+# Keep wake-eligible strings in this single constant so a later transient class is a one-line addition.
+WAKE_ELIGIBLE_ERROR_SUBSTRINGS = (
+    'http2: timeout awaiting response headers',
+)
+
+
+def _parse_step_time(step):
+    meta = step.get('metadata') if isinstance(step, dict) else None
+    raw = meta.get('createdAt') if isinstance(meta, dict) else None
+    if not isinstance(raw, str) or not 1 <= len(raw) <= 64:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw[:-1] + '+00:00' if raw.endswith('Z') else raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    seconds = parsed.timestamp()
+    if not 0 <= seconds <= 253402300799:
+        return None
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _wake_failure_kind(short_error):
+    if not isinstance(short_error, str) or not short_error:
+        return None
+    for pattern in WAKE_ELIGIBLE_ERROR_SUBSTRINGS:
+        if isinstance(pattern, str) and pattern and pattern in short_error:
+            if pattern == 'http2: timeout awaiting response headers':
+                return 'provider_header_timeout'
+            slug = re.sub(r'[^a-z0-9]+', '_', pattern.lower()).strip('_')[:64]
+            return f'provider_{slug}' if slug else 'provider_transient_timeout'
+    return None
+
+
+def valid_failure_kind(kind):
+    if not isinstance(kind, str) or not kind:
+        return False
+    allowed = {'provider_header_timeout', 'response_header_timeout', 'terminal_error'}
+    for pattern in WAKE_ELIGIBLE_ERROR_SUBSTRINGS:
+        mapped = _wake_failure_kind(pattern)
+        if mapped:
+            allowed.add(mapped)
+    return kind in allowed
+
+
+def select_summary_server(servers, sid, cwd=None):
+    """Select the live server and trajectory summary for `sid` from an existing poll."""
+    try:
+        sid = str(uuid.UUID(sid))
+    except (ValueError, TypeError, AttributeError):
+        return None, None
+    expected_cwd = None
+    if isinstance(cwd, str) and cwd.strip():
+        try:
+            expected_cwd = Path(cwd).expanduser().resolve()
+        except OSError:
+            expected_cwd = None
+    in_summaries = []
+    for server in servers or ():
+        summaries = server.get('summaries') if isinstance(server, dict) else None
+        summary = summaries.get(sid) if isinstance(summaries, dict) else None
+        if not isinstance(summary, dict):
+            continue
+        summary_cwd = _summary_cwd(summary)
+        if expected_cwd is not None and summary_cwd:
+            try:
+                if Path(summary_cwd).resolve() != expected_cwd:
+                    continue
+            except OSError:
+                continue
+        in_summaries.append((server, summary))
+    if not in_summaries:
+        return None, None
+    running = [pair for pair in in_summaries if normalize_status(pair[1].get('status')) == 'running']
+    if len(running) > 1:
+        return None, None
+    ranked = sorted(
+        in_summaries,
+        key=lambda pair: _summary_rank(pair[0], pair[1]),
+        reverse=True,
+    )
+    if len(ranked) > 1 and _summary_rank(ranked[0][0], ranked[0][1]) == _summary_rank(ranked[1][0], ranked[1][1]):
+        return None, None
+    return ranked[0]
+
+
+def read_tail_steps(server, sid, step_count, timeout=5):
+    """Fetch only the tail step (`stepOffset = step_count - 1`) for an idle session."""
+    if type(step_count) is not int or step_count < 1:
+        return []
+    sid = str(uuid.UUID(sid))
+    data = rpc_call(
+        server['url'],
+        server['csrf'],
+        'GetCascadeTrajectorySteps',
+        {'cascadeId': sid, 'stepOffset': step_count - 1},
+        timeout=timeout,
+    )
+    steps = data.get('steps') if isinstance(data, dict) else None
+    return steps if isinstance(steps, list) else []
+
+
+def classify_tail_steps(steps, step_count, sid=None):
+    """Classify the tail step of an IDLE Antigravity trajectory."""
+    if not isinstance(steps, list) or not steps or type(step_count) is not int or step_count < 1:
+        return None
+    step_index = step_count - 1
+    turn_id = f'agy:{step_index}'
+    first = steps[0]
+    if not isinstance(first, dict):
+        return None
+    if first.get('type') != 'CORTEX_STEP_TYPE_ERROR_MESSAGE':
+        return {'outcome': 'non_error', 'step_index': step_index, 'step_count': step_count, 'turn_id': turn_id}
+    error_message = first.get('errorMessage')
+    if not isinstance(error_message, dict) or error_message.get('shouldShowUser') is not True:
+        return {'outcome': 'transient_attempt', 'step_index': step_index, 'step_count': step_count, 'turn_id': turn_id}
+    err_obj = error_message.get('error') if isinstance(error_message.get('error'), dict) else {}
+    short_error = (
+        err_obj.get('shortError')
+        or err_obj.get('modelErrorMessage')
+        or err_obj.get('userErrorMessage')
+        or ''
+    )
+    raw_id = err_obj.get('errorId')
+    has_error_id = (
+        isinstance(raw_id, str)
+        and bool(raw_id.strip())
+        and len(raw_id.strip()) <= 128
+        and not any(c.isspace() for c in raw_id.strip())
+    )
+    error_id = raw_id.strip() if has_error_id else f'{sid or "agy"}:{step_index}'
+    failed_at = _parse_step_time(first)
+    wake_kind = _wake_failure_kind(short_error)
+    has_trailing_step = len(steps) != 1
+    step_not_done = first.get('status') != 'CORTEX_STEP_STATUS_DONE'
+    if wake_kind is None:
+        if has_trailing_step or step_not_done:
+            return {'outcome': 'non_terminal', 'step_index': step_index, 'step_count': step_count, 'turn_id': turn_id}
+        return {
+            'outcome': 'notify_only',
+            'kind': 'terminal_error',
+            'step_index': step_index,
+            'step_count': step_count,
+            'turn_id': turn_id,
+            'error_id': error_id,
+            'failed_at': failed_at,
+        }
+    if has_trailing_step or step_not_done or not has_error_id:
+        reason = 'trailing_step' if has_trailing_step else ('step_not_done' if step_not_done else 'missing_error_id')
+        return {
+            'outcome': 'unsafe',
+            'reason': reason,
+            'kind': wake_kind,
+            'step_index': step_index,
+            'step_count': step_count,
+            'turn_id': turn_id,
+            'error_id': error_id,
+            'failed_at': failed_at,
+        }
+    return {
+        'outcome': 'wake',
+        'kind': wake_kind,
+        'step_index': step_index,
+        'step_count': step_count,
+        'turn_id': turn_id,
+        'error_id': error_id,
+        'failed_at': failed_at,
+    }
+
+
+def agy_fingerprint(sid, classified):
+    value = dict(
+        session=str(uuid.UUID(sid)),
+        outcome=classified.get('outcome'),
+        kind=classified.get('kind'),
+        step_index=classified.get('step_index'),
+        step_count=classified.get('step_count'),
+        turn_id=classified.get('turn_id'),
+        error_id=classified.get('error_id'),
+        failed_at=classified.get('failed_at'),
+    )
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def wake_failed_turn(route, turn_id, fingerprint, reserve, timeout=5):
+    """Recheck the live Antigravity trajectory and tail step, durably reserve, then wake once."""
+    import codex_failures
+    mutation_sent = False
+    try:
+        sid = str(uuid.UUID(route['session']))
+        servers = discover_servers(timeout=timeout)
+        server, summary = select_summary_server(servers, sid, route.get('cwd'))
+        if server is None or summary is None:
+            raise codex_failures.RetryRefused('server_or_trajectory_missing')
+        if normalize_status(summary.get('status')) != 'idle':
+            raise codex_failures.RetryRefused('trajectory_not_idle')
+        try:
+            step_count = int(summary.get('stepCount') or 0)
+        except (ValueError, TypeError):
+            step_count = 0
+        if step_count < 1 or f'agy:{step_count - 1}' != turn_id:
+            raise codex_failures.RetryRefused('newer_step_or_changed_count')
+        steps = read_tail_steps(server, sid, step_count, timeout=timeout)
+        classified = classify_tail_steps(steps, step_count, sid=sid)
+        if classified is None or classified.get('outcome') != 'wake':
+            raise codex_failures.RetryRefused('tail_step_not_wake_eligible')
+        if agy_fingerprint(sid, classified) != fingerprint:
+            raise codex_failures.RetryRefused('intervening_input_or_changed_step')
+        reserve()
+        mutation_sent = True
+        wake_state = wake_session(server['url'], server['csrf'], sid, initial_status='idle', timeout=timeout)
+        if wake_state != 'woke':
+            raise DeliveryError('Antigravity wake outcome was not confirmed', True)
+        return turn_id
+    except codex_failures.RetryRefused:
+        raise
+    except DeliveryError as error:
+        error.uncertain = error.uncertain or mutation_sent
+        raise
+    except (OSError, KeyError, TypeError, ValueError):
+        raise DeliveryError('Antigravity continuation transport or payload failed', mutation_sent) from None
+
+
+class AgyRetryMonitor:
+    """Per-session failure observer and guarded wake continuation monitor for `agy` routes."""
+
+    def __init__(self, state, policy=None, clock=time.time):
+        self.state, self.policy, self.clock = state, policy, clock
+        self.cached_steps = {}
+        self._woken_in_pass = set()
+
+    def action(self, notice, action, **fields):
+        return self.state.action(dict(op='provider-retry', id=notice['id'], action=action,
+                                      at=self.clock(), **fields))
+
+    def stop(self, notice, event, kind):
+        return self.action(notice, 'stop', event=event, kind=kind)
+
+    async def check_route(self, route, servers=None):
+        import codex_failures
+        notice = codex_failures.retry_notice(self.state, route)
+        if notice and notice['provider_retry']['status'] == 'reserved':
+            self.stop(notice, provider_failures.UNCERTAIN, 'broker_restarted_during_reservation')
+            return
+        sid = str(uuid.UUID(route['session']))
+        if servers is None:
+            self._woken_in_pass = set()
+            servers = await asyncio.to_thread(discover_servers)
+        elif sid in self._woken_in_pass:
+            return
+        server, summary = select_summary_server(servers, sid, route.get('cwd'))
+        if server is None or summary is None:
+            return
+        status = normalize_status(summary.get('status'))
+        try:
+            step_count = int(summary.get('stepCount') or 0)
+        except (ValueError, TypeError):
+            step_count = 0
+
+        # 1. Check wake acceptance from the previous poll window.
+        if notice and notice['provider_retry']['status'] == 'accepted':
+            failed_step_count = int(notice['provider_retry']['turn_id'].split(':', 1)[1]) + 1
+            if status != 'running' and step_count <= failed_step_count:
+                self.stop(notice, provider_failures.UNCERTAIN, 'wake_not_accepted')
+                return
+            if status != 'idle':
+                return
+
+        # 2. Never inspect or wake while RUNNING (including internal attempts 1-8).
+        if status != 'idle':
+            if notice and notice['provider_retry']['status'] == 'waiting':
+                self.stop(notice, provider_failures.UNSAFE, 'native_retry_or_changed_turn')
+            return
+
+        if step_count < 1:
+            if notice and notice['provider_retry']['status'] == 'waiting':
+                self.stop(notice, provider_failures.UNSAFE, 'native_retry_or_changed_turn')
+            return
+
+        # 3. Fetch the tail step only when IDLE and stepCount changed.
+        cached = self.cached_steps.get(sid)
+        if cached is None or cached[0] != step_count:
+            steps = await asyncio.to_thread(read_tail_steps, server, sid, step_count)
+            classified = classify_tail_steps(steps, step_count, sid=sid)
+            self.cached_steps[sid] = (step_count, classified)
+        else:
+            classified = cached[1]
+
+        if classified is None or classified['outcome'] in ('transient_attempt', 'non_terminal'):
+            if notice and notice['provider_retry']['status'] in ('waiting', 'accepted'):
+                self.stop(notice, provider_failures.UNSAFE, 'native_retry_or_changed_turn')
+            return
+
+        if classified['outcome'] == 'non_error':
+            if notice and classified['turn_id'] != json.loads(notice['body'])['turn_id']:
+                self.action(notice, 'reset', turn_id=classified['turn_id'])
+            elif notice and notice['provider_retry']['status'] == 'waiting':
+                self.stop(notice, provider_failures.UNSAFE, 'native_retry_or_changed_turn')
+            return
+
+        failure = dict(kind=classified['kind'], failed_at=classified['failed_at'],
+                       turn_id=classified['turn_id'], error_id=classified['error_id'])
+        source = codex_failures.last_sender_message(self.state, route)
+        detected = self.state.action(dict(op='provider-failure', expected_route=route,
+            source_message_id=source['id'] if source else None, failure=failure))
+
+        if classified['outcome'] == 'notify_only':
+            if notice and notice['provider_retry']['status'] in ('waiting', 'accepted'):
+                self.stop(notice, provider_failures.UNSAFE, 'non_wake_terminal_error')
+            return
+
+        if self.policy is None:
+            return
+
+        fingerprint = agy_fingerprint(sid, classified)
+        if notice is None or notice['provider_retry']['status'] == 'recovered':
+            notice = self.action(detected, 'arm', fingerprint=fingerprint,
+                                 backoff=list(self.policy.backoff), cap=self.policy.cap)
+
+        if classified['outcome'] == 'unsafe':
+            self.stop(notice, provider_failures.UNSAFE, classified.get('reason') or 'unsafe_tail_step')
+            return
+
+        control = notice['provider_retry']
+        if self.state.correspondence is not None and self.state.correspondence.loss:
+            self.stop(notice, provider_failures.UNCERTAIN, 'correspondence_checkpoint_lost')
+            return
+
+        if control['status'] == 'accepted':
+            notice = self.action(notice, 'wait', failure=failure, fingerprint=fingerprint)
+            control = notice['provider_retry']
+
+        if control['status'] != 'waiting':
+            return
+
+        if control['turn_id'] != failure['turn_id'] or control['fingerprint'] != fingerprint:
+            self.stop(notice, provider_failures.UNSAFE, 'intervening_input_or_changed_step')
+            return
+
+        if self.clock() < control['next_at']:
+            return
+
+        loop = asyncio.get_running_loop()
+        cancelled = threading.Event()
+        def reserve():
+            if cancelled.is_set():
+                raise codex_failures.RetryRefused('continuation_cancelled')
+            future = concurrent.futures.Future()
+            def commit():
+                if not future.set_running_or_notify_cancel():
+                    return
+                try:
+                    if cancelled.is_set():
+                        raise codex_failures.RetryRefused('continuation_cancelled')
+                    future.set_result(self.action(notice, 'reserve', fingerprint=control['fingerprint']))
+                except BaseException as error:
+                    future.set_exception(error)
+            loop.call_soon_threadsafe(commit)
+            try:
+                reservation = future.result(timeout=5)
+                if cancelled.is_set():
+                    raise codex_failures.RetryRefused('continuation_cancelled')
+                return reservation
+            except TimeoutError:
+                future.cancel()
+                raise
+        try:
+            accepted = await asyncio.to_thread(wake_failed_turn, notice['return_route'],
+                                               control['turn_id'], control['fingerprint'], reserve)
+            current = self.state.get(notice['id'])
+            self.action(current, 'finish', reservation_id=current['provider_retry']['reservation_id'],
+                        outcome='accepted', turn_id=accepted)
+            self._woken_in_pass.add(sid)
+        except codex_failures.RetryRefused as error:
+            self.stop(self.state.get(notice['id']), provider_failures.UNSAFE, str(error))
+        except DeliveryError as error:
+            event = provider_failures.UNCERTAIN if error.uncertain else provider_failures.UNSAFE
+            self.stop(self.state.get(notice['id']), event,
+                      'delivery_outcome_unknown' if error.uncertain else 'continuation_prewrite_failed')
+        except asyncio.CancelledError:
+            cancelled.set()
+            current = self.state.get(notice['id'])
+            if current['provider_retry']['status'] == 'reserved':
+                self.stop(current, provider_failures.UNCERTAIN, 'continuation_cancelled')
+            raise
+
+    async def check_routes(self, routes=None):
+        import codex_failures
+        if routes is None:
+            routes = [route for route in list(self.state.endpoints.values()) if route['transport'] == 'agy']
+        self._woken_in_pass = set()
+        pending_routes = []
+        for route in routes:
+            if route.get('transport') != 'agy':
+                continue
+            notice = codex_failures.retry_notice(self.state, route)
+            if notice and notice['provider_retry']['status'] == 'reserved':
+                try:
+                    self.stop(notice, provider_failures.UNCERTAIN, 'broker_restarted_during_reservation')
+                except (ValueError, OSError, TypeError, KeyError, AttributeError):
+                    pass
+                continue
+            pending_routes.append(route)
+        if not pending_routes:
+            return
+        try:
+            servers = await asyncio.to_thread(discover_servers)
+        except (ValueError, OSError, TypeError, KeyError, AttributeError):
+            return
+        for route in pending_routes:
+            try:
+                await self.check_route(route, servers=servers)
+            except (ValueError, OSError, TypeError, KeyError, AttributeError):
+                continue
+
+
+async def observe_agy_failures(state, interval, policy=None):
+    """Read each registered Antigravity session once per server pass and notify its last retained sender."""
+    monitor = AgyRetryMonitor(state, policy)
+    while True:
+        await asyncio.sleep(interval)
+        await monitor.check_routes()
+
