@@ -1,0 +1,32 @@
+{
+  "id": "00000000-0000-4000-8000-000000000107",
+  "resumeState": "resumed",
+  "threadRuntimeStatus": {"type": "idle"},
+  "turnHistory": {
+    "kind": "canonical",
+    "history": {
+      "isComplete": true,
+      "islands": [{
+        "newerBoundary": {"status": "exhausted"},
+        "entries": [{"key": "turn-key", "value": "turn-key"}]
+      }],
+      "entitiesByKey": {
+        "turn-key": {
+          "turnId": "failed-turn",
+          "status": "failed",
+          "turnStartedAtMs": 1000,
+          "durationMs": 2000,
+          "error": {
+            "message": "PRIVATE_PROVIDER_DIAGNOSTIC",
+            "codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": 503}}
+          },
+          "items": [
+            {"type": "commandExecution", "status": "completed", "aggregatedOutput": "PRIVATE_TOOL_OUTPUT"},
+            {"type": "error", "willRetry": true, "errorInfo": {"responseStreamDisconnected": {"httpStatusCode": 503}}},
+            {"type": "error", "willRetry": false, "message": "PRIVATE_PROVIDER_DIAGNOSTIC", "errorInfo": {"responseStreamDisconnected": {"httpStatusCode": 503}}}
+          ]
+        }
+      }
+    }
+  }
+}

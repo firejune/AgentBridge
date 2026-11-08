@@ -15,6 +15,7 @@ class RunningBroker:
         self.max_messages = max_messages
         self.usage = ['--usage-interval', str(usage_interval)]
         self.usage += ['--no-claude-live']  # Tests never read the Keychain.
+        self.usage += ['--codex-failure-interval', '0']  # Native reads require explicit fixtures.
         if codex_executable:
             self.usage += ['--codex-executable', codex_executable]
 

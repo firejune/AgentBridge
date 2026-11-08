@@ -87,6 +87,10 @@ python3 "$bridge_cli" register codex-worker --project PROJECT --transport codex 
   - 모델 정책 및 재조회 검증(`--model` > `AGENT_BRIDGE_CODEX_MODEL` > `policy.json` `defaults.codex` > `gpt-6.1-sol`; `gpt-6-astra`로 코딩 세션을 열지 않음)과 Full Access 권한(`:danger-full-access`, `approvalPolicy: never`)을 강제한다.
   - 일반 `open --provider codex --title TITLE`은 동일한 제목·`cwd`의 보관되지 않은 기존 스레드가 있으면 중복 생성을 거부(`stage: "duplicate"`)하며, `--new`를 주면 중복 검사를 건너뛴다. 실패하거나 `uncertain`인 생성을 자동 재실행하지 않는다.
 
+Codex 공급자 실패는 등록된 모든 Codex 스레드를 대상으로 관찰하며 관찰 회차 사이 기본 간격은 10초다. `serve --codex-failure-interval SECONDS`로 주기를 정하며 `0`은 관찰을 끈다. 등록된 스레드·현재 Desktop 소유자·최신 최종 턴를 고정하고, 실행 상태가 idle이며 최신 턴의 완료 상태가 `failed`이고 일치하는 최종 오류가 `willRetry: false`일 때 알려진 네트워크·스트림 실패를 감지한다. 원래 메시지의 고정 반환 주소로 정규화한 `provider_failure_detected` 알림 하나를 남긴다. 소유자의 `inbox`에서 ID를 찾고 `show ID`로 읽거나 MCP inbox를 사용한다. 원본 작업 상태는 유지하며 완료된 도구 호출이 있는 턴도 감지한다.
+
+알림에는 `observed_at`·턴 ID·실패 종류를 담는다. `failed_at`은 턴 시작 시각과 실행 시간이 모두 있으면 합산하고 `failure_time_source: turn_duration`을 표시하며, 자료가 없으면 null이다. 공급자 원문·도구 출력·Desktop 소유자 메타데이터는 알림과 체크포인트에서 제외한다. 관찰은 읽기 전용이며 앱의 capacity 재시도를 따른다. 브로커 재시작 뒤 등록 라우트에서 관찰을 재개한다. 진행 중 작업이 없어도 해당 라우트의 마지막 보관 발신자에게 알린다. 보관 한도 내에 발신자가 없으면 등록 스레드 자신의 inbox에 알림을 남긴다. 보관 한도 내 알림의 중복 방지는 재시작 후에도 유지한다. 소유자 부재·미지원 스냅샷·무응답 시간만으로 공급자 실패를 판정하지 않는다.
+
 ### 3. Antigravity IDE & Desktop (`agy`)
 
 ```bash

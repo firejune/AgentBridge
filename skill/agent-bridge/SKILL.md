@@ -93,6 +93,10 @@ python3 "$bridge_cli" register codex-worker --project PROJECT --transport codex 
   - Enforces model policy and readback (`--model` > `AGENT_BRIDGE_CODEX_MODEL` > `policy.json` `defaults.codex` > `gpt-6.1-sol`; never starts coding work on `gpt-6-astra`) and Full Access permissions (`:danger-full-access`, `approvalPolicy: never`).
   - Ordinary `open --provider codex --title TITLE` refuses duplicate unarchived threads matching the same title and `cwd` (`stage: "duplicate"`); pass `--new` to bypass duplicate detection. Never automatically repeat a failed or `uncertain` creation.
 
+Codex provider failure observation checks every registered Codex thread, with 10 seconds between passes. Configure `serve --codex-failure-interval SECONDS` (`0` disables observation). It pins the registered thread, current Desktop owner and latest terminal turn, and requires an idle runtime, the latest turn's `failed` completion and a matching terminal error with `willRetry: false`. Known network/stream failures produce one normalized `provider_failure_detected` notice to the originating message's frozen return route. Inspect the owner's `inbox`, then `show ID`, or read the notice through the MCP inbox. The original task keeps its state. Completed tool calls remain eligible for detection.
+
+The notice records `observed_at`, the turn ID and failure kind. `failed_at` is derived from turn start plus duration when available and carries `failure_time_source: turn_duration`, otherwise it is null. Provider text, tool output and Desktop owner metadata stay out of the notice/checkpoint. Observation is read-only and leaves native capacity retries to the app. Observation resumes from registered routes after a broker restart. With no task in flight, the notice goes to the last retained sender to that route. If no sender remains in bounded correspondence, it stays in the registered thread's own inbox. Deduplication survives restart while the notice remains in bounded correspondence. Missing owners, unsupported snapshots and inactivity provide no provider-failure signal.
+
 ### 3. Antigravity IDE & Desktop (`agy`)
 
 ```bash

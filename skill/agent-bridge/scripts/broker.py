@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import route_store
 import message_store
 import usage
+import provider_failures
 
 DEFAULT_SOCKET = Path.home() / '.local/share/agent-bridge/bridge.sock'
 MAX_FRAME = 1024 * 1024
@@ -380,7 +381,7 @@ class State:
         # Stage mutations in isolation. A failed durable write must not acknowledge
         # an ACK, publish an event, wake a waiter or leave a half-posted reply.
         mutations = ('send', 'reply', 'ack', 'progress', 'resolve', 'claim', 'finish',
-                     'inbox_ack')
+                     'inbox_ack', 'provider-failure')
         if self.correspondence is None or args['op'] not in mutations:
             return self.apply_action(args)
         staged = copy(self)
@@ -389,6 +390,8 @@ class State:
         staged.answers = self.answers.copy()
         staged.pending_publications = []
         result = staged.apply_action(args)
+        if args['op'] == 'provider-failure' and not staged.pending_publications:
+            return result  # A retained notice needs no repeated checkpoint write.
         self.correspondence.save(staged)
         for field in ('messages', 'keys', 'inbox_receipts', 'inbox_snapshots', 'answers'):
             setattr(self, field, getattr(staged, field))
@@ -398,8 +401,57 @@ class State:
                 self.answers[message['id']].set()
         return result
 
+    def provider_failure(self, origin, source_message_id, failure):
+        key = (origin['project'], origin['name'])
+        current = self.endpoints.get(key)
+        source = provider_failures.last_sender_message(self, origin)
+        if (current != origin or origin['transport'] != 'codex'
+                or (source['id'] if source else None) != source_message_id):
+            raise ValueError('Provider observation route or task changed')
+        destination = source['return_route'] if source else origin
+        if (set(failure) != {'kind', 'failed_at', 'turn_id'}
+                or provider_failures.transient_kind(failure['kind']) is None
+                and failure['kind'] != 'httpConnectionFailed'):
+            raise ValueError('Invalid normalized provider failure')
+        if not isinstance(failure['turn_id'], str) or not 1 <= len(failure['turn_id']) <= 256:
+            raise ValueError('Invalid provider failure turn')
+        failed_at = failure['failed_at']
+        if failed_at is not None:
+            parsed = datetime.fromisoformat(failed_at)
+            if parsed.tzinfo is None or len(failed_at) > 40:
+                raise ValueError('Invalid provider failure time')
+        identity = [origin['project'], origin['name'], origin['session'], failure['turn_id'],
+                    route_key(destination)]
+        dedup_key = provider_failures.DETECTED_EVENT + ':' + hashlib.sha256(
+            json.dumps(identity, sort_keys=True).encode()).hexdigest()
+        if dedup_key in self.keys:
+            return self.get(self.keys[dedup_key][1])
+        observed_at = now()
+        body = json.dumps(dict(event=provider_failures.DETECTED_EVENT, provider='codex',
+                               kind=failure['kind'], failed_at=failed_at,
+                               failure_time_source='turn_duration' if failed_at else 'unavailable',
+                               observed_at=observed_at, turn_id=failure['turn_id'],
+                               source_message_id=source_message_id), sort_keys=True)
+        self.make_room(source_message_id)
+        mid = str(uuid.uuid4())
+        notice = dict(id=mid, conversation=str(uuid.uuid4()), project=destination['project'],
+                      sender=origin['name'], recipient=destination['name'], route=deepcopy(destination),
+                      return_route=deepcopy(origin), channel=destination.get('channel'),
+                      sender_channel=origin.get('channel'), body=body, reply_to=None,
+                      state='pending', created=observed_at, events=[], note=None)
+        self.messages[mid] = notice
+        intent = dict(project=notice['project'], sender=notice['sender'], recipient=notice['recipient'],
+                      channel=notice['channel'], sender_channel=notice['sender_channel'], body=body,
+                      key=dedup_key, reply_to=None)
+        self.keys[dedup_key] = (intent, mid)
+        self.answers[mid] = asyncio.Event()
+        self.status(notice, 'pending', event=provider_failures.DETECTED_EVENT)
+        return notice
+
     def apply_action(self, args):
         op = args['op']
+        if op == 'provider-failure':
+            return self.provider_failure(args['expected_route'], args['source_message_id'], args['failure'])
         if op in ('inbox_list', 'inbox_get', 'inbox_ack'):
             return self.inbox_action(args)
         if op == 'ping':
@@ -587,7 +639,10 @@ async def watch(state, args, reader, writer):
 
 
 async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DEFAULT_INTERVAL_MINUTES,
-                codex_executable='codex', claude_live=True):
+                codex_executable='codex', claude_live=True,
+                codex_failure_interval=provider_failures.DEFAULT_INTERVAL):
+    if type(codex_failure_interval) is not int or codex_failure_interval < 0:
+        raise ValueError('Codex failure observation interval must be a nonnegative integer')
     path = Path(path).expanduser().absolute()
     path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
     lock = path.with_suffix('.lock').open('a')
@@ -599,6 +654,7 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
     server = None
     store = None
     collectors = []
+    failure_observer = None
     try:
         if path.exists():
             if not stat.S_ISSOCK(path.stat().st_mode):
@@ -606,6 +662,9 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
             path.unlink()
         store = route_store.RouteStore(state_dir or path.with_suffix('.state'))
         state = State(max_messages, store)
+        if codex_failure_interval:
+            failure_observer = asyncio.create_task(
+                provider_failures.observe_codex_failures(state, codex_failure_interval))
         if usage_interval:
             # Read-only limit sampling beside the broker; it never touches `state`.
             collectors = [usage.Collector(usage.UsageStore(store.directory / 'usage', provider=provider),
@@ -670,6 +729,9 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
         await asyncio.gather(*active,return_exceptions=True)
         await server.wait_closed()
     finally:
+        if failure_observer is not None:
+            failure_observer.cancel()
+            await asyncio.gather(failure_observer, return_exceptions=True)
         for collector in collectors:
             collector.stop()
         if server is not None:
