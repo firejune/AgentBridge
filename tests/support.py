@@ -16,6 +16,7 @@ class RunningBroker:
         self.usage = ['--usage-interval', str(usage_interval)]
         self.usage += ['--no-claude-live']  # Tests never read the Keychain.
         self.usage += ['--codex-failure-interval', '0']  # Native reads require explicit fixtures.
+        self.usage += ['--agy-failure-interval', '0']
         if codex_executable:
             self.usage += ['--codex-executable', codex_executable]
 

@@ -21,15 +21,17 @@ CSRF = 'ca5f-' + 'ab' * 16
 class FakeAgyServer:
     """Isolated local HTTP ConnectRPC stub for Antigravity language_server."""
 
-    def __init__(self, root, sid, other_sid=None, send_behavior='ok'):
+    def __init__(self, root, sid, other_sid=None, send_behavior='ok', wake_behavior='ok'):
         self.root = Path(root).resolve()
         self.sid = sid
         self.other_sid = other_sid or str(uuid.uuid4())
         self.send_behavior = send_behavior
+        self.wake_behavior = wake_behavior
         self.ignore_archive = False
         self.requests = []
         self.projects = {}
         self.environments = {}
+        self.trajectory_steps = {}
         self.trajectories = {
             self.sid: {
                 'summary': 'Agent-Bridge Skill Verification',
@@ -155,11 +157,23 @@ class FakeAgyServer:
                         self.wfile.write(b'not-json')
                     else:
                         self.respond(200, {})
+                elif self.path.endswith('/GetCascadeTrajectorySteps'):
+                    cid = body.get('cascadeId')
+                    offset = int(body.get('stepOffset') or 0)
+                    steps = parent.trajectory_steps.get(cid)
+                    if steps is None:
+                        traj = parent.trajectories.get(cid) or {}
+                        steps = traj.get('steps') or []
+                    self.respond(200, {'steps': steps[offset:] if 0 <= offset <= len(steps) else []})
                 elif self.path.endswith('/SendUserCascadeMessage'):
                     cid = body.get('cascadeId')
                     traj = parent.trajectories.get(cid)
                     if not traj:
                         self.respond(500, {'code': 'unknown', 'message': f'trajectory not found: {cid}'})
+                    elif parent.wake_behavior == 'error':
+                        self.respond(500, {'code': 'internal', 'message': 'wake transport error'})
+                    elif parent.wake_behavior == 'noop-idle':
+                        self.respond(200, {})
                     elif traj.get('status') == 'CASCADE_RUN_STATUS_RUNNING':
                         if parent.send_behavior == 'finish-after-first-wake':
                             traj['status'] = 'CASCADE_RUN_STATUS_IDLE'
@@ -791,7 +805,400 @@ class AgyLiveTests(unittest.TestCase):
                 self.assertEqual(opened_unreg['session']['cwd'], str(wt_b))
 
 
+FAILURE_FIXTURE = Path(__file__).with_name('fixtures') / 'agy-provider-failure.json'
+
+
+def load_failure_fixture():
+    return json.loads(FAILURE_FIXTURE.read_text(encoding='utf-8'))
+
+
+class AgyProviderFailureTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='ab-agy-fail-', dir='/tmp')
+        self.root = Path(self.temp.name).resolve()
+        self.fixture = load_failure_fixture()
+        self.sid = self.fixture['cascadeId']
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def make_timeout_step(self, step_index, created_at='2026-11-08T12:04:00Z', status='CORTEX_STEP_STATUS_DONE'):
+        step = json.loads(json.dumps(self.fixture['terminal_timeout_step']))
+        step['status'] = status
+        step['metadata']['createdAt'] = created_at
+        step['errorMessage']['error']['errorId'] = f'00000000-0000-4000-8000-000000000900-{step_index}'
+        return step
+
+    def test_fixture_is_synthetic_and_classifies_two_match_classes_and_guards(self):
+        import agy_live
+
+        raw_text = FAILURE_FIXTURE.read_text(encoding='utf-8')
+        self.assertNotIn('/Users/', raw_text)
+        self.assertNotIn('firejune', raw_text)
+
+        # 1) Transient internal attempt (attempt 1-8 without shouldShowUser) neither wakes nor notifies.
+        transient = agy_live.classify_tail_steps([self.fixture['transient_attempt_step']], 18, sid=self.sid)
+        self.assertEqual(transient['outcome'], 'transient_attempt')
+
+        # 2) Terminal shouldShowUser step carrying "http2: timeout awaiting response headers" -> wake class.
+        wake = agy_live.classify_tail_steps([self.fixture['terminal_timeout_step']], 19, sid=self.sid)
+        self.assertEqual(wake['outcome'], 'wake')
+        self.assertEqual(wake['kind'], 'provider_header_timeout')
+        self.assertEqual(wake['step_index'], 18)
+        self.assertEqual(wake['turn_id'], 'agy:18')
+        self.assertEqual(wake['failed_at'], '2026-11-08T12:04:00+00:00')
+
+        # 3) Any other terminal shouldShowUser error step -> notify_only class.
+        notify = agy_live.classify_tail_steps([self.fixture['terminal_notify_only_step']], 20, sid=self.sid)
+        self.assertEqual(notify['outcome'], 'notify_only')
+        self.assertEqual(notify['kind'], 'terminal_error')
+        self.assertEqual(notify['step_index'], 19)
+        self.assertEqual(notify['turn_id'], 'agy:19')
+
+        # 4) Non-error tail step -> non_error outcome (used to reset retry counter).
+        non_err = agy_live.classify_tail_steps([self.fixture['non_error_step']], 21, sid=self.sid)
+        self.assertEqual(non_err['outcome'], 'non_error')
+
+        # 5) Trailing step, non-DONE status, or missing errorId on a wake-eligible error -> unsafe outcome.
+        trailing = agy_live.classify_tail_steps(
+            [self.fixture['terminal_timeout_step'], self.fixture['non_error_step']], 19, sid=self.sid,
+        )
+        self.assertEqual(trailing['outcome'], 'unsafe')
+        running_step = self.make_timeout_step(18, status='CORTEX_STEP_STATUS_RUNNING')
+        self.assertEqual(agy_live.classify_tail_steps([running_step], 19, sid=self.sid)['outcome'], 'unsafe')
+        missing_id_step = self.make_timeout_step(18)
+        missing_id_step['errorMessage']['error']['errorId'] = ''
+        self.assertEqual(agy_live.classify_tail_steps([missing_id_step], 19, sid=self.sid)['outcome'], 'unsafe')
+
+        # 6) Extending WAKE_ELIGIBLE_ERROR_SUBSTRINGS by one entry enables wake on a new transient signature.
+        custom_step = json.loads(json.dumps(self.fixture['terminal_notify_only_step']))
+        custom_step['errorMessage']['error']['shortError'] = 'agent executor error: upstream stream reset by peer'
+        with mock.patch.object(
+            agy_live,
+            'WAKE_ELIGIBLE_ERROR_SUBSTRINGS',
+            agy_live.WAKE_ELIGIBLE_ERROR_SUBSTRINGS + ('upstream stream reset by peer',),
+        ):
+            custom = agy_live.classify_tail_steps([custom_step], 20, sid=self.sid)
+            self.assertEqual(custom['outcome'], 'wake')
+            self.assertTrue(agy_live.valid_failure_kind(custom['kind']))
+
+    def _make_state(self):
+        import broker
+        import route_store
+
+        state_dir = Path(self.temp.name) / f'state-{uuid.uuid4().hex[:8]}'
+        store = route_store.RouteStore(state_dir)
+        self.addCleanup(store.close)
+        state = broker.State(store=store)
+        for name, transport, sid in (('parent', 'realtime', None), ('worker', 'agy', self.sid)):
+            state.action(dict(op='register', project='demo', name=name, transport=transport,
+                              session=sid, cwd=str(self.root)))
+        source = state.action(dict(op='send', project='demo', sender='parent',
+                                   recipient='worker', body='task payload', key='task-1'))
+        state.action(dict(op='claim', id=source['id']))
+        state.action(dict(op='finish', id=source['id'], state='submitted', event='pushed'))
+        return state, store, source
+
+    def test_monitor_polls_once_per_server_skips_running_and_fetches_tail_only_on_idle_change(self):
+        import asyncio
+        import agy_live
+        import codex_failures
+        import provider_failures
+
+        state, _, source = self._make_state()
+        state.action(dict(op='register', project='demo', name='worker-alias', transport='agy',
+                          session=self.sid, cwd=str(self.root)))
+        now = [100.0]
+        monitor = agy_live.AgyRetryMonitor(state, provider_failures.retry_policy(), clock=lambda: now[0])
+
+        with FakeAgyServer(self.root, self.sid) as fake:
+            fake.trajectories[self.sid]['status'] = 'CASCADE_RUN_STATUS_RUNNING'
+            fake.trajectories[self.sid]['stepCount'] = 18
+            fake.trajectory_steps[self.sid] = [self.fixture['transient_attempt_step']] * 18
+
+            with mock.patch.dict(os.environ, {'AGENT_BRIDGE_AGY_URL': fake.url, 'AGENT_BRIDGE_AGY_CSRF': CSRF}):
+                # While RUNNING (attempts 1-8), GetAllCascadeTrajectories is polled once across both routes and tail step is not fetched.
+                asyncio.run(monitor.check_routes())
+                step_calls = [b for p, _, b in fake.requests if p.endswith('/GetCascadeTrajectorySteps')]
+                traj_calls = [b for p, _, b in fake.requests if p.endswith('/GetAllCascadeTrajectories')]
+                self.assertEqual(len(traj_calls), 1)
+                self.assertEqual(len(step_calls), 0)
+                self.assertIsNone(codex_failures.retry_notice(state, state.endpoints[('demo', 'worker')]))
+
+                # Transition to IDLE at stepCount=19 with terminal timeout step.
+                fake.trajectories[self.sid]['status'] = 'CASCADE_RUN_STATUS_IDLE'
+                fake.trajectories[self.sid]['stepCount'] = 19
+                fake.trajectory_steps[self.sid] = [self.fixture['non_error_step']] * 18 + [self.fixture['terminal_timeout_step']]
+                asyncio.run(monitor.check_routes())
+                step_calls = [b for p, _, b in fake.requests if p.endswith('/GetCascadeTrajectorySteps')]
+                self.assertEqual(len(step_calls), 1)
+                self.assertEqual(step_calls[0], {'cascadeId': self.sid, 'stepOffset': 18})
+                root = codex_failures.retry_notice(state, state.endpoints[('demo', 'worker')])
+                self.assertIsNotNone(root)
+                self.assertEqual(root['recipient'], 'parent')
+                self.assertEqual(root['provider_retry']['status'], 'waiting')
+                self.assertEqual(root['provider_retry']['next_at'], 115.0)
+                self.assertEqual(state.get(source['id'])['state'], 'submitted')
+
+                # Next poll while still IDLE at stepCount=19 before 15 s backoff: no second tail-step fetch.
+                now[0] = 110.0
+                asyncio.run(monitor.check_routes())
+                step_calls = [b for p, _, b in fake.requests if p.endswith('/GetCascadeTrajectorySteps')]
+                self.assertEqual(len(step_calls), 1)
+                self.assertEqual(len([b for p, _, b in fake.requests if p.endswith('/SendUserCascadeMessage')]), 0)
+
+                # At +15 s total elapsed, durable reservation precedes single empty-items wake and emits provider_retry 1/3.
+                now[0] = 115.0
+                asyncio.run(monitor.check_routes())
+                root = codex_failures.retry_notice(state, state.endpoints[('demo', 'worker')])
+                self.assertEqual(root['provider_retry']['status'], 'accepted')
+                self.assertEqual(root['provider_retry']['attempts'], 1)
+                events = state.action(dict(op='conversation', id=root['id']))
+                retry_msgs = [json.loads(m['body']) for m in events if json.loads(m['body']).get('event') == provider_failures.RETRY_EVENT]
+                self.assertEqual(len(retry_msgs), 1)
+                self.assertEqual((retry_msgs[0]['attempt'], retry_msgs[0]['cap'], retry_msgs[0]['correlation']), (1, 3, 'agy:18'))
+                wakes = [b for p, _, b in fake.requests if p.endswith('/SendUserCascadeMessage')]
+                sends = [b for p, _, b in fake.requests if p.endswith('/SendAgentMessage')]
+                self.assertEqual(len(wakes), 1)
+                self.assertEqual(len(sends), 0)
+                self.assertEqual(wakes[0], {
+                    'cascadeId': self.sid,
+                    'deliveryStrategy': 'MESSAGE_DELIVERY_STRATEGY_NEXT_INVOCATION',
+                })
+
+    def test_monitor_backoff_15_30_60_cap_3_dedup_and_non_error_reset(self):
+        import asyncio
+        import agy_live
+        import codex_failures
+        import provider_failures
+
+        state, _, _ = self._make_state()
+        route = state.endpoints[('demo', 'worker')]
+        now = [0.0]
+        monitor = agy_live.AgyRetryMonitor(state, provider_failures.retry_policy(), clock=lambda: now[0])
+
+        with FakeAgyServer(self.root, self.sid) as fake, \
+                mock.patch.dict(os.environ, {'AGENT_BRIDGE_AGY_URL': fake.url, 'AGENT_BRIDGE_AGY_CSRF': CSRF}):
+            # Stall 1 at step_index=9 (stepCount=10): requires 15 s backoff.
+            fake.trajectories[self.sid]['status'] = 'CASCADE_RUN_STATUS_IDLE'
+            fake.trajectories[self.sid]['stepCount'] = 10
+            fake.trajectory_steps[self.sid] = [self.fixture['non_error_step']] * 9 + [self.make_timeout_step(9)]
+            asyncio.run(monitor.check_route(route))
+            root = codex_failures.retry_notice(state, route)
+            self.assertEqual(root['provider_retry']['next_at'], 15.0)
+            now[0] = 14.0
+            asyncio.run(monitor.check_route(route))
+            self.assertEqual(root['provider_retry']['attempts'], 0)
+            now[0] = 15.0
+            asyncio.run(monitor.check_route(route))
+            root = codex_failures.retry_notice(state, route)
+            self.assertEqual((root['provider_retry']['status'], root['provider_retry']['attempts']), ('accepted', 1))
+
+            # Next poll sees RUNNING (wake accepted).
+            now[0] = 25.0
+            asyncio.run(monitor.check_route(route))
+            self.assertEqual(codex_failures.retry_notice(state, route)['provider_retry']['status'], 'accepted')
+
+            # Stall 2 at step_index=18 (stepCount=19): requires 30 s backoff.
+            fake.trajectories[self.sid]['status'] = 'CASCADE_RUN_STATUS_IDLE'
+            fake.trajectories[self.sid]['stepCount'] = 19
+            fake.trajectory_steps[self.sid] = [self.fixture['non_error_step']] * 18 + [self.make_timeout_step(18)]
+            now[0] = 30.0
+            asyncio.run(monitor.check_route(route))
+            root = codex_failures.retry_notice(state, route)
+            self.assertEqual((root['provider_retry']['status'], root['provider_retry']['next_at']), ('waiting', 60.0))
+            now[0] = 59.0
+            asyncio.run(monitor.check_route(route))
+            self.assertEqual(codex_failures.retry_notice(state, route)['provider_retry']['attempts'], 1)
+            now[0] = 60.0
+            asyncio.run(monitor.check_route(route))
+            self.assertEqual(codex_failures.retry_notice(state, route)['provider_retry']['attempts'], 2)
+
+            # Stall 3 at step_index=27 (stepCount=28): requires 60 s backoff.
+            fake.trajectories[self.sid]['status'] = 'CASCADE_RUN_STATUS_IDLE'
+            fake.trajectories[self.sid]['stepCount'] = 28
+            fake.trajectory_steps[self.sid] = [self.fixture['non_error_step']] * 27 + [self.make_timeout_step(27)]
+            now[0] = 70.0
+            asyncio.run(monitor.check_route(route))
+            root = codex_failures.retry_notice(state, route)
+            self.assertEqual((root['provider_retry']['status'], root['provider_retry']['next_at']), ('waiting', 130.0))
+            now[0] = 129.0
+            asyncio.run(monitor.check_route(route))
+            self.assertEqual(codex_failures.retry_notice(state, route)['provider_retry']['attempts'], 2)
+            now[0] = 130.0
+            asyncio.run(monitor.check_route(route))
+            self.assertEqual(codex_failures.retry_notice(state, route)['provider_retry']['attempts'], 3)
+
+            # 4th stall at step_index=36 (stepCount=37): cap reached -> provider_retry_exhausted immediately, no 4th wake.
+            wakes_before = len([b for p, _, b in fake.requests if p.endswith('/SendUserCascadeMessage')])
+            fake.trajectories[self.sid]['status'] = 'CASCADE_RUN_STATUS_IDLE'
+            fake.trajectories[self.sid]['stepCount'] = 37
+            fake.trajectory_steps[self.sid] = [self.fixture['non_error_step']] * 36 + [self.make_timeout_step(36)]
+            now[0] = 140.0
+            asyncio.run(monitor.check_route(route))
+            root = codex_failures.retry_notice(state, route)
+            self.assertEqual(root['provider_retry']['status'], 'exhausted')
+            events = [json.loads(m['body']) for m in state.action(dict(op='conversation', id=root['id']))]
+            retry_events = [e for e in events if e.get('event') == provider_failures.RETRY_EVENT]
+            exhausted_events = [e for e in events if e.get('event') == provider_failures.EXHAUSTED]
+            self.assertEqual([(e['attempt'], e['cap'], e['correlation']) for e in retry_events],
+                             [(1, 3, 'agy:9'), (2, 3, 'agy:18'), (3, 3, 'agy:27')])
+            self.assertEqual([(e['attempt'], e['cap'], e['correlation']) for e in exhausted_events],
+                             [(3, 3, 'agy:36')])
+            wakes_after = len([b for p, _, b in fake.requests if p.endswith('/SendUserCascadeMessage')])
+            self.assertEqual(wakes_after, wakes_before)
+
+            # Non-error step at step_index=37 (stepCount=38) resets the retry counter back to 0 ('recovered').
+            fake.trajectories[self.sid]['stepCount'] = 38
+            fake.trajectory_steps[self.sid] = [self.fixture['non_error_step']] * 38
+            now[0] = 150.0
+            asyncio.run(monitor.check_route(route))
+            self.assertEqual(codex_failures.retry_notice(state, route)['provider_retry']['status'], 'recovered')
+            self.assertEqual(codex_failures.retry_notice(state, route)['provider_retry']['attempts'], 0)
+
+            # A subsequent stall starts a fresh episode with attempt 1 after 15 s.
+            old_root_id = root['id']
+            fake.trajectories[self.sid]['stepCount'] = 39
+            fake.trajectory_steps[self.sid] = [self.fixture['non_error_step']] * 38 + [self.make_timeout_step(38)]
+            now[0] = 160.0
+            asyncio.run(monitor.check_route(route))
+            new_root = codex_failures.retry_notice(state, route)
+            self.assertNotEqual(new_root['id'], old_root_id)
+            self.assertEqual(new_root['provider_retry']['next_at'], 175.0)
+            now[0] = 175.0
+            asyncio.run(monitor.check_route(route))
+            self.assertEqual(codex_failures.retry_notice(state, route)['provider_retry']['attempts'], 1)
+
+    def test_monitor_wake_acceptance_records_uncertain_and_never_wakes_twice(self):
+        import asyncio
+        import agy_live
+        import broker
+        import codex_failures
+        import provider_failures
+        import route_store
+
+        state, store, _ = self._make_state()
+        route = state.endpoints[('demo', 'worker')]
+        now = [0.0]
+        policy = provider_failures.retry_policy(backoff=(5, 10, 20), cap=3)
+        monitor = agy_live.AgyRetryMonitor(state, policy=policy, clock=lambda: now[0])
+
+        with FakeAgyServer(self.root, self.sid, wake_behavior='noop-idle') as fake, \
+                mock.patch.dict(os.environ, {'AGENT_BRIDGE_AGY_URL': fake.url, 'AGENT_BRIDGE_AGY_CSRF': CSRF}):
+            fake.trajectories[self.sid]['status'] = 'CASCADE_RUN_STATUS_IDLE'
+            fake.trajectories[self.sid]['stepCount'] = 10
+            fake.trajectory_steps[self.sid] = [self.fixture['non_error_step']] * 9 + [self.make_timeout_step(9)]
+
+            asyncio.run(monitor.check_route(route))
+            now[0] = 5.0
+            asyncio.run(monitor.check_route(route))
+            root = codex_failures.retry_notice(state, route)
+            self.assertEqual(root['provider_retry']['status'], 'accepted')
+
+            # Next poll window: stepCount is still 10 and status is still IDLE -> provider_retry_uncertain and stop.
+            now[0] = 15.0
+            asyncio.run(monitor.check_route(route))
+            root = codex_failures.retry_notice(state, route)
+            self.assertEqual(root['provider_retry']['status'], 'uncertain')
+            events = [json.loads(m['body']) for m in state.action(dict(op='conversation', id=root['id']))]
+            uncertain = [e for e in events if e.get('event') == provider_failures.UNCERTAIN]
+            self.assertEqual(len(uncertain), 1)
+            self.assertIsNone(uncertain[0]['attempt'])
+            self.assertEqual(uncertain[0]['correlation'], 'agy:9')
+
+            # Even if another error step appears at stepCount=11, uncertain halt prevents waking again.
+            fake.trajectories[self.sid]['stepCount'] = 11
+            fake.trajectory_steps[self.sid] = [self.fixture['non_error_step']] * 10 + [self.make_timeout_step(10)]
+            now[0] = 25.0
+            asyncio.run(monitor.check_route(route))
+            now[0] = 50.0
+            asyncio.run(monitor.check_route(route))
+            wakes = [b for p, _, b in fake.requests if p.endswith('/SendUserCascadeMessage')]
+            self.assertEqual(len(wakes), 1)
+
+        # Also verify broker restart during 'reserved' stops as uncertain without touching the provider.
+        state2, store2, _ = self._make_state()
+        route2 = state2.endpoints[('demo', 'worker')]
+        monitor2 = agy_live.AgyRetryMonitor(state2, policy=policy, clock=lambda: now[0])
+        with FakeAgyServer(self.root, self.sid) as fake2, \
+                mock.patch.dict(os.environ, {'AGENT_BRIDGE_AGY_URL': fake2.url, 'AGENT_BRIDGE_AGY_CSRF': CSRF}):
+            fake2.trajectories[self.sid]['status'] = 'CASCADE_RUN_STATUS_IDLE'
+            fake2.trajectories[self.sid]['stepCount'] = 10
+            fake2.trajectory_steps[self.sid] = [self.fixture['non_error_step']] * 9 + [self.make_timeout_step(9)]
+            now[0] = 100.0
+            asyncio.run(monitor2.check_route(route2))
+            root2 = codex_failures.retry_notice(state2, route2)
+            now[0] = 105.0
+            monitor2.action(root2, 'reserve', fingerprint=root2['provider_retry']['fingerprint'])
+        with mock.patch.object(route_store, 'verify_route', return_value=None):
+            restored = broker.State(store=store2)
+        restored_monitor = agy_live.AgyRetryMonitor(restored, policy=policy, clock=lambda: now[0])
+        with mock.patch.object(agy_live, 'discover_servers', side_effect=AssertionError('must not poll provider')):
+            asyncio.run(restored_monitor.check_route(route2))
+        self.assertEqual(codex_failures.retry_notice(restored, route2)['provider_retry']['status'], 'uncertain')
+
+    def test_monitor_notify_only_unsafe_dedup_and_no_sender_inbox_routing(self):
+        import asyncio
+        import agy_live
+        import codex_failures
+        import provider_failures
+
+        state, _, source = self._make_state()
+        route = state.endpoints[('demo', 'worker')]
+        now = [0.0]
+        monitor = agy_live.AgyRetryMonitor(state, provider_failures.retry_policy(), clock=lambda: now[0])
+
+        with FakeAgyServer(self.root, self.sid) as fake, \
+                mock.patch.dict(os.environ, {'AGENT_BRIDGE_AGY_URL': fake.url, 'AGENT_BRIDGE_AGY_CSRF': CSRF}):
+            # 1) Notify-only terminal error notifies last sender once and does not arm or wake.
+            fake.trajectories[self.sid]['status'] = 'CASCADE_RUN_STATUS_IDLE'
+            fake.trajectories[self.sid]['stepCount'] = 20
+            fake.trajectory_steps[self.sid] = [self.fixture['non_error_step']] * 19 + [self.fixture['terminal_notify_only_step']]
+
+            asyncio.run(monitor.check_route(route))
+            inbox = state.action(dict(op='inbox', project='demo', name='parent'))
+            self.assertEqual(len(inbox), 1)
+            notice = state.action(dict(op='show', id=inbox[0]['id']))
+            self.assertEqual(json.loads(notice['body'])['event'], provider_failures.DETECTED_EVENT)
+            self.assertEqual(json.loads(notice['body'])['kind'], 'terminal_error')
+            self.assertIsNone(codex_failures.retry_notice(state, route))
+
+            # Same (sid, step_index, errorId) is deduplicated; a distinct errorId at the same step_index is not.
+            asyncio.run(monitor.check_route(route))
+            self.assertEqual(len(state.action(dict(op='inbox', project='demo', name='parent'))), 1)
+            distinct_failure = dict(kind='terminal_error', failed_at='2026-11-08T12:05:00+00:00',
+                                    turn_id='agy:19', error_id='00000000-0000-4000-8000-000000000999')
+            second = state.action(dict(op='provider-failure', expected_route=route,
+                                       source_message_id=source['id'], failure=distinct_failure))
+            self.assertNotEqual(second['id'], notice['id'])
+
+            # 2) Unsafe terminal timeout (trailing step present) -> provider_retry_unsafe, no wake.
+            fake.trajectories[self.sid]['stepCount'] = 21
+            fake.trajectory_steps[self.sid] = (
+                [self.fixture['non_error_step']] * 20
+                + [self.make_timeout_step(20), self.fixture['non_error_step']]
+            )
+            asyncio.run(monitor.check_route(route))
+            root = codex_failures.retry_notice(state, route)
+            self.assertEqual(root['provider_retry']['status'], 'unsafe')
+            wakes = [b for p, _, b in fake.requests if p.endswith('/SendUserCascadeMessage')]
+            self.assertEqual(len(wakes), 0)
+
+            # 3) With no retained sender in correspondence, notice routes to the registered agy route's own inbox.
+            state.messages.clear()
+            state.keys.clear()
+            monitor.cached_steps.clear()
+            fake.trajectories[self.sid]['stepCount'] = 22
+            fake.trajectory_steps[self.sid] = [self.fixture['non_error_step']] * 21 + [self.fixture['terminal_notify_only_step']]
+            asyncio.run(monitor.check_route(route))
+            worker_inbox = state.action(dict(op='inbox', project='demo', name='worker'))
+            self.assertEqual(len(worker_inbox), 1)
+            self.assertEqual(worker_inbox[0]['recipient'], 'worker')
+            self.assertIsNone(json.loads(state.action(dict(op='show', id=worker_inbox[0]['id']))['body'])['source_message_id'])
+
+
 if __name__ == '__main__':
     unittest.main()
+
 
 

@@ -22,6 +22,7 @@ import message_store
 import usage
 import provider_failures
 import codex_failures
+import agy_live
 
 DEFAULT_SOCKET = Path.home() / '.local/share/agent-bridge/bridge.sock'
 MAX_FRAME = 1024 * 1024
@@ -408,33 +409,52 @@ class State:
         key = (origin['project'], origin['name'])
         current = self.endpoints.get(key)
         source = codex_failures.last_sender_message(self, origin)
-        if (current != origin or origin['transport'] != 'codex'
+        if (current != origin or origin['transport'] not in ('codex', 'agy')
                 or (source['id'] if source else None) != source_message_id):
             raise ValueError('Provider observation route or task changed')
         destination = source['return_route'] if source else origin
-        if (set(failure) != {'kind', 'failed_at', 'turn_id'}
-                or codex_failures.transient_kind(failure['kind']) is None
-                and failure['kind'] != 'httpConnectionFailed'):
+        transport = origin['transport']
+        if not isinstance(failure, dict):
             raise ValueError('Invalid normalized provider failure')
-        if not isinstance(failure['turn_id'], str) or not 1 <= len(failure['turn_id']) <= 256:
-            raise ValueError('Invalid provider failure turn')
+        if transport == 'codex':
+            if (set(failure) != {'kind', 'failed_at', 'turn_id'}
+                    or codex_failures.transient_kind(failure['kind']) is None
+                    and failure['kind'] != 'httpConnectionFailed'):
+                raise ValueError('Invalid normalized provider failure')
+            if not isinstance(failure['turn_id'], str) or not 1 <= len(failure['turn_id']) <= 256:
+                raise ValueError('Invalid provider failure turn')
+            identity = [origin['project'], origin['name'], origin['session'], failure['turn_id'],
+                        route_key(destination)]
+            extra = {}
+        else:
+            if (set(failure) != {'kind', 'failed_at', 'turn_id', 'error_id'}
+                    or not agy_live.valid_failure_kind(failure['kind'])):
+                raise ValueError('Invalid normalized provider failure')
+            if (not isinstance(failure['turn_id'], str) or not re.fullmatch(r'agy:\d+', failure['turn_id'])
+                    or len(failure['turn_id']) > 256):
+                raise ValueError('Invalid provider failure turn')
+            error_id = failure['error_id']
+            if not isinstance(error_id, str) or not 1 <= len(error_id) <= 128 or any(c.isspace() for c in error_id):
+                raise ValueError('Invalid provider failure error ID')
+            identity = [origin['project'], origin['name'], origin['session'], failure['turn_id'],
+                        error_id, route_key(destination)]
+            extra = dict(error_id=error_id)
         failed_at = failure['failed_at']
         if failed_at is not None:
             parsed = datetime.fromisoformat(failed_at)
             if parsed.tzinfo is None or len(failed_at) > 40:
                 raise ValueError('Invalid provider failure time')
-        identity = [origin['project'], origin['name'], origin['session'], failure['turn_id'],
-                    route_key(destination)]
         dedup_key = provider_failures.DETECTED_EVENT + ':' + hashlib.sha256(
             json.dumps(identity, sort_keys=True).encode()).hexdigest()
         if dedup_key in self.keys:
             return self.get(self.keys[dedup_key][1])
         observed_at = now()
-        body = json.dumps(dict(event=provider_failures.DETECTED_EVENT, provider='codex',
+        source_label = ('turn_duration' if transport == 'codex' else 'step_metadata') if failed_at else 'unavailable'
+        body = json.dumps(dict(event=provider_failures.DETECTED_EVENT, provider=transport,
                                kind=failure['kind'], failed_at=failed_at,
-                               failure_time_source='turn_duration' if failed_at else 'unavailable',
+                               failure_time_source=source_label,
                                observed_at=observed_at, turn_id=failure['turn_id'],
-                               source_message_id=source_message_id), sort_keys=True)
+                               source_message_id=source_message_id, **extra), sort_keys=True)
         return self.provider_notice(origin, destination, body, dedup_key,
                                     provider_failures.DETECTED_EVENT, protect=source_message_id)
 
@@ -655,10 +675,13 @@ async def watch(state, args, reader, writer):
 async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DEFAULT_INTERVAL_MINUTES,
                 codex_executable='codex', claude_live=True,
                 codex_failure_interval=codex_failures.DEFAULT_INTERVAL,
-                retry_backoff=provider_failures.DEFAULT_BACKOFF, retry_cap=provider_failures.DEFAULT_CAP):
+                retry_backoff=provider_failures.DEFAULT_BACKOFF, retry_cap=provider_failures.DEFAULT_CAP,
+                agy_failure_interval=agy_live.DEFAULT_FAILURE_INTERVAL):
     retry_policy = provider_failures.retry_policy(retry_backoff, retry_cap)
     if type(codex_failure_interval) is not int or codex_failure_interval < 0:
         raise ValueError('Codex failure observation interval must be a nonnegative integer')
+    if type(agy_failure_interval) is not int or agy_failure_interval < 0:
+        raise ValueError('Antigravity failure observation interval must be a nonnegative integer')
     path = Path(path).expanduser().absolute()
     path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
     lock = path.with_suffix('.lock').open('a')
@@ -671,6 +694,7 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
     store = None
     collectors = []
     failure_observer = None
+    agy_failure_observer = None
     try:
         if path.exists():
             if not stat.S_ISSOCK(path.stat().st_mode):
@@ -681,6 +705,9 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
         if codex_failure_interval:
             failure_observer = asyncio.create_task(
                 codex_failures.observe_codex_failures(state, codex_failure_interval, retry_policy))
+        if agy_failure_interval:
+            agy_failure_observer = asyncio.create_task(
+                agy_live.observe_agy_failures(state, agy_failure_interval, retry_policy))
         if usage_interval:
             # Read-only limit sampling beside the broker; it never touches `state`.
             collectors = [usage.Collector(usage.UsageStore(store.directory / 'usage', provider=provider),
@@ -745,9 +772,10 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
         await asyncio.gather(*active,return_exceptions=True)
         await server.wait_closed()
     finally:
-        if failure_observer is not None:
-            failure_observer.cancel()
-            await asyncio.gather(failure_observer, return_exceptions=True)
+        for observer in (failure_observer, agy_failure_observer):
+            if observer is not None:
+                observer.cancel()
+                await asyncio.gather(observer, return_exceptions=True)
         for collector in collectors:
             collector.stop()
         if server is not None:

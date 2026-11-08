@@ -1,0 +1,81 @@
+{
+  "cascadeId": "00000000-0000-4000-8000-000000000106",
+  "transcript_attempts": [
+    {
+      "step_index": 16,
+      "source": "SYSTEM",
+      "type": "ERROR_MESSAGE",
+      "status": "DONE",
+      "created_at": "2026-11-08T12:00:00Z",
+      "error": "API error (attempt 1): request failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse\": http2: timeout awaiting response headers"
+    },
+    {
+      "step_index": 17,
+      "source": "SYSTEM",
+      "type": "ERROR_MESSAGE",
+      "status": "DONE",
+      "created_at": "2026-11-08T12:01:04Z",
+      "error": "API error (attempt 2): request failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse\": http2: timeout awaiting response headers"
+    }
+  ],
+  "transient_attempt_step": {
+    "type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+    "status": "CORTEX_STEP_STATUS_DONE",
+    "metadata": {
+      "createdAt": "2026-11-08T12:03:00Z",
+      "completedAt": "2026-11-08T12:03:00Z"
+    },
+    "errorMessage": {
+      "error": {
+        "shortError": "API error (attempt 8): request failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse\": http2: timeout awaiting response headers",
+        "errorId": "00000000-0000-4000-8000-000000000900-17"
+      }
+    }
+  },
+  "terminal_timeout_step": {
+    "type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+    "status": "CORTEX_STEP_STATUS_DONE",
+    "metadata": {
+      "createdAt": "2026-11-08T12:04:00Z"
+    },
+    "errorMessage": {
+      "shouldShowUser": true,
+      "error": {
+        "userErrorMessage": "There was a network issue connecting to the server, please try again.",
+        "modelErrorMessage": "agent executor error: generating and executing: request failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse\": http2: timeout awaiting response headers",
+        "shortError": "agent executor error: generating and executing: request failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse\": http2: timeout awaiting response headers",
+        "errorCode": 2,
+        "errorId": "00000000-0000-4000-8000-000000000900-18"
+      }
+    }
+  },
+  "terminal_notify_only_step": {
+    "type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+    "status": "CORTEX_STEP_STATUS_DONE",
+    "metadata": {
+      "createdAt": "2026-11-08T12:05:00Z"
+    },
+    "errorMessage": {
+      "shouldShowUser": true,
+      "error": {
+        "userErrorMessage": "Model capacity or quota was exceeded for this request.",
+        "modelErrorMessage": "agent executor error: generating and executing: resource_exhausted: model quota exceeded",
+        "shortError": "agent executor error: generating and executing: resource_exhausted: model quota exceeded",
+        "errorCode": 8,
+        "errorId": "00000000-0000-4000-8000-000000000900-19"
+      }
+    }
+  },
+  "non_error_step": {
+    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+    "status": "CORTEX_STEP_STATUS_DONE",
+    "metadata": {
+      "createdAt": "2026-11-08T12:06:00Z",
+      "completedAt": "2026-11-08T12:06:05Z"
+    },
+    "plannerResponse": {
+      "messageId": "bot-00000000-0000-4000-8000-000000000901",
+      "stopReason": "STOP_REASON_STOP_PATTERN"
+    }
+  }
+}

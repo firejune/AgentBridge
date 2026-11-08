@@ -114,6 +114,8 @@ python3 "$bridge_cli" register agy-worker --project PROJECT --transport agy \
 - **무인 세션 생성 (`open` / `register --new`)**:
   - **데스크톱과 IDE (`--host desktop` / `--host ide`) 동일 동작**: 통합 Antigravity 서버(`~/.gemini/antigravity`)에 `StartCascade` + `UpdateConversationAnnotations`를 호출하고, 프로젝트(`~/.gemini/projects/*.json`) 및 워크트리 환경(`projectEnvConfig`) 자동 매칭·생성 및 `customAgentSpec` 초기화를 수행해 0-step 신규 세션도 첫 push 즉시 모든 빌트인 도구와 함께 깨어나며 대화 스택에 동일하게 쌓인다.
 
+Antigravity (`agy`) 공급자 실패 관찰은 등록된 모든 `agy` 라우트를 대상으로 기본 10초마다 서버당 `GetAllCascadeTrajectories`를 1회 폴링하며(`serve --agy-failure-interval SECONDS`, `0`은 비활성화), 세션이 `IDLE`이고 `stepCount`가 바뀌었을 때만 마지막 스텝(`GetCascadeTrajectorySteps`, `stepOffset = stepCount - 1`)을 조회한다. 내부 재시도(`1–8`차, `RUNNING` 상태이거나 `shouldShowUser: true`가 없는 스텝)는 무시한다. 최종 사용자 노출 오류(`shouldShowUser: true`, `CORTEX_STEP_STATUS_DONE`, 뒤따르는 스텝 없음)는 `(sid, step_index, errorId)`로 중복을 방지하고 `agy:<step_index>` 상관 ID를 사용한다. `WAKE_ELIGIBLE_ERROR_SUBSTRINGS`(`"http2: timeout awaiting response headers"`)와 일치하는 최종 스텝만 공통 `15/30/60`초·최대 `3`회 정책(`provider_retry` k/N, `provider_retry_exhausted`, `provider_retry_unsafe`, `provider_retry_uncertain`)으로 예약 후 `wake_session`(빈 `items`의 `SendUserCascadeMessage`, `NEXT_INVOCATION`)으로 깨우며, 그 외 최종 오류 스텝은 `provider_failure_detected`만 기록하고 깨우지 않는다. 진행 중 메시지 유무와 관계없이 알림은 해당 라우트의 마지막 보관 발신자(없으면 라우트 자신의 inbox)로 전달된다. 깨운 뒤 다음 폴링 주기에 `stepCount`가 늘지 않고 `RUNNING`도 아니면 `provider_retry_uncertain`을 기록하고 다시 깨우지 않는다. 메모리 내 스텝 캐시는 브로커 재시작 시 초기화된다.
+
 ### 4. 메시지 발신·응답 및 세션 닫기
 
 ```bash

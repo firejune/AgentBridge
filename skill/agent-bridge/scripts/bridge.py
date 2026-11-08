@@ -677,6 +677,8 @@ def main(argv=None):
     p.add_argument('--codex-executable',default='codex')
     p.add_argument('--codex-failure-interval',type=int,default=broker.codex_failures.DEFAULT_INTERVAL,
                    help='Seconds between read-only checks of registered Codex threads (0 = off)')
+    p.add_argument('--agy-failure-interval',type=int,default=agy_live.DEFAULT_FAILURE_INTERVAL,
+                   help='Seconds between read-only checks of registered Antigravity sessions (0 = off)')
     p.add_argument('--provider-retry-backoff',default=','.join(map(str,broker.provider_failures.DEFAULT_BACKOFF)),
                    help='Comma-separated positive delays before continuation attempts, in seconds')
     p.add_argument('--provider-retry-cap',type=int,default=broker.provider_failures.DEFAULT_CAP,
@@ -807,7 +809,8 @@ def main(argv=None):
                                      args.usage_interval,args.codex_executable,args.claude_live,
                                      args.codex_failure_interval,
                                      tuple(int(value) for value in args.provider_retry_backoff.split(',')),
-                                     args.provider_retry_cap))
+                                     args.provider_retry_cap,
+                                     args.agy_failure_interval))
             return 0
         if args.cmd=='usage':
             state_dir = args.state_dir or Path(args.socket).expanduser().absolute().with_suffix('.state')
