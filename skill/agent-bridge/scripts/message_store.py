@@ -9,6 +9,7 @@ import time
 import uuid
 
 import route_store
+import provider_failures
 
 MESSAGE_FIELDS = ('id', 'conversation', 'project', 'sender', 'recipient', 'channel',
                   'sender_channel', 'body', 'reply_to', 'state', 'created')
@@ -33,6 +34,35 @@ class UnsafeCheckpointError(ValueError):
 
 def encoded(value):
     return (json.dumps(value, ensure_ascii=False) + '\n').encode()
+
+
+def retry_record(raw):
+    fields = {'version', 'status', 'attempts', 'backoff', 'cap', 'turn_id', 'fingerprint',
+              'kind', 'failed_at', 'source_message_id', 'next_at', 'reservation_id', 'event_id'}
+    if (not isinstance(raw, dict) or set(raw) != fields
+            or type(raw['version']) is not int or raw['version'] != 1):
+        raise ValueError('Invalid provider retry checkpoint')
+    if raw['status'] not in ('waiting', 'reserved', 'accepted', 'unsafe', 'uncertain', 'exhausted', 'recovered'):
+        raise ValueError('Invalid provider retry status')
+    if not isinstance(raw['backoff'], list):
+        raise ValueError('Invalid provider retry backoff')
+    policy = provider_failures.retry_policy(tuple(raw['backoff']), raw['cap'])
+    if type(raw['attempts']) is not int or not 0 <= raw['attempts'] <= policy.cap:
+        raise ValueError('Invalid provider retry count')
+    provider_failures.retry_event_body(provider_failures.DETECTED_EVENT, provider='codex',
+        kind=raw['kind'], failed_at=raw['failed_at'], correlation=raw['turn_id'])
+    if (not isinstance(raw['fingerprint'], str) or len(raw['fingerprint']) != 64
+            or any(character not in '0123456789abcdef' for character in raw['fingerprint'])):
+        raise ValueError('Invalid provider retry fingerprint')
+    for field in ('source_message_id', 'reservation_id', 'event_id'):
+        if raw[field] is not None and str(uuid.UUID(raw[field])) != raw[field]:
+            raise ValueError('Invalid provider retry correlation')
+    due = raw['next_at']
+    if due is not None and (type(due) not in (int, float) or not math.isfinite(due) or due < 0):
+        raise ValueError('Invalid provider retry deadline')
+    if raw['status'] == 'reserved' and (raw['reservation_id'] is None or raw['event_id'] is None):
+        raise ValueError('Missing provider retry reservation')
+    return {field: raw[field] for field in sorted(fields)}
 
 
 def message_record(raw):
@@ -60,6 +90,8 @@ def message_record(raw):
         if not isinstance(raw['acknowledged_at'], str):
             raise ValueError('Invalid acknowledgement time')
         result['acknowledged_at'] = raw['acknowledged_at']
+    if raw.get('provider_retry') is not None:
+        result['provider_retry'] = retry_record(raw['provider_retry'])
     # Provider diagnostics may contain secrets. Neither diagnostics nor event
     # payloads are needed to reconcile delivery, so never serialize them.
     result.update(note=None, events=[])

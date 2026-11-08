@@ -12,7 +12,7 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skill/agent-bridge/scripts'))
 import broker
 import codex_live
-import provider_failures
+import codex_failures as provider_failures
 import route_store
 from support import RunningBroker
 from test_codex_new import ModelDesktop
