@@ -170,8 +170,9 @@ python3 "$bridge_cli" usage --events
 ## Agent Worktrees
 
 - Write code only in a worktree under `<workspace>/.worktrees/<repo>/<agent>-<issue>`; keep the main checkout on `main`.
-- Create with `bridge.py wt new REPO AGENT ISSUE [--slug SLUG]` (or `--detach REF` for a read-only pin).
-- Inspect with `bridge.py wt list --text` and preview cleanup with `bridge.py wt sweep` (run `--apply` only when the owner asks). Remove your own worktree right after merge with `git worktree remove PATH` and `git branch -D BRANCH`.
+- Create with `bridge.py wt new REPO AGENT ISSUE [--slug SLUG] [--peer REPO=REF] [--links-config PATH] [--no-link]` (or `--detach REF` for a read-only pin).
+- When `<root>/workspace-links.json` (or `--links-config` / `AGENT_BRIDGE_WT_LINKS`) declares `REPO` in `members`, `wt new` materializes full fixed committed sibling snapshots into `<lane>.ws/peers/<sibling>`, installs in `<lane>.ws` with `[install] linker = "isolated"` without touching shared main checkouts or the lane's tracked manifest/lockfile, verifies post-install workspace symlink bindings into the owned sidecar/worktree paths, marks peer snapshot sources read-only, and returns `source_command` (e.g., `bun --conditions=@rig-c/source`) plus exact peer SHAs in `linked_peers`. Clean failed provisioning rolls back `<lane>`, `<lane>.ws`, and the created branch without `--force`; if an install dirties tracked/source files in `<lane>`, rollback removes `<lane>.ws` and derived `node_modules` while retaining the dirty `<lane>` and branch (`WT_LINK_ROLLBACK_REFUSED_DIRTY`).
+- Inspect with `bridge.py wt list --text` and preview cleanup with `bridge.py wt sweep` (run `--apply` only when the owner asks). Remove your own clean worktree and its owned `.ws` sidecar right after merge with `bridge.py wt remove PATH` (never pass `--force`; `wt remove` and `wt sweep` also clean up same-owner absent-worktree `.ws` sidecars if raw `git worktree remove PATH` was run first, while never deleting arbitrary unowned `.ws` directories or other sessions' lanes).
 
 ## Remote MCP Facade
 
