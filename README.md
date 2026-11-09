@@ -172,10 +172,18 @@ Keep the main repository checkout clean on `main` and isolate every agent's work
 
 ```bash
 python3 "$bridge_cli" wt new . jinni 42 --slug fix-bug --provider agy --session UUID
+python3 "$bridge_cli" wt new rig-review jinni 42 --peer rig-play=pair/branch
+python3 "$bridge_cli" wt remove <path>  # Remove own clean worktree, .ws sidecar, and branch without --force
 python3 "$bridge_cli" wt list --text
-python3 "$bridge_cli" wt sweep          # Dry-run cleanup of merged worktrees whose owner session is gone
-python3 "$bridge_cli" wt sweep --apply  # Remove eligible worktrees and branches
+python3 "$bridge_cli" wt sweep          # Dry-run cleanup of merged worktrees/sidecars whose owner session is gone
+python3 "$bridge_cli" wt sweep --apply  # Remove eligible worktrees, owned .ws sidecars, and branches
 ```
+
+When `<root>/workspace-links.json` (or `--links-config PATH` / `AGENT_BRIDGE_WT_LINKS`) declares the target repository under `members` (and `--no-link` is not passed), `wt new` also provisions an isolated `<root>/<repo>/<agent>-<issue>.ws` sidecar:
+- Extracts full fixed committed sibling trees into `<lane>.ws/peers/<sibling>` via `git archive` (recording exact commit SHAs in `OWNER.json` and `<lane>.ws/SIDECAR.json`), writes `bunfig.toml` (`linker = "isolated"`), runs `bun install` inside `<lane>.ws` without mutating any shared main checkout or the primary lane's tracked `package.json`/`bun.lock`, verifies post-install workspace symlink bindings into the owned sidecar/worktree paths, and locks peer snapshot sources read-only.
+- Returns `source_command` (e.g., `bun --conditions=@rig-c/source`) to run linked source imports when `"condition"` is configured.
+- Refuses invalid setups and rolls back clean `<lane>`, `<lane>.ws`, and the created branch without `--force` using named codes (`WT_LINK_SIDECAR_EXISTS`, `WT_LINK_PROTECTED_MAIN_REFUSED`, `WT_LINK_DECLARATION_MISMATCH`, `WT_LINK_SOURCE_CONDITION_MISSING`, `WT_LINK_INSTALL_FAILED`); if an install dirtied tracked/source files in `<lane>`, rollback removes `<lane>.ws` and derived `node_modules` while retaining the dirty `<lane>` worktree and branch (`WT_LINK_ROLLBACK_REFUSED_DIRTY`).
+- Cleanup via `bridge.py wt remove <path>` or `bridge.py wt sweep --apply` removes the owned `.ws` sidecar alongside its worktree (including same-owner absent-worktree sidecars left after raw `git worktree remove`, while never deleting arbitrary unowned `.ws` directories or active lanes).
 
 ### 5. Broker Persistence & Optional `launchd` Supervision
 
