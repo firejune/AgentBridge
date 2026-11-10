@@ -48,6 +48,7 @@ PEER_TAG = 'cross-session-message'
 PEER_MAX_LINE = 1048576
 PEER_IO_TIMEOUT = 5
 PEER_BROKER_TIMEOUT = 10
+PEER_CLAIM_RELEASE_TIMEOUT = 2
 PEER_PUSH_TIMEOUT = 30
 PEER_FROM_CHARS = re.compile(r'[^A-Za-z0-9%:_/.\-]')
 PEER_CLOSE_TAG = re.compile(r'<(?!\\)(?=\s*/\s*cross[\s_-]*session[\s_-]*message)', re.I)
@@ -148,6 +149,14 @@ def push_frame(target, frame, deadline):
     return None
 
 
+def legacy_claim_confirmed(claimed, mid):
+    if not isinstance(claimed, dict):
+        return False
+    if 'dispatch_claim' in claimed:
+        return set(claimed) == {'dispatch_claim'} and broker.valid_claim_token(claimed['dispatch_claim'])
+    return claimed.get('id') == mid and claimed.get('state') == 'dispatching'
+
+
 def push(path, m, dry_run=False, *, deadline=None):
     """Push one pending claude-peer message. Success = submitted; never retried automatically."""
     if dry_run:
@@ -160,11 +169,37 @@ def push(path, m, dry_run=False, *, deadline=None):
     def rpc(op, rpc_deadline, **fields):
         return broker.request(path, {'op':op, 'id':m['id'], **fields}, deadline=rpc_deadline)
 
+    claim_deadline = min(deadline, time.monotonic() + PEER_BROKER_TIMEOUT)
+    claim_fields = {'claim_token':str(uuid.uuid4()), 'admit_until':claim_deadline}
     try:
-        claimed = rpc('claim', min(deadline, time.monotonic() + PEER_BROKER_TIMEOUT), guarded=True)
+        try:
+            claimed = rpc('claim-guarded', claim_deadline, **claim_fields)
+        except ValueError as error:
+            if str(error) != 'Unknown operation':
+                raise
+            # An older broker rejects the new operation before any mutation.
+            claim_fields = None
+            claimed = rpc('claim', claim_deadline, guarded=True)
+        if claim_fields is None:
+            confirmed = legacy_claim_confirmed(claimed, m['id'])
+        else:
+            confirmed = isinstance(claimed, dict) and claimed.get('dispatch_claim') == claim_fields['claim_token']
+        if not confirmed:
+            raise broker.BrokerResponseError('Broker reply did not confirm the delivery claim')
     except (OSError, broker.BrokerResponseError):
-        # A late broker response may leave a durable claim. This caller has not
-        # entered the peer socket and cannot prove it owns any stored claim.
+        if claim_fields is not None:
+            # A disconnected request can arrive after us. Wait until its
+            # admission window closes before attempting the one exact release.
+            time.sleep(max(0, claim_deadline - time.monotonic()))
+            try:
+                released = rpc('release-claim', time.monotonic() + PEER_CLAIM_RELEASE_TIMEOUT, **claim_fields)
+            except (ValueError, OSError):
+                raise ClaudeDispatchUnknown('claim-release', m['id']) from None
+            if not isinstance(released, dict) or type(released.get('released')) is not bool:
+                raise ClaudeDispatchUnknown('claim-release', m['id']) from None
+            if released['released']:
+                message = {key:m[key] for key in ('id', 'state', 'route', 'return_route')}
+                raise PushFailed(broker.CLAIM_RELEASE_NOTE, message) from None
         raise ClaudeDispatchUnknown('claim', m['id']) from None
 
     def finish(state, note, event=None):

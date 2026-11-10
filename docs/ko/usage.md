@@ -236,7 +236,9 @@ python3 "$bridge_cli" channel-bind modal-view --project my-app --owner codex-age
   - `~/.claude/sessions/<pid>.json`에서 등록된 `sessionId`, 프로세스 생존, `peerProtocol == 1`, `messagingSocketPath`를 확인한다.
   - 소켓에 JSON 두 줄(`{"type":"auth","token":<peerToken>}`, `{"type":"user","message":{...},"session_id":<sessionId>,...}`)을 쓰고 닫는다. `peerToken`은 메모리에서만 읽는다.
   - peer 연결, 쓰기, 빈 EOF 확인에는 합계 최대 5초를 쓴다. `deliver ID --timeout SECONDS`의 한도는 브로커 조회, claim, peer I/O, 쓰기 전 실패가 확실할 때의 결과 기록에 함께 적용된다. 쓰기가 시작됐을 수 있다면 이 한도가 지나도 브로커 finish 요청에는 별도의 10초 한도를 적용한다.
-  - 빈 EOF를 받으면 `pushed` 이벤트와 `submitted`를 기록한다. 쓰기 전 오류가 확실하면 `push_failed` 이벤트와 `pending`을 기록한다. 쓰기가 시작된 뒤 쓰기나 종료에 실패하거나, EOF가 없거나 응답 바이트가 오면 브로커가 finish를 확인한 경우 `uncertain`을 기록한다. 이 실패들은 종료 코드 1을 반환한다. 브로커의 claim 또는 finish 응답을 받지 못하면 종료 코드 1과 `id`, `stage`(`claim` 또는 `finish`), `uncertain: true`를 출력한다. 이 출력은 응답 미확인을 뜻한다. 기록된 메시지 상태는 `show ID`로 조회한다.
+  - 빈 EOF를 받으면 `pushed` 이벤트와 `submitted`를 기록한다. 쓰기 전 오류가 확실하면 `push_failed` 이벤트와 `pending`을 기록한다. 쓰기가 시작된 뒤 쓰기나 종료에 실패하거나, EOF가 없거나 응답 바이트가 오면 브로커가 finish를 확인한 경우 `uncertain`을 기록한다. 이 실패들은 종료 코드 1을 반환한다.
+  - 클라이언트가 peer 소켓을 열기 전에 보호된 claim 응답을 잃으면 접수 한도가 지날 때까지 기다렸다가 별도의 2초 한도로 해제를 한 번 요청한다. 브로커는 클라이언트 토큰과 접수 한도가 둘 다 일치하는 현재 `dispatching` 예약만 해제한다. 한도가 지난 claim은 접수하지 않으며 재시작하면 기존 예약의 소유 정보는 사라진다. 해제가 확인되면 종료 코드 1과 `push_failed: true`를 반환하고 `push_failed` 이벤트와 `pending`을 기록한다. 이 경로에서는 peer 프레임을 보내지 않는다.
+  - 구버전 브로커가 보호된 claim 작업을 명시적으로 거부한 뒤에만 기존 claim 방식을 사용한다. 기존 방식의 응답을 잃으면 예약을 보호 상태로 둔다. claim, 해제, finish가 미확정이면 종료 코드 1과 `id`, `stage`(`claim`, `claim-release` 또는 `finish`), `uncertain: true`를 출력한다. 기록된 메시지 상태는 `show ID`로 조회한다.
 - **Codex (`codex`)**:
   - `CODEX_HOME/ipc/ipc.sock`(또는 `AGENT_BRIDGE_CODEX_IPC`)에서 정확한 대화 소유자에 연결한다.
   - 동료 본문을 standalone `toolOutput`(`agent_bridge`)로 전달하며, 활성 턴이면 `thread-follower-steer-turn`을 먼저 호출해 현재 턴에 합류하고 유휴 상태일 때만 `thread-follower-start-turn`을 호출한다.

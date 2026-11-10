@@ -52,7 +52,7 @@ flowchart LR
 | **Antigravity IDE & Desktop** | `agy` | 로컬 `language_server` / `agy --hub`의 ConnectRPC에 연결해 활성 턴에는 `<SYSTEM_MESSAGE>`(`SendAgentMessage`)로 합류하고, 유휴/대기 상태에는 빈 `SendUserCascadeMessage`(`NEXT_INVOCATION`)로 즉시 깨운다. |
 | **CLI 워커** | `realtime` / `claude` | `realtime`은 `watch`로 JSONL 이벤트를 구독한다. `claude`는 **쉬고 있는 전용 CLI 세션**만 `deliver` 시 읽기 전용 `plan` 모드로 `--resume`한다(라이브 세션에는 절대 사용하지 않는다). |
 
-Claude peer 전송은 소켓 쓰기와 연결 종료 대기에 시간 제한을 둔다. `deliver ID --timeout SECONDS`는 Claude peer 전송의 조회, claim, peer I/O에 적용된다. 쓰기가 시작됐을 수 있다면 결과 기록에 최대 10초를 더 쓸 수 있다. 결과가 미확정인 전송은 수신자에게 중복 전송되지 않도록 계속 보호한다. `show`와 CLI `inbox`는 대기 중인 메시지에 `pending behind <id> since <time>`을 표시한다.
+Claude peer 전송은 소켓 쓰기와 연결 종료 대기에 시간 제한을 둔다. `deliver ID --timeout SECONDS`는 Claude peer 전송의 조회, claim, peer I/O에 적용된다. 쓰기가 시작됐을 수 있다면 결과 기록에 최대 10초를 더 쓸 수 있다. peer에 쓰기 전 보호된 claim 응답을 잃으면, claim 접수 한도가 지난 뒤 자기 예약을 푸는 데 최대 2초를 더 쓴다. 결과가 미확정인 전송은 수신자에게 중복 전송되지 않도록 계속 보호한다. `show`와 CLI `inbox`는 대기 중인 메시지에 `pending behind <id> since <time>`을 표시한다.
 
 ## 글로벌 스킬 설치
 

@@ -1,3 +1,4 @@
+from contextlib import closing
 import hashlib
 import io
 import json
@@ -69,10 +70,12 @@ class FakeClaude:
 
 class DelayedBrokerReply:
     """Proxy one delivery and withhold the selected broker reply."""
-    def __init__(self, root, server, phase, commit, delay=3):
+    def __init__(self, root, server, phase, commit, delay=3, legacy=False, drop_release_reply=False):
         self.path = str(Path(root)/'proxy.sock')
         self.server, self.phase, self.commit = server, phase, commit
         self.delay = delay
+        self.legacy = legacy
+        self.drop_release_reply = drop_release_reply
         self.release = threading.Event()
         self.operations = []
 
@@ -80,14 +83,17 @@ class DelayedBrokerReply:
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.bind(self.path)
         self.sock.listen()
+        self.sock.settimeout(0.1)
         self.thread = threading.Thread(target=self.relay, daemon=True)
         self.thread.start()
         return self
 
     def relay(self):
-        while True:
+        while not self.release.is_set():
             try:
                 conn, _ = self.sock.accept()
+            except TimeoutError:
+                continue
             except OSError:
                 return
             with conn, conn.makefile('rb') as reader:
@@ -97,14 +103,21 @@ class DelayedBrokerReply:
                 if op == self.phase and not self.commit:
                     self.release.wait(self.delay)
                     return
-                result = self.server.call(op, **args)
+                if self.legacy and op == 'claim-guarded':
+                    response = {'error':'Unknown operation'}
+                else:
+                    if self.legacy and op == 'claim':
+                        args.pop('guarded', None)  # Pre-guard brokers ignored the opt-in.
+                    response = {'result':self.server.call(op, **args)}
                 if op == self.phase:
                     self.release.wait(self.delay)
+                if op == 'release-claim' and self.drop_release_reply:
+                    return
                 try:
-                    conn.sendall(bridge.broker.wire({'result':result}))
+                    conn.sendall(bridge.broker.wire(response))
                 except BrokenPipeError:
                     pass
-                if op == self.phase:
+                if op == 'release-claim' or (op == self.phase and self.phase != 'claim-guarded'):
                     return
 
     def __exit__(self, *_):
@@ -243,7 +256,7 @@ class PushTests(unittest.TestCase):
                 self.assertGreater(elapsed, 0.55)
                 self.assertLess(elapsed, 1.5)
                 self.assertIn('did not close', output['error'])
-                self.assertEqual(proxy.operations, ['show', 'claim', 'finish'])
+                self.assertEqual(proxy.operations, ['show', 'claim-guarded', 'finish'])
                 self.assertEqual(output['message']['state'], 'uncertain')
                 self.assertEqual(len(fake.received), 1)
                 stored = server.call('show', id=first['id'])
@@ -261,38 +274,180 @@ class PushTests(unittest.TestCase):
             release.set()
             fake.close()
 
-    def test_delayed_claim_or_finish_reply_respects_deliver_budget_and_never_replays(self):
+    def test_delayed_finish_reply_respects_settlement_budget_and_never_replays(self):
         fake = FakeClaude(self.temp.name, self.sid)
         try:
             with RunningBroker() as server:
                 self.register(server)
-                cases = (('claim', True, 'dispatching', 0), ('finish', True, 'submitted', 1),
-                         ('finish', False, 'dispatching', 2))
-                for phase, commit, state, count in cases:
-                    with self.subTest(phase=phase, commit=commit):
-                        message = self.post(server, f'{phase}-{commit}')
+                for commit, state, count in ((True, 'submitted', 1), (False, 'dispatching', 2)):
+                    with self.subTest(commit=commit):
+                        message = self.post(server, f'finish-{commit}')
                         with mock.patch.object(bridge, 'PEER_BROKER_TIMEOUT', 0.45), \
-                                DelayedBrokerReply(self.temp.name, server, phase, commit) as proxy:
+                                DelayedBrokerReply(self.temp.name, server, 'finish', commit) as proxy:
                             code, output, elapsed = self.deliver(proxy.path, message['id'], 0.35)
                         Path(proxy.path).unlink()
                         self.assertEqual(code, 1)
                         self.assertLess(elapsed, 0.9)
-                        if phase == 'finish':
-                            self.assertGreaterEqual(elapsed, 0.45)
+                        self.assertGreaterEqual(elapsed, 0.45)
                         self.assertEqual((output['stage'], output['id'], output['uncertain']),
-                                         (phase, message['id'], True))
+                                         ('finish', message['id'], True))
                         self.assertNotIn(message['body'], json.dumps(output))
-                        self.assertEqual(proxy.operations,
-                                         ['show', 'claim'] if phase == 'claim' else ['show', 'claim', 'finish'])
+                        self.assertEqual(proxy.operations, ['show', 'claim-guarded', 'finish'])
                         self.assertEqual(server.call('show', id=message['id'])['state'], state)
                         self.assertEqual(len(fake.received), count)
-                        if phase == 'claim':
-                            server.call('resolve', id=message['id'], state='done', note='Fake peer saw no write')
                         if not commit:
                             later = self.post(server, 'later')
                             self.assertEqual(server.call('show', id=later['id'])['blocked_by']['id'], message['id'])
         finally:
             fake.close()
+
+    def test_lost_guarded_claim_reply_releases_only_once_without_writing(self):
+        fake = FakeClaude(self.temp.name, self.sid)
+        try:
+            with RunningBroker() as server:
+                self.register(server)
+                released_ids = []
+                for drop_release_reply in (False, True):
+                    with self.subTest(drop_release_reply=drop_release_reply):
+                        message = self.post(server, f'claim-{drop_release_reply}')
+                        with DelayedBrokerReply(self.temp.name, server, 'claim-guarded', True, delay=0.5,
+                                                drop_release_reply=drop_release_reply) as proxy:
+                            code, output, elapsed = self.deliver(proxy.path, message['id'], 0.35)
+                        Path(proxy.path).unlink()
+                        self.assertEqual(code, 1)
+                        self.assertLess(elapsed, 1.5)
+                        self.assertEqual(proxy.operations, ['show', 'claim-guarded', 'release-claim'])
+                        self.assertEqual(fake.received, [])
+                        self.assertNotIn(message['body'], json.dumps(output))
+                        if drop_release_reply:
+                            self.assertEqual((output['stage'], output['id'], output['uncertain']),
+                                             ('claim-release', message['id'], True))
+                        else:
+                            self.assertTrue(output['push_failed'])
+                            self.assertEqual((output['message']['id'], output['message']['state']),
+                                             (message['id'], 'pending'))
+                        stored = server.call('show', id=message['id'])
+                        self.assertEqual(stored['state'], 'pending')
+                        self.assertEqual([e['state'] for e in stored['events']], ['dispatching', 'pending'])
+                        self.assertEqual(stored['events'][-1]['event'], 'push_failed')
+                        released_ids.append(message['id'])
+                server.restart()
+                for mid in released_ids:
+                    self.assertEqual(server.call('show', id=mid)['state'], 'pending')
+        finally:
+            fake.close()
+
+    def test_expired_claim_cannot_be_admitted_after_out_of_order_release(self):
+        FakeClaude(self.temp.name, self.sid, listen=False)
+        with RunningBroker() as server:
+            self.register(server)
+            mid = self.post(server, 'out-of-order')['id']
+            claim = dict(id=mid, claim_token=str(uuid.uuid4()), admit_until=time.monotonic() + 0.25)
+            with self.assertRaisesRegex(ValueError, 'admission is still open'):
+                server.call('release-claim', **claim)
+            time.sleep(max(0, claim['admit_until'] - time.monotonic()))
+            self.assertEqual(server.call('release-claim', **claim), {'released':False})
+            with self.assertRaisesRegex(ValueError, 'admission expired'):
+                server.call('claim-guarded', **claim)
+            shown = server.call('show', id=mid)
+            self.assertEqual((shown['state'], shown['events']), ('pending', []))
+
+    def test_release_rejects_reclaimed_foreign_and_restarted_claims(self):
+        FakeClaude(self.temp.name, self.sid, listen=False)
+        with RunningBroker() as server:
+            self.register(server)
+            mid = self.post(server, 'exact-token')['id']
+            deadline = time.monotonic() + 0.5
+            first = dict(id=mid, claim_token=str(uuid.uuid4()), admit_until=deadline)
+            server.call('claim-guarded', **first)
+            server.call('resolve', id=mid, state='pending', note='Test operator released the first claim')
+            second = dict(first, claim_token=str(uuid.uuid4()))
+            server.call('claim-guarded', **second)
+            time.sleep(max(0, deadline - time.monotonic()))
+            for stale in (first, dict(second, claim_token=str(uuid.uuid4())), dict(second, admit_until=deadline-0.01)):
+                self.assertEqual(server.call('release-claim', **stale), {'released':False})
+                self.assertEqual(server.call('show', id=mid)['state'], 'dispatching')
+            self.assertEqual(server.call('release-claim', **second), {'released':True})
+            self.assertEqual(server.call('show', id=mid)['state'], 'pending')
+
+            legacy = server.call('claim', id=mid, guarded=True)
+            self.assertEqual(server.call('release-claim', **dict(second, claim_token=legacy['dispatch_claim'])),
+                             {'released':False})
+            server.call('finish', id=mid, state='pending', event='push_failed', note='Legacy test client did not write',
+                        expect_dispatch_claim=legacy['dispatch_claim'])
+            current = dict(second, claim_token=str(uuid.uuid4()), admit_until=time.monotonic() + 0.25)
+            server.call('claim-guarded', **current)
+            server.restart()
+            time.sleep(max(0, current['admit_until'] - time.monotonic()))
+            self.assertEqual(server.call('release-claim', **current), {'released':False})
+            self.assertEqual(server.call('show', id=mid)['state'], 'uncertain')
+
+    def test_legacy_broker_fallback_requires_definite_unsupported_reply(self):
+        fake = FakeClaude(self.temp.name, self.sid)
+        try:
+            with RunningBroker() as server:
+                self.register(server)
+                sent = self.post(server, 'legacy-success')
+                with DelayedBrokerReply(self.temp.name, server, 'finish', True, delay=0, legacy=True) as proxy:
+                    code, output, _ = self.deliver(proxy.path, sent['id'], 0.35)
+                Path(proxy.path).unlink()
+                self.assertEqual((code, output['state']), (0, 'submitted'))
+                self.assertEqual(proxy.operations, ['show', 'claim-guarded', 'claim', 'finish'])
+
+                lost = self.post(server, 'legacy-lost')
+                with DelayedBrokerReply(self.temp.name, server, 'claim', True, legacy=True) as proxy:
+                    code, output, elapsed = self.deliver(proxy.path, lost['id'], 0.35)
+                self.assertEqual((code, output['stage'], output['uncertain']), (1, 'claim', True))
+                self.assertLess(elapsed, 0.9)
+                self.assertEqual(proxy.operations, ['show', 'claim-guarded', 'claim'])
+                self.assertEqual(server.call('show', id=lost['id'])['state'], 'dispatching')
+                self.assertEqual(len(fake.received), 1)
+        finally:
+            fake.close()
+
+    def test_legacy_claim_receipts_must_confirm_the_requested_reservation(self):
+        mid = str(uuid.uuid4())
+        message = {'id':mid, 'route':{'session':self.sid}}
+        invalid = ({}, {'id':str(uuid.uuid4()), 'state':'dispatching'},
+                   {'id':mid, 'state':'pending'}, {'dispatch_claim':'invalid'})
+        for receipt in invalid:
+            with self.subTest(receipt=receipt), \
+                    mock.patch.object(bridge.broker, 'request', side_effect=[ValueError('Unknown operation'), receipt]) as rpc, \
+                    mock.patch.object(sessions, 'resolve_claude_peer') as resolve:
+                with self.assertRaises(bridge.ClaudeDispatchUnknown) as caught:
+                    bridge.push('/unused.sock', message)
+                self.assertEqual(caught.exception.stage, 'claim')
+                self.assertEqual(rpc.call_count, 2)
+                resolve.assert_not_called()
+        self.assertTrue(bridge.legacy_claim_confirmed({'dispatch_claim':str(uuid.uuid4())}, mid))
+        self.assertTrue(bridge.legacy_claim_confirmed({'id':mid, 'state':'dispatching'}, mid))
+
+    def test_claim_credentials_are_visible_only_to_the_claim_request(self):
+        FakeClaude(self.temp.name, self.sid, listen=False)
+        with RunningBroker() as server:
+            self.register(server)
+            parent = server.call('send', project='demo', sender='beta', recipient='alpha',
+                                 body='Question', key='question')
+            reply_args = dict(id=parent['id'], body='Answer', key='answer')
+            reply = server.call('reply', **reply_args)
+            mid = reply['id']
+            token = str(uuid.uuid4())
+            watch_args = dict(op='watch', project='demo', name='beta')
+            with closing(bridge.broker.stream(server.path, watch_args, timeout=1)) as watcher:
+                self.assertEqual(next(watcher)['type'], 'subscribed')
+                claim = server.call('claim-guarded', id=mid, claim_token=token, admit_until=time.monotonic()+1)
+                self.assertEqual(claim, {'dispatch_claim':token})
+                event = next(watcher)['message']
+            shown = server.call('show', id=mid)
+            duplicate = server.call('reply', **reply_args)
+            conversation = server.call('conversation', id=mid)
+            waited = server.call('wait', id=parent['id'], timeout=0.1)['replies']
+            for row in (event, shown, duplicate, *conversation, *waited):
+                self.assertNotIn('dispatch_claim', row)
+                self.assertNotIn('dispatch_claim_deadline', row)
+            checkpoint = (Path(server.state_dir)/'correspondence.json').read_text()
+            self.assertNotIn(token, checkpoint)
+            self.assertNotIn('dispatch_claim_deadline', checkpoint)
 
     def test_dispatch_blocker_visible_in_inbox_across_aliases_and_restart(self):
         FakeClaude(self.temp.name, self.sid, listen=False)
