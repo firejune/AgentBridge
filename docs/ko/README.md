@@ -121,7 +121,12 @@ python3 "$bridge_cli" register codex-worker --project my-app --transport codex \
 
 # 작업이 끝난 워커 세션 닫기 및 라우트 해제 (사이드바에서 숨기려면 --archive 추가):
 python3 "$bridge_cli" close agy-worker --project my-app [--archive]
+
+# 유휴로 닫힌 Claude 데스크톱 세션 깨우기 (woken, already-live, unsupported, uncertain 중 하나를 출력):
+python3 "$bridge_cli" wake claude-tower --project my-app [--timeout 30]
 ```
+
+Claude 데스크톱은 세션을 스스로 닫는다. 화면에 안 보이는 세션은 마지막 턴 뒤 900초가 지나면 멈추고, 메모리가 부족하면 가장 오래 쉰 세션을 내린다. 그러면 CLI가 끝나고 레지스트리 기록과 inbox 소켓이 사라진다. 이런 라우트로 `claude-peer` push가 오면 브릿지가 먼저 세션을 깨운다. 데스크톱 메타데이터에서 `cliSessionId`로 찾은 `claude://claude.ai/epitaxy/<local_id>`를 열면, 앱이 같은 세션 ID와 대화 기록을 새 PID로 이어 받는다. 새 inbox 소켓이 뜨면 메시지를 한 번만 push한다. 그때까지 메시지는 `dispatching`이고, 다른 결과면 아무것도 보내지 않은 채 `pending`으로 돌아간다. 브릿지는 스스로 다시 열거나 다시 보내지 않는다. `bridge.py wake NAME --project P`는 같은 단계를 명시적으로 한다. 링크를 열면 앱이 그 세션으로 포커스를 옮기고 앞으로 올 수 있다. 예약 작업 세션(앱이 세션 간 메시징을 끈 채 띄운다)과 IDE 세션은 `unsupported`다.
 
 `bridge.py remap`은 브로커의 모든 프로젝트에서 보관되지 않은 등록 Codex 세션을 다시 연다. 저장된 작업 디렉터리를 확인하고 Desktop 소유자가 이미 붙은 세션은 건너뛴다. 결과는 엔드포인트별로 출력한다. 세션을 다시 열 때 Codex Desktop이 화면 앞으로 올 수 있다. UUID와 대기 중인 메시지는 그대로 유지한다.
 

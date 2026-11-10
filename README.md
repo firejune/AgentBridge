@@ -121,7 +121,12 @@ python3 "$bridge_cli" register codex-worker --project my-app --transport codex \
 
 # Close a finished worker session and remove its route (pass --archive to hide from sidebar):
 python3 "$bridge_cli" close agy-worker --project my-app [--archive]
+
+# Bring an idle-closed Claude Desktop session back (prints woken, already-live, unsupported or uncertain):
+python3 "$bridge_cli" wake claude-tower --project my-app [--timeout 30]
 ```
+
+Claude Desktop closes sessions on its own: a hidden session is paused 900 s after its last turn, and the longest-idle session is evicted under memory pressure. The CLI exits and its registry record and inbox socket go away. A `claude-peer` push to such a route wakes it first. The bridge opens `claude://claude.ai/epitaxy/<local_id>` (found in the Desktop metadata by `cliSessionId`), the app resumes the same session ID and transcript under a new PID, and the message is pushed once when the new inbox socket appears. Until then it stays `dispatching`; any other outcome returns it to `pending` with nothing sent, and the bridge never reopens or resends on its own. `bridge.py wake NAME --project P` does the same step explicitly. Opening the link focuses that session in the app and can bring the app forward. Scheduled-task sessions (the app starts them with cross-session messaging off) and IDE sessions are `unsupported`.
 
 Run `bridge.py remap` to reopen non-archived Codex sessions registered across all broker projects. The command checks the saved workspace, skips sessions that already have a Desktop owner, and reports the result for each endpoint. Reopening can bring Codex Desktop to the foreground. The command preserves UUIDs and leaves messages queued.
 

@@ -177,7 +177,9 @@ class PushTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='abp-',dir='/tmp')
         self.sid = str(uuid.uuid4())
-        self.env = {**os.environ,'CLAUDE_CONFIG_DIR':self.temp.name}
+        # A closed target is woken from Desktop metadata (#115); never read the real app's.
+        self.env = {**os.environ,'CLAUDE_CONFIG_DIR':self.temp.name,
+                    'CLAUDE_DESKTOP_SESSIONS_DIR':str(Path(self.temp.name)/'desktop')}
 
     def tearDown(self):
         self.temp.cleanup()
