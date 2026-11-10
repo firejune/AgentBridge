@@ -296,7 +296,7 @@ python3 "$bridge_cli" wake NAME --project PROJECT [--timeout 30]
 
 Claude 데스크톱은 세션을 스스로 닫는다(앱 `main.log`에서 관찰, CLI 2.1.317). `[WarmLifecycle:session] Idle timeout reached`는 안 보이는 세션을 마지막 턴 뒤 900초에 멈추고, `[CliGovernor] pressure evicting`은 메모리가 부족할 때 가장 오래 쉰 세션을 멈춘다. CLI가 끝나고 `~/.claude/sessions/<pid>.json`과 inbox 소켓이 사라진다. 대화 기록과 데스크톱 메타데이터(`claude-code-sessions/**/local_*.json`의 `cliSessionId`)는 남는다.
 
-`wake`(그리고 대상이 사라진 `claude-peer` push)는 `cliSessionId`로 데스크톱 세션을 찾고 `open -g`로 `claude://claude.ai/epitaxy/<local_id>`를 연다. 앱이 그 세션으로 포커스를 옮기며 데운다. 앱 자신의 CLI가 `--resume`으로 뜨고, 같은 `sessionId`와 `hostSessionId`가 새 PID로 돌아오며, CLI는 턴 없이 시작 단계에서 inbox 소켓을 연다. 브릿지는 CLI를 직접 띄우지 않고 입력창에 타이핑하지 않는다.
+`wake`(그리고 대상이 사라진 `claude-peer` push)는 `cliSessionId`로 데스크톱 세션을 찾고 `open -g`로 `claude://claude.ai/epitaxy/<local_id>`를 연다. 앱이 그 세션으로 포커스를 옮기며 데운다. 앱 자신의 CLI가 `--resume`으로 뜨고, 같은 `sessionId`와 `hostSessionId`가 새 PID로 돌아오며, CLI는 턴 없이 시작 단계에서 inbox 소켓을 연다. 브릿지는 CLI를 직접 띄우지 않고 입력창에 타이핑하지 않는다. `open -g` 자체도 남은 깨우기 한도 안에서만 기다린다(최대 10초, 최소 0.25초). 한도가 이미 다 쓰였으면 링크를 열지 않는다.
 
 | 결과 | 뜻 | Push |
 | --- | --- | --- |

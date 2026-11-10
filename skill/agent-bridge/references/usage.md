@@ -299,7 +299,7 @@ python3 "$bridge_cli" wake NAME --project PROJECT [--timeout 30]
 
 Claude Desktop closes sessions itself (measured in its `main.log`, CLI 2.1.317): `[WarmLifecycle:session] Idle timeout reached` pauses a hidden session 900 s after its last turn, and `[CliGovernor] pressure evicting` pauses the longest-idle session under memory pressure. The CLI exits; `~/.claude/sessions/<pid>.json` and the inbox socket go away; the transcript and the Desktop metadata (`claude-code-sessions/**/local_*.json`, field `cliSessionId`) stay.
 
-`wake` (and a `claude-peer` push whose target is gone) finds the Desktop session by `cliSessionId` and opens `claude://claude.ai/epitaxy/<local_id>` with `open -g`. The app focuses and warms that session: its own CLI starts with `--resume`, the same `sessionId` and `hostSessionId` come back under a new PID, and the CLI binds its inbox socket during startup, before any turn. The bridge never starts a CLI and never types into the composer.
+`wake` (and a `claude-peer` push whose target is gone) finds the Desktop session by `cliSessionId` and opens `claude://claude.ai/epitaxy/<local_id>` with `open -g`. The app focuses and warms that session: its own CLI starts with `--resume`, the same `sessionId` and `hostSessionId` come back under a new PID, and the CLI binds its inbox socket during startup, before any turn. The bridge never starts a CLI and never types into the composer. `open -g` itself is bounded by the remaining wake budget (at most 10 s, at least 0.25 s); when the budget is already spent the link is not opened.
 
 | Outcome | Meaning | Push |
 | --- | --- | --- |

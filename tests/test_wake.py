@@ -42,7 +42,7 @@ class WakeFixture(unittest.TestCase):
 
     def opener(self, appear=True, socket=True, extra=DESKTOP):
         """What Claude Desktop does with the link: respawn the same session under a new pid."""
-        def open_link(url):
+        def open_link(url, timeout=None):
             self.urls.append(url)
             if not appear:
                 return
@@ -207,7 +207,7 @@ class WakePushTests(WakeFixture):
 
     def test_opener_timeout_returns_message_to_pending_without_blocking(self):
         self.metadata()
-        def hang(url):
+        def hang(url, timeout=None):
             self.urls.append(url)
             raise subprocess.TimeoutExpired(['open','-g',url],10)
         with RunningBroker() as server, self.env(), \
@@ -226,6 +226,30 @@ class WakePushTests(WakeFixture):
             later = self.send(server,key='k2')
             self.assertNotIn('blocked_by',server.call('show',id=later['id']))
             self.assertEqual(len(self.urls),1)
+            frame.assert_not_called()
+
+    def test_blocking_opener_stays_inside_a_short_deliver_deadline(self):
+        # Real time: the opener blocks in a child process until its own subprocess timeout fires.
+        self.metadata()
+        given = []
+        def blocking(url, timeout=sessions.WAKE_OPEN_TIMEOUT):
+            given.append(timeout)
+            subprocess.run([sys.executable,'-c','import time; time.sleep(30)'],timeout=timeout)
+        with RunningBroker() as server, self.env(), \
+                mock.patch.object(sessions,'open_url_background',blocking), \
+                mock.patch.object(bridge,'push_frame') as frame:
+            message = self.send(server)
+            started = time.monotonic()
+            with self.assertRaises(bridge.PushFailed) as caught:
+                bridge.deliver(server.path,message['id'],timeout=6)
+            elapsed = time.monotonic()-started
+            self.assertLess(elapsed,6.5)
+            self.assertEqual(len(given),1)
+            self.assertLessEqual(given[0],6-bridge.PEER_IO_TIMEOUT)
+            self.assertEqual(caught.exception.message['wake']['state'],'uncertain')
+            stored = server.call('show',id=message['id'])
+            self.assertEqual((stored['state'],stored['events'][-1]['event']),('pending','push_failed'))
+            self.assertNotIn('uncertain',[e['state'] for e in stored['events']])
             frame.assert_not_called()
 
     def test_interrupt_before_the_write_is_pending_and_during_it_uncertain(self):
@@ -295,7 +319,7 @@ class WaitBehindWakeTests(WakeFixture):
 
     def slow(self, **kwargs):
         inner = self.opener(**kwargs)
-        def open_link(url):
+        def open_link(url, timeout=None):
             self.opening.set()  # The first message is claimed and waking now.
             time.sleep(0.5)
             inner(url)

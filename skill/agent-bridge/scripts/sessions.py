@@ -914,12 +914,16 @@ def claude_transcript_host(sid, projects_dir=None):
     return None
 
 
-def open_url_background(url):
+WAKE_OPEN_TIMEOUT = 10.0  # upper bound for `open -g` itself
+WAKE_OPEN_FLOOR = 0.25  # least time `open -g` is given when the wake budget is nearly spent
+
+
+def open_url_background(url, timeout=WAKE_OPEN_TIMEOUT):
     """Hand a link to its app without asking macOS to raise the app (`open -g`)."""
     if not shutil.which('open'):
         raise DiscoveryError('Waking a Claude Code desktop session needs the macOS `open` command')
     result = subprocess.run(['open', '-g', url], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            stdin=subprocess.DEVNULL, text=True, timeout=10)
+                            stdin=subprocess.DEVNULL, text=True, timeout=timeout)
     if result.returncode:
         raise DiscoveryError(f'The link {url.split(":", 1)[0]}:// was not opened: ' + result.stderr.strip()[-500:])
 
@@ -935,6 +939,7 @@ def wake_claude(sid, timeout=WAKE_TIMEOUT, sessions_dir=None, desktop_dir=None, 
     sid = str(uuid.UUID(sid))
     if not 0 < timeout <= 600:
         raise DiscoveryError('Wake timeout must be between 0 and 600 seconds')
+    deadline = time.monotonic() + timeout  # Lookup, the opener and the inbox wait all share it.
     root = Path(sessions_dir) if sessions_dir else claude_sessions_dir()
     base = {'session': sid}
     try:
@@ -973,14 +978,18 @@ def wake_claude(sid, timeout=WAKE_TIMEOUT, sessions_dir=None, desktop_dir=None, 
                           'cross-session inbox off (CLAUDE_CODE_HARBOR_KITE=0), so a woken copy has no peer socket'}
     url = claude_desktop_wake_url(host_id)
     started = time.monotonic()
+    remaining = deadline - started
+    if remaining <= 0:
+        return {**found, 'state': 'unsupported',
+                'reason': f'the {timeout:g}s wake budget was spent finding the session; the link was not opened'}
     try:
-        (opener or open_url_background)(url)
+        # `open -g` never outlives the wake budget (a small floor lets it run at all).
+        (opener or open_url_background)(url, timeout=max(WAKE_OPEN_FLOOR, min(WAKE_OPEN_TIMEOUT, remaining)))
     except (subprocess.SubprocessError, OSError) as error:
         # The link may or may not have reached the app; nothing was written to any peer.
         return {**found, 'url': url, 'state': 'uncertain',
                 'reason': f'opening the link failed ({type(error).__name__}); nothing was sent'}
     found['url'] = url
-    deadline = started + timeout
     while True:
         records = [r for r in claude_live_records(root) if r['sessionId'] == sid]
         if records:
