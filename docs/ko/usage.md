@@ -305,7 +305,7 @@ Claude 데스크톱은 세션을 스스로 닫는다(앱 `main.log`에서 관찰
 | `unsupported` | 아무것도 열지 않는다: 보관됨, 예약 작업 세션(앱이 `CLAUDE_CODE_HARBOR_KITE=0`으로 띄워 inbox가 꺼져 있다), inbox가 꺼진 채 실행 중, IDE 세션(`<scheme>://anthropic.claude-code/open?session=ID`는 있으나 측정 안 됨), ID에 맞는 데스크톱 세션 없음 | `pending`으로 복귀, 보낸 것 없음 |
 | `uncertain` | 링크는 열었지만 제한 시간 안에 기록이 안 뜨거나, 소켓이 없거나, 다른 호스트의 기록이 떴다 | `pending`으로 복귀, 보낸 것 없음. 자동으로 다시 열거나 다시 보내지 않는다 |
 
-깨우는 동안 메시지는 `dispatching`에 묶여 있어서, 같은 수신자로 동시에 들어온 push는 두 번 가지 않고 거절된다. `unsupported`나 `uncertain` 뒤에는 앱에서 세션을 확인하고 `deliver MESSAGE_ID`로 한 번 다시 시도한다. 링크를 열면 앱이 보여 주는 세션이 바뀌고, `open -g`여도 앱이 앞으로 올 수 있다.
+깨우는 동안 메시지는 `dispatching`에 묶여 있다. 같은 세션으로 두 번째 `claude-peer` push가 오면 링크를 또 열지 않고 그 뒤에서 한 번 기다린다. 기다림은 깨우기 제한 시간 + 10초와 두 번째 push 자신의 전송 한도 안이고, 쓰기용 5초를 남긴다. 앞 메시지가 전달로 끝나면 두 번째도 같은 호출자 토큰 `claim-guarded` 경로(응답을 잃었을 때의 1회 해제 포함)로 다시 claim해서 한 번 push한다(결과에 `behind: {id, state}`). 아니면 아무것도 보내지 않고 `pending`으로 남으며, 위의 차단된 전송 노트에 앞 전달이 끝난 상태를 붙여 기록한다: `pending behind <id> since <time> (<상태>); not sent`. 앞 전달이 `uncertain`이면 기다리지 않고 바로 그 노트를 단다. 노트는 메시지가 아직 `pending`일 때만 기록하므로, 그사이 다른 호출자가 잡은 claim을 덮어쓰지 않는다. `unsupported`나 `uncertain` 뒤에는 앱에서 세션을 확인하고 `deliver MESSAGE_ID`로 한 번 다시 시도한다. 링크를 열면 앱이 보여 주는 세션이 바뀌고, `open -g`여도 앱이 앞으로 올 수 있다.
 
 ## 비공개 MCP 독립 inbox
 

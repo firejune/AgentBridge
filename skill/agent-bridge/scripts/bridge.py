@@ -157,20 +157,8 @@ def legacy_claim_confirmed(claimed, mid):
     return claimed.get('id') == mid and claimed.get('state') == 'dispatching'
 
 
-def push(path, m, dry_run=False, *, deadline=None, wake_timeout=sessions.WAKE_TIMEOUT):
-    """Push one pending claude-peer message. Success = submitted; never retried automatically.
-
-    A closed target is woken once in its own host first (issue #115), inside the same delivery
-    budget; the message is pushed once when the woken session's inbox appears, and goes back to
-    pending (nothing written) otherwise.
-    """
-    if dry_run:
-        target = sessions.resolve_claude_peer(m['route']['session'])
-        return {'sent':False,'state':m['state'],'transport':'claude-peer','pid':target['pid'],
-                'socket':target['socket'],'frame':peer_frame(m, target, path)}
-    if deadline is None:
-        deadline = time.monotonic() + PEER_PUSH_TIMEOUT
-
+def claim_peer(path, m, deadline):
+    """Claim `m` for one claude-peer write with a caller token (#118); release it once if the reply is lost."""
     def rpc(op, rpc_deadline, **fields):
         return broker.request(path, {'op':op, 'id':m['id'], **fields}, deadline=rpc_deadline)
 
@@ -206,6 +194,27 @@ def push(path, m, dry_run=False, *, deadline=None, wake_timeout=sessions.WAKE_TI
                 message = {key:m[key] for key in ('id', 'state', 'route', 'return_route')}
                 raise PushFailed(broker.CLAIM_RELEASE_NOTE, message) from None
         raise ClaudeDispatchUnknown('claim', m['id']) from None
+    return claimed
+
+
+def push(path, m, dry_run=False, *, deadline=None, wake_timeout=sessions.WAKE_TIMEOUT):
+    """Push one pending claude-peer message. Success = submitted; never retried automatically.
+
+    A closed target is woken once in its own host first (issue #115), inside the same delivery
+    budget; the message is pushed once when the woken session's inbox appears, and goes back to
+    pending (nothing written) otherwise.
+    """
+    if dry_run:
+        target = sessions.resolve_claude_peer(m['route']['session'])
+        return {'sent':False,'state':m['state'],'transport':'claude-peer','pid':target['pid'],
+                'socket':target['socket'],'frame':peer_frame(m, target, path)}
+    if deadline is None:
+        deadline = time.monotonic() + PEER_PUSH_TIMEOUT
+
+    def rpc(op, rpc_deadline, **fields):
+        return broker.request(path, {'op':op, 'id':m['id'], **fields}, deadline=rpc_deadline)
+
+    claimed, behind = claim_behind(path, m, deadline, wake_timeout)
 
     def finish(state, note, event=None):
         # Older brokers ignore the opt-in and return no claim token.
@@ -254,6 +263,8 @@ def push(path, m, dry_run=False, *, deadline=None, wake_timeout=sessions.WAKE_TI
                     + (f" after wake ({woke['state']})" if woke else ''), 'pushed')
     if woke:
         result = {**result, 'wake':woke}
+    if behind:
+        result = {**result, 'behind':behind}
     title_wait = TITLE_WAIT if fresh_session(target) else 0.0
     remaining = deadline - time.monotonic()
     if remaining > 0:
@@ -261,6 +272,65 @@ def push(path, m, dry_run=False, *, deadline=None, wake_timeout=sessions.WAKE_TI
         if found['state'] == 'written':
             result = {**result, 'title': found}
     return result
+
+
+BUSY_CLAIM = 'Recipient has an active or uncertain delivery'
+DELIVERED = ('submitted', 'received', 'in_progress', 'answered', 'done')
+BEHIND_GRACE = 10.0  # seconds past the wake budget for the earlier push to write and finish
+
+
+class ClaimBusy(ValueError):
+    """The broker refused the claim because another delivery holds the same session."""
+
+
+def claim_behind(path, m, deadline, wake_timeout, poll=0.25):
+    """Claim `m` via claim_peer; if another delivery holds the same session (e.g. a wake), wait behind it once.
+
+    Returns (claim reply, behind). `behind` is None, or {'id', 'state'} of the delivery it waited
+    for. When that delivery ends delivered, `m` is claimed and pushed once. Any other end leaves `m`
+    pending with the broker's "pending behind <id> since <time>" note plus that end, and raises
+    PushFailed; nothing is sent. The wait stays inside the delivery budget.
+    """
+    def call(op, mid, **fields):
+        return broker.request(path, {'op':op, 'id':mid, **fields},
+                              deadline=min(deadline, time.monotonic() + PEER_BROKER_TIMEOUT))
+
+    def claim():
+        try:
+            return claim_peer(path, m, deadline)
+        except ValueError as error:
+            # Only the broker's plain refusal; PushFailed and ClaudeDispatchUnknown pass through.
+            if type(error) is ValueError and str(error).startswith(BUSY_CLAIM):
+                raise ClaimBusy(str(error)) from None
+            raise
+
+    try:
+        return claim(), None
+    except ClaimBusy:
+        pass
+    waiting = call('show', m['id'])
+    blocker = waiting.get('blocked_by')
+    note = waiting.get('note') or 'pending behind another delivery to this session'
+    state = blocker['state'] if blocker else 'finished before it could be read'
+    if state == 'dispatching':
+        stop = min(deadline - PEER_IO_TIMEOUT, time.monotonic() + wake_timeout + BEHIND_GRACE)
+        while state == 'dispatching' and time.monotonic() < stop:
+            time.sleep(max(0.0, min(poll, stop - time.monotonic())))
+            state = call('show', blocker['id'])['state']
+        if state in DELIVERED:
+            try:
+                return claim(), {'id':blocker['id'], 'state':state}
+            except ClaimBusy:
+                state = 'superseded by another delivery'
+    reason = f'{note} ({state}); not sent. Deliver it once the session is live'
+    try:
+        # Never rewrite a message someone else claimed meanwhile (older brokers ignore the guard).
+        message = call('resolve', m['id'], state='pending', note=reason, expect_state='pending')
+    except broker.BrokerResponseError:
+        raise
+    except ValueError:
+        message = call('show', m['id'])
+    raise PushFailed(reason, message)
 
 
 def public_wake(found):

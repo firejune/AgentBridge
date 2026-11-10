@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -243,6 +244,117 @@ class WakePushTests(WakeFixture):
             self.assertEqual(result['state'],'submitted')
             self.assertNotIn('wake',result)
             self.assertEqual(self.urls,[])
+
+
+class WaitBehindWakeTests(WakeFixture):
+    """A second message to the same recipient during a wake waits behind it, never silently pending."""
+    def setUp(self):
+        super().setUp()
+        self.opening = threading.Event()
+
+    def slow(self, **kwargs):
+        inner = self.opener(**kwargs)
+        def open_link(url):
+            self.opening.set()  # The first message is claimed and waking now.
+            time.sleep(0.5)
+            inner(url)
+        return open_link
+
+    def two(self, server):
+        server.call('register',project='demo',name='alpha',cwd=self.temp.name)
+        server.call('register',project='demo',name='beta',cwd=self.temp.name,transport='claude-peer',session=self.sid)
+        return [server.call('send',project='demo',sender='alpha',recipient='beta',body=f'Question {n}',key=f'k{n}')
+                for n in (1,2)]
+
+    def env(self):
+        return mock.patch.dict(os.environ,{'CLAUDE_CONFIG_DIR':self.temp.name,
+                                           'CLAUDE_DESKTOP_SESSIONS_DIR':str(self.root/'desktop')})
+
+    def first_in_thread(self, server, message, results):
+        def run():
+            try:
+                results.append(bridge.push(server.path,message,wake_timeout=2))
+            except bridge.PushFailed as error:
+                results.append(error)
+        thread = threading.Thread(target=run);thread.start()
+        self.assertTrue(self.opening.wait(5))
+        return thread
+
+    def test_second_message_is_delivered_once_after_the_wake(self):
+        self.metadata()
+        with RunningBroker() as server, self.env(), \
+                mock.patch.object(sessions,'open_url_background',self.slow()), \
+                mock.patch.object(bridge,'TITLE_WAIT',0.0):
+            first, second = self.two(server)
+            results = []
+            with mock.patch.object(bridge.broker,'request',wraps=bridge.broker.request) as calls:
+                thread = self.first_in_thread(server,first,results)
+                later = bridge.push(server.path,second,wake_timeout=2)
+                thread.join(10)
+            ops = [c.args[1]['op'] for c in calls.call_args_list]
+            # Both claims, the waiting one included, use the caller-token claim (#118); no other flavour.
+            self.assertEqual(ops.count('claim-guarded'),3)  # first, refused second, second after the wait
+            self.assertNotIn('claim',ops)
+            self.assertEqual(results[0]['state'],'submitted')
+            self.assertEqual(results[0]['wake']['state'],'woken')
+            self.assertEqual(later['state'],'submitted')
+            self.assertEqual(later['behind'],{'id':first['id'],'state':'submitted'})
+            self.assertNotIn('wake',later)  # It rode on the first wake; no second link.
+            self.assertEqual(len(self.urls),1)
+            frames = [user['message']['content'] for _,user in self.fakes[0].received]
+            self.assertEqual(len(frames),2)
+            self.assertEqual([sum(m['id'] in f for f in frames) for m in (first,second)],[1,1])
+
+    def test_second_message_gets_a_behind_note_when_the_wake_fails(self):
+        self.metadata()
+        with RunningBroker() as server, self.env(), \
+                mock.patch.object(sessions,'open_url_background',self.slow(socket=False)), \
+                mock.patch.object(bridge,'push_frame') as frame:
+            first, second = self.two(server)
+            results = []
+            thread = self.first_in_thread(server,first,results)
+            with self.assertRaises(bridge.PushFailed) as caught:
+                bridge.push(server.path,second,wake_timeout=2)
+            thread.join(10)
+            self.assertIsInstance(results[0],bridge.PushFailed)
+            # One wording with the broker's blocked-delivery note (#117), plus how the blocker ended.
+            self.assertRegex(str(caught.exception),
+                             rf"^pending behind {first['id']} since \S+ \(pending\); not sent")
+            stored = server.call('show',id=second['id'])
+            self.assertEqual(stored['state'],'pending')
+            self.assertIn(f"pending behind {first['id']}",stored['note'])
+            self.assertEqual(server.call('show',id=first['id'])['state'],'pending')
+            self.assertEqual(len(self.urls),1)
+            frame.assert_not_called()
+
+    def test_message_behind_an_uncertain_delivery_is_noted_without_waiting(self):
+        self.metadata()
+        with RunningBroker() as server, self.env(), \
+                mock.patch.object(sessions,'open_url_background',self.opener()), \
+                mock.patch.object(bridge,'push_frame') as frame:
+            first, second = self.two(server)
+            server.call('claim',id=first['id'])
+            server.call('finish',id=first['id'],state='uncertain',note='bytes may have reached the receiver')
+            started = time.monotonic()
+            with self.assertRaises(bridge.PushFailed) as caught:
+                bridge.push(server.path,second,wake_timeout=2)
+            self.assertLess(time.monotonic()-started,1.5)
+            since = server.call('show',id=first['id'])['dispatch_started_at']
+            self.assertIn(f"pending behind {first['id']} since {since} (uncertain); not sent",str(caught.exception))
+            shown = server.call('show',id=second['id'])
+            self.assertEqual(shown['state'],'pending')
+            self.assertEqual(shown['blocked_by']['id'],first['id'])
+            self.assertEqual(self.urls,[])
+            frame.assert_not_called()
+
+    def test_behind_note_never_rewrites_a_message_claimed_meanwhile(self):
+        self.metadata()
+        with RunningBroker() as server:
+            first, second = self.two(server)
+            server.call('claim',id=second['id'])
+            with self.assertRaisesRegex(ValueError,'state changed'):
+                server.call('resolve',id=second['id'],state='pending',note='pending behind x',expect_state='pending')
+            self.assertEqual(server.call('show',id=second['id'])['state'],'dispatching')
 
 
 class WakeCommandTests(WakeFixture):

@@ -697,6 +697,9 @@ class State:
                 return self.status(m,args['state'],args.get('note'),event)
             if m['state'] in ('done','answered'):
                 raise ValueError('Message is already complete')
+            if op=='resolve' and 'expect_state' in args and m['state'] != args['expect_state']:
+                # A guarded note never rewrites a message another caller claimed meanwhile.
+                raise ValueError('Message state changed. Inspect the current state.')
             if op in ('ack','progress') and m['state'] in ('dispatching','uncertain'):
                 raise ValueError('Resolve delivery outcome first')
             state = {'ack':'received','progress':'in_progress'}.get(op,args.get('state'))
