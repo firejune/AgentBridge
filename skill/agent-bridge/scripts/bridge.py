@@ -157,8 +157,13 @@ def legacy_claim_confirmed(claimed, mid):
     return claimed.get('id') == mid and claimed.get('state') == 'dispatching'
 
 
-def push(path, m, dry_run=False, *, deadline=None):
-    """Push one pending claude-peer message. Success = submitted; never retried automatically."""
+def push(path, m, dry_run=False, *, deadline=None, wake_timeout=sessions.WAKE_TIMEOUT):
+    """Push one pending claude-peer message. Success = submitted; never retried automatically.
+
+    A closed target is woken once in its own host first (issue #115), inside the same delivery
+    budget; the message is pushed once when the woken session's inbox appears, and goes back to
+    pending (nothing written) otherwise.
+    """
     if dry_run:
         target = sessions.resolve_claude_peer(m['route']['session'])
         return {'sent':False,'state':m['state'],'transport':'claude-peer','pid':target['pid'],
@@ -215,13 +220,27 @@ def push(path, m, dry_run=False, *, deadline=None):
         except (ValueError, OSError):
             raise ClaudeDispatchUnknown('finish', m['id']) from None
 
+    woke = None
     try:
-        target = sessions.resolve_claude_peer(m['route']['session'])
+        try:
+            target = sessions.resolve_claude_peer(m['route']['session'])
+        except sessions.DiscoveryError as error:
+            # Idle-closed session (issue #115): wake it in its own host while the claim holds the
+            # message. Nothing has been written, so any non-live outcome returns it to pending.
+            # Keep PEER_IO_TIMEOUT of the delivery budget for the push itself; the wake never extends it.
+            budget = min(wake_timeout, deadline - time.monotonic() - PEER_IO_TIMEOUT)
+            if budget <= 0:
+                raise ValueError(f'{error}; the delivery budget leaves no time to wake it') from None
+            woke = public_wake(sessions.wake_claude(m['route']['session'], timeout=budget))
+            if woke['state'] not in ('woken', 'already-live'):
+                raise ValueError(f"{error}; wake {woke['state']}: {woke['reason']}") from None
+            target = sessions.resolve_claude_peer(m['route']['session'])
         frame = peer_frame(m, target, path)
         problem = push_frame(target, frame, min(deadline, time.monotonic() + PEER_IO_TIMEOUT))
     except (ValueError, OSError) as error:
         reason = f'push_failed: {error}'
-        raise PushFailed(reason, finish('pending', reason, 'push_failed')) from None
+        message = finish('pending', reason, 'push_failed')
+        raise PushFailed(reason, message if woke is None else {**message, 'wake':woke}) from None
     except BaseException:
         try:
             finish('uncertain', 'Push interrupted; check the receiving session before resolving')
@@ -229,8 +248,12 @@ def push(path, m, dry_run=False, *, deadline=None):
             pass  # Leave the durable claim protected if the broker cannot confirm settlement.
         raise
     if problem:
+        # Bytes may already be in the receiver's queue: never resend on our own.
         raise PushFailed(problem, finish('uncertain', problem))
-    result = finish('submitted', f"pushed to Claude session {target['id']} (pid {target['pid']}, msg_id {frame['msg_id']})", 'pushed')
+    result = finish('submitted', f"pushed to Claude session {target['id']} (pid {target['pid']}, msg_id {frame['msg_id']})"
+                    + (f" after wake ({woke['state']})" if woke else ''), 'pushed')
+    if woke:
+        result = {**result, 'wake':woke}
     title_wait = TITLE_WAIT if fresh_session(target) else 0.0
     remaining = deadline - time.monotonic()
     if remaining > 0:
@@ -238,6 +261,25 @@ def push(path, m, dry_run=False, *, deadline=None):
         if found['state'] == 'written':
             result = {**result, 'title': found}
     return result
+
+
+def public_wake(found):
+    """A wake outcome without the peer endpoint (pid, socket, registry path)."""
+    return {k: v for k, v in found.items() if k != 'peer'}
+
+
+def wake_participant(args):
+    """bridge.py wake NAME --project P: bring an idle-closed claude-peer session back (issue #115)."""
+    route = next((r for r in broker.request(args.socket, {'op':'routes','project':args.project})
+                  if r['name'] == args.name), None)
+    if route is None:
+        raise ValueError(f'No participant {args.name!r} is registered in project {args.project!r}')
+    base = {'name':args.name, 'project':args.project, 'transport':route['transport'], 'session':route['session']}
+    if route['transport'] != 'claude-peer':
+        hint = {'codex':' (Codex: bridge.py remap reopens Desktop owners)'}.get(route['transport'], '')
+        return {**base, 'state':'unsupported', 'host':None,
+                'reason':f"{route['transport']}: wake covers claude-peer routes only{hint}"}
+    return {**base, **public_wake(sessions.wake_claude(route['session'], timeout=args.timeout))}
 
 
 TITLE_WAIT = 5.0  # seconds a first push waits for a --new session to write its transcript (issue #87)
@@ -824,6 +866,9 @@ def main(argv=None):
     p.add_argument('--archive',action='store_true',help='Archive the finished session out of the active sidebar')
     p.add_argument('--keep-route',action='store_true',help='Close the session but keep the route registered')
     p.add_argument('--timeout',type=float,default=10)
+    p = sub.add_parser('wake',help="Bring an idle-closed claude-peer session back in its own host; prints woken, already-live, unsupported or uncertain")
+    p.add_argument('name');p.add_argument('--project',required=True)
+    p.add_argument('--timeout',type=float,default=sessions.WAKE_TIMEOUT,help='Seconds to wait for the woken session inbox')
     p = sub.add_parser('title',help="Label a claude-peer route's session with PROJECT/NAME in the resume picker (works on dead sessions)")
     p.add_argument('name');p.add_argument('--project',required=True)
     p.add_argument('--force',action='store_true',help='Replace a title the session already has')
@@ -943,6 +988,10 @@ def main(argv=None):
         if args.cmd=='close':
             output(close_participant(args))
             return 0
+        if args.cmd=='wake':
+            result = wake_participant(args)
+            output(result)
+            return 0 if result['state'] in ('woken','already-live') else 1
         if args.cmd=='remap':
             if all(value is None for value in (args.name, args.project, args.expect_session, args.session)):
                 results = refresh_codex_routes(args.socket)

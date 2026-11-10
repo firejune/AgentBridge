@@ -242,6 +242,7 @@ Handoff succeeds only when `--expect-generation` matches the current generation.
   - Returns `submitted` with a `pushed` event on clean EOF. A definite pre-write error returns `pending` with a `push_failed` event. Once the write starts, a write or shutdown error, a missing EOF, or unexpected response bytes records `uncertain` if the broker confirms the finish. These failures exit 1.
   - If the guarded claim reply is lost before the client touches the peer socket, the client waits until the claim admission deadline and makes one release request with a separate 2-second limit. A broker may only release the live `dispatching` reservation with the exact client token and admission deadline. Expired claims cannot be admitted, and a broker restart clears live claim ownership. A confirmed release exits 1 with `push_failed: true` and leaves the message `pending` with a `push_failed` event. The client never sends the peer frame on this path.
   - Older brokers explicitly refuse the guarded claim operation before the CLI falls back to their legacy claim. If that legacy reply is lost, its reservation stays protected. When a claim, release or finish remains unconfirmed, the CLI exits 1 with `id`, `stage` (`claim`, `claim-release` or `finish`) and `uncertain: true`. Use `show ID` to inspect the recorded message state.
+  - When the session has no live record, it is woken once first (see "Waking an Idle-Closed Claude Session") inside the same budget, leaving 5 seconds for the push, and pushed once if its inbox appears.
 - **Codex (`codex`)**:
   - Connects to the exact registered thread owner over `CODEX_HOME/ipc/ipc.sock` (or `AGENT_BRIDGE_CODEX_IPC`).
   - Delivers peer bodies as standalone `toolOutput` (`agent_bridge`), calling `thread-follower-steer-turn` first to join an active turn and falling back to `thread-follower-start-turn` only when inactive.
@@ -289,6 +290,25 @@ python3 "$bridge_cli" close NAME --project PROJECT [--keep-route] [--timeout 10]
 | `agy` (Desktop & IDE) | Refused while `running`; sends `UpdateConversationAnnotations {archived: true}` and verifies readback | Conversation leaves the IDE panel / Desktop sidebar | Restore from archive in the UI |
 | `codex` | `unsupported` (nothing sent) | Desktop IPC exposes no archive/unload request | — |
 | `realtime` / `claude` | Route removal only | — | — |
+
+## Waking an Idle-Closed Claude Session (issue #115)
+
+```bash
+python3 "$bridge_cli" wake NAME --project PROJECT [--timeout 30]
+```
+
+Claude Desktop closes sessions itself (measured in its `main.log`, CLI 2.1.317): `[WarmLifecycle:session] Idle timeout reached` pauses a hidden session 900 s after its last turn, and `[CliGovernor] pressure evicting` pauses the longest-idle session under memory pressure. The CLI exits; `~/.claude/sessions/<pid>.json` and the inbox socket go away; the transcript and the Desktop metadata (`claude-code-sessions/**/local_*.json`, field `cliSessionId`) stay.
+
+`wake` (and a `claude-peer` push whose target is gone) finds the Desktop session by `cliSessionId` and opens `claude://claude.ai/epitaxy/<local_id>` with `open -g`. The app focuses and warms that session: its own CLI starts with `--resume`, the same `sessionId` and `hostSessionId` come back under a new PID, and the CLI binds its inbox socket during startup, before any turn. The bridge never starts a CLI and never types into the composer.
+
+| Outcome | Meaning | Push |
+| --- | --- | --- |
+| `already-live` | The inbox is running; nothing opened | Pushed once |
+| `woken` | The same session came back with an inbox socket within `--timeout` | Pushed once (`wake` in the result, note `after wake (woken)`) |
+| `unsupported` | Nothing opened: archived, scheduled-task session (the app starts those with `CLAUDE_CODE_HARBOR_KITE=0`, so the inbox stays off), running with the inbox off, IDE session (`<scheme>://anthropic.claude-code/open?session=ID` exists but is unmeasured), or no Desktop session maps to the ID | Back to `pending`, nothing sent |
+| `uncertain` | The link was opened but no record, no socket, or a record under another host appeared in time | Back to `pending`, nothing sent; never reopened or resent automatically |
+
+While a wake runs, the message is held in `dispatching`, so a concurrent push to the same recipient is refused rather than doubled. After `unsupported` or `uncertain`, check the session in the app and retry once with `deliver MESSAGE_ID`. Opening the link changes which session the app shows and can bring the app forward even with `open -g`.
 
 ## Private MCP Independent Inbox
 
