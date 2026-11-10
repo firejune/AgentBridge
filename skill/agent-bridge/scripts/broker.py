@@ -56,10 +56,39 @@ def route_key(route):
 
 
 TERMINAL_STATES = frozenset(('done', 'answered', 'failed'))
+GUARDED_CLAIM_WINDOW = 10
+CLAIM_RELEASE_NOTE = 'Claude claim response was lost. The claim was released before any peer write.'
 
 
 def delivery_destination(route):
     return route['transport'], route['session']
+
+
+def valid_claim_token(token):
+    if not isinstance(token, str) or len(token) != 36:
+        return False
+    try:
+        value = uuid.UUID(token)
+    except ValueError:
+        return False
+    return value.version == 4 and str(value) == token
+
+
+def guarded_claim_fields(args):
+    token = args.get('claim_token')
+    if not valid_claim_token(token):
+        raise ValueError('Invalid delivery claim token')
+    admit_until = args.get('admit_until')
+    if type(admit_until) not in (int, float) or not 0 < admit_until <= time.monotonic() + GUARDED_CLAIM_WINDOW:
+        raise ValueError('Invalid delivery claim admission deadline')
+    return token, admit_until
+
+
+def public_message(message):
+    if 'dispatch_claim' not in message and 'dispatch_claim_deadline' not in message:
+        return message
+    return {key:value for key,value in message.items()
+            if key not in ('dispatch_claim', 'dispatch_claim_deadline')}
 
 
 class BrokerResponseError(ValueError):
@@ -217,6 +246,7 @@ class State:
         return any(route_key(route) == sub['route'] for route in destinations)
 
     def publish(self, m, kind):
+        m = public_message(m)
         if self.pending_publications is not None:
             self.pending_publications.append((deepcopy(m), kind))
             return
@@ -243,6 +273,7 @@ class State:
             m['dispatch_started_at'] = entry['at']
         else:
             m.pop('dispatch_claim', None)
+            m.pop('dispatch_claim_deadline', None)
             if state != 'uncertain':
                 m.pop('dispatch_started_at', None)
         if event:
@@ -422,6 +453,7 @@ class State:
         # Stage mutations in isolation. A failed durable write must not acknowledge
         # an ACK, publish an event, wake a waiter or leave a half-posted reply.
         mutations = ('send', 'reply', 'ack', 'progress', 'resolve', 'claim', 'finish',
+                     'claim-guarded', 'release-claim',
                      'inbox_ack', 'provider-failure', 'provider-retry')
         if self.correspondence is None or args['op'] not in mutations:
             return self.apply_action(args)
@@ -431,8 +463,8 @@ class State:
         staged.answers = self.answers.copy()
         staged.pending_publications = []
         result = staged.apply_action(args)
-        if args['op'] in ('provider-failure', 'provider-retry') and not staged.pending_publications:
-            return result  # A retained notice needs no repeated checkpoint write.
+        if args['op'] in ('provider-failure', 'provider-retry', 'release-claim') and not staged.pending_publications:
+            return result  # A no-op needs no repeated checkpoint write.
         self.correspondence.save(staged)
         for field in ('messages', 'keys', 'inbox_receipts', 'inbox_snapshots', 'answers'):
             setattr(self, field, getattr(staged, field))
@@ -517,9 +549,9 @@ class State:
     def apply_action(self, args):
         op = args['op']
         if op == 'provider-failure':
-            return self.provider_failure(args['expected_route'], args['source_message_id'], args['failure'])
+            return public_message(self.provider_failure(args['expected_route'], args['source_message_id'], args['failure']))
         if op == 'provider-retry':
-            return codex_failures.retry_action(self, args)
+            return public_message(codex_failures.retry_action(self, args))
         if op in ('inbox_list', 'inbox_get', 'inbox_ack'):
             return self.inbox_action(args)
         if op == 'ping':
@@ -591,15 +623,15 @@ class State:
             item = dict(item, active=False, generation=item['generation']+1)
             return self.routing_change('channels', (args['project'],args['name']), item)
         if op in ('send','reply'):
-            return self.post(args,args.get('id') if op=='reply' else None)
+            return public_message(self.post(args, args.get('id') if op=='reply' else None))
         if op == 'show':
-            message = self.get(args['id'])
+            message = public_message(self.get(args['id']))
             if message['state'] == 'pending':
                 return message | self.pending_delivery(message, self.delivery_blockers())
             return message
         if op == 'conversation':
             cid = self.get(args['id'])['conversation']
-            return [m for m in self.messages.values() if m['conversation']==cid]
+            return [public_message(m) for m in self.messages.values() if m['conversation']==cid]
         if op == 'inbox':
             if not args.get('name') and not args.get('channel'):
                 raise ValueError('Select a recipient or channel')
@@ -612,9 +644,18 @@ class State:
                     and (not args.get('channel') or m['channel']==args['channel'])
                     and (not args.get('session') or m['route']['session']==args['session'])
                     and (args.get('all') or m['state'] not in ('done','answered'))]
-        if op in ('ack','progress','resolve','claim','finish'):
+        if op in ('ack','progress','resolve','claim','claim-guarded','release-claim','finish'):
             m = self.get(args['id'])
-            if op=='claim':
+            if op == 'release-claim':
+                token, admit_until = guarded_claim_fields(args)
+                if time.monotonic() < admit_until:
+                    raise ValueError('Delivery claim admission is still open')
+                if (m['state'] != 'dispatching' or m.get('dispatch_claim') != token
+                        or m.get('dispatch_claim_deadline') != admit_until):
+                    return {'released':False}
+                self.status(m, 'pending', CLAIM_RELEASE_NOTE, 'push_failed')
+                return {'released':True}
+            if op in ('claim', 'claim-guarded'):
                 if m['state']!='pending':
                     raise ValueError('Only pending messages may be delivered')
                 destination = delivery_destination(m['route'])
@@ -626,6 +667,13 @@ class State:
                 if blocker:
                     note = self.delivery_wait(blocker)['note']
                     raise ValueError(f"Recipient has an active or uncertain delivery. Message {m['id']} {note}")
+                if op == 'claim-guarded':
+                    token, admit_until = guarded_claim_fields(args)
+                    if time.monotonic() >= admit_until:
+                        raise ValueError('Delivery claim admission expired')
+                    self.status(m, 'dispatching')
+                    m.update(dispatch_claim=token, dispatch_claim_deadline=admit_until)
+                    return {'dispatch_claim':token}
                 self.status(m,'dispatching')
                 if args.get('guarded') is True:
                     m['dispatch_claim'] = str(uuid.uuid4())
@@ -675,7 +723,7 @@ async def wait_answer(state, args, reader):
         done,_ = await asyncio.wait(pending,timeout=timeout,return_when=asyncio.FIRST_COMPLETED)
         if pending[1] in done:
             return None
-        replies = [m for m in state.messages.values() if m['reply_to']==mid]
+        replies = [public_message(m) for m in state.messages.values() if m['reply_to']==mid]
         return {'id':mid,'timed_out':not bool(replies),'replies':replies}
     finally:
         for task in pending:
