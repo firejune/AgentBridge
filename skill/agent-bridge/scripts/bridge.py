@@ -691,6 +691,7 @@ def main(argv=None):
     p.add_argument('--since',default='6h',help='Burn-rate and reset window, e.g. 90m, 6h, 2d')
     p.add_argument('--json',action='store_true',help='Full records and summary')
     p.add_argument('--events',action='store_true',help='Reset events, early-reset intervals, the next-reset estimate and the spend/stop-risk horizons')
+    p.add_argument('--refresh',action='store_true',help='Force a fresh Antigravity quota read before querying')
     p.add_argument('--seed-announcements',metavar='FILE',help='Merge promo-reset announcements (JSONL: at with UTC offset, note) into the state dir, then exit')
     sub.add_parser('ping'); sub.add_parser('stop')
     for cmd in ('install-service','uninstall-service'):
@@ -817,6 +818,8 @@ def main(argv=None):
             if args.seed_announcements:
                 output(usage.seed_announcements(state_dir, args.seed_announcements))
                 return 0
+            if args.refresh and args.provider in ('all', 'agy'):
+                usage.refresh_agy(state_dir)
             records, summary, moment = usage.query(state_dir, args.since, args.provider)
             if args.events:
                 if args.json:

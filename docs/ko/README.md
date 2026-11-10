@@ -156,9 +156,16 @@ python3 "$bridge_cli" policy                                   # 적용 중인 �
 ```bash
 python3 "$bridge_cli" usage                        # 전체 공급자(Codex + Antigravity + Claude) 버킷 한도 및 소모율 출력
 python3 "$bridge_cli" usage --provider claude     # Claude 데스크톱 계정과 Claude Code(IDE/CLI) 계정
-python3 "$bridge_cli" usage --provider agy --json  # Antigravity 버킷(agy/gemini, agy/partner) JSON 조회
+python3 "$bridge_cli" usage --provider agy --json  # Antigravity 버킷(agy/gemini-weekly, agy/gemini-5h, agy/partner-weekly, agy/partner-5h) JSON 조회
+python3 "$bridge_cli" usage --provider agy --refresh  # Antigravity 5분 서버 캐시를 우회해 즉시 갱신 조회
 python3 "$bridge_cli" usage --events               # 리셋 이력, spend horizon 및 stop-risk horizon 확인
 ```
+
+**Antigravity (`agy/gemini-weekly`, `agy/gemini-5h`, `agy/partner-weekly`, `agy/partner-5h`)**:
+
+- 로컬 `language_server`의 `RetrieveUserQuotaSummary`를 호출한다(백그라운드 수집기는 항상 `{}`만 보내 서버의 5분 메모리 캐시를 사용하며 `forceRefresh`를 보내지 않고, 명시적 `--refresh` 실행 시에만 `{"forceRefresh": true}`를 전송한다).
+- Gemini(`gemini-*`)와 Claude/GPT(`3p-*` → `partner-*`)의 주간 한도(`window_mins: 10080`)와 5시간 한도(`window_mins: 300`)를 나란히 보고하며, 기존 `agy/gemini`·`agy/partner` 기록도 히스토리로 그대로 읽는다. 주간 수치가 없을 때는 `0%`나 `100%`가 아닌 `weekly: unknown`으로 표시한다.
+- 용량 위험도(`AT RISK` / `holds until reset`)는 주간 버킷(`*-weekly`)을 기준으로만 판정하며, 5시간 창은 함께 표시하되 용량 위험 판정에는 사용하지 않는다.
 
 **Claude (`claude/desktop`, `claude/ide`)** — Claude 데스크톱과 Claude Code IDE 확장이 서로 다른 계정으로 도는 머신용이다. 어느 읽기도 모델 턴을 시작하지 않는다:
 
