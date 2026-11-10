@@ -69,9 +69,10 @@ class FakeClaude:
 
 class DelayedBrokerReply:
     """Proxy one delivery and withhold the selected broker reply."""
-    def __init__(self, root, server, phase, commit):
+    def __init__(self, root, server, phase, commit, delay=3):
         self.path = str(Path(root)/'proxy.sock')
         self.server, self.phase, self.commit = server, phase, commit
+        self.delay = delay
         self.release = threading.Event()
         self.operations = []
 
@@ -94,11 +95,11 @@ class DelayedBrokerReply:
                 op = args.pop('op')
                 self.operations.append(op)
                 if op == self.phase and not self.commit:
-                    self.release.wait(3)
+                    self.release.wait(self.delay)
                     return
                 result = self.server.call(op, **args)
                 if op == self.phase:
-                    self.release.wait(3)
+                    self.release.wait(self.delay)
                 try:
                     conn.sendall(bridge.broker.wire({'result':result}))
                 except BrokenPipeError:
@@ -229,17 +230,21 @@ class PushTests(unittest.TestCase):
             elapsed = time.monotonic() - started
         return code, json.loads(stdout.getvalue()), elapsed
 
-    def test_deliver_bounds_peer_eof_and_records_uncertain_without_replay(self):
+    def test_deliver_records_uncertain_after_peer_eof_timeout_and_delayed_finish(self):
         release = threading.Event()
         fake = FakeClaude(self.temp.name, self.sid, ack_gate=release)
         try:
             with RunningBroker() as server:
                 self.register(server)
                 first = self.post(server, 'first')
-                code, output, elapsed = self.deliver(server.path, first['id'], 0.4)
+                with DelayedBrokerReply(self.temp.name, server, 'finish', True, delay=0.25) as proxy:
+                    code, output, elapsed = self.deliver(proxy.path, first['id'], 0.4)
                 self.assertEqual(code, 1)
-                self.assertLess(elapsed, 0.75)
+                self.assertGreater(elapsed, 0.55)
+                self.assertLess(elapsed, 1.5)
                 self.assertIn('did not close', output['error'])
+                self.assertEqual(proxy.operations, ['show', 'claim', 'finish'])
+                self.assertEqual(output['message']['state'], 'uncertain')
                 self.assertEqual(len(fake.received), 1)
                 stored = server.call('show', id=first['id'])
                 self.assertEqual([e['state'] for e in stored['events']], ['dispatching', 'uncertain'])
@@ -266,11 +271,14 @@ class PushTests(unittest.TestCase):
                 for phase, commit, state, count in cases:
                     with self.subTest(phase=phase, commit=commit):
                         message = self.post(server, f'{phase}-{commit}')
-                        with DelayedBrokerReply(self.temp.name, server, phase, commit) as proxy:
+                        with mock.patch.object(bridge, 'PEER_BROKER_TIMEOUT', 0.45), \
+                                DelayedBrokerReply(self.temp.name, server, phase, commit) as proxy:
                             code, output, elapsed = self.deliver(proxy.path, message['id'], 0.35)
                         Path(proxy.path).unlink()
                         self.assertEqual(code, 1)
-                        self.assertLess(elapsed, 0.75)
+                        self.assertLess(elapsed, 0.9)
+                        if phase == 'finish':
+                            self.assertGreaterEqual(elapsed, 0.45)
                         self.assertEqual((output['stage'], output['id'], output['uncertain']),
                                          (phase, message['id'], True))
                         self.assertNotIn(message['body'], json.dumps(output))

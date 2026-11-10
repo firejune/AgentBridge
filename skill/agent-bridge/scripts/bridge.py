@@ -47,6 +47,7 @@ def envelope(m):
 PEER_TAG = 'cross-session-message'
 PEER_MAX_LINE = 1048576
 PEER_IO_TIMEOUT = 5
+PEER_BROKER_TIMEOUT = 10
 PEER_PUSH_TIMEOUT = 30
 PEER_FROM_CHARS = re.compile(r'[^A-Za-z0-9%:_/.\-]')
 PEER_CLOSE_TAG = re.compile(r'<(?!\\)(?=\s*/\s*cross[\s_-]*session[\s_-]*message)', re.I)
@@ -156,12 +157,11 @@ def push(path, m, dry_run=False, *, deadline=None):
     if deadline is None:
         deadline = time.monotonic() + PEER_PUSH_TIMEOUT
 
-    def rpc(op, **fields):
-        return broker.request(path, {'op':op, 'id':m['id'], **fields},
-                              deadline=min(deadline, time.monotonic() + 10))
+    def rpc(op, rpc_deadline, **fields):
+        return broker.request(path, {'op':op, 'id':m['id'], **fields}, deadline=rpc_deadline)
 
     try:
-        claimed = rpc('claim', guarded=True)
+        claimed = rpc('claim', min(deadline, time.monotonic() + PEER_BROKER_TIMEOUT), guarded=True)
     except (OSError, broker.BrokerResponseError):
         # A late broker response may leave a durable claim. This caller has not
         # entered the peer socket and cannot prove it owns any stored claim.
@@ -171,18 +171,19 @@ def push(path, m, dry_run=False, *, deadline=None):
         # Older brokers ignore the opt-in and return no claim token.
         claim = claimed.get('dispatch_claim')
         guard = {'expect_dispatch_claim':claim} if claim is not None else {}
+        finish_deadline = time.monotonic() + PEER_BROKER_TIMEOUT
+        # Settle a possible write even when the caller's peer I/O budget has elapsed.
+        if state == 'pending':
+            finish_deadline = min(deadline, finish_deadline)
         try:
-            return rpc('finish', state=state, note=note, event=event, **guard)
+            return rpc('finish', finish_deadline, state=state, note=note, event=event, **guard)
         except (ValueError, OSError):
             raise ClaudeDispatchUnknown('finish', m['id']) from None
 
     try:
         target = sessions.resolve_claude_peer(m['route']['session'])
         frame = peer_frame(m, target, path)
-        now = time.monotonic()
-        # Leave time in the caller's budget for persisting a peer timeout.
-        finish_budget = min(0.25, max(0, deadline - now) / 4)
-        problem = push_frame(target, frame, min(now + PEER_IO_TIMEOUT, deadline - finish_budget))
+        problem = push_frame(target, frame, min(deadline, time.monotonic() + PEER_IO_TIMEOUT))
     except (ValueError, OSError) as error:
         reason = f'push_failed: {error}'
         raise PushFailed(reason, finish('pending', reason, 'push_failed')) from None

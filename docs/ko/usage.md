@@ -235,7 +235,7 @@ python3 "$bridge_cli" channel-bind modal-view --project my-app --owner codex-age
 - **Claude (`claude-peer`)**:
   - `~/.claude/sessions/<pid>.json`에서 등록된 `sessionId`, 프로세스 생존, `peerProtocol == 1`, `messagingSocketPath`를 확인한다.
   - 소켓에 JSON 두 줄(`{"type":"auth","token":<peerToken>}`, `{"type":"user","message":{...},"session_id":<sessionId>,...}`)을 쓰고 닫는다. `peerToken`은 메모리에서만 읽는다.
-  - peer 연결, 쓰기, 빈 EOF 확인에는 합계 최대 5초를 쓴다. `deliver ID --timeout SECONDS`를 지정하면 브로커 조회, claim, peer I/O, 브로커 finish가 하나의 시간 한도를 공유한다. 한도가 더 짧으면 peer 대기를 줄이고 결과 기록에 시간을 남긴다.
+  - peer 연결, 쓰기, 빈 EOF 확인에는 합계 최대 5초를 쓴다. `deliver ID --timeout SECONDS`의 한도는 브로커 조회, claim, peer I/O, 쓰기 전 실패가 확실할 때의 결과 기록에 함께 적용된다. 쓰기가 시작됐을 수 있다면 이 한도가 지나도 브로커 finish 요청에는 별도의 10초 한도를 적용한다.
   - 빈 EOF를 받으면 `pushed` 이벤트와 `submitted`를 기록한다. 쓰기 전 오류가 확실하면 `push_failed` 이벤트와 `pending`을 기록한다. 쓰기가 시작된 뒤 쓰기나 종료에 실패하거나, EOF가 없거나 응답 바이트가 오면 브로커가 finish를 확인한 경우 `uncertain`을 기록한다. 이 실패들은 종료 코드 1을 반환한다. 브로커의 claim 또는 finish 응답을 받지 못하면 종료 코드 1과 `id`, `stage`(`claim` 또는 `finish`), `uncertain: true`를 출력한다. 이 출력은 응답 미확인을 뜻한다. 기록된 메시지 상태는 `show ID`로 조회한다.
 - **Codex (`codex`)**:
   - `CODEX_HOME/ipc/ipc.sock`(또는 `AGENT_BRIDGE_CODEX_IPC`)에서 정확한 대화 소유자에 연결한다.

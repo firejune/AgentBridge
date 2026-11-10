@@ -238,7 +238,7 @@ Handoff succeeds only when `--expect-generation` matches the current generation.
 - **Claude (`claude-peer`)**:
   - Re-reads `~/.claude/sessions/<pid>.json` for the registered `sessionId`, confirming the PID is alive, `peerProtocol == 1`, and `messagingSocketPath` exists.
   - Writes two JSON lines (`{"type":"auth","token":<peerToken>}` and `{"type":"user","message":{...},"session_id":<sessionId>,...}`) and closes the socket. The `peerToken` is read in memory only.
-  - Uses at most 5 seconds for peer connect, write and the expected empty EOF combined. For `deliver ID --timeout SECONDS`, the broker lookup, claim, peer I/O and broker finish share the caller's budget. A shorter budget shortens the peer wait and reserves time for reporting the outcome.
+  - Uses at most 5 seconds for peer connect, write and the expected empty EOF combined. For `deliver ID --timeout SECONDS`, broker lookup, claim, peer I/O and a definite pre-write failure report share the caller's budget. After a possible write, the broker finish request has its own 10-second limit, even if the caller's budget has elapsed.
   - Returns `submitted` with a `pushed` event on clean EOF. A definite pre-write error returns `pending` with a `push_failed` event. Once the write starts, a write or shutdown error, a missing EOF, or unexpected response bytes records `uncertain` if the broker confirms the finish. These failures exit 1. If the broker claim or finish response is lost, the CLI exits 1 with `id`, `stage` (`claim` or `finish`) and `uncertain: true`. This describes the missing response. Use `show ID` to inspect the recorded message state.
 - **Codex (`codex`)**:
   - Connects to the exact registered thread owner over `CODEX_HOME/ipc/ipc.sock` (or `AGENT_BRIDGE_CODEX_IPC`).
