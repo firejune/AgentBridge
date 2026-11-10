@@ -235,7 +235,8 @@ python3 "$bridge_cli" channel-bind modal-view --project my-app --owner codex-age
 - **Claude (`claude-peer`)**:
   - `~/.claude/sessions/<pid>.json`에서 등록된 `sessionId`, 프로세스 생존, `peerProtocol == 1`, `messagingSocketPath`를 확인한다.
   - 소켓에 JSON 두 줄(`{"type":"auth","token":<peerToken>}`, `{"type":"user","message":{...},"session_id":<sessionId>,...}`)을 쓰고 닫는다. `peerToken`은 메모리에서만 읽는다.
-  - 성공 시 `submitted`(`pushed` 이벤트), 전송 전 오류 시 `pending`(`push_failed` 이벤트, 종료 코드 1), 전송 후 비정상 바이트 수신 시 `uncertain`으로 기록한다.
+  - peer 연결, 쓰기, 빈 EOF 확인에는 합계 최대 5초를 쓴다. `deliver ID --timeout SECONDS`의 한도는 브로커 조회, claim, peer I/O, 쓰기 전 실패가 확실할 때의 결과 기록에 함께 적용된다. 쓰기가 시작됐을 수 있다면 이 한도가 지나도 브로커 finish 요청에는 별도의 10초 한도를 적용한다.
+  - 빈 EOF를 받으면 `pushed` 이벤트와 `submitted`를 기록한다. 쓰기 전 오류가 확실하면 `push_failed` 이벤트와 `pending`을 기록한다. 쓰기가 시작된 뒤 쓰기나 종료에 실패하거나, EOF가 없거나 응답 바이트가 오면 브로커가 finish를 확인한 경우 `uncertain`을 기록한다. 이 실패들은 종료 코드 1을 반환한다. 브로커의 claim 또는 finish 응답을 받지 못하면 종료 코드 1과 `id`, `stage`(`claim` 또는 `finish`), `uncertain: true`를 출력한다. 이 출력은 응답 미확인을 뜻한다. 기록된 메시지 상태는 `show ID`로 조회한다.
 - **Codex (`codex`)**:
   - `CODEX_HOME/ipc/ipc.sock`(또는 `AGENT_BRIDGE_CODEX_IPC`)에서 정확한 대화 소유자에 연결한다.
   - 동료 본문을 standalone `toolOutput`(`agent_bridge`)로 전달하며, 활성 턴이면 `thread-follower-steer-turn`을 먼저 호출해 현재 턴에 합류하고 유휴 상태일 때만 `thread-follower-start-turn`을 호출한다.
@@ -245,6 +246,7 @@ python3 "$bridge_cli" channel-bind modal-view --project my-app --owner codex-age
   - `SendAgentMessage`로 `<SYSTEM_MESSAGE>`(`MESSAGE_PRIORITY_HIGH`)를 주입해 `running` 턴이면 작업을 끊지 않고 다음 스텝에 합류시키고, `idle`이거나 백그라운드 명령/서브에이전트 대기 중이면 빈 `SendUserCascadeMessage`(`MESSAGE_DELIVERY_STRATEGY_NEXT_INVOCATION`)를 이어 호출해 즉시 깨운다.
 - **전용 Claude CLI (`claude`)**:
   - ⛔ **라이브 세션에는 `--transport claude`를 절대 쓰지 않는다** — 별개의 CLI 사본을 띄운다. 쉬고 있는 전용 CLI 세션에만 사용하며 `deliver`가 읽기 전용 `plan` 모드로 `--resume`한다.
+- **차단된 전송**. 같은 transport와 세션의 다른 메시지가 `dispatching` 또는 `uncertain`이면 `show`와 CLI `inbox`는 `blocked_by: {id, state, since}`와 `pending behind <id> since <time>`을 표시한다. 대기 중인 메시지의 claim을 거부할 때는 두 메시지 ID를 출력한다. 이전 체크포인트에는 `since: null`이 표시될 수 있다. 같은 세션을 가리키는 별칭도 보호 범위에 포함된다. 발신 측 전송 클라이언트가 종료됐는지 확인하고 차단 중인 메시지와 정확한 수신 세션을 확인한 후 `resolve`를 사용한다. 브로커는 차단 중인 메시지를 자동 만료하거나 재전송하지 않는다.
 - **명시적 재전달 및 수동 상태 확정 (`deliver`, `resolve`)**:
 
 ```bash
@@ -289,7 +291,7 @@ python3 "$bridge_cli" close NAME --project PROJECT [--keep-route] [--timeout 10]
 
 ## 메시지 체크포인트 복원
 
-소유자 전용 `correspondence.json`의 버전은 1이며 메시지·전달 상태·중복키·ACK 시각을 보존한다. 재시작은 메시지를 자동 전송하지 않는다. `--max-messages`를 줄이면 브로커의 기존 `make_room`을 재사용해 보호되지 않은 종료 메시지부터 오래된 순서로 제거한다. 부모·조상 보호 조건을 적용하고 남은 메시지는 저장 순서를 유지한다. 중복키는 실제 제거한 메시지의 것만 해제한다. 비종료 메시지와 보호된 메시지는 새 한도를 넘어도 유지한다. 시작 시 stderr에 `correspondence.json`·보존 건수·한도를 기록하고, `ping.correspondence_over_limit`과 `ping.max_messages`로 상태를 알린다. 새 메시지를 넣을 자리가 생길 때까지 전송은 기존 메시지 한도 오류로 거부된다. 실제 제거한 종료 메시지 ID만 손실 원장에 기록하며, 제거한 메시지가 없으면 원장을 새로 쓰지 않는다.
+소유자 전용 `correspondence.json`의 버전은 1이며 메시지·전달 상태·중복키·ACK 시각과 차단 중인 전송의 `dispatch_started_at`을 보존한다. 재시작은 메시지를 자동 전송하지 않는다. `--max-messages`를 줄이면 브로커의 기존 `make_room`을 재사용해 보호되지 않은 종료 메시지부터 오래된 순서로 제거한다. 부모·조상 보호 조건을 적용하고 남은 메시지는 저장 순서를 유지한다. 중복키는 실제 제거한 메시지의 것만 해제한다. 비종료 메시지와 보호된 메시지는 새 한도를 넘어도 유지한다. 시작 시 stderr에 `correspondence.json`·보존 건수·한도를 기록하고, `ping.correspondence_over_limit`과 `ping.max_messages`로 상태를 알린다. 새 메시지를 넣을 자리가 생길 때까지 전송은 기존 메시지 한도 오류로 거부된다. 실제 제거한 종료 메시지 ID만 손실 원장에 기록하며, 제거한 메시지가 없으면 원장을 새로 쓰지 않는다.
 
 쓰기 상한은 `max_messages * 1 MiB + 16 MiB + 8192 * 1024`바이트이며 건수 한도를 초과해 복원된 집합에도 적용한다. 읽기 상한은 최소 2048건 기준을 유지하며, 더 큰 이전 저장본은 검증된 메타데이터 인덱스의 건수로 본문 읽기 상한을 높인다. 상한을 넘고 인덱스를 사용할 수 없으면 시작을 거부한다.
 

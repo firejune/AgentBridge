@@ -60,7 +60,8 @@ python3 "$bridge_cli" register claude-worker --project PROJECT --transport claud
 ```
 
 - **직접 Push**: `--discover`는 `~/.claude/sessions/<pid>.json`에서 정확한 `sessionId`, 생존 여부, `peerProtocol == 1`, 작업 경로를 검증한다. `send`·`ask`·`reply`는 즉시 메시징 소켓으로 주입(`submitted`)되며, 마지막 줄에 브릿지 답장 명령(`bridge.py reply <ID> …`)이 실린다.
-- **실패 처리**: 전송 전 검증·소켓 오류는 `pending`(`push_failed` 이벤트)과 종료 코드 1로 남으며 `watch`로 몰래 넘어가지 않는다. `peerToken` 키는 메모리에서만 읽는다.
+- **실패 처리**. 쓰기 전 오류는 `push_failed` 이벤트와 함께 `pending`으로 남는다. 쓰기가 시작된 뒤 쓰기 또는 연결 종료 대기에 실패하면 `uncertain`으로 기록한다. `deliver ID --timeout SECONDS`는 해당 전송의 조회, claim, peer I/O에 적용된다. 쓰기가 시작됐을 수 있다면 브로커에 결과를 기록하는 데 최대 10초를 더 쓸 수 있다. 브로커의 claim 또는 finish 응답을 확인하지 못하면 메시지 ID와 단계를 출력한다. `resolve` 전에 `show ID`로 상태를 확인한다.
+- **대기 중인 전송**. `show`와 CLI `inbox`는 다른 전송에 막힌 `pending` 메시지에 `blocked_by`와 `pending behind <id> since <time>`을 표시한다. 차단 중인 전송을 `resolve`하기 전에 발신 측 전송 클라이언트가 종료됐는지와 정확한 수신 세션을 확인한다. 미확정 전송은 자동 재시도하지 않는다. `peerToken` 키는 메모리에서만 읽는다.
 - **새 세션 열기**:
   - **IDE (`--host ide`)**: IDE CLI로 해당 폴더 창을 포커스/오픈한 뒤 `<scheme>://anthropic.claude-code/open`을 열어 `--cwd` 아래 새 `entrypoint == "claude-vscode"` 레코드 하나를 사람 개입 없이 즉시 등록한다.
   - **데스크톱 (기본)**: `claude://code/new?folder=…&q=…`를 열고 사람이 Enter를 눌러 생성된 `entrypoint == "claude-desktop"`(`hostSessionId: "local_…"`) 레코드를 `--timeout`까지 기다려 등록한다.

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
@@ -29,7 +30,7 @@ def dead_pid():
 
 class FakeClaude:
     """A fake live Claude session: registry file, key file and inbox socket."""
-    def __init__(self, root, sid, pid=None, protocol=1, listen=True, extra=None):
+    def __init__(self, root, sid, pid=None, protocol=1, listen=True, extra=None, ack_gate=None):
         self.root, self.sid = Path(root), sid
         self.pid = os.getpid() if pid is None else pid
         self.registry = self.root/'sessions'
@@ -41,6 +42,7 @@ class FakeClaude:
         digest = hashlib.sha256(os.path.abspath(self.sock).encode()).hexdigest()
         (self.registry/f'{self.pid}.{digest}.key').write_text(json.dumps({'peerToken':TOKEN}))
         self.received, self.server = [], None
+        self.ack_gate = ack_gate
         if listen:
             self.server = socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
             self.server.bind(self.sock);self.server.listen(4)
@@ -56,11 +58,59 @@ class FakeClaude:
                 data = b''
                 while chunk := conn.recv(65536):
                     data += chunk
-            self.received.append([json.loads(line) for line in data.decode().splitlines()])
+                self.received.append([json.loads(line) for line in data.decode().splitlines()])
+                if self.ack_gate is not None:
+                    self.ack_gate.wait(3)
 
     def close(self):
         if self.server:
             self.server.close()
+
+
+class DelayedBrokerReply:
+    """Proxy one delivery and withhold the selected broker reply."""
+    def __init__(self, root, server, phase, commit, delay=3):
+        self.path = str(Path(root)/'proxy.sock')
+        self.server, self.phase, self.commit = server, phase, commit
+        self.delay = delay
+        self.release = threading.Event()
+        self.operations = []
+
+    def __enter__(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.bind(self.path)
+        self.sock.listen()
+        self.thread = threading.Thread(target=self.relay, daemon=True)
+        self.thread.start()
+        return self
+
+    def relay(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            with conn, conn.makefile('rb') as reader:
+                args = json.loads(reader.readline())
+                op = args.pop('op')
+                self.operations.append(op)
+                if op == self.phase and not self.commit:
+                    self.release.wait(self.delay)
+                    return
+                result = self.server.call(op, **args)
+                if op == self.phase:
+                    self.release.wait(self.delay)
+                try:
+                    conn.sendall(bridge.broker.wire({'result':result}))
+                except BrokenPipeError:
+                    pass
+                if op == self.phase:
+                    return
+
+    def __exit__(self, *_):
+        self.release.set()
+        self.thread.join(timeout=2)
+        self.sock.close()
 
 
 class ResolverAndFrameTests(unittest.TestCase):
@@ -167,6 +217,190 @@ class PushTests(unittest.TestCase):
             self.assertEqual(stored['state'],'pending')
             self.assertEqual(stored['events'][-1]['event'],'push_failed')
             self.assertNotIn(TOKEN,result.stdout+result.stderr)
+
+    def post(self, server, key, recipient='beta'):
+        return server.call('send', project='demo', sender='alpha', recipient=recipient,
+                           body='private body ' + key, key=key)
+
+    def deliver(self, path, mid, timeout):
+        stdout = io.StringIO()
+        with mock.patch.dict(os.environ, self.env), mock.patch('sys.stdout', stdout):
+            started = time.monotonic()
+            code = bridge.main(['--socket', path, 'deliver', mid, '--timeout', str(timeout)])
+            elapsed = time.monotonic() - started
+        return code, json.loads(stdout.getvalue()), elapsed
+
+    def test_deliver_records_uncertain_after_peer_eof_timeout_and_delayed_finish(self):
+        release = threading.Event()
+        fake = FakeClaude(self.temp.name, self.sid, ack_gate=release)
+        try:
+            with RunningBroker() as server:
+                self.register(server)
+                first = self.post(server, 'first')
+                with DelayedBrokerReply(self.temp.name, server, 'finish', True, delay=0.25) as proxy:
+                    code, output, elapsed = self.deliver(proxy.path, first['id'], 0.4)
+                self.assertEqual(code, 1)
+                self.assertGreater(elapsed, 0.55)
+                self.assertLess(elapsed, 1.5)
+                self.assertIn('did not close', output['error'])
+                self.assertEqual(proxy.operations, ['show', 'claim', 'finish'])
+                self.assertEqual(output['message']['state'], 'uncertain')
+                self.assertEqual(len(fake.received), 1)
+                stored = server.call('show', id=first['id'])
+                self.assertEqual([e['state'] for e in stored['events']], ['dispatching', 'uncertain'])
+                result = self.cli(server, 'send', '--project', 'demo', '--from', 'alpha',
+                                  '--to', 'beta', '--key', 'second', '--file', '-')
+                self.assertEqual(result.returncode, 1)
+                row, = (row for row in server.call('inbox', project='demo', name='beta')
+                        if row['state'] == 'pending')
+                self.assertIn(row['id'], result.stdout)
+                self.assertIn(f"pending behind {first['id']} since {stored['dispatch_started_at']}", result.stdout)
+                self.assertNotIn(first['body'], result.stdout)
+                self.assertEqual(len(fake.received), 1)
+        finally:
+            release.set()
+            fake.close()
+
+    def test_delayed_claim_or_finish_reply_respects_deliver_budget_and_never_replays(self):
+        fake = FakeClaude(self.temp.name, self.sid)
+        try:
+            with RunningBroker() as server:
+                self.register(server)
+                cases = (('claim', True, 'dispatching', 0), ('finish', True, 'submitted', 1),
+                         ('finish', False, 'dispatching', 2))
+                for phase, commit, state, count in cases:
+                    with self.subTest(phase=phase, commit=commit):
+                        message = self.post(server, f'{phase}-{commit}')
+                        with mock.patch.object(bridge, 'PEER_BROKER_TIMEOUT', 0.45), \
+                                DelayedBrokerReply(self.temp.name, server, phase, commit) as proxy:
+                            code, output, elapsed = self.deliver(proxy.path, message['id'], 0.35)
+                        Path(proxy.path).unlink()
+                        self.assertEqual(code, 1)
+                        self.assertLess(elapsed, 0.9)
+                        if phase == 'finish':
+                            self.assertGreaterEqual(elapsed, 0.45)
+                        self.assertEqual((output['stage'], output['id'], output['uncertain']),
+                                         (phase, message['id'], True))
+                        self.assertNotIn(message['body'], json.dumps(output))
+                        self.assertEqual(proxy.operations,
+                                         ['show', 'claim'] if phase == 'claim' else ['show', 'claim', 'finish'])
+                        self.assertEqual(server.call('show', id=message['id'])['state'], state)
+                        self.assertEqual(len(fake.received), count)
+                        if phase == 'claim':
+                            server.call('resolve', id=message['id'], state='done', note='Fake peer saw no write')
+                        if not commit:
+                            later = self.post(server, 'later')
+                            self.assertEqual(server.call('show', id=later['id'])['blocked_by']['id'], message['id'])
+        finally:
+            fake.close()
+
+    def test_dispatch_blocker_visible_in_inbox_across_aliases_and_restart(self):
+        FakeClaude(self.temp.name, self.sid, listen=False)
+        with RunningBroker() as server:
+            self.register(server)
+            server.call('register', project='demo', name='alias', cwd=self.temp.name,
+                        transport='claude-peer', session=self.sid)
+            first = self.post(server, 'first')
+            claimed = server.call('claim', id=first['id'])
+            second = self.post(server, 'second', recipient='alias')
+            since = claimed['events'][-1]['at']
+            for state in ('dispatching', 'uncertain'):
+                with self.subTest(state=state):
+                    row, = server.call('inbox', project='demo', name='alias')
+                    shown = server.call('show', id=second['id'])
+                    blocker = {'id':first['id'], 'state':state, 'since':since}
+                    self.assertEqual(row['blocked_by'], blocker)
+                    self.assertEqual(shown['blocked_by'], blocker)
+                    self.assertEqual(row['note'], f"pending behind {first['id']} since {since}")
+                    self.assertNotIn(first['body'], json.dumps(row))
+                    self.assertEqual(shown['state'], 'pending')
+                    if state == 'dispatching':
+                        server.restart()
+            server.call('resolve', id=first['id'], state='done', note='Test operator released the guard')
+            row, = server.call('inbox', project='demo', name='alias')
+            self.assertNotIn('blocked_by', row)
+            self.assertIsNone(server.call('show', id=second['id'])['note'])
+
+    def test_late_finish_cannot_settle_a_new_claim_after_manual_resolution(self):
+        FakeClaude(self.temp.name, self.sid, listen=False)
+        with RunningBroker() as server:
+            self.register(server)
+            message = self.post(server, 'first')
+            mid = message['id']
+            first = server.call('claim', id=mid, guarded=True)['dispatch_claim']
+            server.call('resolve', id=mid, state='pending', note='Test operator verified no write')
+            second = server.call('claim', id=mid, guarded=True)['dispatch_claim']
+            self.assertNotEqual(first, second)
+            with self.assertRaisesRegex(ValueError, 'Delivery claim changed'):
+                server.call('finish', id=mid, state='submitted', expect_dispatch_claim=first)
+            self.assertEqual(server.call('show', id=mid)['state'], 'dispatching')
+            self.assertEqual(server.call('finish', id=mid, state='submitted',
+                                         expect_dispatch_claim=second)['state'], 'submitted')
+
+    def test_legacy_finish_is_refused_against_a_guarded_reclaim(self):
+        FakeClaude(self.temp.name, self.sid, listen=False)
+        with RunningBroker() as server:
+            self.register(server)
+            mid = self.post(server, 'mixed-claim')['id']
+            self.assertNotIn('dispatch_claim', server.call('claim', id=mid))
+            server.call('resolve', id=mid, state='pending', note='Test operator released the old claim')
+            claimed = server.call('claim', id=mid, guarded=True)
+            self.assertEqual(set(claimed), {'dispatch_claim'})
+            with self.assertRaisesRegex(ValueError, 'Delivery claim changed'):
+                server.call('finish', id=mid, state='submitted')
+            self.assertEqual(server.call('show', id=mid)['state'], 'dispatching')
+            self.assertEqual(server.call('finish', id=mid, state='submitted',
+                                         expect_dispatch_claim=claimed['dispatch_claim'])['state'], 'submitted')
+            legacy = self.post(server, 'legacy-claim')['id']
+            self.assertNotIn('dispatch_claim', server.call('claim', id=legacy))
+            self.assertEqual(server.call('finish', id=legacy, state='submitted')['state'], 'submitted')
+
+    def test_guarded_finish_after_release_or_reply_uses_current_state(self):
+        FakeClaude(self.temp.name, self.sid, listen=False)
+        with RunningBroker() as server:
+            self.register(server)
+            for state in ('pending', 'answered', 'uncertain'):
+                with self.subTest(state=state):
+                    mid = self.post(server, state)['id']
+                    claim = server.call('claim', id=mid, guarded=True)['dispatch_claim']
+                    if state == 'pending':
+                        server.call('resolve', id=mid, state=state, note='Test operator released the claim')
+                    elif state == 'uncertain':
+                        server.restart()
+                    else:
+                        server.call('reply', id=mid, key='fast-reply', body='Fast reply')
+                    if state == 'answered':
+                        self.assertEqual(server.call('finish', id=mid, state='submitted',
+                                                     expect_dispatch_claim=claim)['state'], state)
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'Delivery claim changed'):
+                            server.call('finish', id=mid, state='submitted', expect_dispatch_claim=claim)
+                        self.assertEqual(server.call('show', id=mid)['state'], state)
+                    if state == 'uncertain':
+                        server.call('resolve', id=mid, state='done', note='Release the restart test blocker')
+
+    def test_errors_from_sendall_and_shutdown_are_potential_writes(self):
+        target = {'socket':'/fake/peer.sock'}
+        for method, error, expected in (('sendall', TimeoutError(), 'write timed out'),
+                                        ('shutdown', OSError('lost'), 'error during the write')):
+            with self.subTest(method=method), mock.patch.object(bridge, 'peer_token', return_value=TOKEN), \
+                    mock.patch.object(socket, 'socket') as connection:
+                sock = connection.return_value.__enter__.return_value
+                getattr(sock, method).side_effect = error
+                self.assertIn(expected, bridge.push_frame(target, {}, time.monotonic() + 1))
+                sock.sendall.assert_called_once()
+                sock.recv.assert_not_called()
+
+    def test_socket_teardown_error_after_eof_is_a_potential_write(self):
+        target = {'socket':'/fake/peer.sock'}
+        with mock.patch.object(bridge, 'peer_token', return_value=TOKEN), \
+                mock.patch.object(socket, 'socket') as connection:
+            sock = connection.return_value.__enter__.return_value
+            sock.recv.return_value = b''
+            connection.return_value.__exit__.side_effect = OSError('teardown failed')
+            self.assertIn('error after the write', bridge.push_frame(target, {}, time.monotonic() + 1))
+            sock.sendall.assert_called_once()
+            sock.recv.assert_called_once()
 
     def test_dead_session_fails_loudly_on_ask(self):
         fake = FakeClaude(self.temp.name,self.sid)

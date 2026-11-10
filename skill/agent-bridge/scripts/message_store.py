@@ -1,4 +1,5 @@
 """Owner-private correspondence checkpoint. Runtime credentials never enter it."""
+from datetime import datetime
 import json
 import math
 import os
@@ -86,6 +87,12 @@ def message_record(raw):
             or result['route']['name'] != result['recipient']
             or result['return_route']['name'] != result['sender']):
         raise ValueError('Inconsistent message routes')
+    if raw.get('dispatch_started_at') is not None:
+        started = raw['dispatch_started_at']
+        if (not isinstance(started, str) or len(started) > 40
+                or datetime.fromisoformat(started).utcoffset() is None):
+            raise ValueError('Invalid dispatch start time')
+        result['dispatch_started_at'] = started
     if raw.get('acknowledged_at') is not None:
         if not isinstance(raw['acknowledged_at'], str):
             raise ValueError('Invalid acknowledgement time')
