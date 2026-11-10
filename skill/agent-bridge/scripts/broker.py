@@ -453,7 +453,7 @@ class State:
         # Stage mutations in isolation. A failed durable write must not acknowledge
         # an ACK, publish an event, wake a waiter or leave a half-posted reply.
         mutations = ('send', 'reply', 'ack', 'progress', 'resolve', 'claim', 'finish',
-                     'claim-guarded', 'release-claim',
+                     'claim-guarded', 'release-claim', 'note-pending',
                      'inbox_ack', 'provider-failure', 'provider-retry')
         if self.correspondence is None or args['op'] not in mutations:
             return self.apply_action(args)
@@ -463,7 +463,7 @@ class State:
         staged.answers = self.answers.copy()
         staged.pending_publications = []
         result = staged.apply_action(args)
-        if args['op'] in ('provider-failure', 'provider-retry', 'release-claim') and not staged.pending_publications:
+        if args['op'] in ('provider-failure', 'provider-retry', 'release-claim', 'note-pending') and not staged.pending_publications:
             return result  # A no-op needs no repeated checkpoint write.
         self.correspondence.save(staged)
         for field in ('messages', 'keys', 'inbox_receipts', 'inbox_snapshots', 'answers'):
@@ -644,8 +644,18 @@ class State:
                     and (not args.get('channel') or m['channel']==args['channel'])
                     and (not args.get('session') or m['route']['session']==args['session'])
                     and (args.get('all') or m['state'] not in ('done','answered'))]
-        if op in ('ack','progress','resolve','claim','claim-guarded','release-claim','finish'):
+        if op in ('ack','progress','resolve','claim','claim-guarded','release-claim','note-pending','finish'):
             m = self.get(args['id'])
+            if op == 'note-pending':
+                # Annotate a message only while it is still pending: never rewrite a claim
+                # another caller took meanwhile, and never change its state.
+                note = args.get('note')
+                if not isinstance(note, str) or not note.strip():
+                    raise ValueError('A pending note requires an explanation')
+                if m['state'] != 'pending':
+                    return {'noted':False}
+                self.status(m, 'pending', note)
+                return {'noted':True}
             if op == 'release-claim':
                 token, admit_until = guarded_claim_fields(args)
                 if time.monotonic() < admit_until:
@@ -697,9 +707,6 @@ class State:
                 return self.status(m,args['state'],args.get('note'),event)
             if m['state'] in ('done','answered'):
                 raise ValueError('Message is already complete')
-            if op=='resolve' and 'expect_state' in args and m['state'] != args['expect_state']:
-                # A guarded note never rewrites a message another caller claimed meanwhile.
-                raise ValueError('Message state changed. Inspect the current state.')
             if op in ('ack','progress') and m['state'] in ('dispatching','uncertain'):
                 raise ValueError('Resolve delivery outcome first')
             state = {'ack':'received','progress':'in_progress'}.get(op,args.get('state'))

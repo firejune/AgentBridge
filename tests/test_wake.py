@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -204,6 +205,46 @@ class WakePushTests(WakeFixture):
             self.assertEqual(len(self.urls),1)
             frame.assert_not_called()
 
+    def test_opener_timeout_returns_message_to_pending_without_blocking(self):
+        self.metadata()
+        def hang(url):
+            self.urls.append(url)
+            raise subprocess.TimeoutExpired(['open','-g',url],10)
+        with RunningBroker() as server, self.env(), \
+                mock.patch.object(sessions,'open_url_background',hang), \
+                mock.patch.object(bridge,'push_frame') as frame:
+            message = self.send(server)
+            with self.assertRaises(bridge.PushFailed) as caught:
+                bridge.push(server.path,message,wake_timeout=2)
+            self.assertEqual(caught.exception.message['wake']['state'],'uncertain')
+            self.assertIn('TimeoutExpired',str(caught.exception))
+            stored = server.call('show',id=message['id'])
+            self.assertEqual(stored['state'],'pending')
+            self.assertEqual(stored['events'][-1]['event'],'push_failed')
+            self.assertNotIn('uncertain',[e['state'] for e in stored['events']])
+            # The recipient is not blocked: another message to it is claimable at once.
+            later = self.send(server,key='k2')
+            self.assertNotIn('blocked_by',server.call('show',id=later['id']))
+            self.assertEqual(len(self.urls),1)
+            frame.assert_not_called()
+
+    def test_interrupt_before_the_write_is_pending_and_during_it_uncertain(self):
+        self.metadata()
+        with RunningBroker() as server, self.env(), \
+                mock.patch.object(sessions,'open_url_background',side_effect=KeyboardInterrupt):
+            message = self.send(server)
+            with self.assertRaises(KeyboardInterrupt):
+                bridge.push(server.path,message,wake_timeout=2)
+            stored = server.call('show',id=message['id'])
+            self.assertEqual((stored['state'],stored['events'][-1]['event']),('pending','push_failed'))
+        self.fakes.append(FakeClaude(self.temp.name,self.sid,extra=DESKTOP))
+        with RunningBroker() as server, self.env(), \
+                mock.patch.object(bridge,'push_frame',side_effect=KeyboardInterrupt):
+            message = self.send(server)
+            with self.assertRaises(KeyboardInterrupt):
+                bridge.push(server.path,message,wake_timeout=2)
+            self.assertEqual(server.call('show',id=message['id'])['state'],'uncertain')
+
     def test_unsupported_wake_keeps_the_message_pending_without_opening(self):
         self.metadata(scheduledTaskId='nightly-index')
         with RunningBroker() as server, self.env(), \
@@ -347,14 +388,101 @@ class WaitBehindWakeTests(WakeFixture):
             self.assertEqual(self.urls,[])
             frame.assert_not_called()
 
-    def test_behind_note_never_rewrites_a_message_claimed_meanwhile(self):
+    def race_note(self, legacy):
+        """Blocker uncertain; while the note is in flight an operator settles it and another client claims."""
         self.metadata()
-        with RunningBroker() as server:
+        with RunningBroker() as server, self.env(), \
+                mock.patch.object(sessions,'open_url_background',self.opener()), \
+                mock.patch.object(bridge,'push_frame') as frame:
             first, second = self.two(server)
-            server.call('claim',id=second['id'])
-            with self.assertRaisesRegex(ValueError,'state changed'):
-                server.call('resolve',id=second['id'],state='pending',note='pending behind x',expect_state='pending')
-            self.assertEqual(server.call('show',id=second['id'])['state'],'dispatching')
+            server.call('claim',id=first['id'])
+            server.call('finish',id=first['id'],state='uncertain',note='bytes may have reached the receiver')
+
+            def before_note():
+                server.call('resolve',id=first['id'],state='done',note='operator checked the session')
+                server.call('claim',id=second['id'])  # The concurrent deliverer wins the race.
+            with NoteRace(self.temp.name,server,before_note,legacy) as proxy, \
+                    self.assertRaises(bridge.PushFailed) as caught:
+                bridge.push(proxy.path,second,wake_timeout=2)
+            stored = server.call('show',id=second['id'])
+            self.assertEqual(stored['state'],'dispatching')  # Never turned back to pending.
+            self.assertNotIn('resolve',proxy.operations)
+            self.assertEqual(proxy.operations.count('note-pending'),1)
+            result = caught.exception.message
+            self.assertEqual(result['state'],'dispatching')
+            self.assertFalse(result['noted'])
+            self.assertTrue(result['note'].startswith(f"pending behind {first['id']} since "))
+            self.assertIn('(uncertain); not sent',result['note'])
+            self.assertNotIn('pending behind',json.dumps(stored['events']))  # Nothing durable.
+            frame.assert_not_called()
+            return result
+
+    def test_older_broker_without_note_op_keeps_the_note_local(self):
+        self.assertEqual(self.race_note(legacy=True)['note_scope'],'local')
+
+    def test_note_skips_a_message_claimed_between_check_and_note(self):
+        self.assertNotIn('note_scope',self.race_note(legacy=False))
+
+    def test_note_is_durable_while_the_message_stays_pending(self):
+        self.metadata()
+        with RunningBroker() as server, self.env(), \
+                mock.patch.object(bridge,'push_frame') as frame:
+            first, second = self.two(server)
+            server.call('claim',id=first['id'])
+            server.call('finish',id=first['id'],state='uncertain',note='bytes may have reached the receiver')
+            with self.assertRaises(bridge.PushFailed) as caught:
+                bridge.push(server.path,second,wake_timeout=2)
+            self.assertTrue(caught.exception.message['noted'])
+            stored = server.call('show',id=second['id'])
+            self.assertEqual(stored['state'],'pending')
+            self.assertEqual(stored['events'][-1]['note'],str(caught.exception))
+            frame.assert_not_called()
+
+
+class NoteRace:
+    """Relay broker calls; run `before` just ahead of note-pending, optionally as a broker without that op."""
+    def __init__(self, root, server, before, legacy):
+        self.path = str(Path(root)/'race.sock')
+        self.server, self.before, self.legacy = server, before, legacy
+        self.operations = []
+        self.stop = threading.Event()
+
+    def __enter__(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.bind(self.path)
+        self.sock.listen()
+        self.sock.settimeout(0.1)
+        self.thread = threading.Thread(target=self.relay, daemon=True)
+        self.thread.start()
+        return self
+
+    def relay(self):
+        while not self.stop.is_set():
+            try:
+                conn, _ = self.sock.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            with conn, conn.makefile('rb') as reader:
+                args = json.loads(reader.readline())
+                op = args.pop('op')
+                self.operations.append(op)
+                if op == 'note-pending':
+                    self.before()
+                if op == 'note-pending' and self.legacy:
+                    response = {'error':'Unknown operation'}
+                else:
+                    try:
+                        response = {'result':self.server.call(op, **args)}
+                    except ValueError as error:
+                        response = {'error':str(error)}
+                conn.sendall(bridge.broker.wire(response))
+
+    def __exit__(self, *_):
+        self.stop.set()
+        self.thread.join(timeout=2)
+        self.sock.close()
 
 
 class WakeCommandTests(WakeFixture):

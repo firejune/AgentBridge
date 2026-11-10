@@ -973,7 +973,12 @@ def wake_claude(sid, timeout=WAKE_TIMEOUT, sessions_dir=None, desktop_dir=None, 
                           'cross-session inbox off (CLAUDE_CODE_HARBOR_KITE=0), so a woken copy has no peer socket'}
     url = claude_desktop_wake_url(host_id)
     started = time.monotonic()
-    (opener or open_url_background)(url)
+    try:
+        (opener or open_url_background)(url)
+    except (subprocess.SubprocessError, OSError) as error:
+        # The link may or may not have reached the app; nothing was written to any peer.
+        return {**found, 'url': url, 'state': 'uncertain',
+                'reason': f'opening the link failed ({type(error).__name__}); nothing was sent'}
     found['url'] = url
     deadline = started + timeout
     while True:

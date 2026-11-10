@@ -239,7 +239,7 @@ python3 "$bridge_cli" channel-bind modal-view --project my-app --owner codex-age
   - 빈 EOF를 받으면 `pushed` 이벤트와 `submitted`를 기록한다. 쓰기 전 오류가 확실하면 `push_failed` 이벤트와 `pending`을 기록한다. 쓰기가 시작된 뒤 쓰기나 종료에 실패하거나, EOF가 없거나 응답 바이트가 오면 브로커가 finish를 확인한 경우 `uncertain`을 기록한다. 이 실패들은 종료 코드 1을 반환한다.
   - 클라이언트가 peer 소켓을 열기 전에 보호된 claim 응답을 잃으면 접수 한도가 지날 때까지 기다렸다가 별도의 2초 한도로 해제를 한 번 요청한다. 브로커는 클라이언트 토큰과 접수 한도가 둘 다 일치하는 현재 `dispatching` 예약만 해제한다. 한도가 지난 claim은 접수하지 않으며 재시작하면 기존 예약의 소유 정보는 사라진다. 해제가 확인되면 종료 코드 1과 `push_failed: true`를 반환하고 `push_failed` 이벤트와 `pending`을 기록한다. 이 경로에서는 peer 프레임을 보내지 않는다.
   - 구버전 브로커가 보호된 claim 작업을 명시적으로 거부한 뒤에만 기존 claim 방식을 사용한다. 기존 방식의 응답을 잃으면 예약을 보호 상태로 둔다. claim, 해제, finish가 미확정이면 종료 코드 1과 `id`, `stage`(`claim`, `claim-release` 또는 `finish`), `uncertain: true`를 출력한다. 기록된 메시지 상태는 `show ID`로 조회한다.
-  - 세션의 라이브 기록이 없으면 같은 한도 안에서 push용 5초를 남기고 먼저 한 번 깨우고(「유휴로 닫힌 Claude 세션 깨우기」), inbox가 뜨면 한 번 push한다.
+  - 세션의 라이브 기록이 없으면 같은 한도 안에서 push용 5초를 남기고 먼저 한 번 깨우고(「유휴로 닫힌 Claude 세션 깨우기」), inbox가 뜨면 한 번 push한다. peer 쓰기 전(조회 · 깨우기 · 프레임)에 실패하거나 중단되면 `push_failed` 이벤트와 함께 `pending`으로 돌아간다. `uncertain`은 쓰기가 일어났을 수 있을 때만 기록한다.
 - **Codex (`codex`)**:
   - `CODEX_HOME/ipc/ipc.sock`(또는 `AGENT_BRIDGE_CODEX_IPC`)에서 정확한 대화 소유자에 연결한다.
   - 동료 본문을 standalone `toolOutput`(`agent_bridge`)로 전달하며, 활성 턴이면 `thread-follower-steer-turn`을 먼저 호출해 현재 턴에 합류하고 유휴 상태일 때만 `thread-follower-start-turn`을 호출한다.
@@ -303,9 +303,9 @@ Claude 데스크톱은 세션을 스스로 닫는다(앱 `main.log`에서 관찰
 | `already-live` | inbox가 이미 돌고 있다. 아무것도 열지 않는다 | 한 번 push |
 | `woken` | 같은 세션이 `--timeout` 안에 inbox 소켓과 함께 돌아왔다 | 한 번 push (결과에 `wake`, 노트 `after wake (woken)`) |
 | `unsupported` | 아무것도 열지 않는다: 보관됨, 예약 작업 세션(앱이 `CLAUDE_CODE_HARBOR_KITE=0`으로 띄워 inbox가 꺼져 있다), inbox가 꺼진 채 실행 중, IDE 세션(`<scheme>://anthropic.claude-code/open?session=ID`는 있으나 측정 안 됨), ID에 맞는 데스크톱 세션 없음 | `pending`으로 복귀, 보낸 것 없음 |
-| `uncertain` | 링크는 열었지만 제한 시간 안에 기록이 안 뜨거나, 소켓이 없거나, 다른 호스트의 기록이 떴다 | `pending`으로 복귀, 보낸 것 없음. 자동으로 다시 열거나 다시 보내지 않는다 |
+| `uncertain` | 링크 열기가 실패하거나 시간을 넘겼다. 또는 링크는 열었지만 제한 시간 안에 기록이 안 뜨거나, 소켓이 없거나, 다른 호스트의 기록이 떴다 | `pending`으로 복귀, 보낸 것 없음. 자동으로 다시 열거나 다시 보내지 않는다 |
 
-깨우는 동안 메시지는 `dispatching`에 묶여 있다. 같은 세션으로 두 번째 `claude-peer` push가 오면 링크를 또 열지 않고 그 뒤에서 한 번 기다린다. 기다림은 깨우기 제한 시간 + 10초와 두 번째 push 자신의 전송 한도 안이고, 쓰기용 5초를 남긴다. 앞 메시지가 전달로 끝나면 두 번째도 같은 호출자 토큰 `claim-guarded` 경로(응답을 잃었을 때의 1회 해제 포함)로 다시 claim해서 한 번 push한다(결과에 `behind: {id, state}`). 아니면 아무것도 보내지 않고 `pending`으로 남으며, 위의 차단된 전송 노트에 앞 전달이 끝난 상태를 붙여 기록한다: `pending behind <id> since <time> (<상태>); not sent`. 앞 전달이 `uncertain`이면 기다리지 않고 바로 그 노트를 단다. 노트는 메시지가 아직 `pending`일 때만 기록하므로, 그사이 다른 호출자가 잡은 claim을 덮어쓰지 않는다. `unsupported`나 `uncertain` 뒤에는 앱에서 세션을 확인하고 `deliver MESSAGE_ID`로 한 번 다시 시도한다. 링크를 열면 앱이 보여 주는 세션이 바뀌고, `open -g`여도 앱이 앞으로 올 수 있다.
+깨우는 동안 메시지는 `dispatching`에 묶여 있다. 같은 세션으로 두 번째 `claude-peer` push가 오면 링크를 또 열지 않고 그 뒤에서 한 번 기다린다. 기다림은 깨우기 제한 시간 + 10초와 두 번째 push 자신의 전송 한도 안이고, 쓰기용 5초를 남긴다. 앞 메시지가 전달로 끝나면 두 번째도 같은 호출자 토큰 `claim-guarded` 경로(응답을 잃었을 때의 1회 해제 포함)로 다시 claim해서 한 번 push한다(결과에 `behind: {id, state}`). 아니면 아무것도 보내지 않고 `pending`으로 남으며, 위의 차단된 전송 노트에 앞 전달이 끝난 상태를 붙여 기록한다: `pending behind <id> since <time> (<상태>); not sent`. 앞 전달이 `uncertain`이면 기다리지 않고 바로 그 노트를 단다. 브로커의 `note-pending` 작업은 메시지가 아직 `pending`일 때만 노트를 기록하고, 아니면 `noted: false`를 돌려준다. 그래서 그사이 다른 호출자가 잡은 claim을 덮어쓰지 않는다. 이 작업이 없는 브로커는 `Unknown operation`으로 답하고, 그때 노트는 CLI 결과에만 나오며(`note_scope: local`) 브로커에는 아무것도 기록하지 않는다. `unsupported`나 `uncertain` 뒤에는 앱에서 세션을 확인하고 `deliver MESSAGE_ID`로 한 번 다시 시도한다. 링크를 열면 앱이 보여 주는 세션이 바뀌고, `open -g`여도 앱이 앞으로 올 수 있다.
 
 ## 비공개 MCP 독립 inbox
 

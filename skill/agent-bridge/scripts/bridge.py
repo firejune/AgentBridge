@@ -230,6 +230,7 @@ def push(path, m, dry_run=False, *, deadline=None, wake_timeout=sessions.WAKE_TI
             raise ClaudeDispatchUnknown('finish', m['id']) from None
 
     woke = None
+    writing = False  # Only a possible peer write may settle `uncertain` (and block the recipient).
     try:
         try:
             target = sessions.resolve_claude_peer(m['route']['session'])
@@ -245,12 +246,21 @@ def push(path, m, dry_run=False, *, deadline=None, wake_timeout=sessions.WAKE_TI
                 raise ValueError(f"{error}; wake {woke['state']}: {woke['reason']}") from None
             target = sessions.resolve_claude_peer(m['route']['session'])
         frame = peer_frame(m, target, path)
+        writing = True
         problem = push_frame(target, frame, min(deadline, time.monotonic() + PEER_IO_TIMEOUT))
     except (ValueError, OSError) as error:
         reason = f'push_failed: {error}'
         message = finish('pending', reason, 'push_failed')
         raise PushFailed(reason, message if woke is None else {**message, 'wake':woke}) from None
-    except BaseException:
+    except BaseException as error:
+        if not writing:
+            # Nothing reached the peer socket (lookup, wake, frame build): back to pending, never uncertain.
+            reason = f'push_failed: interrupted before the peer write ({type(error).__name__})'
+            try:
+                finish('pending', reason, 'push_failed')
+            except ClaudeDispatchUnknown:
+                pass  # Leave the durable claim protected if the broker cannot confirm settlement.
+            raise
         try:
             finish('uncertain', 'Push interrupted; check the receiving session before resolving')
         except ClaudeDispatchUnknown:
@@ -324,13 +334,15 @@ def claim_behind(path, m, deadline, wake_timeout, poll=0.25):
                 state = 'superseded by another delivery'
     reason = f'{note} ({state}); not sent. Deliver it once the session is live'
     try:
-        # Never rewrite a message someone else claimed meanwhile (older brokers ignore the guard).
-        message = call('resolve', m['id'], state='pending', note=reason, expect_state='pending')
-    except broker.BrokerResponseError:
-        raise
-    except ValueError:
-        message = call('show', m['id'])
-    raise PushFailed(reason, message)
+        # The broker records the note only while the message is still pending (never over a claim).
+        noted = call('note-pending', m['id'], note=reason)
+        noted = {'noted':noted.get('noted') is True} if isinstance(noted, dict) else {'noted':False}
+    except ValueError as error:
+        if type(error) is not ValueError or str(error) != 'Unknown operation':
+            raise
+        # An older broker has no guarded note; keep it local rather than risk a durable rewrite.
+        noted = {'noted':False, 'note_scope':'local'}
+    raise PushFailed(reason, {**call('show', m['id']), 'note':reason, **noted})
 
 
 def public_wake(found):
