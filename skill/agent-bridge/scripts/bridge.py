@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import shlex
@@ -45,6 +46,8 @@ def envelope(m):
 # falls back to a watch loop or to another session.
 PEER_TAG = 'cross-session-message'
 PEER_MAX_LINE = 1048576
+PEER_IO_TIMEOUT = 5
+PEER_PUSH_TIMEOUT = 30
 PEER_FROM_CHARS = re.compile(r'[^A-Za-z0-9%:_/.\-]')
 PEER_CLOSE_TAG = re.compile(r'<(?!\\)(?=\s*/\s*cross[\s_-]*session[\s_-]*message)', re.I)
 REPLY_CLI = 'python3 "$HOME/.agents/skills/agent-bridge/scripts/bridge.py"'
@@ -54,6 +57,13 @@ class PushFailed(ValueError):
     def __init__(self, reason, message):
         super().__init__(reason)
         self.message = message
+
+
+class ClaudeDispatchUnknown(ValueError):
+    def __init__(self, stage, mid):
+        super().__init__(f'Claude delivery {stage} was not confirmed. Inspect message {mid} before resolving.')
+        self.stage = stage
+        self.mid = mid
 
 
 def reply_command(m, path):
@@ -99,59 +109,98 @@ def peer_token(target):
     return token
 
 
-def push_frame(target, frame, timeout=5):
-    """Write auth + user lines and close. Returns None on the expected empty EOF."""
+def push_frame(target, frame, deadline):
+    """Return a problem after a possible write. Raise for a definite pre-write failure."""
     line = json.dumps(frame, ensure_ascii=False)+'\n'
     if len(line.encode()) > PEER_MAX_LINE - 64:
         raise ValueError('Message is too large for one Claude inbox line')
     payload = (json.dumps({'type':'auth','token':peer_token(target)})+'\n'+line).encode()
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        sock.settimeout(timeout)
-        try:
+
+    def limit(sock):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('timed out')
+        sock.settimeout(remaining)
+
+    stage = 'connect'
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            limit(sock)
             sock.connect(target['socket'])
+            limit(sock)
+            stage = 'write'
             sock.sendall(payload)
             sock.shutdown(socket.SHUT_WR)
-        except OSError as error:
-            raise ValueError(f"Claude messaging socket {target['socket']}: {error.strerror or error}") from None
-        finally:
-            payload = None
-        try:
+            stage = 'ack'
+            limit(sock)
             if sock.recv(4096):
                 return 'Claude inbox answered on the push connection; protocol may have changed'
-        except socket.timeout:
-            return 'Claude inbox did not close the push connection'
-        except OSError as error:
-            return f'Claude inbox connection error after the write: {error.strerror or error}'
+    except OSError as error:
+        if stage == 'connect':
+            raise ValueError(f'Claude messaging socket: {error.strerror or error}') from None
+        if isinstance(error, TimeoutError):
+            if stage == 'write':
+                return 'Claude inbox write timed out'
+            return 'Claude inbox did not close the push connection before the deadline'
+        when = 'during' if stage == 'write' else 'after'
+        return f'Claude inbox connection error {when} the write: {error.strerror or error}'
     return None
 
 
-def push(path, m, dry_run=False):
+def push(path, m, dry_run=False, *, deadline=None):
     """Push one pending claude-peer message. Success = submitted; never retried automatically."""
-    def rpc(op, **fields):
-        return broker.request(path, {'op':op, 'id':m['id'], **fields})
     if dry_run:
         target = sessions.resolve_claude_peer(m['route']['session'])
         return {'sent':False,'state':m['state'],'transport':'claude-peer','pid':target['pid'],
                 'socket':target['socket'],'frame':peer_frame(m, target, path)}
-    rpc('claim')
+    if deadline is None:
+        deadline = time.monotonic() + PEER_PUSH_TIMEOUT
+
+    def rpc(op, **fields):
+        return broker.request(path, {'op':op, 'id':m['id'], **fields},
+                              deadline=min(deadline, time.monotonic() + 10))
+
+    try:
+        claimed = rpc('claim', guarded=True)
+    except (OSError, broker.BrokerResponseError):
+        # A late broker response may leave a durable claim. This caller has not
+        # entered the peer socket and cannot prove it owns any stored claim.
+        raise ClaudeDispatchUnknown('claim', m['id']) from None
+
+    def finish(state, note, event=None):
+        # Older brokers ignore the opt-in and return no claim token.
+        claim = claimed.get('dispatch_claim')
+        guard = {'expect_dispatch_claim':claim} if claim is not None else {}
+        try:
+            return rpc('finish', state=state, note=note, event=event, **guard)
+        except (ValueError, OSError):
+            raise ClaudeDispatchUnknown('finish', m['id']) from None
+
     try:
         target = sessions.resolve_claude_peer(m['route']['session'])
         frame = peer_frame(m, target, path)
-        problem = push_frame(target, frame)
+        now = time.monotonic()
+        # Leave time in the caller's budget for persisting a peer timeout.
+        finish_budget = min(0.25, max(0, deadline - now) / 4)
+        problem = push_frame(target, frame, min(now + PEER_IO_TIMEOUT, deadline - finish_budget))
     except (ValueError, OSError) as error:
         reason = f'push_failed: {error}'
-        raise PushFailed(reason, rpc('finish', state='pending', note=reason, event='push_failed')) from None
+        raise PushFailed(reason, finish('pending', reason, 'push_failed')) from None
     except BaseException:
-        rpc('finish', state='uncertain', note='Push interrupted; check the receiving session before resolving')
+        try:
+            finish('uncertain', 'Push interrupted; check the receiving session before resolving')
+        except ClaudeDispatchUnknown:
+            pass  # Leave the durable claim protected if the broker cannot confirm settlement.
         raise
     if problem:
-        # Bytes may already be in the receiver's queue: never resend on our own.
-        raise PushFailed(problem, rpc('finish', state='uncertain', note=problem))
-    result = rpc('finish', state='submitted', event='pushed',
-                 note=f"pushed to Claude session {target['id']} (pid {target['pid']}, msg_id {frame['msg_id']})")
-    found = label_claude(m['route'], wait=TITLE_WAIT if fresh_session(target) else 0.0)
-    if found['state'] == 'written':
-        result = {**result, 'title': found}
+        raise PushFailed(problem, finish('uncertain', problem))
+    result = finish('submitted', f"pushed to Claude session {target['id']} (pid {target['pid']}, msg_id {frame['msg_id']})", 'pushed')
+    title_wait = TITLE_WAIT if fresh_session(target) else 0.0
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        found = label_claude(m['route'], wait=min(title_wait, remaining))
+        if found['state'] == 'written':
+            result = {**result, 'title': found}
     return result
 
 
@@ -184,7 +233,7 @@ def label_claude(route, force=False, wait=0.0, poll=0.25):
         if found['state'] != 'skipped' or not found.get('reason','').startswith('no transcript yet') \
                 or time.monotonic() >= deadline:
             return found
-        time.sleep(poll)
+        time.sleep(min(poll, max(0, deadline - time.monotonic())))
 
 
 class ModelRelay:
@@ -291,12 +340,16 @@ def command(m):
 
 
 def deliver(path, mid, timeout=180, dry_run=False):
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError('Timeout must be a finite positive number')
+    deadline = time.monotonic() + timeout
+
     def rpc(op, **fields):
         return broker.request(path, {"op":op, "id":mid, **fields})
 
     def finish(state, note=None):
         return rpc("finish", state=state, note=note)
-    m = rpc("show")
+    m = broker.request(path, {'op':'show','id':mid}, deadline=min(deadline, time.monotonic() + 10))
     if m['route']['transport'] == 'codex':
         if m['state'] != 'pending' and not dry_run:
             raise ValueError('Only pending messages may be delivered')
@@ -304,7 +357,7 @@ def deliver(path, mid, timeout=180, dry_run=False):
     if m['route']['transport'] == 'claude-peer':
         if m['state'] != 'pending' and not dry_run:
             raise ValueError('Only pending messages may be delivered')
-        return push(path, m, dry_run)
+        return push(path, m, dry_run, deadline=deadline)
     if m['route']['transport'] == 'agy':
         if m['state'] != 'pending' and not dry_run:
             raise ValueError('Only pending messages may be delivered')
@@ -910,8 +963,6 @@ def main(argv=None):
         if observation and creation_model_source is not None:
             observation['model_source'] = creation_model_source
         if args.cmd=='deliver':
-            if args.timeout<=0:
-                raise ValueError('Timeout must be positive')
             result = deliver(args.socket,args.id,args.timeout,args.dry_run)
             output(result)
             return 1 if result['state'] in ('failed','uncertain') else 0
@@ -946,6 +997,9 @@ def main(argv=None):
         return 2 if args.cmd in ('ask','wait') and result['timed_out'] else 0
     except KeyboardInterrupt:
         return 130
+    except ClaudeDispatchUnknown as error:
+        output({'error':str(error), 'id':error.mid, 'stage':error.stage, 'uncertain':True})
+        return 1
     except PushFailed as error:
         message = error.message
         if message['route']['transport'] == 'codex':

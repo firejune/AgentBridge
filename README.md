@@ -52,6 +52,8 @@ flowchart LR
 | **Antigravity IDE & Desktop** | `agy` | Connects to local `language_server` / `agy --hub` instances over ConnectRPC, injecting `<SYSTEM_MESSAGE>` (`SendAgentMessage`) into active turns and waking idle sessions via empty `SendUserCascadeMessage` (`NEXT_INVOCATION`). |
 | **CLI Workers** | `realtime` / `claude` | `realtime` streams JSONL events over `watch`. `claude` resumes an **idle dedicated** CLI session in read-only `plan` mode via `deliver` (never use `claude` on a live session). |
 
+Claude peer pushes bound the socket write and close wait. `deliver ID --timeout SECONDS` also bounds broker I/O for Claude peer delivery. An unresolved dispatch still protects the recipient from a duplicate push. `show` and CLI `inbox` identify queued messages with a `pending behind <id> since <time>` note.
+
 ## Installation
 
 Install globally across Claude Code, Codex, and Antigravity in one command using [`skills`](https://skills.sh):

@@ -58,6 +58,14 @@ def route_key(route):
 TERMINAL_STATES = frozenset(('done', 'answered', 'failed'))
 
 
+def delivery_destination(route):
+    return route['transport'], route['session']
+
+
+class BrokerResponseError(ValueError):
+    """The broker did not return a usable response to a request."""
+
+
 class State:
     def __init__(self, max_messages=2048, store=None):
         if max_messages < 1:
@@ -167,6 +175,29 @@ class State:
             raise ValueError('Unknown message; broker may have restarted')
         return self.messages[mid]
 
+    def delivery_blockers(self):
+        blockers = {}
+        for message in self.messages.values():
+            if message['state'] in ('dispatching', 'uncertain'):
+                destination = delivery_destination(message['route'])
+                blockers.setdefault(destination, {'id':message['id'], 'state':message['state'],
+                                                   'since':message.get('dispatch_started_at')})
+        return blockers
+
+    @staticmethod
+    def delivery_wait(blocker):
+        note = f"pending behind {blocker['id']}"
+        if blocker['since'] is not None:
+            note += f" since {blocker['since']}"
+        return {'blocked_by':blocker, 'note':note}
+
+    def pending_delivery(self, message, blockers):
+        if message['state'] == 'pending':
+            blocker = blockers.get(delivery_destination(message['route']))
+            if blocker:
+                return self.delivery_wait(blocker)
+        return {}
+
     def route(self, project, name=None, channel=None):
         if channel:
             item = self.channels.get((project,channel))
@@ -208,6 +239,12 @@ class State:
     def status(self, m, state, note=None, event=None):
         m.update(state=state,note=note)
         entry = {'state':state,'note':note,'at':now()}
+        if state == 'dispatching':
+            m['dispatch_started_at'] = entry['at']
+        else:
+            m.pop('dispatch_claim', None)
+            if state != 'uncertain':
+                m.pop('dispatch_started_at', None)
         if event:
             entry['event'] = event
         m['events'].append(entry)
@@ -556,15 +593,20 @@ class State:
         if op in ('send','reply'):
             return self.post(args,args.get('id') if op=='reply' else None)
         if op == 'show':
-            return self.get(args['id'])
+            message = self.get(args['id'])
+            if message['state'] == 'pending':
+                return message | self.pending_delivery(message, self.delivery_blockers())
+            return message
         if op == 'conversation':
             cid = self.get(args['id'])['conversation']
             return [m for m in self.messages.values() if m['conversation']==cid]
         if op == 'inbox':
             if not args.get('name') and not args.get('channel'):
                 raise ValueError('Select a recipient or channel')
+            blockers = self.delivery_blockers()
             return [{k:m[k] for k in ('id','sender','recipient','state','channel','sender_channel','reply_to','created')}
                     | {'session':m['route']['session'],'generation':m['route'].get('generation')}
+                    | self.pending_delivery(m, blockers)
                     for m in self.messages.values() if m['project']==args['project']
                     and (not args.get('name') or m['recipient']==args['name'])
                     and (not args.get('channel') or m['channel']==args['channel'])
@@ -575,16 +617,25 @@ class State:
             if op=='claim':
                 if m['state']!='pending':
                     raise ValueError('Only pending messages may be delivered')
-                destination = (m['route']['transport'],m['route']['session'])
+                destination = delivery_destination(m['route'])
                 for other in self.messages.values():
                     if (other.get('provider_retry', {}).get('status') == 'reserved'
-                            and (other['return_route']['transport'], other['return_route']['session']) == destination):
+                            and delivery_destination(other['return_route']) == destination):
                         raise ValueError('Recipient has a reserved provider continuation')
-                    if other['state'] in ('dispatching','uncertain') and (
-                            other['route']['transport'],other['route']['session'])==destination:
-                        raise ValueError('Recipient has an active or uncertain delivery')
-                return self.status(m,'dispatching')
+                blocker = self.delivery_blockers().get(destination)
+                if blocker:
+                    note = self.delivery_wait(blocker)['note']
+                    raise ValueError(f"Recipient has an active or uncertain delivery. Message {m['id']} {note}")
+                self.status(m,'dispatching')
+                if args.get('guarded') is True:
+                    m['dispatch_claim'] = str(uuid.uuid4())
+                    return {'dispatch_claim':m['dispatch_claim']}
+                return m
             if op=='finish':
+                if m['state'] not in ('dispatching', 'pending', 'uncertain'):
+                    return m
+                if args.get('expect_dispatch_claim') != m.get('dispatch_claim'):
+                    raise ValueError('Delivery claim changed. Inspect the current state.')
                 if m['state']!='dispatching':
                     return m
                 if args['state'] not in ('submitted','failed','uncertain','pending'):
@@ -786,6 +837,22 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
         lock.close()
 
 
+def broker_response(line):
+    if not line:
+        raise BrokerResponseError('Broker disconnected; delivery outcome may be unknown')
+    if len(line)>MAX_FRAME:
+        raise BrokerResponseError('Broker frame exceeds limit')
+    try:
+        result = json.loads(line)
+    except ValueError:
+        raise BrokerResponseError('Broker sent an unreadable response') from None
+    if not isinstance(result, dict):
+        raise BrokerResponseError('Broker sent an invalid response')
+    if 'error' in result:
+        raise ValueError(result['error'])
+    return result
+
+
 def stream(path, args, timeout=None):
     with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as sock:
         sock.settimeout(timeout)
@@ -796,20 +863,48 @@ def stream(path, args, timeout=None):
         sock.sendall(wire(args))
         with sock.makefile('rb') as reader:
             while True:
-                line = reader.readline(MAX_FRAME+1)
-                if not line:
-                    raise ValueError('Broker disconnected; delivery outcome may be unknown')
-                if len(line)>MAX_FRAME:
-                    raise ValueError('Broker frame exceeds limit')
-                result = json.loads(line)
-                if 'error' in result:
-                    raise ValueError(result['error'])
-                yield result
+                yield broker_response(reader.readline(MAX_FRAME+1))
 
 
-def request(path, args, timeout=10):
+def request(path, args, timeout=10, *, deadline=None):
+    if deadline is not None:
+        return timed_request(path, args, deadline)
     connection = stream(path,args,timeout)
     try:
         return next(connection)['result']
     finally:
         connection.close()
+
+
+def timed_request(path, args, deadline):
+    """Read one broker reply against an absolute monotonic deadline."""
+    def limit(sock):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('Broker request timed out')
+        sock.settimeout(remaining)
+
+    payload = wire(args)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        limit(sock)
+        try:
+            sock.connect(str(Path(path).expanduser()))
+        except OSError as error:
+            raise ValueError('Broker unavailable; start bridge.py serve for this socket') from error
+        limit(sock)
+        sock.sendall(payload)
+        line = bytearray()
+        while len(line) <= MAX_FRAME:
+            limit(sock)
+            chunk = sock.recv(min(65536, MAX_FRAME + 1 - len(line)))
+            if not chunk:
+                raise BrokerResponseError('Broker disconnected; delivery outcome may be unknown')
+            end = chunk.find(b'\n')
+            if end >= 0:
+                line.extend(chunk[:end+1])
+                response = broker_response(line)
+                if 'result' not in response:
+                    raise BrokerResponseError('Broker reply has no result')
+                return response['result']
+            line.extend(chunk)
+        raise BrokerResponseError('Broker frame exceeds limit')

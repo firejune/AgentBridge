@@ -238,7 +238,8 @@ Handoff succeeds only when `--expect-generation` matches the current generation.
 - **Claude (`claude-peer`)**:
   - Re-reads `~/.claude/sessions/<pid>.json` for the registered `sessionId`, confirming the PID is alive, `peerProtocol == 1`, and `messagingSocketPath` exists.
   - Writes two JSON lines (`{"type":"auth","token":<peerToken>}` and `{"type":"user","message":{...},"session_id":<sessionId>,...}`) and closes the socket. The `peerToken` is read in memory only.
-  - Returns `submitted` (`pushed` event) on clean write, `pending` (`push_failed` event, exit 1) on pre-write validation/socket error, or `uncertain` if unexpected response bytes arrive.
+  - Uses at most 5 seconds for peer connect, write and the expected empty EOF combined. For `deliver ID --timeout SECONDS`, the broker lookup, claim, peer I/O and broker finish share the caller's budget. A shorter budget shortens the peer wait and reserves time for reporting the outcome.
+  - Returns `submitted` with a `pushed` event on clean EOF. A definite pre-write error returns `pending` with a `push_failed` event. Once the write starts, a write or shutdown error, a missing EOF, or unexpected response bytes records `uncertain` if the broker confirms the finish. These failures exit 1. If the broker claim or finish response is lost, the CLI exits 1 with `id`, `stage` (`claim` or `finish`) and `uncertain: true`. This describes the missing response. Use `show ID` to inspect the recorded message state.
 - **Codex (`codex`)**:
   - Connects to the exact registered thread owner over `CODEX_HOME/ipc/ipc.sock` (or `AGENT_BRIDGE_CODEX_IPC`).
   - Delivers peer bodies as standalone `toolOutput` (`agent_bridge`), calling `thread-follower-steer-turn` first to join an active turn and falling back to `thread-follower-start-turn` only when inactive.
@@ -248,6 +249,7 @@ Handoff succeeds only when `--expect-generation` matches the current generation.
   - Injects `<SYSTEM_MESSAGE>` (`MESSAGE_PRIORITY_HIGH`) via `SendAgentMessage` so `running` turns steer on the next step without interruption, and calls an empty `SendUserCascadeMessage` (`MESSAGE_DELIVERY_STRATEGY_NEXT_INVOCATION`) when `idle` or waiting on background tasks/subagents so the session wakes immediately without a synthetic user prompt.
 - **Dedicated Claude CLI (`claude`)**:
   - ⛔ **Never use `--transport claude` on a live session** — it spawns a duplicate CLI process. Use `claude` only for idle dedicated CLI sessions (`deliver` runs `claude --resume UUID` in read-only `plan` mode).
+- **Blocked deliveries**. `show` and CLI `inbox` include `blocked_by: {id, state, since}` and a `pending behind <id> since <time>` note when another message to the same transport and session is `dispatching` or `uncertain`. A refusal to claim a queued message names both message IDs. An older checkpoint may have `since: null`. The guard also covers aliases to the same session. Verify that the originating delivery client has stopped and inspect the blocker and the exact receiving session before resolving it. The broker never expires or replays the blocker automatically.
 - **Explicit retry & manual resolution**:
 
 ```bash
@@ -319,7 +321,7 @@ The checkpoint's version is 1. Its field allowlist is as follows.
 
 - `messages` preserves `id`, `conversation`, `project`, `sender`, `recipient`,
   `channel`, `sender_channel`, `body`, `reply_to`, `state`, `created`, and optional
-  `acknowledged_at`. Captured `route` and `return_route` each contain project,
+  `acknowledged_at` and `dispatch_started_at`. Captured `route` and `return_route` each contain project,
   name, transport, cwd, session, executable and optional channel/generation.
   These are the original pinned identities, independent of current registration.
 - `keys` contains the idempotency key, message ID and exact original intent fields
@@ -334,8 +336,9 @@ The checkpoint's version is 1. Its field allowlist is as follows.
 Bodies and captured workspace/session identities are private conversation data.
 Do not commit checkpoints or attach them to diagnostic bundles. Peer tokens,
 CSRF tokens, runtime socket metadata, provider diagnostic notes and event payloads
-are excluded. After restart, message `note` is null and `events` is empty. Live
-waits, subscribers and event cursors must reconnect. New events use a new broker
+are excluded. After restart, the stored message `note` is null and `events` is empty. The
+CLI derives current blocker notes from retained dispatch start times. Live waits,
+subscribers and event cursors must reconnect. New events use a new broker
 instance. Persisted message IDs and conversations remain unchanged.
 
 All retained terminal messages keep their terminal state and remain eligible for
