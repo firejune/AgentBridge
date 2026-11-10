@@ -107,23 +107,130 @@ def failed(observed, reason, provider='codex'):
                 reset_credits=None, source=SOURCES[provider], status='failed', reason=reason)
 
 
-# --- Antigravity (#34) ---------------------------------------------------------
-# The language server reports quota per model (quotaInfo.remainingFraction and
-# resetTime), the same figures the app shows. Models of one family share them,
-# so a family is one bucket, as Codex reports one account bucket. A family whose
-# models disagree is kept per model rather than averaged. No window length is
-# reported. Desktop and IDE servers serve one account: one read is enough.
-AGY_SOURCE = 'antigravity language_server GetCascadeModelConfigData'
+# --- Antigravity (#34, #112) ---------------------------------------------------
+# The language server exposes `RetrieveUserQuotaSummary`, returning both the
+# weekly (7d) and 5-hour windows per model group (`gemini-weekly`, `gemini-5h`,
+# `3p-weekly`, `3p-5h`). Collector reads send `{}` so the server's 5-minute
+# in-memory cache is used; only an explicit `usage --refresh` sends
+# `{"forceRefresh": true}`. `3p-*` buckets are stored as `partner-*`, while old
+# `agy/gemini` and `agy/partner` records remain readable as history. Capacity
+# risk (`AT RISK` / `holds until reset`) is judged on the weekly buckets only.
+AGY_SOURCE = 'antigravity language_server RetrieveUserQuotaSummary'
+AGY_FAMILIES = ('gemini', 'partner')
+AGY_BUCKET_ORDER = {
+    'gemini-weekly': 0,
+    'gemini-5h': 1,
+    'partner-weekly': 2,
+    'partner-5h': 3,
+    'gemini': 4,
+    'partner': 5,
+}
 
 
 def agy_family(model_id):
     return 'gemini' if str(model_id).startswith('gemini') else 'partner'
 
 
+def agy_bucket_id(bucket_id, window=None):
+    raw = str(bucket_id).strip()
+    if raw == '3p':
+        raw = 'partner'
+    elif raw.startswith('3p-'):
+        raw = 'partner-' + raw[3:]
+    if raw in AGY_FAMILIES and window in ('weekly', '5h'):
+        raw = f'{raw}-{window}'
+    return raw
+
+
+def agy_family_of_bucket(limit_id):
+    text = str(limit_id or '')
+    for family in AGY_FAMILIES:
+        if text == family or text.startswith((f'{family}-', f'{family}:')):
+            return family
+    return None
+
+
+def is_agy_weekly(row):
+    return row.get('provider') == 'agy' and (
+        str(row.get('limit_id') or '').endswith('-weekly') or row.get('window_mins') == 10080
+    )
+
+
+def has_capacity_verdict(row):
+    return row.get('provider') != 'agy' or is_agy_weekly(row)
+
+
+def bucket_sort_key(limit_id, slot):
+    return (AGY_BUCKET_ORDER.get(limit_id, 99), limit_id or '', slot or '')
+
+
+def _agy_record(observed, limit_id, used, window_mins, resets_at):
+    status = 'stale' if resets_at is not None and parse_time(resets_at) <= observed else 'ok'
+    return dict(observed_at=utc(observed), provider='agy', limit_id=limit_id, slot='primary',
+                used_percent=used, window_mins=window_mins, resets_at=resets_at, allowed=None,
+                reset_credits=None, source=AGY_SOURCE, status=status, reason=None)
+
+
+def _normalize_agy_summary(inner, observed):
+    raw_buckets = []
+    if isinstance(inner.get('groups'), list):
+        for group in inner['groups']:
+            if isinstance(group, dict) and isinstance(group.get('buckets'), list):
+                raw_buckets.extend(group['buckets'])
+    if isinstance(inner.get('buckets'), list):
+        raw_buckets.extend(inner['buckets'])
+    records = []
+    seen_ids = set()
+    families_with_5h = set()
+    has_numeric = False
+    for bucket in raw_buckets:
+        if not isinstance(bucket, dict) or not isinstance(bucket.get('bucketId'), str):
+            continue
+        raw_id = bucket['bucketId'].strip()
+        if not raw_id:
+            continue
+        window = bucket.get('window')
+        limit_id = agy_bucket_id(raw_id, window)
+        if window == 'weekly' or limit_id.endswith('-weekly'):
+            window_mins = 10080
+        elif window == '5h' or limit_id.endswith('-5h'):
+            window_mins = 300
+        else:
+            window_mins = number(bucket.get('windowDurationMins'))
+        fraction = number(bucket.get('remainingFraction'))
+        resets = bucket.get('resetTime')
+        resets_at = utc(parse_time(resets.replace('Z', '+00:00'))) if isinstance(resets, str) else None
+        if fraction is None:
+            if not limit_id.endswith('-weekly'):
+                continue
+            used = None
+        else:
+            used = round((1 - fraction) * 100, 4)
+            has_numeric = True
+        family = agy_family_of_bucket(limit_id)
+        if family and window_mins == 300:
+            families_with_5h.add(family)
+        seen_ids.add(limit_id)
+        records.append(_agy_record(observed, limit_id, used, window_mins, resets_at))
+    if not has_numeric:
+        raise ValueError('no bucket reports remainingFraction')
+    for family in sorted(families_with_5h):
+        weekly_id = f'{family}-weekly'
+        if weekly_id not in seen_ids:
+            records.append(_agy_record(observed, weekly_id, None, 10080, None))
+    records.sort(key=lambda r: bucket_sort_key(r['limit_id'], r['slot']))
+    return records
+
+
 def normalize_agy(result, observed):
-    configs = result.get('clientModelConfigs') if isinstance(result, dict) else None
+    if not isinstance(result, dict):
+        raise ValueError('quota response is not an object')
+    inner = result.get('response') if isinstance(result.get('response'), dict) else result
+    if isinstance(inner.get('groups'), list) or isinstance(inner.get('buckets'), list):
+        return _normalize_agy_summary(inner, observed)
+    configs = result.get('clientModelConfigs')
     if not isinstance(configs, list):
-        raise ValueError('model config response has no clientModelConfigs')
+        raise ValueError('quota response has no groups, buckets or clientModelConfigs')
     families = {}
     for config in configs:
         quota = config.get('quotaInfo') if isinstance(config, dict) else None
@@ -139,26 +246,36 @@ def normalize_agy(result, observed):
         raise ValueError('no model reports quotaInfo')
     records = []
     for family in sorted(families):
+        # clientModelConfigs carries only the 5h window; weekly is unknown (never 0% or 100%).
+        records.append(_agy_record(observed, f'{family}-weekly', None, 10080, None))
         models = families[family]
         values = {(fraction, resets_at) for _, fraction, resets_at in models}
-        groups = ([(family, *values.pop())] if len(values) == 1
-                  else [(f'{family}:{model}', fraction, resets_at) for model, fraction, resets_at in sorted(models)])
+        groups = ([(f'{family}-5h', *values.pop())] if len(values) == 1
+                  else [(f'{family}-5h:{model}', fraction, resets_at) for model, fraction, resets_at in sorted(models)])
         for limit_id, fraction, resets_at in groups:
             used = None if fraction is None else round((1 - fraction) * 100, 4)
-            status = 'stale' if resets_at is not None and parse_time(resets_at) <= observed else 'ok'
-            records.append(dict(observed_at=utc(observed), provider='agy', limit_id=limit_id, slot='primary',
-                                used_percent=used, window_mins=None, resets_at=resets_at, allowed=None,
-                                reset_credits=None, source=AGY_SOURCE, status=status, reason=None))
+            records.append(_agy_record(observed, limit_id, used, 300, resets_at))
+    records.sort(key=lambda r: bucket_sort_key(r['limit_id'], r['slot']))
     return records
 
 
-def read_agy(timeout=10):
+def read_agy(timeout=10, refresh=False):
     """One read-only RPC on whichever Antigravity language server is running."""
     import agy_live  # local: keeps Codex-only use free of the Antigravity module
     servers = agy_live.discover_servers(timeout=timeout)
     live = [s for s in servers if not s.get('orphaned')]
     server = (live or servers)[0]
-    return agy_live.rpc_call(server['url'], server['csrf'], 'GetCascadeModelConfigData', {}, timeout=timeout)
+    payload = {'forceRefresh': True} if refresh else {}
+    return agy_live.rpc_call(server['url'], server['csrf'], 'RetrieveUserQuotaSummary', payload, timeout=timeout)
+
+
+def refresh_agy(state_dir, timeout=10, now=None):
+    """Explicit one-shot Antigravity sample with forceRefresh; never called by Collector."""
+    directory = Path(state_dir).expanduser() / 'usage'
+    store = UsageStore(directory, provider='agy')
+    events = EventStore(directory, provider='agy')
+    clock = (lambda: now) if now is not None else (lambda: datetime.now(timezone.utc))
+    return sample(store, lambda: read_agy(timeout=timeout, refresh=True), clock, events)
 
 
 # --- Claude (#83) ----------------------------------------------------------------
@@ -535,7 +652,7 @@ def detect(records):
         if item['status'] != 'failed' and item['used_percent'] is not None:
             buckets.setdefault((item['limit_id'], item['slot']), []).append(item)
     events = []
-    for (limit_id, slot), items in sorted(buckets.items()):
+    for (limit_id, slot), items in sorted(buckets.items(), key=lambda entry: bucket_sort_key(*entry[0])):
         items.sort(key=lambda r: r['observed_at'])
         for before, after in zip(items, items[1:]):
             if is_reset(before, after):
@@ -673,7 +790,7 @@ def summarize(records, now, since):
         if item['status'] != 'failed':
             buckets.setdefault((item['limit_id'], item['slot']), []).append(item)
     rows = []
-    for (limit_id, slot), items in sorted(buckets.items()):
+    for (limit_id, slot), items in sorted(buckets.items(), key=lambda entry: bucket_sort_key(*entry[0])):
         items.sort(key=lambda r: r['observed_at'])
         last = items[-1]
         observed = parse_time(last['observed_at'])
@@ -745,7 +862,7 @@ def risk(row, rate, now):
 def assess(summary, records, now):
     short = {(r['limit_id'], r['slot']): r['rate'] for r in summarize(records, now, RISK_BURN_SINCE)['buckets']}
     for row in summary['buckets']:
-        row['risk'] = risk(row, short.get((row['limit_id'], row['slot'])), now)
+        row['risk'] = risk(row, short.get((row['limit_id'], row['slot'])), now) if has_capacity_verdict(row) else None
     return summary
 
 
@@ -876,6 +993,13 @@ def window_name(minutes):
     return f'{minutes // 1440}d' if minutes % 1440 == 0 else f'{minutes // 60}h' if minutes % 60 == 0 else f'{minutes}m'
 
 
+def bucket_window_suffix(row):
+    limit_id = str(row.get('limit_id') or '')
+    if row['window_mins'] is None or limit_id.endswith(('-weekly', '-5h')) or limit_id.startswith(('gemini-5h:', 'partner-5h:')):
+        return ''
+    return f" {window_name(row['window_mins'])}"
+
+
 def format_summary(summary, now):
     if 'summaries' in summary:
         return '\n'.join(format_summary(item, now) for item in summary['summaries'])
@@ -891,7 +1015,7 @@ def format_summary(summary, now):
             until = (parse_time(row['resets_at']) - now).total_seconds()
             resets = (f"resets {local(row['resets_at'])} (in {span(until)})" if until > 0
                       else f"reset was due {local(row['resets_at'])}")
-        window = '' if row['window_mins'] is None else f" {window_name(row['window_mins'])}"
+        window = bucket_window_suffix(row)
         parts = [f"{name}{window}: {remaining}", resets,
                  f"observed {local(row['observed_at'])} ({span(row['age_seconds'])} ago, {row['freshness']})"]
         if row['allowed'] is False:
@@ -1033,21 +1157,26 @@ def brief(state_dir, provider='codex', now=None):
         return dict(provider=provider, state='unknown', reason=f'usage unreadable: {error}', lines=[])
     rows, lines = [], []
     for row in summary['buckets']:
-        label = window_name(row['window_mins']) if row['window_mins'] is not None else row['limit_id']
+        label = (row['limit_id'] if row['provider'] == 'agy' or row['window_mins'] is None
+                 else window_name(row['window_mins']))
         name = f"{row['provider']} {label}" + ('' if row['slot'] == 'primary' else f" {row['slot']}")
         remaining = 'unknown' if row['remaining_percent'] is None else f"{pct(row['remaining_percent'])}% left"
-        burn = row['risk'].get('burn_per_hour')
+        verdict = row.get('risk')
+        burn = verdict.get('burn_per_hour') if verdict else None
         parts = [f'{name}: {remaining}']
         if burn is not None:
             parts.append(f'burn {burn:+.2f}%p/h ({RISK_BURN_LABEL})')
         if row['resets_at']:
             parts.append(f"resets {local(row['resets_at'])}")
-        parts.append(risk_text(row['risk']))
+        if verdict:
+            parts.append(risk_text(verdict))
         lines.append(' · '.join(parts))
         rows.append(dict(limit_id=row['limit_id'], slot=row['slot'], remaining_percent=row['remaining_percent'],
-                         resets_at=row['resets_at'], observed_at=row['observed_at'], **row['risk']))
+                         resets_at=row['resets_at'], observed_at=row['observed_at'],
+                         **(verdict or {'state': None})))
     order = ('exhausted', 'at_risk', 'unknown', 'holds')
-    worst = min((r['state'] for r in rows), key=order.index, default='unknown')
+    verdict_states = [r['state'] for r in rows if r.get('state') in order]
+    worst = min(verdict_states, key=order.index, default='unknown')
     if not rows:
         lines.append(f'{provider}: risk unknown (no successful read recorded)')
     return dict(provider=provider, state=worst, buckets=rows, lines=lines)

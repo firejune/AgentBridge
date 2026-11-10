@@ -764,6 +764,40 @@ def agy_config(model, fraction=0.5, reset='2026-10-29T18:16:07Z'):
     return {'label': model, 'modelId': model, 'quotaInfo': quota}
 
 
+def agy_bucket(bucket_id, window, fraction=0.5, reset='2026-10-29T18:16:07Z'):
+    item = {'bucketId': bucket_id, 'window': window}
+    if fraction is not None:
+        item['remainingFraction'] = fraction
+    if reset is not None:
+        item['resetTime'] = reset
+    return item
+
+
+def agy_summary(gemini_weekly=0.78, gemini_5h=0.87, partner_weekly=1.0, partner_5h=1.0,
+                gemini_weekly_reset='2026-10-27T04:26:24Z', gemini_5h_reset='2026-10-23T07:33:50Z',
+                partner_weekly_reset='2026-10-30T03:00:00Z', partner_5h_reset='2026-10-23T08:00:00Z'):
+    return {
+        'response': {
+            'groups': [
+                {
+                    'displayName': 'Gemini Models',
+                    'buckets': [
+                        agy_bucket('gemini-weekly', 'weekly', gemini_weekly, gemini_weekly_reset),
+                        agy_bucket('gemini-5h', '5h', gemini_5h, gemini_5h_reset),
+                    ],
+                },
+                {
+                    'displayName': 'Claude and GPT models',
+                    'buckets': [
+                        agy_bucket('3p-weekly', 'weekly', partner_weekly, partner_weekly_reset),
+                        agy_bucket('3p-5h', '5h', partner_5h, partner_5h_reset),
+                    ],
+                },
+            ]
+        }
+    }
+
+
 class AgyUsageTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='ab-agyq-', dir='/tmp')
@@ -773,28 +807,96 @@ class AgyUsageTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def test_families_that_agree_are_one_bucket_each(self):
+    def test_retrieve_user_quota_summary_reports_weekly_and_five_hour_buckets(self):
+        result = agy_summary(
+            gemini_weekly=0.22032145, gemini_5h=0.86944664,
+            partner_weekly=1.0, partner_5h=1.0,
+            gemini_weekly_reset='2026-10-27T04:26:24Z',
+            gemini_5h_reset='2026-10-23T07:33:50Z',
+            partner_weekly_reset='2026-10-30T03:00:00Z',
+            partner_5h_reset='2026-10-23T08:00:00Z',
+        )
+        records = usage.normalize_agy(result, T0)
+        self.assertEqual(
+            [(r['limit_id'], r['slot'], r['window_mins'], r['used_percent'], r['resets_at']) for r in records],
+            [
+                ('gemini-weekly', 'primary', 10080, 77.9679, '2026-10-27T04:26:24+00:00'),
+                ('gemini-5h', 'primary', 300, 13.0553, '2026-10-23T07:33:50+00:00'),
+                ('partner-weekly', 'primary', 10080, 0.0, '2026-10-30T03:00:00+00:00'),
+                ('partner-5h', 'primary', 300, 0.0, '2026-10-23T08:00:00+00:00'),
+            ],
+        )
+        self.assertEqual({r['provider'] for r in records}, {'agy'})
+        self.assertEqual({r['observed_at'] for r in records}, {usage.utc(T0)})
+
+    def test_missing_weekly_reports_unknown_never_zero_or_hundred(self):
+        # 1) RetrieveUserQuotaSummary with weekly omitted or lacking remainingFraction
+        only_5h = {
+            'response': {
+                'groups': [
+                    {'displayName': 'Gemini Models', 'buckets': [agy_bucket('gemini-5h', '5h', 0.8)]},
+                    {'displayName': 'Claude and GPT models', 'buckets': [
+                        agy_bucket('3p-weekly', 'weekly', None, None),
+                        agy_bucket('3p-5h', '5h', 0.75),
+                    ]},
+                ]
+            }
+        }
+        usage.sample(self.store, lambda: only_5h, lambda: T0)
+        _, summary, now = usage.query(self.root / 'state', '6h', 'agy', now=T0 + timedelta(minutes=1))
+        text = usage.format_summary(summary, now)
+        self.assertIn('agy/gemini-weekly: unknown', text)
+        self.assertIn('agy/partner-weekly: unknown', text)
+        self.assertIn('weekly: unknown', text)
+        for line in text.splitlines():
+            if 'weekly' in line:
+                self.assertNotIn('0% left', line)
+                self.assertNotIn('100% left', line)
+        by_id = {b['limit_id']: b for b in summary['buckets']}
+        self.assertIsNone(by_id['gemini-weekly']['used_percent'])
+        self.assertIsNone(by_id['gemini-weekly']['remaining_percent'])
+        self.assertEqual(by_id['gemini-weekly']['window_mins'], 10080)
+        self.assertEqual(by_id['gemini-5h']['remaining_percent'], 80.0)
+        # 2) Legacy clientModelConfigs (5h-only) also reports weekly: unknown, never 0% or 100%
+        self.tearDown(); self.setUp()
+        usage.sample(self.store, lambda: {'clientModelConfigs': [agy_config('gemini-4-argon-high', 0.8)]}, lambda: T0)
+        _, summary2, now2 = usage.query(self.root / 'state', '6h', 'agy', now=T0 + timedelta(minutes=1))
+        text2 = usage.format_summary(summary2, now2)
+        self.assertIn('agy/gemini-weekly: unknown', text2)
+        self.assertIn('agy/gemini-5h: 80% left', text2)
+        for line in text2.splitlines():
+            if 'weekly' in line:
+                self.assertNotIn('0% left', line)
+                self.assertNotIn('100% left', line)
+
+    def test_families_that_agree_and_disagree_in_model_configs_fallback(self):
         result = {'clientModelConfigs': [agy_config('gemini-4-argon-high', 0.9707855, '2026-10-24T17:19:56Z'),
                                          agy_config('gemini-3.8-flash-low', 0.9707855, '2026-10-24T17:19:56Z'),
                                          agy_config('claude-opus-5-5-high', 0.2640812),
                                          agy_config('gpt-oss-120b-medium', 0.2640812)]}
         records = usage.normalize_agy(result, T0)
-        self.assertEqual([(r['limit_id'], r['used_percent'], r['resets_at']) for r in records],
-                         [('gemini', 2.9215, '2026-10-24T17:19:56+00:00'),
-                          ('partner', 73.5919, '2026-10-29T18:16:07+00:00')])
-        self.assertEqual({r['provider'] for r in records}, {'agy'})
-        self.assertIsNone(records[0]['window_mins'])
-
-    def test_a_family_that_disagrees_is_kept_per_model(self):
-        result = {'clientModelConfigs': [agy_config('gemini-4-argon-high', 0.9), agy_config('gemini-3.8-flash-low', 0.8)]}
-        ids = [r['limit_id'] for r in usage.normalize_agy(result, T0)]
-        self.assertEqual(ids, ['gemini:gemini-3.8-flash-low', 'gemini:gemini-4-argon-high'])
+        self.assertEqual(
+            [(r['limit_id'], r['window_mins'], r['used_percent'], r['resets_at']) for r in records],
+            [
+                ('gemini-weekly', 10080, None, None),
+                ('gemini-5h', 300, 2.9215, '2026-10-24T17:19:56+00:00'),
+                ('partner-weekly', 10080, None, None),
+                ('partner-5h', 300, 73.5919, '2026-10-29T18:16:07+00:00'),
+            ],
+        )
+        disagreed = {'clientModelConfigs': [agy_config('gemini-4-argon-high', 0.9), agy_config('gemini-3.8-flash-low', 0.8)]}
+        ids = [r['limit_id'] for r in usage.normalize_agy(disagreed, T0)]
+        self.assertEqual(ids, ['gemini-weekly', 'gemini-5h:gemini-3.8-flash-low', 'gemini-5h:gemini-4-argon-high'])
 
     def test_missing_quota_is_skipped_and_none_at_all_is_a_failed_sample(self):
         records = usage.normalize_agy({'clientModelConfigs': [agy_config('gemini-x', None), agy_config('gemini-y', 0.4)]}, T0)
-        self.assertEqual([(r['limit_id'], r['used_percent']) for r in records], [('gemini', 60.0)])
+        self.assertEqual([(r['limit_id'], r['used_percent']) for r in records],
+                         [('gemini-weekly', None), ('gemini-5h', 60.0)])
         stored = usage.sample(self.store, lambda: {'clientModelConfigs': [agy_config('gemini-x', None)]}, lambda: T0)
         self.assertEqual((stored[0]['status'], stored[0]['provider'], stored[0]['used_percent']), ('failed', 'agy', None))
+        stored_empty = usage.sample(self.store, lambda: {'response': {'groups': []}}, lambda: T0 + timedelta(minutes=15))
+        self.assertEqual((stored_empty[0]['status'], stored_empty[0]['provider'], stored_empty[0]['used_percent']),
+                         ('failed', 'agy', None))
 
     def test_no_server_is_failed_not_zero_and_files_stay_separate(self):
         def down():
@@ -807,20 +909,104 @@ class AgyUsageTests(unittest.TestCase):
         self.assertIn('agy: unknown (no successful read recorded)', text)
         self.assertIn('agy: last failed read', text)
 
+    def test_risk_is_judged_on_weekly_bucket_never_five_hour_window(self):
+        # 5h burns fast enough to empty before its 5h reset (90% -> 50% -> 10% left),
+        # while weekly burns slowly (80% -> 79.5% -> 79% left with 4 days until reset).
+        weekly_due = usage.utc(T0 + timedelta(days=4))
+        five_h_due = usage.utc(T0 + timedelta(hours=4))
+        for hour, (w_rem, fh_rem) in enumerate(((0.80, 0.90), (0.795, 0.50), (0.79, 0.10))):
+            moment = T0 + timedelta(minutes=61 * hour)
+            usage.sample(
+                self.store,
+                lambda wr=w_rem, fr=fh_rem: agy_summary(
+                    gemini_weekly=wr, gemini_5h=fr, partner_weekly=1.0, partner_5h=1.0,
+                    gemini_weekly_reset=weekly_due, gemini_5h_reset=five_h_due,
+                ),
+                lambda m=moment: m,
+            )
+        now = T0 + timedelta(minutes=123)
+        _, summary, _ = usage.query(self.root / 'state', '6h', 'agy', now=now)
+        by_id = {b['limit_id']: b for b in summary['buckets']}
+        self.assertEqual(by_id['gemini-weekly']['risk']['state'], 'holds')
+        self.assertIsNone(by_id['gemini-5h']['risk'])
+        self.assertEqual(by_id['partner-weekly']['risk']['state'], 'holds')
+        self.assertIsNone(by_id['partner-5h']['risk'])
+        text = usage.format_summary(summary, now)
+        lines = {line.split(':', 1)[0]: line for line in text.splitlines()}
+        self.assertIn('holds until reset', lines['agy/gemini-weekly'])
+        self.assertNotIn('AT RISK', lines['agy/gemini-5h'])
+        self.assertNotIn('holds until reset', lines['agy/gemini-5h'])
+        brief = usage.brief(self.root / 'state', 'agy', now=now)
+        self.assertEqual(brief['state'], 'holds')
+        self.assertTrue(any(l.startswith('agy gemini-weekly: 79% left') and 'holds until reset' in l for l in brief['lines']))
+        self.assertTrue(any(l.startswith('agy gemini-5h: 10% left') and 'AT RISK' not in l and 'holds' not in l for l in brief['lines']))
+
+        # Now make weekly burn fast enough to empty before its 4-day reset: weekly triggers AT RISK.
+        self.tearDown(); self.setUp()
+        for hour, (w_rem, fh_rem) in enumerate(((0.50, 0.95), (0.40, 0.95), (0.30, 0.95))):
+            moment = T0 + timedelta(minutes=61 * hour)
+            usage.sample(
+                self.store,
+                lambda wr=w_rem, fr=fh_rem: agy_summary(
+                    gemini_weekly=wr, gemini_5h=fr, partner_weekly=1.0, partner_5h=1.0,
+                    gemini_weekly_reset=weekly_due, gemini_5h_reset=five_h_due,
+                ),
+                lambda m=moment: m,
+            )
+        _, summary2, _ = usage.query(self.root / 'state', '6h', 'agy', now=now)
+        text2 = usage.format_summary(summary2, now)
+        lines2 = {line.split(':', 1)[0]: line for line in text2.splitlines()}
+        self.assertIn('AT RISK: empty ~', lines2['agy/gemini-weekly'])
+        self.assertNotIn('AT RISK', lines2['agy/gemini-5h'])
+        brief2 = usage.brief(self.root / 'state', 'agy', now=now)
+        self.assertEqual(brief2['state'], 'at_risk')
+
+    def test_legacy_gemini_and_partner_records_remain_readable_as_history(self):
+        legacy = [
+            dict(observed_at=usage.utc(T0 - timedelta(hours=3)), provider='agy', limit_id='gemini', slot='primary',
+                 used_percent=20.0, window_mins=None, resets_at=usage.utc(T0 + timedelta(hours=2)),
+                 allowed=None, reset_credits=None, source='antigravity language_server GetCascadeModelConfigData',
+                 status='ok', reason=None),
+            dict(observed_at=usage.utc(T0 - timedelta(hours=3)), provider='agy', limit_id='partner', slot='primary',
+                 used_percent=5.0, window_mins=None, resets_at=usage.utc(T0 + timedelta(hours=2)),
+                 allowed=None, reset_credits=None, source='antigravity language_server GetCascadeModelConfigData',
+                 status='ok', reason=None),
+        ]
+        self.store.save(legacy, T0)
+        # Readable on their own before any new samples arrive
+        _, old_only, _ = usage.query(self.root / 'state', '6h', 'agy', now=T0)
+        old_text = usage.format_summary(old_only, T0)
+        self.assertIn('agy/gemini: 80% left', old_text)
+        self.assertIn('agy/partner: 95% left', old_text)
+        # Coexisting with new weekly + 5h samples: old history remains readable and never overrides weekly verdict
+        for hour, w_rem in enumerate((0.80, 0.80)):
+            moment = T0 + timedelta(minutes=61 * hour)
+            usage.sample(self.store, lambda wr=w_rem: agy_summary(gemini_weekly=wr, gemini_5h=0.90), lambda m=moment: m)
+        now = T0 + timedelta(minutes=62)
+        records, combined, _ = usage.query(self.root / 'state', '6h', 'agy', now=now)
+        self.assertTrue(any(r['limit_id'] == 'gemini' for r in records))
+        self.assertTrue(any(r['limit_id'] == 'partner' for r in records))
+        combined_text = usage.format_summary(combined, now)
+        self.assertIn('agy/gemini-weekly: 80% left', combined_text)
+        self.assertIn('agy/gemini-5h: 90% left', combined_text)
+        self.assertIn('agy/gemini: 80% left', combined_text)
+        self.assertEqual(usage.brief(self.root / 'state', 'agy', now=now)['state'], 'holds')
+
     def test_collector_for_agy_uses_the_agy_reader(self):
-        collector = usage.Collector(self.store, reader=lambda: {'clientModelConfigs': [agy_config('gemini-z', 0.25)]},
+        collector = usage.Collector(self.store, reader=lambda: agy_summary(gemini_weekly=0.25, gemini_5h=0.75),
                                     clock=lambda: T0)
         self.assertIs(collector.events.provider, 'agy')
         collector.cycle()
         found = usage.brief(self.root / 'state', 'agy', now=T0 + timedelta(minutes=1))
         self.assertEqual(found['provider'], 'agy')
-        self.assertTrue(found['lines'][0].startswith('agy gemini: 25% left'))
+        self.assertTrue(found['lines'][0].startswith('agy gemini-weekly: 25% left'))
+        self.assertTrue(found['lines'][1].startswith('agy gemini-5h: 75% left'))
 
     def test_cli_usage_defaults_to_all_providers_and_includes_agy(self):
         codex_store = usage.UsageStore(self.root / 'state' / 'usage', provider='codex')
         usage.sample(codex_store, lambda: response(used=30), lambda: T0)
-        usage.sample(self.store, lambda: {'clientModelConfigs': [agy_config('gemini-z', 0.8),
-                                                                 agy_config('claude-opus', 1.0)]}, lambda: T0)
+        usage.sample(self.store, lambda: agy_summary(gemini_weekly=0.78, gemini_5h=0.80,
+                                                     partner_weekly=1.0, partner_5h=1.0), lambda: T0)
         state = str(self.root / 'state')
         with patch.object(usage, 'datetime', wraps=datetime) as clock:
             clock.now.return_value = T0 + timedelta(minutes=5)
@@ -829,8 +1015,10 @@ class AgyUsageTests(unittest.TestCase):
                 self.assertEqual(bridge.main(['--socket', '/tmp/ab-never.sock', 'usage', '--state-dir', state]), 0)
             text = out.getvalue()
             self.assertIn('codex/codex 7d: 70% left', text)
-            self.assertIn('agy/gemini: 80% left', text)
-            self.assertIn('agy/partner: 100% left', text)
+            self.assertIn('agy/gemini-weekly: 78% left', text)
+            self.assertIn('agy/gemini-5h: 80% left', text)
+            self.assertIn('agy/partner-weekly: 100% left', text)
+            self.assertIn('agy/partner-5h: 100% left', text)
             json_out = io.StringIO()
             with redirect_stdout(json_out):
                 self.assertEqual(bridge.main(['--socket', '/tmp/ab-never.sock', 'usage', '--state-dir', state, '--json']), 0)
@@ -838,7 +1026,9 @@ class AgyUsageTests(unittest.TestCase):
             self.assertEqual(payload['provider'], 'all')
             self.assertNotIn('summaries', payload)
             self.assertEqual([(b['provider'], b['limit_id']) for b in payload['buckets']],
-                             [('codex', 'codex'), ('agy', 'gemini'), ('agy', 'partner')])
+                             [('codex', 'codex'),
+                              ('agy', 'gemini-weekly'), ('agy', 'gemini-5h'),
+                              ('agy', 'partner-weekly'), ('agy', 'partner-5h')])
 
     def test_rolling_zero_reset_time_and_same_reset_jitter_are_not_resets(self):
         events = usage.EventStore(self.store.directory, provider='agy')
@@ -846,57 +1036,74 @@ class AgyUsageTests(unittest.TestCase):
         # Gemini has minor fraction jitter within one resetTime, then a real scheduled reset.
         fixed_due = T0 + timedelta(hours=2)
         next_due = fixed_due + timedelta(hours=5)
+        weekly_due = T0 + timedelta(days=4)
         samples = [
             (0, 0.773433, fixed_due, 1.0, T0 + timedelta(hours=5)),
             (15, 0.774304, fixed_due, 1.0, T0 + timedelta(hours=5, minutes=15)),  # minor jitter on gemini; rolling 0% on partner
             (65, 0.676136, fixed_due, 1.0, T0 + timedelta(hours=6, minutes=5)),
-            (125, 0.98178, next_due, 1.0, T0 + timedelta(hours=7, minutes=5)),    # real reset on gemini
+            (125, 0.98178, next_due, 1.0, T0 + timedelta(hours=7, minutes=5)),    # real reset on gemini-5h
         ]
         for minutes, gemini_frac, gemini_due, partner_frac, partner_due in samples:
             moment = T0 + timedelta(minutes=minutes)
             usage.sample(
                 self.store,
-                lambda gf=gemini_frac, gd=gemini_due, pf=partner_frac, pd=partner_due: {
-                    'clientModelConfigs': [
-                        agy_config('gemini-pro', gf, usage.utc(gd)),
-                        agy_config('claude-sonnet', pf, usage.utc(pd)),
-                    ]
-                },
+                lambda gf=gemini_frac, gd=gemini_due, pf=partner_frac, pd=partner_due: agy_summary(
+                    gemini_weekly=0.5, gemini_5h=gf,
+                    partner_weekly=pf, partner_5h=pf,
+                    gemini_weekly_reset=usage.utc(weekly_due),
+                    gemini_5h_reset=usage.utc(gd),
+                    partner_weekly_reset=usage.utc(pd + timedelta(days=7)),
+                    partner_5h_reset=usage.utc(pd),
+                ),
                 lambda m=moment: m,
                 events,
             )
-        partner_rows = [r for r in self.store.load() if r['limit_id'] == 'partner']
+        partner_rows = [r for r in self.store.load() if r['limit_id'] == 'partner-5h']
         # 15m rolling 0% sample was deduplicated within the hour; 65m and 125m kept.
         self.assertEqual(len(partner_rows), 3)
         # Seed a legacy false 0%->0% event on disk and verify all_events filters it out.
         events.save(events.load() + [dict(
-            provider='agy', limit_id='partner', slot='primary', kind='early', source='observed',
+            provider='agy', limit_id='partner-weekly', slot='primary', kind='early', source='observed',
             window_start=usage.utc(T0), window_end=usage.utc(T0 + timedelta(minutes=15)),
             used_before=0, used_after=0,
-            resets_at_before=usage.utc(T0 + timedelta(hours=5)),
-            resets_at_after=usage.utc(T0 + timedelta(hours=5, minutes=15)),
+            resets_at_before=usage.utc(T0 + timedelta(days=7)),
+            resets_at_after=usage.utc(T0 + timedelta(days=7, minutes=15)),
             note=None,
         )], T0 + timedelta(minutes=125))
         _, summary, _ = usage.query(self.root / 'state', '6h', 'agy', now=T0 + timedelta(minutes=126))
         by_id = {b['limit_id']: b for b in summary['buckets']}
-        self.assertEqual(len(by_id['gemini']['resets']), 1)
-        self.assertAlmostEqual(by_id['gemini']['resets'][0]['used_before'], 32.3864, places=3)
-        self.assertAlmostEqual(by_id['gemini']['resets'][0]['used_after'], 1.822, places=3)
-        self.assertEqual(by_id['partner']['resets'], [])
-        self.assertEqual(by_id['partner']['events'], [])
-        self.assertEqual(by_id['partner']['rate']['percent_per_hour'], 0.0)
-        self.assertEqual(by_id['partner']['risk']['state'], 'holds')
+        self.assertEqual(len(by_id['gemini-5h']['resets']), 1)
+        self.assertAlmostEqual(by_id['gemini-5h']['resets'][0]['used_before'], 32.3864, places=3)
+        self.assertAlmostEqual(by_id['gemini-5h']['resets'][0]['used_after'], 1.822, places=3)
+        self.assertEqual(by_id['partner-weekly']['resets'], [])
+        self.assertEqual(by_id['partner-weekly']['events'], [])
+        self.assertEqual(by_id['partner-weekly']['rate']['percent_per_hour'], 0.0)
+        self.assertEqual(by_id['partner-weekly']['risk']['state'], 'holds')
 
-    def test_read_agy_prefers_non_orphaned_server(self):
+    def test_read_agy_prefers_non_orphaned_server_and_uses_cache_unless_refreshed(self):
         import agy_live
         servers = [
             {'pid': 100, 'ppid': 1, 'orphaned': True, 'url': 'http://127.0.0.1:51001', 'csrf': 'stale'},
             {'pid': 200, 'ppid': 99, 'orphaned': False, 'url': 'http://127.0.0.1:51002', 'csrf': 'live'},
         ]
         with patch.object(agy_live, 'discover_servers', return_value=servers), \
-                patch.object(agy_live, 'rpc_call', return_value={'clientModelConfigs': []}) as rpc:
+                patch.object(agy_live, 'rpc_call', return_value=agy_summary()) as rpc:
             usage.read_agy(timeout=5)
-        rpc.assert_called_once_with('http://127.0.0.1:51002', 'live', 'GetCascadeModelConfigData', {}, timeout=5)
+            rpc.assert_called_once_with('http://127.0.0.1:51002', 'live', 'RetrieveUserQuotaSummary', {}, timeout=5)
+            rpc.reset_mock()
+            collector = usage.Collector(self.store, clock=lambda: T0)
+            collector.cycle()
+            rpc.assert_called_once_with('http://127.0.0.1:51002', 'live', 'RetrieveUserQuotaSummary', {}, timeout=10)
+            rpc.reset_mock()
+            state = str(self.root / 'state')
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = bridge.main(['--socket', '/tmp/ab-never.sock', 'usage', '--state-dir', state,
+                                    '--provider', 'agy', '--refresh'])
+            self.assertEqual(code, 0)
+            rpc.assert_called_once_with(
+                'http://127.0.0.1:51002', 'live', 'RetrieveUserQuotaSummary', {'forceRefresh': True}, timeout=10
+            )
 
 
 def ms(moment):
