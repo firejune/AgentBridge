@@ -11,7 +11,7 @@ import uuid
 
 import route_store
 import provider_failures
-import peer_retry
+import peer_wake
 
 MESSAGE_FIELDS = ('id', 'conversation', 'project', 'sender', 'recipient', 'channel',
                   'sender_channel', 'body', 'reply_to', 'state', 'created')
@@ -100,14 +100,11 @@ def message_record(raw):
         result['acknowledged_at'] = raw['acknowledged_at']
     if raw.get('provider_retry') is not None:
         result['provider_retry'] = retry_record(raw['provider_retry'])
-    # claude-peer wake evidence and closed-inbox retry schedule (#121): bounded, credential-free.
-    # A malformed entry is dropped rather than the checkpoint (dropping only ever stops a retry).
-    wakes = peer_retry.wake_records(raw.get('wakes'))
+    # claude-peer wake evidence (#121): normalized fields and fixed codes only, no diagnostics.
+    # A malformed entry is dropped on its own; it never costs the correspondence.
+    wakes = peer_wake.wake_records(raw.get('wakes'))
     if wakes:
         result['wakes'] = wakes
-    schedule = peer_retry.retry_record(raw.get('peer_retry'))
-    if schedule is not None:
-        result['peer_retry'] = schedule
     # Provider diagnostics may contain secrets. Neither diagnostics nor event
     # payloads are needed to reconcile delivery, so never serialize them.
     result.update(note=None, events=[])

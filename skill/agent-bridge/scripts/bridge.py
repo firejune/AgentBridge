@@ -61,10 +61,6 @@ class PushFailed(ValueError):
         self.message = message
 
 
-class PeerClosed(ValueError):
-    """The session's inbox socket refused the connection: nothing was written."""
-
-
 class ClaudeDispatchUnknown(ValueError):
     def __init__(self, stage, mid):
         super().__init__(f'Claude delivery {stage} was not confirmed. Inspect message {mid} before resolving.')
@@ -143,7 +139,7 @@ def push_frame(target, frame, deadline):
                 return 'Claude inbox answered on the push connection; protocol may have changed'
     except OSError as error:
         if stage == 'connect':
-            raise PeerClosed(f'Claude messaging socket: {error.strerror or error}') from None
+            raise ValueError(f'Claude messaging socket: {error.strerror or error}') from None
         if isinstance(error, TimeoutError):
             if stage == 'write':
                 return 'Claude inbox write timed out'
@@ -206,9 +202,8 @@ def push(path, m, dry_run=False, *, deadline=None, wake_timeout=sessions.WAKE_TI
 
     A closed target is woken once in its own host first (issue #115), inside the same delivery
     budget; the message is pushed once when the woken session's inbox appears, and goes back to
-    pending (nothing written) otherwise. The finish carries the wake outcome (kept on the message,
-    issue #121) and a failure class: only `closed` (the inbox was not there and nothing was written)
-    lets the broker retry later; `wake-uncertain`, `interrupted` and `error` never do.
+    pending (nothing written) otherwise. The finish carries the wake outcome; the broker keeps its
+    normalized fields with the message (issue #121). Nothing retries the push.
     """
     if dry_run:
         target = sessions.resolve_claude_peer(m['route']['session'])
@@ -223,16 +218,13 @@ def push(path, m, dry_run=False, *, deadline=None, wake_timeout=sessions.WAKE_TI
     claimed, behind = claim_behind(path, m, deadline, wake_timeout)
 
     woke = None
-    failure = 'error'
 
     def finish(state, note, event=None):
-        # Older brokers ignore the opt-in and return no claim token, and ignore wake/failure.
+        # Older brokers ignore the opt-in and return no claim token, and ignore the wake report.
         claim = claimed.get('dispatch_claim')
         guard = {'expect_dispatch_claim':claim} if claim is not None else {}
         if woke is not None:
             guard['wake'] = woke
-        if state == 'pending':
-            guard['failure'] = failure
         finish_deadline = time.monotonic() + PEER_BROKER_TIMEOUT
         # Settle a possible write even when the caller's peer I/O budget has elapsed.
         if state == 'pending':
@@ -250,30 +242,26 @@ def push(path, m, dry_run=False, *, deadline=None, wake_timeout=sessions.WAKE_TI
             # Idle-closed session (issue #115): wake it in its own host while the claim holds the
             # message. Nothing has been written, so any non-live outcome returns it to pending.
             # Keep PEER_IO_TIMEOUT of the delivery budget for the push itself; the wake never extends it.
-            failure = 'closed'
             budget = min(wake_timeout, deadline - time.monotonic() - PEER_IO_TIMEOUT)
             if budget <= 0:
+                woke = {'session':m['route']['session'], 'state':'unsupported', 'code':'budget_spent',
+                        'host':None, 'reason':'the delivery budget leaves no time to wake it',
+                        'at':sessions.observed_now()}
                 raise ValueError(f'{error}; the delivery budget leaves no time to wake it') from None
             woke_at = sessions.observed_now()
             try:
                 found = sessions.wake_claude(m['route']['session'], timeout=budget)
             except sessions.DiscoveryError as refused:
                 # E.g. two Desktop sessions claim this CLI session: nothing was opened.
-                found = {'session':m['route']['session'], 'state':'unsupported', 'host':None, 'reason':str(refused)}
+                found = {'session':m['route']['session'], 'state':'unsupported', 'code':'ambiguous_desktop_session',
+                         'host':None, 'reason':str(refused)}
             woke = {**public_wake(found), 'at':woke_at}
-            if woke['state'] == 'uncertain':
-                failure = 'wake-uncertain'  # The link may have reached the app: never reopen on our own.
             if woke['state'] not in ('woken', 'already-live'):
                 raise ValueError(f"{error}; wake {woke['state']}: {woke['reason']}") from None
             target = sessions.resolve_claude_peer(m['route']['session'])
-        failure = 'error'
         frame = peer_frame(m, target, path)
         writing = True
-        try:
-            problem = push_frame(target, frame, min(deadline, time.monotonic() + PEER_IO_TIMEOUT))
-        except PeerClosed:
-            failure = 'closed'  # Refused at connect: nothing was written.
-            raise
+        problem = push_frame(target, frame, min(deadline, time.monotonic() + PEER_IO_TIMEOUT))
     except (ValueError, OSError) as error:
         reason = f'push_failed: {error}'
         message = finish('pending', reason, 'push_failed')
@@ -281,8 +269,6 @@ def push(path, m, dry_run=False, *, deadline=None, wake_timeout=sessions.WAKE_TI
     except BaseException as error:
         if not writing:
             # Nothing reached the peer socket (lookup, wake, frame build): back to pending, never uncertain.
-            # An interrupted wake may already have handed the link to the app: never retried.
-            failure = 'interrupted'
             reason = f'push_failed: interrupted before the peer write ({type(error).__name__})'
             try:
                 finish('pending', reason, 'push_failed')
@@ -371,11 +357,6 @@ def claim_behind(path, m, deadline, wake_timeout, poll=0.25):
         # An older broker has no guarded note; keep it local rather than risk a durable rewrite.
         noted = {'noted':False, 'note_scope':'local'}
     raise PushFailed(reason, {**call('show', m['id']), 'note':reason, **noted})
-
-
-def retry_peer(path, m):
-    """The broker's closed-inbox retry (issue #121): one ordinary push, so one claim and at most one wake."""
-    return push(path, m)
 
 
 def public_wake(found):
@@ -925,12 +906,6 @@ def main(argv=None):
                    help='Seconds between read-only checks of registered Codex threads (0 = off)')
     p.add_argument('--agy-failure-interval',type=int,default=agy_live.DEFAULT_FAILURE_INTERVAL,
                    help='Seconds between read-only checks of registered Antigravity sessions (0 = off)')
-    p.add_argument('--peer-retry-interval',type=int,default=broker.peer_retry.DEFAULT_INTERVAL,
-                   help='Seconds between scans for claude-peer messages left pending by a closed inbox (0 = no retries)')
-    p.add_argument('--peer-retry-backoff',default=','.join(map(str,broker.peer_retry.DEFAULT_BACKOFF)),
-                   help='Comma-separated seconds before each claude-peer retry; the last delay repeats')
-    p.add_argument('--peer-retry-cap',type=int,default=broker.peer_retry.DEFAULT_CAP,
-                   help='Most claude-peer retries per message after its first failed push')
     p.add_argument('--provider-retry-backoff',default=','.join(map(str,broker.provider_failures.DEFAULT_BACKOFF)),
                    help='Comma-separated positive delays before continuation attempts, in seconds')
     p.add_argument('--provider-retry-cap',type=int,default=broker.provider_failures.DEFAULT_CAP,
@@ -1066,11 +1041,7 @@ def main(argv=None):
                                      args.codex_failure_interval,
                                      tuple(int(value) for value in args.provider_retry_backoff.split(',')),
                                      args.provider_retry_cap,
-                                     args.agy_failure_interval,
-                                     peer_pusher=retry_peer,
-                                     peer_retry_interval=args.peer_retry_interval,
-                                     peer_retry_backoff=tuple(int(value) for value in args.peer_retry_backoff.split(',')),
-                                     peer_retry_cap=args.peer_retry_cap))
+                                     args.agy_failure_interval))
             return 0
         if args.cmd=='usage':
             state_dir = args.state_dir or Path(args.socket).expanduser().absolute().with_suffix('.state')

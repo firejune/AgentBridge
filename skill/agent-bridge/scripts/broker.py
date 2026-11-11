@@ -23,7 +23,7 @@ import usage
 import provider_failures
 import codex_failures
 import agy_live
-import peer_retry
+import peer_wake
 
 DEFAULT_SOCKET = Path.home() / '.local/share/agent-bridge/bridge.sock'
 MAX_FRAME = 1024 * 1024
@@ -115,7 +115,6 @@ class State:
             self.endpoints, self.channels = store.load()
         self.correspondence = None
         self.pending_publications = None
-        self.peer_retries = peer_retry.PeerRetries()
         if store is not None:
             self.correspondence = message_store.MessageStore(store.directory, max_messages)
             saved = self.correspondence.load()
@@ -140,8 +139,6 @@ class State:
                     self.answers[mid].set()
                 if message['state'] == 'dispatching':
                     message.update(state='uncertain', note='Broker restarted during delivery; resolve explicitly')
-                elif message['state'] == 'pending':
-                    peer_retry.restored(message)
             self.correspondence.save(self)
         # Volatile endpoint history distinguishes unused inbox pins from removed
         # return routes. Restored endpoints are already initialized this epoch.
@@ -708,10 +705,8 @@ class State:
                 if args['state']=='pending' and (event!='push_failed' or not args.get('note','').strip()):
                     # A failed push stays deliverable, but never silently.
                     raise ValueError('Returning to pending requires a push_failed event and reason')
-                # Keep the wake outcome and the retry schedule on the message before it is published (#121).
-                failure = args.get('failure') if args.get('failure') in peer_retry.FAILURES else None
-                self.peer_retries.record_wake(m, args.get('wake'))
-                self.peer_retries.settle(m, args['state'], failure, args.get('note'))
+                # Keep the normalized wake outcome on the message before it is published (#121).
+                peer_wake.record_wake(m, args.get('wake'))
                 return self.status(m,args['state'],args.get('note'),event)
             if m['state'] in ('done','answered'):
                 raise ValueError('Message is already complete')
@@ -793,13 +788,8 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
                 codex_executable='codex', claude_live=True,
                 codex_failure_interval=codex_failures.DEFAULT_INTERVAL,
                 retry_backoff=provider_failures.DEFAULT_BACKOFF, retry_cap=provider_failures.DEFAULT_CAP,
-                agy_failure_interval=agy_live.DEFAULT_FAILURE_INTERVAL,
-                peer_pusher=None, peer_retry_interval=peer_retry.DEFAULT_INTERVAL,
-                peer_retry_backoff=peer_retry.DEFAULT_BACKOFF, peer_retry_cap=peer_retry.DEFAULT_CAP):
+                agy_failure_interval=agy_live.DEFAULT_FAILURE_INTERVAL):
     retry_policy = provider_failures.retry_policy(retry_backoff, retry_cap)
-    peer_policy = provider_failures.retry_policy(peer_retry_backoff, peer_retry_cap)
-    if type(peer_retry_interval) is not int or peer_retry_interval < 0:
-        raise ValueError('claude-peer retry interval must be a nonnegative integer')
     if type(codex_failure_interval) is not int or codex_failure_interval < 0:
         raise ValueError('Codex failure observation interval must be a nonnegative integer')
     if type(agy_failure_interval) is not int or agy_failure_interval < 0:
@@ -817,7 +807,6 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
     collectors = []
     failure_observer = None
     agy_failure_observer = None
-    peer_observer = None
     try:
         if path.exists():
             if not stat.S_ISSOCK(path.stat().st_mode):
@@ -825,9 +814,6 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
             path.unlink()
         store = route_store.RouteStore(state_dir or path.with_suffix('.state'))
         state = State(max_messages, store)
-        state.peer_retries.policy = peer_policy
-        if peer_retry_interval and peer_pusher is not None:
-            peer_observer = asyncio.create_task(peer_retry.observe(state, path, peer_pusher, peer_retry_interval))
         if codex_failure_interval:
             failure_observer = asyncio.create_task(
                 codex_failures.observe_codex_failures(state, codex_failure_interval, retry_policy))
@@ -898,7 +884,7 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
         await asyncio.gather(*active,return_exceptions=True)
         await server.wait_closed()
     finally:
-        for observer in (failure_observer, agy_failure_observer, peer_observer):
+        for observer in (failure_observer, agy_failure_observer):
             if observer is not None:
                 observer.cancel()
                 await asyncio.gather(observer, return_exceptions=True)

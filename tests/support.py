@@ -17,7 +17,6 @@ class RunningBroker:
         self.usage += ['--no-claude-live']  # Tests never read the Keychain.
         self.usage += ['--codex-failure-interval', '0']  # Native reads require explicit fixtures.
         self.usage += ['--agy-failure-interval', '0']
-        self.usage += ['--peer-retry-interval', '0']  # Tests that exercise retries opt in.
         if codex_executable:
             self.usage += ['--codex-executable', codex_executable]
 

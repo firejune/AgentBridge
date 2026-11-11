@@ -842,6 +842,11 @@ def close_claude(sid, own_session=None, timeout=10, sessions_dir=None, killer=No
 # cross-session inbox off, so a woken copy of one never gets a socket.
 # The bridge never starts a CLI itself and never types into the composer.
 WAKE_STATES = ('woken', 'already-live', 'unsupported', 'failed', 'uncertain')
+# Fixed reason codes: the only wake reason that may be kept with a message (issue #121). The
+# free-text `reason` is a diagnostic and stays in the volatile note/event stream.
+WAKE_CODES = ('woken', 'already_live', 'inbox_off', 'live_unreachable', 'ide_host', 'no_desktop_session',
+              'ambiguous_desktop_session', 'archived', 'scheduled_task', 'budget_spent', 'opener_failed',
+              'opener_error', 'record_timeout', 'inbox_timeout', 'host_mismatch')
 WAKE_TIMEOUT = 30.0  # seconds a wake waits for the woken session's inbox (measured ~4 s)
 DESKTOP_HEAD = 16384  # cliSessionId sits near the top of a Desktop metadata file
 TRANSCRIPT_TAIL = 262144
@@ -945,7 +950,8 @@ def wake_claude(sid, timeout=WAKE_TIMEOUT, sessions_dir=None, desktop_dir=None, 
     root = Path(sessions_dir) if sessions_dir else claude_sessions_dir()
     base = {'session': sid}
     try:
-        return {**base, 'state': 'already-live', 'host': None, 'reason': 'the session inbox is running',
+        return {**base, 'state': 'already-live', 'code': 'already_live', 'host': None,
+                'reason': 'the session inbox is running',
                 'peer': resolve_claude_peer(sid, root)}
     except DiscoveryError as error:
         closed_reason = str(error)
@@ -953,36 +959,38 @@ def wake_claude(sid, timeout=WAKE_TIMEOUT, sessions_dir=None, desktop_dir=None, 
     if live:
         # Alive but unreachable: a link cannot restart a running process, so waking cannot help.
         host = live[0].get('entrypoint') or 'unknown'
-        reason = closed_reason
+        reason, code = closed_reason, 'live_unreachable'
         if not live[0].get('messagingSocketPath'):
+            code = 'inbox_off'
             reason = ('the session is running with its cross-session inbox off (Claude Desktop turns it off '
                       'for scheduled-task sessions); a wake cannot turn it on')
-        return {**base, 'state': 'unsupported', 'host': host, 'reason': reason}
+        return {**base, 'state': 'unsupported', 'code': code, 'host': host, 'reason': reason}
     desktop = find_claude_desktop_session(sid, desktop_dir)
     if desktop is None:
         host = claude_transcript_host(sid, projects_dir)
         if host == CLAUDE_IDE_ENTRYPOINT:
-            return {**base, 'state': 'unsupported', 'host': host,
+            return {**base, 'state': 'unsupported', 'code': 'ide_host', 'host': host,
                     'reason': 'IDE wake is not measured: the extension opens a saved session from '
                               '<scheme>://anthropic.claude-code/open?session=ID, but whether that starts its CLI '
                               'and inbox without a turn, and in which window it lands, is unverified. '
                               'Open the session in its IDE tab.'}
-        return {**base, 'state': 'unsupported', 'host': host,
+        return {**base, 'state': 'unsupported', 'code': 'no_desktop_session', 'host': host,
                 'reason': 'no Claude Desktop session maps to this CLI session'
                           + (f' (its transcript names host {host})' if host else ' and no transcript names its host')}
     host_id = desktop['host_session_id']
     found = {**base, 'host': CLAUDE_DESKTOP_ENTRYPOINT, 'desktop_session': host_id}
     if desktop['archived']:
-        return {**found, 'state': 'unsupported', 'reason': 'the Claude Desktop session is archived; unarchive it first'}
+        return {**found, 'state': 'unsupported', 'code': 'archived',
+                'reason': 'the Claude Desktop session is archived; unarchive it first'}
     if desktop['scheduled_task']:
-        return {**found, 'state': 'unsupported',
+        return {**found, 'state': 'unsupported', 'code': 'scheduled_task',
                 'reason': 'the session belongs to a scheduled task; Claude Desktop starts those with the '
                           'cross-session inbox off (CLAUDE_CODE_HARBOR_KITE=0), so a woken copy has no peer socket'}
     url = claude_desktop_wake_url(host_id)
     started = time.monotonic()
     remaining = deadline - started
     if remaining <= 0:
-        return {**found, 'state': 'unsupported',
+        return {**found, 'state': 'unsupported', 'code': 'budget_spent',
                 'reason': f'the {timeout:g}s wake budget was spent finding the session; the link was not opened'}
     try:
         # `open -g` never outlives the wake budget (a small floor lets it run at all).
@@ -990,11 +998,11 @@ def wake_claude(sid, timeout=WAKE_TIMEOUT, sessions_dir=None, desktop_dir=None, 
     except DiscoveryError as error:
         # The opener ran and reported failure (issue #121: this escaped the wake before, so the
         # outcome was recorded only as a push note). Nothing was written to any peer.
-        return {**found, 'url': url, 'state': 'failed', 'elapsed': round(time.monotonic() - started, 2),
+        return {**found, 'url': url, 'state': 'failed', 'code': 'opener_failed', 'elapsed': round(time.monotonic() - started, 2),
                 'reason': f'the link was not opened: {error}; nothing was sent'}
     except (subprocess.SubprocessError, OSError) as error:
         # The link may or may not have reached the app; nothing was written to any peer.
-        return {**found, 'url': url, 'state': 'uncertain', 'elapsed': round(time.monotonic() - started, 2),
+        return {**found, 'url': url, 'state': 'uncertain', 'code': 'opener_error', 'elapsed': round(time.monotonic() - started, 2),
                 'reason': f'opening the link failed ({type(error).__name__}); nothing was sent'}
     found['url'] = url
     while True:
@@ -1003,7 +1011,7 @@ def wake_claude(sid, timeout=WAKE_TIMEOUT, sessions_dir=None, desktop_dir=None, 
             mismatch = [r for r in records if r.get('entrypoint') != CLAUDE_DESKTOP_ENTRYPOINT
                         or r.get('hostSessionId') != host_id]
             if mismatch:
-                return {**found, 'state': 'uncertain',
+                return {**found, 'state': 'uncertain', 'code': 'host_mismatch',
                         'reason': 'a live record for this session appeared under another host or Desktop session; '
                                   'not pushing into it'}
             try:
@@ -1011,12 +1019,13 @@ def wake_claude(sid, timeout=WAKE_TIMEOUT, sessions_dir=None, desktop_dir=None, 
             except DiscoveryError:
                 peer = None  # The record is written before the inbox socket is announced.
             if peer:
-                return {**found, 'state': 'woken', 'reason': 'the session restarted in Claude Desktop',
+                return {**found, 'state': 'woken', 'code': 'woken', 'reason': 'the session restarted in Claude Desktop',
                         'peer': peer, 'elapsed': round(time.monotonic() - started, 2)}
         if time.monotonic() >= deadline:
             what = ('the session restarted but announced no messaging socket' if records
                     else 'no live record for the session appeared')
-            return {**found, 'state': 'uncertain', 'elapsed': round(time.monotonic() - started, 2),
+            return {**found, 'state': 'uncertain', 'code': 'inbox_timeout' if records else 'record_timeout',
+                    'elapsed': round(time.monotonic() - started, 2),
                     'reason': f'opened the session link; {what} within {timeout:g}s. Not reopening it; '
                               'check the session in Claude Desktop'}
         time.sleep(poll)
