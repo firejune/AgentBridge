@@ -1051,9 +1051,13 @@ def main(argv=None):
             if args.refresh and args.provider in ('all', 'agy'):
                 usage.refresh_agy(state_dir)
             records, summary, moment = usage.query(state_dir, args.since, args.provider)
+            warning = usage.claude_caller_warning(summary, args.provider)
+            if warning and not args.json:
+                print(warning, flush=True)  # First, before any Claude bucket (#125).
+            extra = {} if warning is None else {'warning': warning}
             if args.events:
                 if args.json:
-                    output(dict(announcements=summary['announcements'],
+                    output(dict(**extra, announcements=summary['announcements'],
                                 buckets=[{key: row[key] for key in ('limit_id','slot','resets_at','events','early_reset',
                                                                     'spend_horizon','spend_basis','stop_risk_horizon')}
                                          for row in summary['buckets']]))
@@ -1062,7 +1066,7 @@ def main(argv=None):
             elif args.json:
                 cutoff = moment-usage.parse_since(args.since)
                 payload = {k: v for k, v in summary.items() if k != 'summaries'}
-                output(dict(records=[r for r in records if usage.parse_time(r['observed_at'])>=cutoff],
+                output(dict(**extra, records=[r for r in records if usage.parse_time(r['observed_at'])>=cutoff],
                             **payload))
             else:
                 print(usage.format_summary(summary, moment), flush=True)

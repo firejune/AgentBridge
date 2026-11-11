@@ -3,10 +3,12 @@
 For Codex the collector reads `account/rateLimits/read` from a short-lived
 `codex app-server --stdio`, then stops it; Antigravity and Claude are read as
 described in their sections. It never starts a thread or a turn,
-never sends to a session, and never stores account identifiers. A failed read
-is recorded as unknown (null values), never as 0%.
+never sends to a session, and never stores account identifiers (Claude samples
+carry only an opaque hash of theirs, #125). A failed read is recorded as unknown
+(null values), never as 0%.
 """
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -299,6 +301,40 @@ CLAUDE_DESKTOP_SLOTS = (('fh', 'primary', 300), ('sd', 'secondary', 10080))
 # Desktop history is backfilled this far so a first read already has a burn rate.
 CLAUDE_BACKFILL = timedelta(hours=3)
 TOKEN_MARGIN_SECONDS = 60
+# Issue #125: the Claude login can switch accounts, and a bucket's history must
+# never blend two of them. Each Claude sample carries `account`, a one-way hash
+# of the identifier its source already reports (Desktop's `org`, the Claude Code
+# login's `accountUuid`); the identifier itself is never stored or printed.
+CLAUDE_ACCOUNT_SALT = 'agent-bridge usage account v1'
+CLAUDE_FIELDS = FIELDS + ('account',)
+CLAUDE_CALLER_ENV = 'CLAUDE_CODE_SESSION_ID'
+CLAUDE_CALLER_WARNING = ('warning: you are a Claude session; read your own Claude limits from the app '
+                         '(get_usage). Bridge Claude figures may lag or mix accounts.')
+
+
+def account_key(identifier):
+    """An opaque, stable key for an account identifier; None when there is none."""
+    if not isinstance(identifier, str) or not identifier:
+        return None
+    return hashlib.sha256(f'{CLAUDE_ACCOUNT_SALT}\0{identifier}'.encode()).hexdigest()[:16]
+
+
+def claude_login(config_path=None):
+    """The Claude Code login's account key from its config, or None."""
+    try:
+        config = json.loads(Path(config_path or claude_config_path()).read_text())
+        return account_key((config.get('oauthAccount') or {}).get('accountUuid'))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def claude_caller_warning(summary, provider, env=None):
+    """The one line a Claude Code caller sees before Claude buckets (#125), or None."""
+    env = os.environ if env is None else env
+    if not env.get(CLAUDE_CALLER_ENV):
+        return None
+    shown = provider == 'claude' or any(row.get('provider') == 'claude' for row in summary.get('buckets', []))
+    return CLAUDE_CALLER_WARNING if shown else None
 
 
 def claude_config_path():
@@ -351,7 +387,8 @@ def read_claude(live=True, desktop_dir=None, config_path=None, token=claude_toke
         try:
             found = token(now)
             if found:
-                result['ide'] = dict(observed=utc(now), utilization=fetch(found), source=CLAUDE_SOURCES['ide'])
+                result['ide'] = dict(observed=utc(now), utilization=fetch(found), source=CLAUDE_SOURCES['ide'],
+                                     account=claude_login(config_path))
         except Exception as error:  # noqa: BLE001 - the token or reply must never reach a log.
             result['ide_live_error'] = claude_failure(error)
     if 'ide' not in result:
@@ -363,7 +400,7 @@ def read_claude(live=True, desktop_dir=None, config_path=None, token=claude_toke
                 raise ValueError('no usage cache for the Claude Code login')
             observed = datetime.fromtimestamp(cache['fetchedAtMs'] / 1000, timezone.utc)
             result['ide'] = dict(observed=utc(observed), utilization=cache.get('utilization'),
-                                 source=CLAUDE_SOURCES['ide_cache'])
+                                 source=CLAUDE_SOURCES['ide_cache'], account=account_key(login))
         except FileNotFoundError:
             result['ide'] = dict(error=result.get('ide_live_error') or 'claude code config not found')
         except ValueError as error:
@@ -387,11 +424,11 @@ def claude_failure(error):
     return 'invalid or failed response'
 
 
-def claude_record(observed, limit_id, slot, used, window, resets_at, source, allowed=None):
+def claude_record(observed, limit_id, slot, used, window, resets_at, source, allowed=None, account=None):
     status = 'stale' if resets_at is not None and parse_time(resets_at) <= observed else 'ok'
     return dict(observed_at=utc(observed), provider='claude', limit_id=limit_id, slot=slot,
                 used_percent=used, window_mins=window, resets_at=resets_at, allowed=allowed,
-                reset_credits=None, source=source, status=status, reason=None)
+                reset_credits=None, source=source, status=status, reason=None, account=account)
 
 
 def claude_time(value):
@@ -407,7 +444,8 @@ def normalize_claude_desktop(history, now):
     if not samples:
         raise ValueError('desktop history is empty')
     samples.sort(key=lambda s: s['t'])
-    org = samples[-1].get('org')  # The account Desktop is signed in to now; never stored.
+    org = samples[-1].get('org')  # The account Desktop is signed in to now; stored only as a hash.
+    account = account_key(org)
     cutoff = now - CLAUDE_BACKFILL
     records = []
     for item in samples:
@@ -418,7 +456,7 @@ def normalize_claude_desktop(history, now):
             used = number(item['u'].get(key))
             if used is not None:  # A missing field is unknown, never 0.
                 records.append(claude_record(observed, 'desktop', slot, used, window, None,
-                                             CLAUDE_SOURCES['desktop']))
+                                             CLAUDE_SOURCES['desktop'], account=account))
     if not records:
         raise ValueError('no recent desktop sample')
     return records
@@ -428,21 +466,21 @@ def normalize_claude_ide(reading):
     utilization = reading.get('utilization')
     if not isinstance(utilization, dict):
         raise ValueError('claude code usage has no utilization')
-    observed, source = parse_time(reading['observed']), reading['source']
+    observed, source, account = parse_time(reading['observed']), reading['source'], reading.get('account')
     records = []
     for key, slot, window in (('five_hour', 'primary', 300), ('seven_day', 'secondary', 10080)):
         bucket = utilization.get(key)
         if isinstance(bucket, dict) and number(bucket.get('utilization')) is not None:
             allowed = False if bucket.get('locked_reason') else None
             records.append(claude_record(observed, 'ide', slot, bucket['utilization'], window,
-                                         claude_time(bucket.get('resets_at')), source, allowed))
+                                         claude_time(bucket.get('resets_at')), source, allowed, account))
     for limit in utilization.get('limits') or []:
         if not isinstance(limit, dict) or limit.get('kind') != 'weekly_scoped':
             continue
         model = ((limit.get('scope') or {}).get('model') or {}).get('display_name')
         if isinstance(model, str) and number(limit.get('percent')) is not None:
             records.append(claude_record(observed, 'ide', f'weekly:{model}', limit['percent'], 10080,
-                                         claude_time(limit.get('resets_at')), source))
+                                         claude_time(limit.get('resets_at')), source, account=account))
     if not records:
         raise ValueError('claude code usage has no windows')
     return records
@@ -481,12 +519,32 @@ def read_codex(executable='codex', timeout=10):
         return client.call('account/rateLimits/read', {})
 
 
+def series(item):
+    """One bucket of one account: samples of two accounts never compare (#125)."""
+    return item['limit_id'], item['slot'], item.get('account')
+
+
+def current_account(items):
+    """A bucket's samples from the account its latest read saw (#125), oldest first.
+
+    `items` are in store order, which is read order: the last one came from the
+    newest read, even when its source time is older (a switched account's backfill).
+    Samples of any other account, including older ones that recorded no account,
+    are dropped rather than blended into the burn rate and risk. Providers that
+    record no account are unchanged: every sample shares the key None.
+    """
+    account = items[-1].get('account')
+    return sorted((item for item in items if item.get('account') == account), key=lambda r: r['observed_at'])
+
+
 class UsageStore:
     """Bounded, owner-private JSONL history; every write replaces the file atomically."""
     name, fields, key = '{provider}.jsonl', FIELDS, 'observed_at'
 
     def __init__(self, directory, retention_days=RETENTION_DAYS, max_bytes=MAX_BYTES, provider='codex'):
         self.provider = provider
+        if provider == 'claude' and self.fields is FIELDS:
+            self.fields = CLAUDE_FIELDS  # Samples only; events and announcements keep their shape.
         self.name = self.name.format(provider=provider)
         self.directory = Path(directory).expanduser().absolute()
         self.path = self.directory / self.name
@@ -554,10 +612,10 @@ class UsageStore:
         records = self.load()
         last = {}
         for item in records:
-            last[(item['limit_id'], item['slot'])] = item
+            last[series(item)] = item
         kept = []
         for item in new:
-            previous = last.get((item['limit_id'], item['slot']))
+            previous = last.get(series(item))
             if (item.get('provider') == 'claude' and previous is not None
                     and parse_time(item['observed_at']) <= parse_time(previous['observed_at'])):
                 continue  # Claude sources carry their own time: an older or equal sample says nothing new.
@@ -571,7 +629,7 @@ class UsageStore:
             if same and (now - parse_time(previous['observed_at'])).total_seconds() < DEDUP_SECONDS:
                 continue
             kept.append(item)
-            last[(item['limit_id'], item['slot'])] = item
+            last[series(item)] = item
         if kept or len(self.bound(records, now)[0]) != len(records):
             self.save(records + kept, now)
         return kept
@@ -650,9 +708,10 @@ def detect(records):
     buckets = {}
     for item in records:
         if item['status'] != 'failed' and item['used_percent'] is not None:
-            buckets.setdefault((item['limit_id'], item['slot']), []).append(item)
+            buckets.setdefault(series(item), []).append(item)
     events = []
-    for (limit_id, slot), items in sorted(buckets.items(), key=lambda entry: bucket_sort_key(*entry[0])):
+    for (limit_id, slot, _), items in sorted(buckets.items(),
+                                             key=lambda entry: (bucket_sort_key(*entry[0][:2]), entry[0][2] or '')):
         items.sort(key=lambda r: r['observed_at'])
         for before, after in zip(items, items[1:]):
             if is_reset(before, after):
@@ -791,7 +850,7 @@ def summarize(records, now, since):
             buckets.setdefault((item['limit_id'], item['slot']), []).append(item)
     rows = []
     for (limit_id, slot), items in sorted(buckets.items(), key=lambda entry: bucket_sort_key(*entry[0])):
-        items.sort(key=lambda r: r['observed_at'])
+        items = current_account(items)
         last = items[-1]
         observed = parse_time(last['observed_at'])
         age = (now - observed).total_seconds()
@@ -1159,6 +1218,8 @@ def brief(state_dir, provider='codex', now=None):
     for row in summary['buckets']:
         label = (row['limit_id'] if row['provider'] == 'agy' or row['window_mins'] is None
                  else window_name(row['window_mins']))
+        if row['provider'] == 'claude' and row['window_mins'] is not None:
+            label = f"{row['limit_id']} {label}"  # Desktop and Claude Code can be two accounts (#125).
         name = f"{row['provider']} {label}" + ('' if row['slot'] == 'primary' else f" {row['slot']}")
         remaining = 'unknown' if row['remaining_percent'] is None else f"{pct(row['remaining_percent'])}% left"
         verdict = row.get('risk')
