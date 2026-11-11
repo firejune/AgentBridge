@@ -841,7 +841,7 @@ def close_claude(sid, own_session=None, timeout=10, sessions_dir=None, killer=No
 # from a scheduled task with CLAUDE_CODE_HARBOR_KITE=0, which turns the
 # cross-session inbox off, so a woken copy of one never gets a socket.
 # The bridge never starts a CLI itself and never types into the composer.
-WAKE_STATES = ('woken', 'already-live', 'unsupported', 'uncertain')
+WAKE_STATES = ('woken', 'already-live', 'unsupported', 'failed', 'uncertain')
 WAKE_TIMEOUT = 30.0  # seconds a wake waits for the woken session's inbox (measured ~4 s)
 DESKTOP_HEAD = 16384  # cliSessionId sits near the top of a Desktop metadata file
 TRANSCRIPT_TAIL = 262144
@@ -932,9 +932,11 @@ def wake_claude(sid, timeout=WAKE_TIMEOUT, sessions_dir=None, desktop_dir=None, 
                 opener=None, poll=0.25):
     """Bring one idle-closed Claude Code session back in its own host, then wait for its inbox.
 
-    Returns {'state': woken | already-live | unsupported | uncertain, 'reason', ...}. Only `woken` and
-    `already-live` mean a push can go out now. `uncertain` means the link was handed to the app but the
-    session's inbox did not appear in time: the bridge does not open it again or push on its own.
+    Returns {'state': woken | already-live | unsupported | failed | uncertain, 'reason', ...}. Only `woken`
+    and `already-live` mean a push can go out now. `failed` means the opener reported that the link was
+    not opened (non-zero `open -g` exit or no `open`). `uncertain` means the link may have been handed to
+    the app but the session's inbox did not appear in time: the bridge does not open it again or push on
+    its own.
     """
     sid = str(uuid.UUID(sid))
     if not 0 < timeout <= 600:
@@ -985,9 +987,14 @@ def wake_claude(sid, timeout=WAKE_TIMEOUT, sessions_dir=None, desktop_dir=None, 
     try:
         # `open -g` never outlives the wake budget (a small floor lets it run at all).
         (opener or open_url_background)(url, timeout=max(WAKE_OPEN_FLOOR, min(WAKE_OPEN_TIMEOUT, remaining)))
+    except DiscoveryError as error:
+        # The opener ran and reported failure (issue #121: this escaped the wake before, so the
+        # outcome was recorded only as a push note). Nothing was written to any peer.
+        return {**found, 'url': url, 'state': 'failed', 'elapsed': round(time.monotonic() - started, 2),
+                'reason': f'the link was not opened: {error}; nothing was sent'}
     except (subprocess.SubprocessError, OSError) as error:
         # The link may or may not have reached the app; nothing was written to any peer.
-        return {**found, 'url': url, 'state': 'uncertain',
+        return {**found, 'url': url, 'state': 'uncertain', 'elapsed': round(time.monotonic() - started, 2),
                 'reason': f'opening the link failed ({type(error).__name__}); nothing was sent'}
     found['url'] = url
     while True:
