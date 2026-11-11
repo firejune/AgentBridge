@@ -1282,3 +1282,95 @@ class ClaudeUsageTests(unittest.TestCase):
         with redirect_stdout(out), self.assertRaises(SystemExit):
             bridge.main(['serve', '--help'])
         self.assertIn('--no-claude-live', out.getvalue())
+
+    def test_two_accounts_never_blend_and_burn_is_the_active_accounts(self):
+        """Issue #125: a login switch starts a new series; burn and risk read only the active account."""
+        def weekly(used):
+            return dict(CLAUDE_UTILIZATION, seven_day={'utilization': used, 'resets_at': '2026-10-26T19:00:00+00:00'})
+        stream_a = [(T0, 10), (T0 + timedelta(hours=1), 30), (T0 + timedelta(hours=2), 50)]
+        stream_b = [(T0 + timedelta(hours=2, minutes=20), 20), (T0 + timedelta(hours=3), 22)]
+        for login, stream in (('acct-a', stream_a), ('acct-b', stream_b)):
+            for moment, used in stream:
+                self.cache(moment, login=login, cached=login, utilization=weekly(used))
+                self.collect(now=moment + timedelta(minutes=1))
+        stored = self.store.load()
+        ide = [r for r in stored if r['limit_id'] == 'ide' and r['slot'] == 'secondary']
+        self.assertEqual(len(ide), 5)
+        self.assertEqual(len({r['account'] for r in ide}), 2)
+        self.assertEqual({r['account'] for r in ide}, {usage.account_key('acct-a'), usage.account_key('acct-b')})
+        raw = self.store.path.read_text()
+        for secret in ('acct-a', 'acct-b', 'x@y'):
+            self.assertNotIn(secret, raw)
+        # The drop from 50 (account a) to 20 (account b) is a switch, not a reset.
+        self.assertEqual([e for e in usage.detect(stored) if e['limit_id'] == 'ide'], [])
+        now = T0 + timedelta(hours=3, minutes=2)
+        _, summary, _ = usage.query(self.root / 'state', '6h', 'claude', now=now)
+        row = next(b for b in summary['buckets'] if (b['limit_id'], b['slot']) == ('ide', 'secondary'))
+        self.assertEqual(row['used_percent'], 22)
+        self.assertEqual(row['resets'], [])
+        self.assertEqual(row['rate']['samples'], 2)
+        self.assertAlmostEqual(row['rate']['percent_per_hour'], 3.0)  # (22 - 20) over 40 minutes
+        self.assertEqual(row['risk']['state'], 'at_risk')  # 78% left at 3%p/h empties in 26 h, before the reset
+        self.assertAlmostEqual(row['risk']['burn_per_hour'], 3.0)
+        self.assertEqual(row['risk']['empty_at'], usage.utc(now + timedelta(hours=26)))
+        # Blended, the same history would read 10 -> 22 over three hours with a "reset" inside it.
+        blended = [dict(r, account=None) for r in stored]
+        mixed = usage.summarize(blended, now, usage.parse_since('6h'))['buckets']
+        mixed_row = next(b for b in mixed if (b['limit_id'], b['slot']) == ('ide', 'secondary'))
+        self.assertEqual(len(mixed_row['resets']), 1)
+
+    def test_a_switched_desktop_account_backfill_is_kept_though_older(self):
+        """Issue #125: the new account's backfill predates the old account's last sample."""
+        self.history((T0 - timedelta(minutes=10), {'sd': 60}), org='org-a')
+        self.collect()
+        self.history((T0 - timedelta(minutes=40), {'sd': 5}), (T0 - timedelta(minutes=20), {'sd': 7}), org='org-b')
+        self.collect(now=T0 + timedelta(minutes=5))
+        _, summary, _ = usage.query(self.root / 'state', '6h', 'claude', now=T0 + timedelta(minutes=6))
+        row = next(b for b in summary['buckets'] if (b['limit_id'], b['slot']) == ('desktop', 'secondary'))
+        self.assertEqual(row['used_percent'], 7)
+        self.assertEqual(row['observed_at'], usage.utc(T0 - timedelta(minutes=20)))
+        self.assertAlmostEqual(row['rate']['percent_per_hour'], 6.0)
+        self.assertNotIn('org-a', self.store.path.read_text())
+
+    def test_claude_session_callers_are_warned_first_and_others_are_not(self):
+        """Issue #125: a Claude Code caller reads its own limits from the app; Codex output is unchanged."""
+        self.history((T0 - timedelta(minutes=10), {'fh': 5, 'sd': 30}))
+        self.collect()
+        state = str(self.root / 'state')
+        base = ['--socket', '/tmp/ab-never.sock', 'usage', '--state-dir', state]
+        clean = {k: v for k, v in os.environ.items() if k != usage.CLAUDE_CALLER_ENV}
+
+        def run(env, *extra):
+            out = io.StringIO()
+            with patch.dict(os.environ, env, clear=True), redirect_stdout(out):
+                self.assertEqual(bridge.main(base + list(extra)), 0)
+            return out.getvalue()
+
+        inside = dict(clean, **{usage.CLAUDE_CALLER_ENV: 'session-under-test'})
+        for extra in ((), ('--provider', 'claude'), ('--events',)):
+            text = run(inside, *extra)
+            self.assertEqual(text.splitlines()[0], usage.CLAUDE_CALLER_WARNING, extra)
+            self.assertEqual(text.count(usage.CLAUDE_CALLER_WARNING), 1)
+            self.assertNotIn(usage.CLAUDE_CALLER_WARNING, run(clean, *extra))
+        self.assertEqual(json.loads(run(inside, '--json'))['warning'], usage.CLAUDE_CALLER_WARNING)
+        self.assertNotIn('warning', json.loads(run(clean, '--json')))
+        # No Claude bucket shown: a Codex-only query in a Claude session is unchanged.
+        self.assertEqual(run(inside, '--provider', 'codex'), run(clean, '--provider', 'codex'))
+        self.assertNotIn(usage.CLAUDE_CALLER_WARNING, run(inside, '--provider', 'codex'))
+
+    def test_switching_back_to_an_unchanged_account_selects_it_again(self):
+        """Issue #125 review: A -> B -> A inside the dedup hour, A's source time unchanged."""
+        def weekly(used):
+            return dict(CLAUDE_UTILIZATION, seven_day={'utilization': used, 'resets_at': '2026-10-26T19:00:00+00:00'})
+        for login, used, fetched, read_at in (('acct-a', 10, T0, T0 + timedelta(minutes=1)),
+                                              ('acct-b', 100, T0 + timedelta(minutes=10), T0 + timedelta(minutes=11)),
+                                              ('acct-a', 10, T0, T0 + timedelta(minutes=21))):
+            self.cache(fetched, login=login, cached=login, utilization=weekly(used))
+            self.collect(now=read_at)
+        _, summary, _ = usage.query(self.root / 'state', '6h', 'claude', now=T0 + timedelta(minutes=22))
+        row = next(b for b in summary['buckets'] if (b['limit_id'], b['slot']) == ('ide', 'secondary'))
+        self.assertEqual(row['used_percent'], 10)
+        self.assertEqual(row['remaining_percent'], 90)
+        self.assertNotEqual(row['risk']['state'], 'exhausted')
+        # The returning read is one row, not a re-append of the whole series.
+        self.assertEqual(len([r for r in self.store.load() if (r['limit_id'], r['slot']) == ('ide', 'secondary')]), 3)

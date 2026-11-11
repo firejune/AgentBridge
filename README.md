@@ -179,6 +179,8 @@ python3 "$bridge_cli" usage --events               # Reset history, spend horizo
 - `claude/desktop`: Desktop's own 15-minute history (`~/Library/Application Support/Claude/plan-usage-history.json`) for the account Desktop is signed in to. Used % only; no reset times.
 - `claude/ide`: the Claude Code login (IDE extension and terminal CLI), read live from the usage endpoint the CLI's `/usage` uses, with the login's access token read per call from the Keychain item `Claude Code-credentials`. The token is never stored, logged, or refreshed. If it is missing or expired, or the call fails, the CLI's own cache in `~/.claude.json` is used (written only at session start or on `/usage`, so often old — check `observed`). `serve --no-claude-live` disables the Keychain read.
 - Samples keep the time their source measured them, so `observed … ago` is the source's age, not the broker's.
+- Each sample is keyed by an opaque hash of the account its source reports (never the address or name). Burn and `AT RISK` use only samples of the account the latest read saw; after a login switch, the other account's samples are dropped from the reading, not blended.
+- Run inside a Claude Code session (`CLAUDE_CODE_SESSION_ID` set), `usage` prints `warning: you are a Claude session; read your own Claude limits from the app (get_usage). …` before any Claude bucket (`--json`: a `warning` field). A Claude session reads its own limits from the app; these figures are for the other surface and may lag.
 
 ### 4. Agent Worktrees (`wt`)
 

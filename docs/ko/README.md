@@ -179,6 +179,8 @@ python3 "$bridge_cli" usage --events               # 리셋 이력, spend horizo
 - `claude/desktop`: 데스크톱이 스스로 15분마다 남기는 기록(`~/Library/Application Support/Claude/plan-usage-history.json`), 데스크톱에 로그인된 계정 기준. 사용률만 있고 리셋 시각은 없다.
 - `claude/ide`: Claude Code 로그인(IDE 확장 · 터미널 CLI). CLI의 `/usage`가 부르는 사용량 엔드포인트를 실시간으로 읽고, 토큰은 매번 키체인 항목 `Claude Code-credentials`에서 읽는다. 토큰은 저장 · 기록 · 갱신하지 않는다. 토큰이 없거나 만료됐거나 호출이 실패하면 CLI 자체 캐시(`~/.claude.json`)를 쓴다 — 세션 시작이나 `/usage` 때만 쓰여서 낡은 경우가 많으니 `observed`를 본다. `serve --no-claude-live`로 키체인 읽기를 끈다.
 - 표본은 원천이 잰 시각을 그대로 가진다 — `observed … ago`는 브로커가 아니라 원천의 나이다.
+- 표본마다 원천이 알려 준 계정을 불투명한 해시로 붙인다(주소 · 이름은 저장하지 않는다). 소모율과 `AT RISK`는 가장 최근 읽기가 본 계정의 표본만 쓴다 — 로그인이 바뀌면 다른 계정의 표본은 섞지 않고 판독에서 뺀다.
+- Claude Code 세션 안에서(`CLAUDE_CODE_SESSION_ID`가 있으면) `usage`는 Claude 버킷 앞에 `warning: you are a Claude session; read your own Claude limits from the app (get_usage). …` 한 줄을 찍는다(`--json`은 `warning` 필드). Claude 세션은 자기 한도를 앱에서 읽는다 — 이 수치는 다른 표면용이고 늦을 수 있다.
 
 ### 4. 에이전트 워크트리 (`wt`)
 

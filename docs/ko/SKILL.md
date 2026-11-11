@@ -161,7 +161,7 @@ python3 "$bridge_cli" usage --events
 - `usage`는 기본 `--provider all`(Codex 계정 버킷 + Antigravity `agy/gemini-weekly`·`agy/gemini-5h`·`agy/partner-weekly`·`agy/partner-5h` 버킷 + Claude `claude/desktop`·`claude/ide` 버킷)을 출력하며, 용량 판정 대상 줄 끝에 `holds until reset`, `AT RISK: empty ~T before reset`, `EXHAUSTED`, `risk unknown` 중 하나를 표시한다.
 - Antigravity (`agy`): `RetrieveUserQuotaSummary`를 조회한다(기본 `{}` 호출로 서버의 5분 캐시를 사용하며 백그라운드 수집기는 절대 `forceRefresh`를 보내지 않고, 명시적 `--refresh`만 `{"forceRefresh": true}`를 전송한다). `3p-*` 버킷은 `partner-*`로 기록하고 기존 `agy/gemini`·`agy/partner` 레코드도 히스토리로 유지한다. 주간 수치가 없으면 `weekly: unknown`(`0%`나 `100%` 금지)으로 표시하며, `AT RISK` / `holds until reset` 판정은 주간 버킷(`*-weekly`)에서만 수행하고 5시간 창은 표시만 한다.
 - `--events`는 리셋 이력과 두 기준 시각을 보여 준다: 사용 계획은 **spend horizon**(공식 리셋과 추정 조기 리셋 중 이른 쪽)에 맞추고, 멈출 위험은 **stop risk horizon**(공식 `resets_at`)으로만 판단한다.
-- Claude: `claude/desktop`은 Claude 데스크톱 계정(데스크톱 자체 기록, 사용률만 · 리셋 시각 없음), `claude/ide`는 IDE 확장 · CLI가 쓰는 Claude Code 로그인(키체인 토큰으로 사용량 엔드포인트 실시간 조회, 안 되면 `~/.claude.json` 캐시)이다. 데스크톱 HQ는 여기서 IDE 세션의 한도를, IDE 세션은 데스크톱의 한도를 본다. 어느 읽기도 모델 턴을 시작하지 않는다.
+- Claude: `claude/desktop`은 Claude 데스크톱 계정(데스크톱 자체 기록, 사용률만 · 리셋 시각 없음), `claude/ide`는 IDE 확장 · CLI가 쓰는 Claude Code 로그인(키체인 토큰으로 사용량 엔드포인트 실시간 조회, 안 되면 `~/.claude.json` 캐시)이다. 데스크톱 HQ는 여기서 IDE 세션의 한도를, IDE 세션은 데스크톱의 한도를 본다. 어느 읽기도 모델 턴을 시작하지 않는다. 소모율과 위험 판정은 가장 최근 읽기가 본 계정(불투명한 해시)의 표본만 쓰고, 다른 계정의 표본은 섞지 않는다. Claude Code 세션 안에서 `usage`는 경고 한 줄을 먼저 찍는다 — 자기 Claude 한도는 브릿지가 아니라 앱(`get_usage`)에서 읽는다.
 - `codex`나 `agy` 경로(또는 `claude-peer`끼리의 경로)를 거치는 모든 `send`·`ask`·`reply` 출력에는 `usage` 요약(`ok`, `at_risk`, `exhausted`, `unknown`)이 실린다. `at_risk`나 `exhausted`면 작업 속도를 늦추거나 다른 에이전트로 배정한다.
 
 ## 에이전트 워크트리
