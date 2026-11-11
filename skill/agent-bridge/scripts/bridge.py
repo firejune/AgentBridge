@@ -198,11 +198,12 @@ def claim_peer(path, m, deadline):
 
 
 def push(path, m, dry_run=False, *, deadline=None, wake_timeout=sessions.WAKE_TIMEOUT):
-    """Push one pending claude-peer message. Success = submitted; never retried automatically.
+    """Push one pending claude-peer message once. Success = submitted.
 
     A closed target is woken once in its own host first (issue #115), inside the same delivery
     budget; the message is pushed once when the woken session's inbox appears, and goes back to
-    pending (nothing written) otherwise.
+    pending (nothing written) otherwise. The finish carries the wake outcome; the broker keeps its
+    normalized fields with the message (issue #121). Nothing retries the push.
     """
     if dry_run:
         target = sessions.resolve_claude_peer(m['route']['session'])
@@ -216,10 +217,14 @@ def push(path, m, dry_run=False, *, deadline=None, wake_timeout=sessions.WAKE_TI
 
     claimed, behind = claim_behind(path, m, deadline, wake_timeout)
 
+    woke = None
+
     def finish(state, note, event=None):
-        # Older brokers ignore the opt-in and return no claim token.
+        # Older brokers ignore the opt-in and return no claim token, and ignore the wake report.
         claim = claimed.get('dispatch_claim')
         guard = {'expect_dispatch_claim':claim} if claim is not None else {}
+        if woke is not None:
+            guard['wake'] = woke
         finish_deadline = time.monotonic() + PEER_BROKER_TIMEOUT
         # Settle a possible write even when the caller's peer I/O budget has elapsed.
         if state == 'pending':
@@ -229,7 +234,6 @@ def push(path, m, dry_run=False, *, deadline=None, wake_timeout=sessions.WAKE_TI
         except (ValueError, OSError):
             raise ClaudeDispatchUnknown('finish', m['id']) from None
 
-    woke = None
     writing = False  # Only a possible peer write may settle `uncertain` (and block the recipient).
     try:
         try:
@@ -240,8 +244,18 @@ def push(path, m, dry_run=False, *, deadline=None, wake_timeout=sessions.WAKE_TI
             # Keep PEER_IO_TIMEOUT of the delivery budget for the push itself; the wake never extends it.
             budget = min(wake_timeout, deadline - time.monotonic() - PEER_IO_TIMEOUT)
             if budget <= 0:
+                woke = {'session':m['route']['session'], 'state':'unsupported', 'code':'budget_spent',
+                        'host':None, 'reason':'the delivery budget leaves no time to wake it',
+                        'at':sessions.observed_now()}
                 raise ValueError(f'{error}; the delivery budget leaves no time to wake it') from None
-            woke = public_wake(sessions.wake_claude(m['route']['session'], timeout=budget))
+            woke_at = sessions.observed_now()
+            try:
+                found = sessions.wake_claude(m['route']['session'], timeout=budget)
+            except sessions.DiscoveryError as refused:
+                # E.g. two Desktop sessions claim this CLI session: nothing was opened.
+                found = {'session':m['route']['session'], 'state':'unsupported', 'code':'ambiguous_desktop_session',
+                         'host':None, 'reason':str(refused)}
+            woke = {**public_wake(found), 'at':woke_at}
             if woke['state'] not in ('woken', 'already-live'):
                 raise ValueError(f"{error}; wake {woke['state']}: {woke['reason']}") from None
             target = sessions.resolve_claude_peer(m['route']['session'])
@@ -948,7 +962,7 @@ def main(argv=None):
     p.add_argument('--archive',action='store_true',help='Archive the finished session out of the active sidebar')
     p.add_argument('--keep-route',action='store_true',help='Close the session but keep the route registered')
     p.add_argument('--timeout',type=float,default=10)
-    p = sub.add_parser('wake',help="Bring an idle-closed claude-peer session back in its own host; prints woken, already-live, unsupported or uncertain")
+    p = sub.add_parser('wake',help="Bring an idle-closed claude-peer session back in its own host; prints woken, already-live, unsupported, failed or uncertain")
     p.add_argument('name');p.add_argument('--project',required=True)
     p.add_argument('--timeout',type=float,default=sessions.WAKE_TIMEOUT,help='Seconds to wait for the woken session inbox')
     p = sub.add_parser('title',help="Label a claude-peer route's session with PROJECT/NAME in the resume picker (works on dead sessions)")

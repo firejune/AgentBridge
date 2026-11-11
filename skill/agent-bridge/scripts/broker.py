@@ -23,6 +23,7 @@ import usage
 import provider_failures
 import codex_failures
 import agy_live
+import peer_wake
 
 DEFAULT_SOCKET = Path.home() / '.local/share/agent-bridge/bridge.sock'
 MAX_FRAME = 1024 * 1024
@@ -704,6 +705,8 @@ class State:
                 if args['state']=='pending' and (event!='push_failed' or not args.get('note','').strip()):
                     # A failed push stays deliverable, but never silently.
                     raise ValueError('Returning to pending requires a push_failed event and reason')
+                # Keep the normalized wake outcome on the message before it is published (#121).
+                peer_wake.record_wake(m, args.get('wake'))
                 return self.status(m,args['state'],args.get('note'),event)
             if m['state'] in ('done','answered'):
                 raise ValueError('Message is already complete')
