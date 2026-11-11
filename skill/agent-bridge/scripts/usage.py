@@ -610,12 +610,27 @@ class UsageStore:
     def append(self, new, now):
         """Add samples, skipping any equal to its bucket's last one within the hour."""
         records = self.load()
-        last = {}
+        last, read_by = {}, {}
         for item in records:
             last[series(item)] = item
+            read_by[item['limit_id'], item['slot']] = item.get('account')  # store order = read order
+        # A read whose account differs from the bucket's last stored read is an account
+        # switch (#125): its newest sample is kept even when dedup would drop it, so
+        # current_account() follows A -> B -> A although A's reading did not change.
+        switch = {}
+        for item in new:
+            bucket = item['limit_id'], item['slot']
+            if (item.get('provider') == 'claude' and bucket in read_by
+                    and item.get('account') != read_by[bucket]
+                    and (bucket not in switch or item['observed_at'] > switch[bucket]['observed_at'])):
+                switch[bucket] = item
         kept = []
         for item in new:
             previous = last.get(series(item))
+            if switch.get((item['limit_id'], item['slot'])) is item:
+                kept.append(item)
+                last[series(item)] = item if previous is None or item['observed_at'] >= previous['observed_at'] else previous
+                continue
             if (item.get('provider') == 'claude' and previous is not None
                     and parse_time(item['observed_at']) <= parse_time(previous['observed_at'])):
                 continue  # Claude sources carry their own time: an older or equal sample says nothing new.

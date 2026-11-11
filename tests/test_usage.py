@@ -1357,3 +1357,20 @@ class ClaudeUsageTests(unittest.TestCase):
         # No Claude bucket shown: a Codex-only query in a Claude session is unchanged.
         self.assertEqual(run(inside, '--provider', 'codex'), run(clean, '--provider', 'codex'))
         self.assertNotIn(usage.CLAUDE_CALLER_WARNING, run(inside, '--provider', 'codex'))
+
+    def test_switching_back_to_an_unchanged_account_selects_it_again(self):
+        """Issue #125 review: A -> B -> A inside the dedup hour, A's source time unchanged."""
+        def weekly(used):
+            return dict(CLAUDE_UTILIZATION, seven_day={'utilization': used, 'resets_at': '2026-10-26T19:00:00+00:00'})
+        for login, used, fetched, read_at in (('acct-a', 10, T0, T0 + timedelta(minutes=1)),
+                                              ('acct-b', 100, T0 + timedelta(minutes=10), T0 + timedelta(minutes=11)),
+                                              ('acct-a', 10, T0, T0 + timedelta(minutes=21))):
+            self.cache(fetched, login=login, cached=login, utilization=weekly(used))
+            self.collect(now=read_at)
+        _, summary, _ = usage.query(self.root / 'state', '6h', 'claude', now=T0 + timedelta(minutes=22))
+        row = next(b for b in summary['buckets'] if (b['limit_id'], b['slot']) == ('ide', 'secondary'))
+        self.assertEqual(row['used_percent'], 10)
+        self.assertEqual(row['remaining_percent'], 90)
+        self.assertNotEqual(row['risk']['state'], 'exhausted')
+        # The returning read is one row, not a re-append of the whole series.
+        self.assertEqual(len([r for r in self.store.load() if (r['limit_id'], r['slot']) == ('ide', 'secondary')]), 3)
