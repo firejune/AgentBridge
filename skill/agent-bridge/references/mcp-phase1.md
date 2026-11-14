@@ -93,7 +93,24 @@ Queued operations have no external intent and may resume. Anything with a
 persisted intent is never blindly replayed. For a known message on the same broker
 instance, recovery observes only; missing IDs, eviction, broker restart, pending
 or dispatching ambiguity become `unknown`. A reply body can settle a known message.
-Unknown message operations block further sends to that owned session. No tool
+Unknown message operations block further sends to that owned session.
+
+Reading a known message is not a delivery outcome (issue #134). While an operation
+is `running`, a failed read (broker timeout, disconnect, unreadable reply) leaves
+it `running`; the next read waits 1 s, doubling per consecutive error, and the
+sixth consecutive error closes the operation as `unknown`. Backend `failed` /
+`uncertain` and a broker instance change still close it at once. The last read
+error (class, message, time) and the consecutive count are kept on the ledger
+record as `error` / `observe_errors`; they are never part of a tool result.
+
+A closed `unknown` or `failed` message operation with a known message is still
+read on the same broker instance: every 5 s for 10 minutes after it closed, then
+every 60 s. A correlated reply settles it as `succeeded` (the previous status and
+code stay on the ledger as `settled_after`), resolves the reply, and frees the
+session. The caller reads it with `bridge_operation_get` on the same
+`operation_id`. This watch only reads: it never posts, pushes or resends, and it
+ends on a broker instance change, when the broker no longer knows the message, or
+when the record expires. Correlated replies stay out of the independent inbox. No tool
 resolves uncertainty, deletes a ledger, cancels work, or sends with a fresh key.
 Exactly-once external effects are not promised.
 

@@ -248,8 +248,140 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(self.backend.pushes,0)
     def test_evicted_message_unknown(self):
         sid=self.create()['agent_session_id']; oid=self.send(sid)['data']['operation_id']; self.engine.tick()
-        self.backend.messages.clear(); self.engine.tick()
+        self.engine.observe_retry_base=0; self.backend.messages.clear(); self.engine.tick()
+        self.assertEqual(self.engine.operation(oid,'owner-a')['status'],'running')
+        for _ in range(phase.OBSERVE_RETRY_LIMIT-1): self.engine.tick()
         self.assertEqual(self.engine.operation(oid,'owner-a')['status'],'unknown')
+
+    # Issue #134: a failed read of a known message is not a delivery outcome.
+    def observing(self,key='message_key_000001'):
+        sid=self.create('create_'+key)['agent_session_id']; oid=self.send(sid,key=key)['data']['operation_id']
+        self.engine.tick(); op=self.engine.operation(oid,'owner-a')
+        self.assertEqual((op['status'],op['stage'],op['backend_message_state']),('running','observing','submitted'))
+        self.retired=[]; self.backend.retire_reply=lambda mid,parent:self.retired.append((mid,parent))
+        return sid,oid,op['backend_id']
+    def flaky(self,times,error=None):
+        real=self.backend.observe; left=[times]; calls=[]
+        def observe(mid):
+            calls.append(mid)
+            if left[0]>0:
+                left[0]-=1; raise error or TimeoutError('timed out')
+            return real(mid)
+        self.backend.observe=observe
+        return calls
+    def reply(self,mid,body='the answer',rid='r1'):
+        self.backend.replies.setdefault(mid,[]).append({'id':rid,'reply_to':mid,'created':1,'body':body})
+
+    def test_one_failed_observe_keeps_running_then_reply_succeeds(self):
+        sid,oid,mid=self.observing(); self.engine.observe_retry_base=0
+        self.flaky(1); self.engine.tick()
+        op=self.engine.operation(oid,'owner-a')
+        self.assertEqual((op['status'],op['failure'],op['observe_errors']),('running',None,1))
+        self.assertEqual((op['error']['type'],op['error']['message']),('TimeoutError','timed out'))
+        self.assertEqual(self.call('bridge_operation_get',operation_id=oid)['data']['status'],'running')
+        self.reply(mid); self.engine.tick()
+        got=self.call('bridge_operation_get',operation_id=oid)['data']
+        self.assertEqual((got['status'],got['result']['text'],got['failure']),('succeeded','the answer',None))
+        self.assertEqual(self.retired,[('r1',mid)])
+        self.assertEqual(self.engine.operation(oid,'owner-a')['observe_errors'],0)
+        self.assertEqual((self.backend.posts,self.backend.pushes),(1,1))
+        self.assertTrue(self.send(sid,key='next_message_0001')['ok'])
+
+    def test_failed_observe_waits_before_the_next_read(self):
+        sid,oid,mid=self.observing(); calls=self.flaky(1)
+        self.engine.tick(); self.engine.tick(); self.engine.tick()
+        self.assertEqual(len(calls),1)
+        self.engine.observe_at[oid]=0; self.engine.tick()
+        self.assertEqual(len(calls),2)
+
+    def test_backend_failed_or_uncertain_still_fails(self):
+        for state,status,code in (('failed','failed','BACKEND_UNAVAILABLE'),('uncertain','unknown','DELIVERY_UNKNOWN')):
+            with self.subTest(state=state):
+                sid,oid,mid=self.observing('terminal_'+state+'_00001')
+                self.backend.messages[mid]['state']=state; self.engine.tick()
+                got=self.call('bridge_operation_get',operation_id=oid)['data']
+                self.assertEqual((got['status'],got['failure']['code'],got['result']),(status,code,None))
+                self.assertNotIn('error',self.engine.operation(oid,'owner-a'))
+
+    def test_instance_change_still_fails_and_ends_the_watch(self):
+        sid,oid,mid=self.observing(); self.backend.current='restarted'; self.engine.tick()
+        self.assertEqual(self.engine.operation(oid,'owner-a')['status'],'unknown')
+        self.reply(mid); self.engine.tick()
+        op=self.engine.operation(oid,'owner-a')
+        self.assertEqual((op['status'],op['reply_watch_closed']),('unknown','instance_changed'))
+        calls=self.flaky(0); self.engine.watch_at.clear(); self.engine.tick()
+        self.assertEqual(calls,[])
+
+    def test_consecutive_observe_errors_are_bounded_and_recorded(self):
+        sid,oid,mid=self.observing(); self.engine.observe_retry_base=0
+        calls=self.flaky(99,ValueError('timed out'))
+        for _ in range(phase.OBSERVE_RETRY_LIMIT-1): self.engine.tick()
+        self.assertEqual(self.engine.operation(oid,'owner-a')['status'],'running')
+        self.engine.tick(); op=self.engine.operation(oid,'owner-a')
+        self.assertEqual((op['status'],op['failure']['code'],op['observe_errors']),('unknown','DELIVERY_UNKNOWN',phase.OBSERVE_RETRY_LIMIT))
+        self.assertEqual((op['error']['type'],op['error']['message']),('ValueError','timed out'))
+        self.assertEqual(len(calls),phase.OBSERVE_RETRY_LIMIT)
+        got=self.call('bridge_operation_get',operation_id=oid)
+        self.assertNotIn('timed out',json.dumps(got)); self.assertNotIn('error',got['data'])
+        self.assertEqual((self.backend.posts,self.backend.pushes),(1,1))
+
+    def test_reply_after_unknown_or_failed_close_is_attached(self):
+        for state in ('unknown','failed'):
+            with self.subTest(closed=state):
+                sid,oid,mid=self.observing('late_reply_'+state+'_0001')
+                if state=='unknown':
+                    self.engine.observe_retry_limit=1; self.flaky(1); self.engine.tick()
+                else:
+                    self.backend.messages[mid]['state']='failed'; self.engine.tick()
+                closed=self.engine.operation(oid,'owner-a')
+                self.assertEqual(closed['status'],state); code=closed['failure']['code']
+                if state=='unknown':
+                    self.assertEqual(self.send(sid,key='blocked_message_001')['error']['code'],'SESSION_BUSY')
+                counts=(self.backend.posts,self.backend.pushes)
+                self.engine.watch_at.clear(); self.engine.tick()
+                self.assertEqual(self.engine.operation(oid,'owner-a')['status'],state)
+                self.reply(mid,'late answer'); self.engine.tick()
+                self.assertEqual(self.engine.operation(oid,'owner-a')['status'],state)  # Not due yet.
+                self.restart(); self.backend.retire_reply=lambda m,parent:self.retired.append((m,parent))
+                self.engine.tick()
+                got=self.call('bridge_operation_get',operation_id=oid)['data']
+                self.assertEqual((got['status'],got['result']['text'],got['failure']),('succeeded','late answer',None))
+                self.assertEqual(self.engine.operation(oid,'owner-a')['settled_after'],{'status':state,'code':code})
+                self.assertEqual(self.retired,[('r1',mid)])
+                self.assertEqual((self.backend.posts,self.backend.pushes),counts)
+                if state=='unknown':
+                    self.assertTrue(self.send(sid,key='unblocked_message_1')['ok'])
+
+    def test_late_settle_restarts_retention_from_the_success(self):
+        sid,oid,mid=self.observing(); self.backend.messages[mid]['state']='failed'; self.engine.tick()
+        op=self.engine.operation(oid,'owner-a'); self.assertEqual(op['status'],'failed')
+        self.engine.update(op,finished_epoch=time.time()-phase.RETENTION+60)
+        self.reply(mid,'late answer'); self.engine.watch_at.clear(); self.engine.tick()
+        settled=self.engine.operation(oid,'owner-a')
+        self.assertEqual(settled['status'],'succeeded')
+        self.assertLess(time.time()-settled['finished_epoch'],30)
+        with patch.object(phase.time,'time',return_value=time.time()+120): self.engine.tick()
+        self.assertEqual(self.call('bridge_operation_get',operation_id=oid)['data']['result']['text'],'late answer')
+
+    def test_reply_watch_never_changes_a_closed_operation_on_error(self):
+        sid,oid,mid=self.observing(); self.backend.messages[mid]['state']='failed'; self.engine.tick()
+        before=self.engine.operation(oid,'owner-a')
+        self.flaky(1,OSError('down')); self.engine.watch_at.clear(); self.engine.tick()
+        self.backend.replies[mid]=[{'id':'bad','reply_to':mid,'body':'no created field'}]
+        self.engine.watch_at.clear(); self.engine.tick()
+        after=self.engine.operation(oid,'owner-a')
+        self.assertEqual((after['status'],after['failure']),(before['status'],before['failure']))
+        self.assertFalse(self.engine.stop.is_set())
+
+    def test_recovery_read_error_keeps_running_and_the_recovery_rule(self):
+        sid=self.create()['agent_session_id']; oid=self.send(sid)['data']['operation_id']
+        op=self.engine.operation(oid,'owner-a'); m=self.backend.post(op,{})
+        self.engine.update(op,status='running',stage='posted',backend_id=m['id'],instance=self.backend.current)
+        self.flaky(1); self.restart()
+        self.assertEqual(self.engine.operation(oid,'owner-a')['status'],'running')
+        self.engine.observe_at.clear(); self.engine.tick()
+        self.assertEqual(self.engine.operation(oid,'owner-a')['status'],'unknown')
+        self.assertEqual(self.backend.pushes,0)
     def test_tombstone_and_private_permissions(self):
         op=self.create(); stored=self.engine.operation(op['operation_id'],'owner-a')
         self.engine.update(stored,finished_epoch=time.time()-phase.RETENTION-1); self.engine.tick()
@@ -373,6 +505,19 @@ class BrokerIntegrationTest(unittest.TestCase):
                     engine.tick();result=engine.get({'operation_id':op['operation_id']},'test-owner')
                     self.assertEqual(result['result']['text'],'actual correlated reply')
                     self.assertEqual(result['status'],'succeeded')
+                    # Issue #134 against a real broker: the read fails once, the operation closes,
+                    # the reply arrives pending, and a later read attaches and resolves it.
+                    engine.observe_retry_limit=1
+                    late=engine.call('bridge_message_send',{'agent_session_id':op['agent_session_id'],'message':'again','idempotency_key':'integrate_message2'})['data']
+                    with patch.object(phase.bridge,'push_if_peer',side_effect=mock_peer), patch.object(backend,'observe',side_effect=TimeoutError('timed out')):
+                        engine.tick()
+                    op=engine.operation(late['operation_id'],'test-owner')
+                    self.assertEqual((op['status'],op['backend_message_state'],op['error']['type']),('unknown','submitted','TimeoutError'))
+                    answer=running.call('reply',id=op['backend_id'],body='late correlated reply',key='late-reply-key')
+                    self.assertEqual(running.call('show',id=answer['id'])['state'],'pending')
+                    engine.tick();result=engine.get({'operation_id':op['operation_id']},'test-owner')
+                    self.assertEqual((result['status'],result['result']['text']),('succeeded','late correlated reply'))
+                    self.assertEqual(running.call('show',id=answer['id'])['state'],'done')
             finally:
                 engine.close()
 
