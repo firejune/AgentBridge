@@ -125,9 +125,136 @@ def read_codex(sid):
     return result
 
 
+CLAUDE_TOKENS = (('input_tokens', ('input_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens')),
+                 ('cached_input_tokens', ('cache_read_input_tokens',)),
+                 ('cache_write_tokens', ('cache_creation_input_tokens',)),
+                 ('output_tokens', ('output_tokens',)))
+CLAUDE_COUNTERS = ('input_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens', 'output_tokens')
+CLAUDE_DIFFERING = 'lines of one response carry differing usage; per-counter maximum kept'
+
+
+def claude_responses(path, skip_ids, notes, responses=None):
+    """Unique responses of one transcript as {key: (model, counters)}, plus its timestamps.
+
+    One response is written as one line per content block carrying the same usage, so lines are keyed
+    on message.id + requestId (message.id alone when requestId is missing). A response whose message.id
+    is in skip_ids (already counted in the parent transcript) is dropped. Pass `responses` to merge
+    several transcripts into one deduplicated set.
+    """
+    responses, timestamps = {} if responses is None else responses, []
+    with path.open(encoding='utf-8') as stream:
+        for number, line in enumerate(stream, 1):
+            try:
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    raise ValueError('record is not an object')
+                stamp = row.get('timestamp')
+                if stamp is not None:
+                    parsed = datetime.fromisoformat(stamp.replace('Z', '+00:00'))
+                    if parsed.tzinfo is None:
+                        raise ValueError('timestamp lacks timezone')
+                    timestamps.append((stamp, parsed))
+                message = row.get('message')
+                if row.get('type') != 'assistant' or not isinstance(message, dict):
+                    continue
+                usage = message.get('usage')
+                if not isinstance(usage, dict):
+                    continue
+                mid = message.get('id')
+                if mid is not None and mid in skip_ids:
+                    continue
+                counters = {key: count(usage.get(key)) for key in CLAUDE_COUNTERS}
+                earlier = None
+                if mid is None:
+                    key = (None, None, str(path), number)
+                    if 'usage line without message.id counted per line' not in notes:
+                        notes.append('usage line without message.id counted per line')
+                elif row.get('requestId'):
+                    key = (mid, row['requestId'])
+                    earlier = responses.pop((mid, None), None)  # an earlier line of this response lacked requestId
+                else:
+                    key = next((k for k in responses if k[0] == mid), (mid, None))
+                earlier = responses.get(key, earlier)
+                if earlier is not None:
+                    if earlier[1] != counters and CLAUDE_DIFFERING not in notes:
+                        notes.append(CLAUDE_DIFFERING)
+                    # Streamed block lines grow output_tokens; a later rewrite can carry zeros. The
+                    # response's own figure is the largest any of its lines recorded, per counter.
+                    counters = {k: None if earlier[1][k] is None or v is None else max(earlier[1][k], v)
+                                for k, v in counters.items()}
+                responses[key] = (message.get('model'), counters)
+            except (ValueError, TypeError, AttributeError) as error:
+                raise ValueError(f'{path}: record {number}: {error}') from error
+    return responses, timestamps
+
+
+def claude_totals(responses):
+    """Normalised sums; a field is None when any response lacks one of its counters."""
+    totals = {}
+    for field, keys in CLAUDE_TOKENS:
+        values = [usage[key] for _, usage in responses.values() for key in keys]
+        totals[field] = None if any(v is None for v in values) else sum(values)
+    return totals
+
+
 def read_claude(sid):
+    """Sum unique responses of the session transcript; sub-agent transcripts are reported apart."""
+    import uuid
+    try:
+        sid = str(uuid.UUID(sid))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise ValueError(f'Claude session id is not a UUID: {sid}') from error
+    root = sessions.claude_projects_dir()
+    paths = sorted(root.glob(f'*/{sid}.jsonl'))
+    if len(paths) != 1:
+        found = 'no Claude transcript found' if not paths else f'{len(paths)} transcripts match'
+        raise ValueError(f"{root / '*' / (sid + '.jsonl')}: {found}")
+    path = paths[0]
     result = empty('claude', sid)
-    result['notes'].append('reader not implemented')
+    result['notes'] = ['sub-agent usage excluded from the top-level figures; reported separately under subagents']
+    result['source'] = str(path)
+    try:
+        responses, timestamps = claude_responses(path, (), result['notes'])
+        main_ids = {key[0] for key in responses if key[0] is not None}
+        subagent_files = sorted((path.parent / sid / 'subagents').glob('agent-*.jsonl'))
+        side = {}
+        for file in subagent_files:
+            claude_responses(file, main_ids, result['notes'], side)
+    except OSError as error:
+        raise ValueError(f'{path}: transcript unreadable: {error}') from error
+    result.update(claude_totals(responses))
+    result['subagents'] = dict(claude_totals(side), count=len(subagent_files))
+    models, skipped = [], set()
+    for model, _ in responses.values():
+        if not isinstance(model, str) or not model or model.startswith('<'):
+            skipped.add(str(model))
+        else:
+            models.append(model)
+    if skipped:
+        result['notes'].append('placeholder model values ignored: ' + ', '.join(sorted(skipped)))
+    if models:
+        result['model'] = models[-1]
+    for field in ('model', 'input_tokens', 'cached_input_tokens', 'cache_write_tokens', 'output_tokens'):
+        if result[field] is None:
+            result['notes'].append(f'{field} unavailable from record')
+    result['notes'].append('responses deduplicated on message.id + requestId (message.id alone when requestId is missing)')
+    result['notes'].append('input_tokens = input + cache_creation + cache_read; cached_input_tokens = cache_read; '
+                           'cache_write_tokens = cache_creation; output_tokens = output')
+    result['notes'].append('cache_write_tokens priced at the input rate; cache-write surcharge not applied')
+    if len(set(models)) > 1:
+        result['notes'].append('multiple models recorded; model is the last recorded model; usd unavailable')
+    if timestamps:
+        # Claude writes some records (attachments, queued prompts) after later ones, so file order is
+        # not time order; durations are taken over the recorded instants in time order.
+        ordered = sorted(timestamps, key=lambda stamp: stamp[1])
+        if ordered != timestamps:
+            result['notes'].append('timestamps not in file order; first_ts, last_ts and durations use time order')
+        gaps = [(b[1]-a[1]).total_seconds() for a, b in zip(ordered, ordered[1:])]
+        result['first_ts'], result['last_ts'] = ordered[0][0], ordered[-1][0]
+        result['wall_seconds'] = (ordered[-1][1]-ordered[0][1]).total_seconds()
+        result['active_seconds'] = sum(gap for gap in gaps if gap <= 600)
+    else:
+        result['notes'].append('timestamps not recorded; durations unavailable')
     return result
 
 

@@ -194,7 +194,9 @@ JSON 필드는 `provider`, `id`, `model`, `input_tokens`(캐시 포함), `cached
 `active_seconds`, `usd`, `source`, `notes`다. 모르는 값은 설명과 함께 null이며 일반 출력도
 같은 필드를 한 줄로 표시한다. Codex는 마지막 누적 `total_token_usage`만 읽고 reasoning을
 output에 다시 더하지 않는다. active 시간은 600초를 넘는 간격 전체를 제외한 기록 간 시간이다.
-여러 모델이면 마지막 모델과 설명을 표시하고 USD는 null이다. Claude·Antigravity는 현재
+여러 모델이면 마지막 모델과 설명을 표시하고 USD는 null이다. Claude는 `CLAUDE_CONFIG_DIR`(기본 `~/.claude`)의
+transcript에서 message·request id로 중복을 뺀 응답을 합산하고 sub-agent transcript는 `subagents`에
+따로 보고한다. Antigravity는 현재
 `reader not implemented` 설명과 null을 반환하는 독립 함수이며 해당 담당자가 추가한다.
 
 `--prices FILE`은 `model id | input | cached input | output` 헤더의 Markdown 표를 읽는다.
