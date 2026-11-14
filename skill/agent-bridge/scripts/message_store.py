@@ -183,6 +183,9 @@ class MessageStore:
         self.loss = self.path.with_name('correspondence-lost.json').exists()
         self.max_messages = max_messages
         self.retained_limit = max_messages
+        self.last_save_seconds = None
+        self.max_save_seconds = 0.0
+        self.checkpoint_bytes = 0
         self.max_bytes = max_messages * FRAME_BYTES + SNAPSHOT_BYTES + MAX_RECEIPTS * 1024
         self.restore_bytes = max(max_messages, RESTORE_MESSAGES) * FRAME_BYTES + SNAPSHOT_BYTES + MAX_RECEIPTS * 1024
 
@@ -223,6 +226,23 @@ class MessageStore:
             raise OSError(error.errno, error.strerror or str(error), str(path)) from error
 
     def save(self, state):
+        started = time.monotonic()
+        try:
+            self._save(state)
+        finally:
+            self.last_save_seconds = time.monotonic() - started
+            self.max_save_seconds = max(self.max_save_seconds, self.last_save_seconds)
+            if self.last_save_seconds > 1:
+                # Volatile diagnostics only: never expose bodies, routes or paths.
+                try:
+                    print(json.dumps(dict(event='checkpoint_save_slow',
+                                          duration_seconds=self.last_save_seconds,
+                                          bytes=self.checkpoint_bytes,
+                                          retained_count=len(state.messages))), file=sys.stderr, flush=True)
+                except (OSError, ValueError):
+                    pass  # A diagnostic cannot change durable acceptance.
+
+    def _save(self, state):
         messages = [message_record(m) for m in state.messages.values()]
         if len(messages) > self.retained_limit:
             raise ValueError('Correspondence message count limit reached')
@@ -252,6 +272,7 @@ class MessageStore:
             atomic_write(self.manifest, encoded(dict(version=1, messages=index)))
             atomic_write(self.path, data)
         self.retained_limit = max(self.max_messages, len(messages))
+        self.checkpoint_bytes = len(data)
 
     def load(self):
         self.read_loss_reports()

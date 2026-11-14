@@ -364,3 +364,5 @@ fork·subagent는 `subagent_history_start_ordinal` 경계 또는 부모 snapshot
 누적값에 더하지 않는다. `scope: "session-alone"`, `subagents: null`은 세션 단독 수치와
 하위 에이전트 수치를 분리한다. provider reader는 독립적인 결과 객체 목록으로 `subagents`를
 채울 수 있으며 캐시 입력 정규화는 notes와 fixture 테스트에 명시한다.
+
+`ping`은 `checkpoint_last_save_seconds`, `checkpoint_max_save_seconds`, `checkpoint_bytes`를 반환한다. 각각 마지막 저장 시도 시간, 브로커 시작 이후 최대 시간(실패한 시도 포함, 초), 마지막으로 성공한 `correspondence.json` 페이로드 크기(메타데이터 인덱스 제외, 바이트)다. 저장소가 없으면 각각 `null`, `0.0`, `0`이다. 저장이 1초를 넘으면 `checkpoint_save_slow` JSON 로그 한 줄을 stderr에 남긴다. `duration_seconds`, `bytes`, `retained_count`만 포함하며 실패 시 `bytes`는 마지막 성공 크기다. 시간에는 검증·직렬화·영속 쓰기가 포함되며 변경 상태 준비는 제외한다. 계측은 재시작하면 초기화되며 저장 순서·내구성·전달 동작은 바뀌지 않는다.

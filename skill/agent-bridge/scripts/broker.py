@@ -559,6 +559,9 @@ class State:
             return {'instance':self.instance,'messages':len(self.messages),'subscribers':len(self.subscribers),
                     'correspondence_lost': bool(self.correspondence and self.correspondence.loss),
                     'correspondence_over_limit': len(self.messages) > self.max_messages,
+                    'checkpoint_last_save_seconds': self.correspondence.last_save_seconds if self.correspondence else None,
+                    'checkpoint_max_save_seconds': self.correspondence.max_save_seconds if self.correspondence else 0.0,
+                    'checkpoint_bytes': self.correspondence.checkpoint_bytes if self.correspondence else 0,
                     'max_messages': self.max_messages}
         if op == 'register':
             project, name = identifier(args['project']), identifier(args['name'])
