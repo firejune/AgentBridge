@@ -182,6 +182,20 @@ python3 "$bridge_cli" usage --events               # Reset history, spend horizo
 - Each sample is keyed by an opaque hash of the account its source reports (never the address or name). Burn and `AT RISK` use only samples of the account the latest read saw; after a login switch, the other account's samples are dropped from the reading, not blended.
 - Run inside a Claude Code session (`CLAUDE_CODE_SESSION_ID` set), `usage` prints `warning: you are a Claude session; read your own Claude limits from the app (get_usage). …` before any Claude bucket (`--json`: a `warning` field). A Claude session reads its own limits from the app; these figures are for the other surface and may lag.
 
+
+#### Per-session consumption (`session-usage`)
+
+`bridge.py session-usage NAME --project P [--json] [--prices FILE]` reads one
+session without starting a turn, contacting a provider, or writing its files.
+Use `session-usage --provider codex --id ID --json` without a route. Codex reads
+the last cumulative rollout count, including cached input and reasoning within
+output; wall time spans the record and active time excludes gaps over 600 seconds.
+Unknown values are null with notes. Claude and Antigravity are reader stubs in
+this first step. Optional prices use `model id | input | cached input | output`
+columns in USD per million tokens; no default prices are loaded. See the
+[usage reference](skill/agent-bridge/references/usage.md#per-session-consumption-session-usage)
+for fields, formula, offline lookup and reader extension details.
+
 ### 4. Agent Worktrees (`wt`)
 
 Keep the main repository checkout clean on `main` and isolate every agent's work under `<workspace>/.worktrees/<repo>/<agent>-<issue>`:

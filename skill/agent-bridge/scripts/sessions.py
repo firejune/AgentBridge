@@ -207,6 +207,14 @@ def list_codex(executable='codex', cwd=None, search=None, limit=100, mode='auto'
 
 def read_codex(sid, executable='codex', mode='auto'):
     sid = str(uuid.UUID(sid))
+    if mode == 'record':
+        # Offline lookup: do not start app-server (which may maintain provider files).
+        root = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex').expanduser()
+        patterns = (f'sessions/**/rollout-*-{sid}.jsonl', f'archived_sessions/**/rollout-*-{sid}.jsonl')
+        paths = [path for pattern in patterns for path in root.glob(pattern)]
+        if len(paths) != 1:
+            raise ValueError(f'Expected one Codex record at {root}/{{sessions,archived_sessions}}/**/rollout-*-{sid}.jsonl; found {len(paths)}')
+        return {'session': {'provider': 'codex', 'id': sid, 'path': str(paths[0])}, 'warning': None}
     with CodexClient(executable,mode) as client:
         result = client.call('thread/read',{'threadId':sid,'includeTurns':False})
         item = result.get('thread')
