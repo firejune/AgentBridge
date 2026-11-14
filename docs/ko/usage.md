@@ -346,8 +346,10 @@ JSON 필드는 `provider`, `id`, `model`, `input_tokens`(캐시 포함), `cached
 output에 다시 더하지 않는다. active 시간은 600초를 넘는 간격 전체를 제외한 기록 간 시간이다.
 여러 모델이면 마지막 모델과 설명을 표시하고 USD는 null이다. Claude는 `CLAUDE_CONFIG_DIR`(기본 `~/.claude`)의
 transcript에서 message·request id로 중복을 뺀 응답을 합산하고 sub-agent transcript는 `subagents`에
-따로 보고한다. Antigravity는 현재
-`reader not implemented` 설명과 null을 반환하는 독립 함수이며 해당 담당자가 추가한다.
+따로 보고한다. Antigravity는 `conversations/<id>.db`(`-wal`/`-shm` 포함)를 임시 디렉터리로 복사해
+응답 ID `#11`로 중복 제거한 `gen_metadata` 행을 합산하며(전체 0 행 건너뜀, `#9 + #10 == #3` 항등식 검증),
+`input_tokens = #2 + #5 + #4`, `cached_input_tokens = #5`, `cache_write_tokens = #4`,
+`output_tokens = #3`으로 정규화하고 타임스탬프는 null로 두며 재시도 사용량 포함 여부가 미확인임을 설명에 남긴다.
 
 `--prices FILE`은 `model id | input | cached input | output` 헤더의 Markdown 표를 읽는다.
 단위는 백만 토큰당 USD이고 기본 파일은 없다. 계산식은

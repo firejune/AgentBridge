@@ -207,7 +207,12 @@ it measures record activity, not CPU time. Multiple recorded models retain the
 last model with a note and no USD attribution. Claude sums the unique responses of
 the transcript under `CLAUDE_CONFIG_DIR` (or `~/.claude`), deduplicated on message
 and request id, and reports sub-agent transcripts separately under `subagents`;
-Antigravity currently returns nulls with `reader not implemented`.
+Antigravity copies `conversations/<id>.db` (with `-wal`/`-shm`) to a temporary
+directory and sums `gen_metadata` protobuf rows deduplicated by response ID `#11`
+(skipping all-zero rows and verifying `#9 + #10 == #3`), normalising
+`input_tokens = #2 + #5 + #4`, `cached_input_tokens = #5`, `cache_write_tokens = #4`,
+and `output_tokens = #3` while leaving timestamps null and noting that retry-usage
+inclusion in `gen_metadata` is unknown.
 
 `--prices FILE` accepts a Markdown table headed `model id | input | cached input |
 output`, with USD per million tokens. There is no default price file. USD is
