@@ -191,7 +191,9 @@ Use `session-usage --provider codex --id ID --json` without a route. Codex reads
 the last cumulative rollout count, including cached input and reasoning within
 output; wall time spans the record and active time excludes gaps over 600 seconds.
 Unknown values are null with notes. Claude sums the transcript's unique responses,
-reporting sub-agents apart; Antigravity is a reader stub in this first step. Optional prices use `model id | input | cached input | output`
+reporting sub-agents apart; Antigravity reads a temporary copy of
+`conversations/<id>.db` (with `-wal`/`-shm`), summing deduplicated `gen_metadata`
+rows (`input_tokens = #2 + #5 + #4`, `output_tokens = #3 = #9 + #10`). Optional prices use `model id | input | cached input | output`
 columns in USD per million tokens; no default prices are loaded. See the
 [usage reference](skill/agent-bridge/references/usage.md#per-session-consumption-session-usage)
 for fields, formula, offline lookup and reader extension details.

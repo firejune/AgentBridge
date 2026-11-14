@@ -259,9 +259,198 @@ def read_claude(sid):
 
 
 def read_agy(sid):
-    result = empty('agy', sid)
-    result['notes'].append('reader not implemented')
+    """Read per-generation protobuf usage from a temporary copy of conversations/<sid>.db."""
+    path = _agy_record_path(sid)
+    result = empty('agy', str(path.stem))
+    result['source'] = str(path)
+    models, by_rid, anonymous_rows, differing_dups, failed = set(), {}, [], False, False
+    # Copy .db with any -wal/-shm files into a temp dir: opening a WAL database
+    # in place with mode=ro still creates/touches <sid>.db-shm in the live directory.
+    with _agy_temp_copy(path) as copied:
+        try:
+            with _agy_connect(copied) as conn:
+                has_table = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='gen_metadata'"
+                ).fetchone()
+                rows = conn.execute('SELECT idx, data FROM gen_metadata ORDER BY idx').fetchall() if has_table else None
+        except _agy_sqlite_error() as error:
+            raise ValueError(f'{path}: {error}') from error
+    if rows is None:
+        result['notes'].append('gen_metadata table missing; tokens unavailable')
+        failed = True
+    else:
+        for idx, data in rows:
+            if not data:
+                continue
+            try:
+                if not isinstance(data, (bytes, bytearray, memoryview)):
+                    raise ValueError('row data is not bytes')
+                top = _agy_fields(bytes(data))
+                cm_bytes = _agy_submessage(top, 1)
+                if not cm_bytes:
+                    continue
+                cm = _agy_fields(cm_bytes)
+                model_bytes = _agy_scalar_bytes(cm, 19)
+                if model_bytes:
+                    model_name = model_bytes.decode('utf-8', errors='replace').strip()
+                    if model_name:
+                        models.add(model_name)
+                        result['model'] = model_name
+                usage_bytes = _agy_submessage(cm, 4)
+                if usage_bytes is None:
+                    continue
+                usage_fields = _agy_fields(usage_bytes)
+            except ValueError as error:
+                result['notes'].append(f'gen_metadata row {idx} invalid protobuf ({error}); tokens unavailable')
+                failed = True
+                break
+            nums = _agy_varints(usage_fields)
+            if not any(nums.get(k, 0) for k in (2, 3, 4, 5, 9, 10)):
+                continue
+            if nums.get(9, 0) + nums.get(10, 0) != nums.get(3, 0):
+                result['notes'].append(f'gen_metadata row {idx} failed output identity (#9 + #10 != #3); tokens unavailable')
+                failed = True
+                break
+            row_counts = {k: nums.get(k, 0) for k in (2, 3, 4, 5)}
+            rid = _agy_scalar_bytes(usage_fields, 11)
+            if rid is not None:
+                earlier = by_rid.get(rid)
+                if earlier is not None:
+                    if earlier != row_counts:
+                        differing_dups = True
+                    row_counts = {k: max(earlier[k], row_counts[k]) for k in (2, 3, 4, 5)}
+                by_rid[rid] = row_counts
+            else:
+                anonymous_rows.append(row_counts)
+    all_rows = [*by_rid.values(), *anonymous_rows]
+    if differing_dups:
+        result['notes'].append('duplicate response ids had differing counters; per-counter maximum kept')
+    if not failed and all_rows:
+        totals = {k: sum(row[k] for row in all_rows) for k in (2, 3, 4, 5)}
+        result['input_tokens'] = totals[2] + totals[5] + totals[4]
+        result['cached_input_tokens'] = totals[5]
+        result['cache_write_tokens'] = totals[4]
+        result['output_tokens'] = totals[3]
+    for field in ('model', 'input_tokens', 'cached_input_tokens', 'cache_write_tokens', 'output_tokens'):
+        if result[field] is None:
+            result['notes'].append(f'{field} unavailable from record')
+    result['notes'].append(
+        'input_tokens is #2 + #5 + #4 (non-cached input + cached_input_tokens #5 + cache_write_tokens #4); '
+        'output_tokens is #3 (#9 thinking + #10 response)'
+    )
+    result['notes'].append('whether retry usage is recorded in gen_metadata is unknown')
+    if len(models) > 1:
+        result['notes'].append('multiple models recorded; model is the last recorded model; usd unavailable')
+    result['notes'].append('timestamps not recorded in gen_metadata; durations unavailable')
     return result
+
+
+def _agy_record_path(sid):
+    import os
+    import uuid
+    sid = str(uuid.UUID(sid))
+    env = os.environ.get('AGY_HOME')
+    roots = (Path(env).expanduser(),) if env else (
+        Path.home() / '.gemini' / 'antigravity',
+        Path.home() / '.gemini' / 'antigravity-ide',
+        Path.home() / '.antigravity_cli',
+    )
+    candidates = [root / 'conversations' / f'{sid}.db' for root in roots]
+    found = [path for path in candidates if path.exists()]
+    if len(found) != 1:
+        searched = str(candidates[0]) if len(candidates) == 1 else ', '.join(str(p) for p in candidates)
+        raise ValueError(f'Expected one Antigravity record at {searched}; found {len(found)}')
+    return found[0]
+
+
+def _agy_temp_copy(path):
+    from contextlib import contextmanager
+    import shutil
+    import tempfile
+
+    @contextmanager
+    def _ctx():
+        with tempfile.TemporaryDirectory() as tmp:
+            dst = Path(tmp) / path.name
+            shutil.copy2(path, dst)
+            for suffix in ('-wal', '-shm'):
+                sidecar = Path(f'{path}{suffix}')
+                if sidecar.exists():
+                    shutil.copy2(sidecar, Path(f'{dst}{suffix}'))
+            yield dst
+
+    return _ctx()
+
+
+def _agy_connect(path):
+    from contextlib import closing
+    import sqlite3
+    return closing(sqlite3.connect(path))
+
+
+def _agy_sqlite_error():
+    import sqlite3
+    return sqlite3.DatabaseError
+
+
+def _agy_varint(buf, index):
+    result = shift = 0
+    while index < len(buf) and shift < 64:
+        byte = buf[index]
+        index += 1
+        result |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return result, index
+        shift += 7
+    raise ValueError('truncated or overflowed varint')
+
+
+def _agy_fields(buf):
+    import struct
+    index, out = 0, []
+    while index < len(buf):
+        tag, index = _agy_varint(buf, index)
+        field_num, wire_type = tag >> 3, tag & 7
+        if field_num <= 0:
+            raise ValueError('invalid field number')
+        if wire_type == 0:
+            value, index = _agy_varint(buf, index)
+        elif wire_type == 2:
+            length, index = _agy_varint(buf, index)
+            if index + length > len(buf):
+                raise ValueError('truncated length-delimited field')
+            value = buf[index:index + length]
+            index += length
+        elif wire_type == 1:
+            if index + 8 > len(buf):
+                raise ValueError('truncated 64-bit field')
+            value = struct.unpack_from('<Q', buf, index)[0]
+            index += 8
+        elif wire_type == 5:
+            if index + 4 > len(buf):
+                raise ValueError('truncated 32-bit field')
+            value = struct.unpack_from('<I', buf, index)[0]
+            index += 4
+        else:
+            raise ValueError(f'unsupported wire type {wire_type}')
+        out.append((field_num, wire_type, value))
+    return out
+
+
+def _agy_submessage(fields, number):
+    chunks = [value for fn, wt, value in fields if fn == number and wt == 2]
+    return b''.join(chunks) if chunks else None
+
+
+def _agy_scalar_bytes(fields, number):
+    for fn, wt, value in reversed(fields):
+        if fn == number and wt == 2:
+            return value
+    return None
+
+
+def _agy_varints(fields):
+    return {fn: value for fn, wt, value in fields if wt == 0}
 
 
 def prices(path):
