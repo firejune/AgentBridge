@@ -353,7 +353,7 @@ def _agy_record_path(sid):
     roots = (Path(env).expanduser(),) if env else (
         Path.home() / '.gemini' / 'antigravity',
         Path.home() / '.gemini' / 'antigravity-ide',
-        Path.home() / '.antigravity_cli',
+        Path.home() / '.gemini' / 'antigravity-cli',
     )
     candidates = [root / 'conversations' / f'{sid}.db' for root in roots]
     found = [path for path in candidates if path.exists()]
