@@ -182,6 +182,18 @@ python3 "$bridge_cli" usage --events               # 리셋 이력, spend horizo
 - 표본마다 원천이 알려 준 계정을 불투명한 해시로 붙인다(주소 · 이름은 저장하지 않는다). 소모율과 `AT RISK`는 가장 최근 읽기가 본 계정의 표본만 쓴다 — 로그인이 바뀌면 다른 계정의 표본은 섞지 않고 판독에서 뺀다.
 - Claude Code 세션 안에서(`CLAUDE_CODE_SESSION_ID`가 있으면) `usage`는 Claude 버킷 앞에 `warning: you are a Claude session; read your own Claude limits from the app (get_usage). …` 한 줄을 찍는다(`--json`은 `warning` 필드). Claude 세션은 자기 한도를 앱에서 읽는다 — 이 수치는 다른 표면용이고 늦을 수 있다.
 
+
+#### 세션별 소비량 (`session-usage`)
+
+`bridge.py session-usage NAME --project P [--json] [--prices FILE]`은 턴·provider 통신·
+provider 파일 쓰기 없이 세션 하나를 읽는다. 라우트 없이도
+`session-usage --provider codex --id ID --json`을 사용할 수 있다. Codex는 마지막 누적
+rollout 값(캐시 포함 input, reasoning 포함 output)을 사용한다. wall 시간은 기록 전체,
+active 시간은 600초 초과 간격을 뺀 값이다. 모르는 값은 설명과 함께 null이다.
+이번 단계의 Claude·Antigravity는 reader 스텁이다. 선택적인 가격 표는
+`model id | input | cached input | output` 열, 백만 토큰당 USD이며 기본 가격은 없다.
+필드·계산식·offline 조회·reader 확장은 [사용법](usage.md#세션별-소비량-session-usage)을 참고한다.
+
 ### 4. 에이전트 워크트리 (`wt`)
 
 메인 저장소 체크아웃은 항상 `main`으로 유지하고, 각 에이전트의 코드 작업은 `<workspace>/.worktrees/<repo>/<agent>-<issue>` 아래 격리된 워크트리에서 수행한다.

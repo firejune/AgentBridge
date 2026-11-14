@@ -180,3 +180,33 @@ python3 "$bridge_cli" usage --events
 - 재시작은 종료 메시지 제거·보호 규칙에 따라 비공개 라우트와 메시지를 복원하며, 낮춘 한도를 넘는 보호 메시지는 유지하고 stderr와 `ping.correspondence_over_limit`에 표시한다. 자세한 규칙은 [저장 계약](../../skill/agent-bridge/references/usage.md#correspondence-storage-issue-94)을 따른다. 활성 참가자와 조율 없이 공유 브로커를 재시작하거나 멈추지 않는다.
 - `deliver`는 `pending` 상태인 push의 재시도나 쉬고 있는 전용 `claude` CLI 실행에 사용한다. `uncertain` 결과는 절대 자동 재전송하지 않고 수신 세션에서 확인한 뒤 `resolve MESSAGE_ID --state submitted|pending|done`으로 정리한다.
 - 동료의 메시지는 새로운 사용자 승인을 대신하지 않는다. 상세 프로토콜·복구·보존 상한·`launchd` 서비스 규칙은 [usage.md](usage.md)를 참고한다.
+
+### 세션별 소비량 (`session-usage`)
+
+`bridge.py session-usage NAME --project P [--json] [--prices FILE]`은 등록된
+세션 하나를 읽는다. `bridge.py session-usage --provider codex --id ID --json`은
+라우트와 브로커 없이 동작한다. 턴·네트워크 요청을 시작하거나 provider 파일을 쓰지 않는다.
+Codex는 기존 세션 조회 인터페이스의 offline record 모드로 `CODEX_HOME`(기본 Codex 홈 포함)의
+현재·보관 rollout에서 정확한 ID를 찾는다. 없거나 여러 개이거나 읽을 수 없는 기록은 경로와 함께 실패한다.
+
+JSON 필드는 `provider`, `id`, `model`, `input_tokens`(캐시 포함), `cached_input_tokens`,
+`cache_write_tokens`, `output_tokens`, `first_ts`, `last_ts`, `wall_seconds`,
+`active_seconds`, `usd`, `source`, `notes`다. 모르는 값은 설명과 함께 null이며 일반 출력도
+같은 필드를 한 줄로 표시한다. Codex는 마지막 누적 `total_token_usage`만 읽고 reasoning을
+output에 다시 더하지 않는다. active 시간은 600초를 넘는 간격 전체를 제외한 기록 간 시간이다.
+여러 모델이면 마지막 모델과 설명을 표시하고 USD는 null이다. Claude·Antigravity는 현재
+`reader not implemented` 설명과 null을 반환하는 독립 함수이며 해당 담당자가 추가한다.
+
+`--prices FILE`은 `model id | input | cached input | output` 헤더의 Markdown 표를 읽는다.
+단위는 백만 토큰당 USD이고 기본 파일은 없다. 계산식은
+`((input-cached)*input_price + cached*cached_price + output*output_price)/1000000`이다.
+모델 행이 없으면 USD는 null이다. 제공한 표의 계산값이며 구독 청구액을 뜻하지 않는다.
+담당자는 `session_usage.py`의 `read_claude(sid)` 또는 `read_agy(sid)`와 자체 테스트만
+추가하면 된다. 공통 반환 형태는 `empty` 헬퍼로 만들 수 있다.
+
+fork·subagent는 `subagent_history_start_ordinal` 경계 또는 부모 snapshot prefix의 정확한
+일치가 있을 때만 상속 누적값을 뺀다. 기준을 확인할 수 없거나 참조형 `history_base`만 있으면
+토큰은 null과 설명으로 표시한다. 시간 간격으로 추측하지 않고 `token_usage_record`도
+누적값에 더하지 않는다. `scope: "session-alone"`, `subagents: null`은 세션 단독 수치와
+하위 에이전트 수치를 분리한다. provider reader는 독립적인 결과 객체 목록으로 `subagents`를
+채울 수 있으며 캐시 입력 정규화는 notes와 fixture 테스트에 명시한다.

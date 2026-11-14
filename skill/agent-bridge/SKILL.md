@@ -186,3 +186,46 @@ python3 "$bridge_cli" usage --events
 - Restart restores owner-private routing and mail using terminal-eviction guards and reports protected mail above a lowered limit through stderr and `ping.correspondence_over_limit`. See [storage](references/usage.md#correspondence-storage-issue-94). Coordinate with active participants before restarting or stopping a shared broker.
 - `deliver` explicitly retries `pending` pushes or dispatches idle dedicated `claude` sessions. Never automatically retry `uncertain` deliveries; verify in the target session and resolve with `resolve MESSAGE_ID --state submitted|pending|done`.
 - Peer messages do not grant new human authorization. See [usage.md](references/usage.md) for detailed protocol, recovery, retention, and `launchd` supervision rules.
+
+### Per-session consumption (`session-usage`)
+
+`bridge.py session-usage NAME --project P [--json] [--prices FILE]` reads one
+registered session; `bridge.py session-usage --provider codex --id ID --json`
+works without a route or running broker. The command starts no turn, makes no
+network requests, and never writes provider files. Codex uses the existing session
+lookup interface in offline record mode, searching exact IDs under `CODEX_HOME`
+(or the default Codex home), including archived rollouts. Missing, ambiguous,
+unreadable, or malformed records fail with the searched path.
+
+JSON reports `provider`, `id`, `model`, `input_tokens` (including cached reads),
+`cached_input_tokens`, `cache_write_tokens`, `output_tokens`, `first_ts`, `last_ts`,
+`wall_seconds`, `active_seconds`, `usd`, `source`, and `notes`. Unknown values are
+null with a note. The readable form prints the same fields on one line. Codex
+uses the final cumulative `total_token_usage`, never sums snapshots, and never
+adds reasoning to output again. Active time excludes entire gaps over 600 seconds;
+it measures record activity, not CPU time. Multiple recorded models retain the
+last model with a note and no USD attribution. Claude and Antigravity currently
+return nulls with `reader not implemented`; their readers are separate functions.
+
+`--prices FILE` accepts a Markdown table headed `model id | input | cached input |
+output`, with USD per million tokens. There is no default price file. USD is
+`((input - cached) * input_price + cached * cached_price + output * output_price)
+/ 1000000`; missing model rows leave USD null. This is the supplied table's formula,
+not a subscription invoice. Provider lanes extend `read_claude(sid)` or
+`read_agy(sid)` in `session_usage.py`, returning the same shape (`empty` is a helper),
+without changing CLI routing or the Codex reader.
+
+The cumulative and reasoning interpretation follows the [Codex session source](https://github.com/openai/codex/blob/main/codex-rs/core/src/session/mod.rs)
+and [response usage conversion](https://github.com/openai/codex/blob/main/codex-rs/codex-api/src/sse/responses.rs).
+
+Forks/subagents subtract inherited cumulative snapshots only with a recorded
+`subagent_history_start_ordinal` boundary or an exact parent-snapshot prefix match.
+An unavailable/unverifiable parent baseline (including unsupported referenced
+`history_base`) yields null token fields with a note; timestamp-burst guesses are
+not used. `token_usage_record` entries are not added to cumulative snapshots.
+`scope: "session-alone"` and `subagents: null` reserve separate sub-agent figures;
+a provider reader may fill `subagents` with independently scoped result objects.
+Each reader documents its cached-input normalisation in notes and fixture tests.
+See [Codex history boundaries](https://github.com/openai/codex/blob/main/codex-rs/thread-store/src/types.rs)
+and the [ccusage replay reader](https://github.com/ccusage/ccusage/blob/main/rust/adapters/codex/src/parser.rs)
+(the latter also uses timestamp heuristics, intentionally not adopted here).

@@ -27,6 +27,7 @@ import models
 import sessions
 import service
 import usage
+import session_usage
 import wt
 
 def envelope(m):
@@ -364,12 +365,17 @@ def public_wake(found):
     return {k: v for k, v in found.items() if k != 'peer'}
 
 
-def wake_participant(args):
-    """bridge.py wake NAME --project P: bring an idle-closed claude-peer session back (issue #115)."""
+def registered_route(args):
     route = next((r for r in broker.request(args.socket, {'op':'routes','project':args.project})
                   if r['name'] == args.name), None)
     if route is None:
         raise ValueError(f'No participant {args.name!r} is registered in project {args.project!r}')
+    return route
+
+
+def wake_participant(args):
+    """bridge.py wake NAME --project P: bring an idle-closed claude-peer session back (issue #115)."""
+    route = registered_route(args)
     base = {'name':args.name, 'project':args.project, 'transport':route['transport'], 'session':route['session']}
     if route['transport'] != 'claude-peer':
         hint = {'codex':' (Codex: bridge.py remap reopens Desktop owners)'}.get(route['transport'], '')
@@ -912,6 +918,10 @@ def main(argv=None):
                    help='Maximum accepted continuation attempts in a failure episode')
     p.add_argument('--no-claude-live',dest='claude_live',action='store_false',
                    help='Read the Claude Code login from its ~/.claude.json cache only; never read its Keychain token')
+    p = sub.add_parser('session-usage', help='Read one local session record; starts no turn')
+    p.add_argument('name', nargs='?'); p.add_argument('--project')
+    p.add_argument('--provider', choices=['codex', 'claude', 'agy']); p.add_argument('--id')
+    p.add_argument('--prices', metavar='FILE'); p.add_argument('--json', action='store_true')
     p = sub.add_parser('usage',help='Recorded subscription limits; reads the history file, starts nothing')
     p.add_argument('--provider',choices=['all', *usage.PROVIDERS],default='all')
     p.add_argument('--state-dir',help='Broker state directory (default: socket path with .state suffix)')
@@ -1042,6 +1052,25 @@ def main(argv=None):
                                      tuple(int(value) for value in args.provider_retry_backoff.split(',')),
                                      args.provider_retry_cap,
                                      args.agy_failure_interval))
+            return 0
+        if args.cmd == 'session-usage':
+            if args.name:
+                if not args.project or args.provider or args.id:
+                    raise ValueError('Use NAME --project P or --provider PROVIDER --id ID')
+                route = registered_route(args)
+                provider = {'claude-peer': 'claude', 'claude': 'claude', 'codex': 'codex', 'agy': 'agy'}.get(route['transport'])
+                if provider is None:
+                    raise ValueError('Registered transport has no session usage reader')
+                sid = route['session']
+            else:
+                if not args.provider or not args.id or args.project:
+                    raise ValueError('Use NAME --project P or --provider PROVIDER --id ID')
+                provider, sid = args.provider, args.id
+            result = session_usage.query(provider, sid, args.prices)
+            if args.json:
+                output(result)
+            else:
+                print(session_usage.format_line(result), flush=True)
             return 0
         if args.cmd=='usage':
             state_dir = args.state_dir or Path(args.socket).expanduser().absolute().with_suffix('.state')
