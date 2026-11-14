@@ -236,3 +236,5 @@ Each reader documents its cached-input normalisation in notes and fixture tests.
 See [Codex history boundaries](https://github.com/openai/codex/blob/main/codex-rs/thread-store/src/types.rs)
 and the [ccusage replay reader](https://github.com/ccusage/ccusage/blob/main/rust/adapters/codex/src/parser.rs)
 (the latter also uses timestamp heuristics, intentionally not adopted here).
+
+`ping` includes `checkpoint_last_save_seconds`, `checkpoint_max_save_seconds` and `checkpoint_bytes`: the last save attempt duration, the maximum since broker start (seconds, including failed attempts), and the payload bytes of the last successful `correspondence.json` save (excluding the metadata index). Without a checkpoint store, these are `null`, `0.0` and `0`. A save taking more than 1 second emits one volatile JSON stderr line (`checkpoint_save_slow`) with `duration_seconds`, `bytes` and `retained_count`; `bytes` still means the last successful payload on failure. Timing covers validation, serialization and durable writes, not mutation staging. The measurements reset on restart; save ordering, durability and delivery behavior are unchanged.
