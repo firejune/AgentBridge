@@ -976,7 +976,7 @@
     },
     {
       "name": "bridge_operation_get",
-      "description": "Read only an operation owned by the authenticated caller for an authorized adapter session. Optional bounded long-poll; no dispatch or replay. Result exists only on succeeded, failure only on failed/unknown. An unknown operation outcome is a successful read with status=unknown, not a tool-call error. Cursor is valid only for completed message-result pagination over immutable Unicode-code-point windows; max_chars also bounds the returned page. Never return another caller's or session's result. Session-create success IDs must agree across data and result. Backend message state is separately observed and is not the adapter status. Absent in Phase 0.",
+      "description": "Read only an operation owned by the authenticated caller for an authorized adapter session. Optional bounded long-poll; no dispatch or replay. Result exists only on succeeded, failure only on failed/unknown. An unknown operation outcome is a successful read with status=unknown, not a tool-call error. An unknown or failed message operation may later become succeeded when a correlated reply to its known message arrives; read the same operation again instead of resending. Cursor is valid only for completed message-result pagination over immutable Unicode-code-point windows; max_chars also bounds the returned page. Never return another caller's or session's result. Session-create success IDs must agree across data and result. Backend message state is separately observed and is not the adapter status. Absent in Phase 0.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",

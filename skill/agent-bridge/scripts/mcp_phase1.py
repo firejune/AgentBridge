@@ -39,6 +39,12 @@ ACTIVE = ('accepted', 'running', 'unknown')
 STATES = {'pending','dispatching','submitted','received','in_progress','answered','done','failed','uncertain'}
 RETENTION = 720 * 3600  # Detailed records >=168h, full keys >=720h; tombstones never deleted.
 MAX_RESULT = 1024 * 1024
+OBSERVE_RETRY_LIMIT = 6    # Consecutive read errors before a known message becomes unknown (issue #134).
+OBSERVE_RETRY_BASE = 1.0   # Seconds before the next read; doubles per consecutive error.
+REPLY_WATCH_FAST = 5.0     # Seconds between reads of a closed operation's known message.
+REPLY_WATCH_SLOW = 60.0    # The same once the operation closed more than REPLY_WATCH_WINDOW ago.
+REPLY_WATCH_WINDOW = 600.0
+UNKNOWN_MESSAGE = 'Unknown message; broker may have restarted'
 
 
 def stamp():
@@ -65,6 +71,14 @@ def iso_timestamp(value):
 def digest(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
                                      separators=(',', ':')).encode()).hexdigest()
+
+
+def describe(error, message=True):
+    """Ledger-only cause of a failure; never part of a tool result."""
+    record = {'type': type(error).__qualname__, 'at': stamp()}
+    if message:
+        record['message'] = str(error)[:300]
+    return record
 
 
 def opaque(prefix):
@@ -439,7 +453,7 @@ class Backend:
         try:
             reply = self.rpc('show', id=mid)
         except ValueError as error:
-            if str(error) == 'Unknown message; broker may have restarted':
+            if str(error) == UNKNOWN_MESSAGE:
                 return
             raise
         if reply.get('reply_to') != parent:
@@ -498,6 +512,9 @@ class Engine:
         self.stop = threading.Event()
         self.wake = threading.Event()
         self.thread = None
+        self.observe_retry_limit, self.observe_retry_base = OBSERVE_RETRY_LIMIT, OBSERVE_RETRY_BASE
+        self.reply_watch_fast, self.reply_watch_slow = REPLY_WATCH_FAST, REPLY_WATCH_SLOW
+        self.observe_at, self.watch_at = {}, {}  # Volatile schedules; a restart only reads sooner.
         self.recover()
         if start:
             self.thread = threading.Thread(target=self.run, daemon=True, name='bridge-mcp-worker')
@@ -697,17 +714,22 @@ class Engine:
             if alias != session['alias']:
                 raise Fault('WORKSPACE_NOT_ALLOWED')
 
-    def fail(self, op, code='DELIVERY_UNKNOWN', unknown=True):
+    def fail(self, op, code='DELIVERY_UNKNOWN', unknown=True, error=None, **fields):
         failure = Fault(code).payload
         failure['operation_id'] = op['operation_id']
-        self.update(op,status='unknown' if unknown else 'failed',failure=failure,result=None)
+        if error is not None:
+            fields['error'] = error
+        self.update(op,status='unknown' if unknown else 'failed',failure=failure,result=None,
+                    closed_epoch=time.time(),**fields)
 
     def recover(self):
         for op in self.rows():
             if op['status'] == 'running':
                 # Known IDs may be observed; no create/post/push call is replayed.
                 if op['kind'] == 'message_send' and op['backend_id']:
-                    self.observe(op, recovering=True)
+                    # Durable, so a read retried on a later tick keeps the recovery rule.
+                    self.update(op, recovered=True)
+                    self.observe(op)
                 else:
                     self.fail(op)
 
@@ -724,15 +746,19 @@ class Engine:
                 if op['status']=='accepted':
                     self.dispatch(op)
                 elif op['status']=='running' and op['kind']=='message_send':
-                    self.observe(op)
+                    if time.monotonic() >= self.observe_at.get(op['operation_id'],0):
+                        self.observe(op)
                 elif op['status']=='succeeded' and op.get('pending_reply_cleanup'):
                     self.cleanup_replies(op)
                 elif op['status'] in ('succeeded','failed') and not op.get('expired') and time.time()-op.get('finished_epoch',time.time()) >= RETENTION:
                     self.update(op,expired=True,message=None,result=None,text=None)
-            except Exception:
+                elif op['status'] in ('unknown','failed') and self.reply_watch_due(op):
+                    self.watch_reply(op)
+            except Exception as error:
                 # Persist conservatively; if disk fails, stop the worker without further effects.
+                # Dispatch can raise provider diagnostics, so only the class is recorded here.
                 try:
-                    self.fail(op)
+                    self.fail(op,error=describe(error,message=False))
                 except Exception:
                     self.stop.set(); return
 
@@ -824,29 +850,80 @@ class Engine:
         self.registered(op,session)
         return self.get({'operation_id':oid},self.principal)
 
-    def observe(self, op, recovering=False):
+    def observe(self, op):
+        try:
+            try:
+                # Read-only broker calls. A failure here says nothing about the message.
+                same = self.backend.instance()==op['instance']
+                if same:
+                    message,replies = self.backend.observe(op['backend_id'])
+                    state = message['state']
+                    if state not in STATES:
+                        raise ValueError('Unknown message state')
+            except Exception as error:
+                self.observe_error(op,error); return
+            if not same:
+                self.fail(op); return
+            self.observe_at.pop(op['operation_id'],None)
+            self.update(op,backend_message_state=state,observe_errors=0)
+            if self.settle(op,replies):
+                return
+            if state=='failed':
+                self.fail(op,'BACKEND_UNAVAILABLE',False)
+            elif state=='uncertain' or (op.get('recovered') and state in ('pending','dispatching')):
+                self.fail(op)
+        except Exception as error:
+            self.fail(op,error=describe(error))
+
+    def observe_error(self, op, error):
+        # The message is known and nothing is re-sent, so reading again is safe. Bounded:
+        # after the limit the operation closes as unknown and the reply watch takes over.
+        count = op.get('observe_errors',0)+1
+        if count >= self.observe_retry_limit:
+            self.fail(op,error=describe(error),observe_errors=count); return
+        self.update(op,observe_errors=count,error=describe(error))
+        self.observe_at[op['operation_id']] = time.monotonic()+self.observe_retry_base*2**(count-1)
+
+    def settle(self, op, replies, late=False):
+        replies = [r for r in replies if r.get('reply_to') == op['backend_id'] and isinstance(r.get('body'),str) and r['body'].strip()]
+        if not replies:
+            return False
+        text = '\n\n'.join(r['body'] for r in sorted(replies,key=lambda r:(r['created'],r['id'])))
+        if len(text.encode()) > MAX_RESULT:
+            if late:
+                self.update(op,reply_watch_closed='result_too_large')
+            else:
+                self.fail(op,'CAPACITY_EXCEEDED',False)
+            return True
+        fields = {'settled_after':{'status':op['status'],'code':op['failure']['code']},'failure':None} if late else {}
+        self.update(op,status='succeeded',stage='complete',text=text,result={'type':'message_result'},
+                    pending_reply_cleanup=[r['id'] for r in replies],**fields)
+        self.cleanup_replies(op)
+        return True
+
+    def reply_watch_due(self, op):
+        return (op['kind']=='message_send' and op.get('backend_id') and op.get('instance')
+                and not op.get('expired') and not op.get('reply_watch_closed')
+                and time.monotonic() >= self.watch_at.get(op['operation_id'],0))
+
+    def watch_reply(self, op):
+        # A correlated reply proves the known message was delivered, whatever closed the
+        # operation (issue #134). Read-only: no post, push or resend, and never a new state
+        # other than succeeded.
+        closed = op.get('closed_epoch')
+        recent = closed is not None and time.time()-closed < REPLY_WATCH_WINDOW
+        self.watch_at[op['operation_id']] = time.monotonic()+(self.reply_watch_fast if recent else self.reply_watch_slow)
         try:
             if self.backend.instance()!=op['instance']:
-                self.fail(op); return
-            message,replies = self.backend.observe(op['backend_id'])
-            state = message['state']
-            if state not in STATES:
-                raise ValueError('Unknown message state')
-            self.update(op,backend_message_state=state)
-            replies = [r for r in replies if r.get('reply_to') == op['backend_id'] and isinstance(r.get('body'),str) and r['body'].strip()]
-            if replies:
-                text = '\n\n'.join(r['body'] for r in sorted(replies,key=lambda r:(r['created'],r['id'])))
-                if len(text.encode()) > MAX_RESULT:
-                    self.fail(op,'CAPACITY_EXCEEDED',False); return
-                self.update(op,status='succeeded',stage='complete',text=text,result={'type':'message_result'},
-                            pending_reply_cleanup=[r['id'] for r in replies])
-                self.cleanup_replies(op)
-            elif state=='failed':
-                self.fail(op,'BACKEND_UNAVAILABLE',False)
-            elif state=='uncertain' or (recovering and state in ('pending','dispatching')):
-                self.fail(op)
+                self.update(op,reply_watch_closed='instance_changed'); return
+            _,replies = self.backend.observe(op['backend_id'])
+            self.settle(op,replies,late=True)
+        except ValueError as error:
+            if str(error)==UNKNOWN_MESSAGE:
+                self.update(op,reply_watch_closed='message_unknown')
         except Exception:
-            self.fail(op)
+            # Leave the closed operation exactly as it was and read again later.
+            return
 
     def cleanup_replies(self, op):
         # Only after the result commit. Cleanup retries never replay message effects.
