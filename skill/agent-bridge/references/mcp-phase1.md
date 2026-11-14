@@ -35,6 +35,15 @@ another binding. Workspaces must already exist, be canonical absolute paths,
 fall within their root, and retain their accepted mapping. Approve any alias
 changes separately. This config does not change the receiving agent's permissions.
 
+The facade reads this file once, at start. A change to `workspaces`,
+`pinned_sessions` or `inbox_enabled` takes effect only after the facade process
+is restarted; the broker does not need a restart. Until then a live session in a
+newly added workspace is not listed by `bridge_sessions_list`. Before restarting,
+check that no operation in the ledger is `accepted` or `running`. Inbox handles
+and cursors are signed over the workspace and pinned-session policy, so those
+issued before the change are refused afterwards (`INVALID_ARGUMENT`); list the
+inbox again.
+
 Register only a single remote connector (`Agent Bridge`) pointing to this tunnel; do not maintain a duplicate status-only connector or local MCP entry. It exposes the five default tools (eight when `inbox_enabled: true` is set) defined in `mcp_phase1_tools.json`.
 No launch agent, key rotation, public listener, model override, or shared plugin is
 installed by this implementation.
