@@ -352,6 +352,17 @@ class PhaseTest(unittest.TestCase):
                 if state=='unknown':
                     self.assertTrue(self.send(sid,key='unblocked_message_1')['ok'])
 
+    def test_late_settle_restarts_retention_from_the_success(self):
+        sid,oid,mid=self.observing(); self.backend.messages[mid]['state']='failed'; self.engine.tick()
+        op=self.engine.operation(oid,'owner-a'); self.assertEqual(op['status'],'failed')
+        self.engine.update(op,finished_epoch=time.time()-phase.RETENTION+60)
+        self.reply(mid,'late answer'); self.engine.watch_at.clear(); self.engine.tick()
+        settled=self.engine.operation(oid,'owner-a')
+        self.assertEqual(settled['status'],'succeeded')
+        self.assertLess(time.time()-settled['finished_epoch'],30)
+        with patch.object(phase.time,'time',return_value=time.time()+120): self.engine.tick()
+        self.assertEqual(self.call('bridge_operation_get',operation_id=oid)['data']['result']['text'],'late answer')
+
     def test_reply_watch_never_changes_a_closed_operation_on_error(self):
         sid,oid,mid=self.observing(); self.backend.messages[mid]['state']='failed'; self.engine.tick()
         before=self.engine.operation(oid,'owner-a')

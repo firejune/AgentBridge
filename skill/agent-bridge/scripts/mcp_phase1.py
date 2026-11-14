@@ -895,7 +895,11 @@ class Engine:
             else:
                 self.fail(op,'CAPACITY_EXCEEDED',False)
             return True
-        fields = {'settled_after':{'status':op['status'],'code':op['failure']['code']},'failure':None} if late else {}
+        fields = {}
+        if late:
+            # Retention runs from the success, not from the earlier failure.
+            fields = {'settled_after':{'status':op['status'],'code':op['failure']['code']},'failure':None,
+                      'finished_epoch':time.time()}
         self.update(op,status='succeeded',stage='complete',text=text,result={'type':'message_result'},
                     pending_reply_cleanup=[r['id'] for r in replies],**fields)
         self.cleanup_replies(op)
