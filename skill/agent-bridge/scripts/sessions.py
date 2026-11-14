@@ -901,6 +901,12 @@ def find_claude_desktop_session(sid, desktop_dir=None):
             'cwd': next((row['cwd'] for row in rows if isinstance(row.get('cwd'), str)), None)}
 
 
+def claude_projects_dir(projects_dir=None):
+    """The Claude transcript root, honouring CLAUDE_CONFIG_DIR like the lookups above."""
+    base = os.environ.get('CLAUDE_CONFIG_DIR')
+    return Path(projects_dir) if projects_dir else (Path(base).expanduser() if base else Path.home() / '.claude') / 'projects'
+
+
 def claude_transcript_host(sid, projects_dir=None):
     """The entrypoint the session's transcript last recorded (e.g. claude-vscode), or None."""
     sid = str(uuid.UUID(sid))

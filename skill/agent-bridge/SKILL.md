@@ -204,8 +204,10 @@ null with a note. The readable form prints the same fields on one line. Codex
 uses the final cumulative `total_token_usage`, never sums snapshots, and never
 adds reasoning to output again. Active time excludes entire gaps over 600 seconds;
 it measures record activity, not CPU time. Multiple recorded models retain the
-last model with a note and no USD attribution. Claude and Antigravity currently
-return nulls with `reader not implemented`; their readers are separate functions.
+last model with a note and no USD attribution. Claude sums the unique responses of
+the transcript under `CLAUDE_CONFIG_DIR` (or `~/.claude`), deduplicated on message
+and request id, and reports sub-agent transcripts separately under `subagents`;
+Antigravity currently returns nulls with `reader not implemented`.
 
 `--prices FILE` accepts a Markdown table headed `model id | input | cached input |
 output`, with USD per million tokens. There is no default price file. USD is
