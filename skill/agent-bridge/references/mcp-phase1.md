@@ -414,7 +414,8 @@ subscription and its actual consumer behavior separately from local tests.
    the plugin catalog and existing task instructions for the new reply branch.
    The official guide does not define migration of cached payload schemas, so
    compatibility with a host retaining an older event definition requires a live
-   test; do not assume a replacement subscription is required or sufficient. Preserve unrelated tasks and messages; inspect saved task and
+   test; do not assume a replacement subscription is required or sufficient.
+   Preserve unrelated tasks and messages; inspect saved task and
    subscription state before retrying a failed or ambiguous creation attempt.
 
 On 2026-11-15 the macOS private-stdio deployment accepted one native ChatGPT
@@ -435,10 +436,23 @@ without another human or driver prompt and called `bridge_inbox_list`. The
 message remained pending and unacknowledged; the consumer did not reply or send
 a bridge message. This verifies one configured end-to-end test, not a delivery
 or wake guarantee for every deployment. That revision excluded correlated replies;
-the reply extension below requires separate live acceptance.
+the reply extension was verified separately below.
 After the test, its task was retained paused, the host's unsubscribe completed,
 and AB reported zero active subscriptions and zero inbox watchers. The existing
 broker continued running.
+
+The reply extension passed all 697 Nova regression tests in 104.536 seconds.
+On the same date, a separate owner-authorized test reused that existing paused
+Cloud task with updated reply-aware instructions and the same event name; no
+replacement task was created. A native `bridge_message_send` request received
+one operator CLI reply. Without another human or driver prompt, an automatic
+Cloud turn received its event in a two-event batch and called
+`bridge_operation_get` once for the exact test operation, retrieving its
+successful complete result. This verifies existing task reuse on that configured
+host, not universal cached-schema compatibility or one-event-per-turn behavior.
+The task was retained disabled afterward, its test subscription was unsubscribed,
+and the unrelated user subscription remained active. The existing broker and
+target chat continued running; no provider session or receive route was removed.
 
 ### Event methods and delivery
 

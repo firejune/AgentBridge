@@ -233,9 +233,18 @@ On 2026-11-15 this combination restored native task creation and accepted a
 verified webhook subscription. An authorized independent-message test then
 triggered an automatic Cloud turn that listed the inbox; the message remained
 pending and unacknowledged. The contribution of each individual configuration
-change was not isolated. Follow the
+change was not isolated. The reply extension passed 697 Nova regression tests.
+An authorized operator CLI reply to an owned MCP request then reached an
+automatic Cloud turn that read that exact result with `bridge_operation_get`,
+without another human or driver prompt. This reused the existing paused task
+after updating its instructions; no replacement task was created. The test task
+was paused again and its subscription removed, preserving the unrelated user
+subscription and running broker. Follow the
 [setup and acceptance steps](skill/agent-bridge/references/mcp-phase1.md#enable-and-test-in-chatgpt)
-before treating a subscription as operational. The event name and server subscription identity stay unchanged; refresh the plugin catalog and update existing task instructions to handle reply results. Acceptance of the extended payload by a host caching an older schema must be checked live.
+before treating a subscription as operational. The event name and server
+subscription identity stay unchanged; refresh the plugin catalog and update
+existing task instructions to handle reply results. This configured-host test
+does not establish compatibility with every host's cached event schema.
 
 ## Development & Verification
 
