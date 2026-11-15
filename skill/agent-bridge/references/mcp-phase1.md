@@ -311,7 +311,10 @@ optional Events integration below supplies a separate notification path.
 Add `"events_enabled": true` to the approved private Phase 1 config only when
 `"inbox_enabled": true` and `bridge:read` are already enabled. Default/false
 exposes no Events methods or capability; Phase 0 remains status-only. Events add
-no tool or scope: the inbox tool count remains eight. Preserve the existing
+no tool or scope: the inbox tool count remains eight. When enabled, initialize
+advertises both `capabilities.events: {}` and
+`capabilities.extensions["io.modelcontextprotocol/events"]: {}`. This does not
+change protocol-version negotiation or implement MCP 2. Preserve the existing
 owner/tunnel policy and wait until no ledger operation is `accepted` or `running`
 before restarting the corresponding facade to activate the configuration.
 
@@ -386,8 +389,20 @@ fsynced; the existing ledger lock keeps a single facade process. Record shapes:
 - `mcp_request`: UTC `at`, `type`, fixed `method`, and fixed `tool` only for
   `tools/call`. Known methods are `initialize`, `notifications/initialized`,
   `ping`, `tools/list`, `tools/call`, `events/list`, `events/subscribe` and
-  `events/unsubscribe`; all others become `other`. Tool names are one of the
-  eight existing tools or `other`.
+  `events/unsubscribe`, plus `server/discover`, `resources/list`, `prompts/list`
+  and `notifications/cancelled`; all others become `other`. Logging these names
+  does not implement unsupported methods; they retain their existing
+  method-not-found behavior. Tool names are one of the eight existing tools or
+  `other`. Initialize receipts also include normalized `requested_protocol`.
+- `mcp_response`: a handler-produced response, not proof of transport delivery
+  or client acceptance. It records UTC `at`, `type`, fixed `method`, fixed `tool` only for
+  `tools/call`, `outcome` (`result` or `error`) and a known JSON-RPC integer
+  `error_code` (`-32700`, `-32600`, `-32601`, `-32602`, `-32603`, `-32015`)
+  or null. Only an initialize result includes
+  `negotiated_protocol`. Protocol metadata uses the public versions `2024-11-05`,
+  `2025-03-26`, `2025-06-18`, `2025-11-25`, `2026-07-28`, or normalized `absent`
+  or `other`; raw version strings are not stored. Notifications have no response
+  audit record. No result bodies, error text or raw capabilities JSON are stored.
 - `event_request_outcome`: UTC `at`, `type`, fixed `method`, `stage`, `outcome`,
   normalized JSON-RPC integer `code` or null, and fixed `reason` or null.
 - `broker_message_observed`: UTC `at`, `type` and boolean `correlated`. This

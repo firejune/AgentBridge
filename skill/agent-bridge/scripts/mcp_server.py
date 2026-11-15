@@ -103,8 +103,16 @@ def error(mid, code, message):
 
 def handle(message, path, engine=None):
     """One JSON-RPC message in, one response or None (notification/response) out."""
-    if engine is not None and getattr(engine, 'events', None) is not None:
-        engine.events.audit_request(message)
+    events = getattr(engine, 'events', None) if engine is not None else None
+    if events is not None:
+        events.audit_request(message)
+    response = _handle(message, path, engine)
+    if events is not None:
+        events.audit_response(message, response)
+    return response
+
+
+def _handle(message, path, engine=None):
     if not isinstance(message, dict) or message.get('jsonrpc') != '2.0':
         return error(None, -32600, 'Invalid Request: one JSON-RPC 2.0 object; batches are not supported')
     if 'method' not in message:
@@ -126,7 +134,8 @@ def handle(message, path, engine=None):
         return {'jsonrpc': '2.0', 'id': mid, 'result': {
             'protocolVersion': asked if asked in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0],
             'capabilities': dict({'tools': {'listChanged': False}},
-                **({'events': {}} if engine is not None and getattr(engine, 'events', None) is not None else {})),
+                **({'events': {}, 'extensions': {'io.modelcontextprotocol/events': {}}}
+                    if engine is not None and getattr(engine, 'events', None) is not None else {})),
             'serverInfo': {'name': 'agent-bridge', 'version': CONTRACT_VERSION}}}
     if method == 'ping':
         return {'jsonrpc': '2.0', 'id': mid, 'result': {}}

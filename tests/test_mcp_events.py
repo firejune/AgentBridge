@@ -107,6 +107,21 @@ class EventTests(unittest.TestCase):
         self.engine.scopes = frozenset()
         self.assertEqual(self.rpc('events/list')['error']['code'], -32601)
 
+    def test_dual_event_capability_is_opt_in_and_keeps_legacy_negotiation(self):
+        for version in mcp_server.PROTOCOL_VERSIONS:
+            result = self.rpc('initialize', {'protocolVersion': version})['result']
+            self.assertEqual(result['protocolVersion'], version)
+            self.assertEqual(result['capabilities'], {'tools': {'listChanged': False},
+                'events': {}, 'extensions': {'io.modelcontextprotocol/events': {}}})
+        result = self.rpc('initialize', {'protocolVersion': '2026-07-28'})['result']
+        self.assertEqual(result['protocolVersion'], '2025-11-25')
+        self.engine.events = None
+        try:
+            self.assertEqual(self.rpc('initialize')['result']['capabilities'], {'tools': {'listChanged': False}})
+        finally:
+            self.engine.events = self.service
+        self.assertEqual(len(self.engine.tools()), 8)
+
     def test_catalog_and_subscribe_signature(self):
         self.assertEqual(self.rpc('events/list')['result']['events'], [events.CATALOG])
         result = self.subscribe()
@@ -538,6 +553,44 @@ class EventTests(unittest.TestCase):
         self.assertEqual((outcome['stage'], outcome['code'], outcome['reason']), ('validate', -32602, 'invalid_event'))
         self.assertEqual(set(outcome), {'at', 'type', 'method', 'stage', 'outcome', 'code', 'reason'})
 
+    def test_audit_standard_method_names_and_handler_errors_without_implementing_them(self):
+        for method in ('server/discover', 'resources/list', 'prompts/list'):
+            self.assertEqual(self.rpc(method)['error']['code'], -32601)
+        self.assertIsNone(mcp_server.handle({'jsonrpc': '2.0', 'method': 'notifications/cancelled',
+            'params': {'requestId': 'private-handle'}}, self.running.path, self.engine))
+        records = self.audit_records()
+        arrivals = [record for record in records if record['type'] == 'mcp_request']
+        self.assertEqual([record['method'] for record in arrivals],
+            ['server/discover', 'resources/list', 'prompts/list', 'notifications/cancelled'])
+        responses = [record for record in records if record['type'] == 'mcp_response']
+        self.assertEqual([record['method'] for record in responses], ['server/discover', 'resources/list', 'prompts/list'])
+        self.assertTrue(all(record['outcome'] == 'error' and record['error_code'] == -32601 for record in responses))
+        self.assertNotIn('private-handle', json.dumps(records))
+
+    def test_audit_initialization_versions_are_normalized_and_no_request_id_is_retained(self):
+        sensitive = 'private-request-id-url-key-cursor-protocol'
+        for asked, expected in (('2024-11-05', '2024-11-05'), ('2026-07-28', '2026-07-28'),
+                                (sensitive, 'other'), (None, 'absent')):
+            message = {'jsonrpc': '2.0', 'id': sensitive, 'method': 'initialize', 'params': {'protocolVersion': asked}}
+            response = mcp_server.handle(message, self.running.path, self.engine)
+            self.assertEqual(response['result']['protocolVersion'], '2025-11-25')
+            request, result = self.audit_records()[-2:]
+            self.assertEqual(request['requested_protocol'], expected)
+            self.assertEqual(result['negotiated_protocol'], '2025-11-25')
+            self.assertEqual((result['type'], result['outcome'], result['error_code']), ('mcp_response', 'result', None))
+        self.assertNotIn(sensitive, json.dumps(self.audit_records()))
+
+    def test_audit_response_excludes_error_text_and_preserves_known_error_code(self):
+        sensitive = 'https://private.example/whsec_key_message_handle'
+        with patch.object(self.service, '_call', side_effect=events.EventError(-32015, sensitive)):
+            self.assertEqual(self.rpc('events/subscribe', self.params)['error']['code'], -32015)
+        response = self.audit_records()[-1]
+        self.assertEqual(response['type'], 'mcp_response')
+        self.assertEqual(response['method'], 'events/subscribe')
+        self.assertEqual((response['outcome'], response['error_code']), ('error', -32015))
+        self.assertEqual(set(response), {'at', 'type', 'method', 'outcome', 'error_code'})
+        self.assertNotIn(sensitive, json.dumps(self.audit_records()))
+
     def test_audit_persists_receipts_but_not_volatile_counters_across_restart(self):
         self.rpc('events/list')
         before = self.service.audit.path.read_bytes()
@@ -555,7 +608,7 @@ class EventTests(unittest.TestCase):
             result = self.rpc('events/list')
         self.assertIn('result', result)
         health = self.service.health()
-        self.assertEqual(health['audit_write_failures'], 2)
+        self.assertEqual(health['audit_write_failures'], 3)
         self.assertEqual(health['audit_last_error'], 'audit_write_failed')
         self.assertEqual(health['request_diagnostics']['methods']['events/list']['accepted_count'], 1)
         self.assertNotIn(sensitive, json.dumps(health))
@@ -585,7 +638,7 @@ class EventTests(unittest.TestCase):
         result = self.rpc('events/list')
         self.assertIn('result', result)
         self.assertEqual(target.read_text(), 'original')
-        self.assertEqual(self.service.health()['audit_write_failures'], 2)
+        self.assertEqual(self.service.health()['audit_write_failures'], 3)
 
     def test_audit_fifo_without_reader_fails_promptly_and_keeps_request_working(self):
         os.mkfifo(self.service.audit.path, 0o600)
@@ -605,7 +658,7 @@ class EventTests(unittest.TestCase):
         self.assertFalse(blocked, 'Audit blocked on a FIFO without a reader')
         self.assertFalse(worker.is_alive())
         self.assertIn('result', results[0])
-        self.assertEqual(self.service.health()['audit_write_failures'], 2)
+        self.assertEqual(self.service.health()['audit_write_failures'], 3)
 
     def test_existing_watch_audits_independent_and_correlated_messages_without_bodies(self):
         self.service.close()
