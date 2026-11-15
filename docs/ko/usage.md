@@ -419,3 +419,85 @@ runner를 발신자로 한 번 전송하며 card·runner·urgency·tags와 첫 5
 수동 후속 조치 전에 영수증과 메시지를 확인한다. 전달 접수는 HQ의 조치 완료가 아니다.
 다른 경로로 원문을 보내지 않는다. 기존 routes/send/unregister를 쓰므로 브로커 변경이나
 재시작은 필요 없다.
+
+### 실행 영수증과 검증된 인계 (#141)
+
+`run --label TEXT [--cwd DIR] [--state-dir DIR] -- COMMAND...`는 브로커 접속 없이
+명령을 실행하고 `<state-dir>/receipts/<id>.json`과 같은 위치의 `.log`를 저장한다.
+JSON은 `schema: agent-bridge-run/1`, `id`, `label`, `argv`, `cwd`, UTC
+`started`/`finished`, `exit_code`, `log`, `log_sha256`, `log_bytes`, `capture`,
+`log_order`, `head`, `dirty`를 기록한다. HEAD/dirty는 실행 직전에 읽고 실패하면 null이다.
+소스 동결을 보장하지 않는다. 명령의 종료 코드를 반환하며 시그널 종료는 128+시그널이다.
+마지막 stderr 줄은 `RUN_RECEIPT: <id>`다. 셸 확장은 없으며 필요하면 `sh -c`를 명시한다.
+
+TTY/리다이렉션 조합별로 자식의 각 stdio `isatty()` 상태를 보존한다.
+전체 TTY와 파이프 입력을 포함한 모든 조합에서 stdin을 그대로 상속한다. 기록기가 입력을
+미리 읽거나 큐를 비우거나 원래 터미널 설정을 바꾸지 않는다. stdin이 TTY면 자식은 기존
+세션/프로세스 그룹을 유지하며, 그룹으로 도착하는 터미널 SIGINT를 다시 전달하지 않는다.
+stdin이 TTY일 때 기록기 PID만 겨냥한 `kill -INT <recorder_pid>`는 억제되며 자식을
+중단하지 않는다. 자식을 중단하려면 터미널/그룹 SIGINT를 사용한다.
+터미널 출력마다 크기를 전달하는 출력 전용 PTY를 쓰고, 같은 터미널을 향한 두 출력은
+PTY 하나를 공유한다. 리다이렉션된 출력마다 별도 파이프를 쓰며 원래 stdout 또는 stderr로
+전달한다. 중간 PTY의 `OPOST`를 꺼서 최종 터미널이 줄 처리를 한 번만 하게 한다.
+일반 터미널의 `printf 'answer\n' | ...`와 `>out 2>err`를 모두 지원한다.
+
+영수증은 `capture: routed`와 `log_order`를 기록한다. 엄격한 합산 쓰기 순서 보장은
+같은 터미널의 공유 PTY 출력(`log_order: shared-pty`)에 한정한다. 별도 파이프/터미널의
+로그는 관측된 읽기 순서(`observed-read-order`)이며 원래의 전역 교차 스트림 쓰기 순서는
+일반적으로 복원할 수 없다. 각 스트림 내부 바이트 순서와 원래 fd 경로는 유지한다.
+로그는 캡처된 stdout/stderr만 담는다. 원래 터미널의 입력 에코와 명시적인 `/dev/tty` 쓰기는
+캡처를 우회한다. 셸 전체 job control이나 별도 stdin 기록은 제공하지 않는다. 출력 PTY의
+로그는 최종 터미널 줄 처리 전 바이트이며 자식이 출력한 ANSI/CRLF를 정규화하지 않는다.
+stderr가 개행 없이 끝나면 표식 전에 개행을 넣어 마지막 stderr 줄에서 시작하게 한다.
+
+receipts 폴더는 0700, 영수증과 로그는 0600이다. retros와 같은 `O_NOFOLLOW`, 배타 잠금,
+`fchmod`, 파일/디렉터리 `fsync`를 쓰고 읽기는 공유 잠금을 쓴다. 심볼릭 링크·비정규 파일은
+거부한다. 로그가 완성·동기화된 뒤 JSON을 게시한다. 캡처 실패 시 JSON 없이 로그만 남을 수
+있다. 자동 만료는 없으며 소유자가 비공개로 관리한다. 명령 출력에는 민감한 정보가 있을 수 있다.
+
+영수증 참조는 bridge id 또는 JSON 경로다. bridge 로그는 바이트 수와 SHA-256을 검사한다.
+Nova `result.json`은 정수 `exitCode`, 선택적 `sourceCommit`(전체 SHA 또는 빈 값/누락 = unknown),
+**형제 `command.log`**를 읽는다. 원격 `root`/`out`은 로컬 경로로 쓰지 않는다.
+일반 외부 JSON은 정수 `exit_code`, JSON 기준 상대/절대 `log`, 선택적 `head`를 받는다.
+외부 형식에는 필수 로그 해시가 없다. 어떤 형식도 암호학적 출처를 인증하지 않으며,
+문자열이 존재한다고 주장 자체의 적절성을 보장하지 않는다.
+
+`handover check --rows FILE --head FULL_SHA [--state-dir DIR]`는 브로커 없이 검증한다.
+rows는 `{claim, receipt, exit, figures:["문자열"]}`의 비어 있지 않은 JSON 목록이다.
+행의 선택적 `head`는 다른 전체 SHA를 명시한다. 영수증/로그 읽기 실패, 잘못된 형식,
+종료 코드 불일치, UTF-8 원문 문자열 누락, 알려진 HEAD 불일치, bridge 로그 크기/해시 불일치는
+`HANDOVER_UNVERIFIED: row N: ...`로 거부한다(1부터 시작). 모르는 HEAD는 unknown으로 남긴다.
+테스트 선택이나 실행은 하지 않는다.
+
+`handover --project P --from RUNNER --to TOWER --card REF --head FULL_SHA --rows FILE
+[--note-file FILE] [--state-dir DIR]`는 모든 행을 검사한 뒤 기존 등록 경로로 메시지 하나를 보낸다.
+표의 주장·수치·참조는 JSON 인용으로 원문을 보존하고 표 구분자를 이스케이프한다.
+각 행의 종료 코드, 검사 범위, 영수증 종류·참조, 명시/기록 HEAD를 표시하고 다른 HEAD는 표시한다.
+노트는 **검증하지 않은 자유 텍스트** 구분 뒤에 원문 그대로 붙는다. 영수증 JSON/전체 로그는
+전송하지 않으며 메시지 상한은 UTF-8 32768바이트다. 동일 내용은 결정적 멱등 키를 쓴다.
+불명확한 발신은 재시도하지 않는다. 접수는 작업 완료가 아니며 브로커 재시작은 필요 없다.
+
+실행 예시 (`FULL_CURRENT_SHA`는 실제 전체 커밋 SHA, `RECEIPT_ID`는 출력된 id로 바꾼다):
+
+```bash
+bridge_cli="$HOME/.agents/skills/agent-bridge/scripts/bridge.py"
+lane="$HOME/.local/share/agent-bridge/bridge.state/example-141"
+mkdir -p "$lane"
+# 일반 터미널에서 세 stdio가 모두 TTY인 상태로 실행하고 probe-141을 입력한다.
+python3 "$bridge_cli" run --label stdin-smoke -- python3 -c \
+  'import sys; value=input("Value: "); print("INPUT="+value); print("checks=1")'
+cat > "$lane/rows.json" <<'JSON'
+[{"claim":"stdin smoke","receipt":"RECEIPT_ID","exit":0,"figures":["INPUT=probe-141","checks=1"]}]
+JSON
+python3 "$bridge_cli" handover check --head FULL_CURRENT_SHA --rows "$lane/rows.json"
+python3 "$bridge_cli" handover --project P --from runner --to tower --card repo#141 \
+  --head FULL_CURRENT_SHA --rows "$lane/rows.json"
+# 파이프 입력과 터미널 출력의 stdio는 False,True,True이며 종료 코드는 7이다.
+printf 'probe-141\n' | python3 "$bridge_cli" run --label pipe-smoke -- python3 -c \
+  'import os,sys; print([os.isatty(i) for i in range(3)]); x=input(); print("INPUT="+x); sys.exit(7)'
+# stdout/stderr를 별도로 보존하며 합산 로그는 관측된 읽기 순서다.
+printf 'probe-141\n' | python3 "$bridge_cli" run --label routed-smoke -- python3 -c \
+  'import sys; print("OUT="+input()); print("ERR",file=sys.stderr)' >"$lane/out" 2>"$lane/err"
+# 회수된 Nova 결과는 receipt를 result.json 절대 경로로 바꾸고 형제 command.log를 유지한다.
+# sourceCommit이 이전 SHA면 행에 head를 명시한다. 비어 있으면 unknown으로 남는다.
+```
