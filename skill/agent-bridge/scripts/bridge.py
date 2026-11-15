@@ -782,7 +782,7 @@ def open_codex_result(args):
         result['model_source'] = source
     name = args.register if args.cmd == 'open' else args.name
     can_register = (not cancelled and result['created'] and result['adopted']
-                    and (result['error'] is None or result['stage'] == 'permissions')
+                    and result['error'] is None and result['stage'] == 'complete'
                     and result['session']['id'] and result['session']['cwd'])
     if name and can_register:
         try:
@@ -801,6 +801,12 @@ def open_codex_result(args):
             cancelled = True
             if result['error'] is None:
                 result.update(error=result['registration_error'], stage='registration')
+    permissions = result.get('permission_settings') or {}
+    approval = permissions.get('approvalPolicy')
+    sandbox = (permissions.get('sandboxPolicy') or {}).get('type')
+    status = 'failed' if result['error'] else 'confirmed'
+    print(f"Codex open {status}: stage={result['stage']} approvalPolicy={approval} sandbox={sandbox}",
+          file=sys.stderr, flush=True)
     output(result)
     return 130 if cancelled else (1 if result['error'] else 0)
 
@@ -961,7 +967,7 @@ def main(argv=None):
     p.add_argument('--host',choices=['desktop','ide'],default='desktop',help='Host (claude, agy): desktop app or IDE. Claude desktop needs Enter; Claude IDE, agy desktop and agy IDE do not')
     p.add_argument('--ide',choices=sorted(sessions.CLAUDE_IDES),help=f'IDE for --host ide (default {sessions.DEFAULT_IDE})')
     p.add_argument('--state-dir')
-    p.add_argument('--register', metavar='NAME', help='Codex: bind the created/adopted thread, including a permission refusal')
+    p.add_argument('--register', metavar='NAME', help='Codex: bind only a successfully verified new thread')
     p.add_argument('--project', help='Project for --register')
     p.add_argument('--new', action='store_true', help='Codex: explicitly create despite a saved title/cwd match')
     p = sub.add_parser('model',help="Read a participant's model, or switch it with --set (provider-neutral)")

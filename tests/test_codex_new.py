@@ -30,8 +30,9 @@ def full_permissions():
 class ModelDesktop(FakeDesktop):
     def __init__(self, model='app-default', reject_update=False, keep_model=False, behavior='active',
                  permissions=None, refuse_permissions=False, stale_current=False, drop_update=False,
-                 update_error=False, sandbox_lag=0, lag_sandbox='readOnly'):
+                 update_error=False, sandbox_lag=0, lag_sandbox='readOnly', snapshot_version=11):
         super().__init__(behavior)
+        self.snapshot_version = snapshot_version
         self.drop_update = drop_update
         self.update_error = update_error
         self.model, self.reject_update, self.keep_model = model, reject_update, keep_model
@@ -53,7 +54,7 @@ class ModelDesktop(FakeDesktop):
                 state = {'id':request['params']['conversationId'],
                          'latestThreadSettings':latest,
                          'currentPermissions':getattr(self,'current_permissions',{} if self.stale_current else self.permissions)}
-                self.write(sock, {'type':'broadcast','method':'thread-stream-state-changed','version':11,
+                self.write(sock, {'type':'broadcast','method':'thread-stream-state-changed','version':self.snapshot_version,
                     'sourceClientId':self.owner,'targetClientIds':[request['sourceClientId']],
                     'params':{'hostId':'local','conversationId':state['id'],
                               'change':{'type':'snapshot','revision':1,'conversationState':state}}})
@@ -454,12 +455,12 @@ class NewCodexTests(unittest.TestCase):
             with patch.object(bridge.broker, 'request', side_effect=lambda _, fields, **kw: original(server.path, fields, **kw)):
                 code, result = self.cli_open(desktop, '--register', 'worker', '--project', 'demo')
             self.assertEqual(code, 1)
-            self.assertTrue(result['registered'])
+            self.assertFalse(result['registered'])
             self.assertTrue(result['created'])
             self.assertTrue(result['adopted'])
             self.assertEqual(result['stage'], 'permissions')
             self.assertIsNotNone(result['error'])
-            self.assertEqual(server.call('routes', project='demo')[0]['session'], self.sid)
+            self.assertEqual(server.call('routes', project='demo'), [])
 
     def test_issue44_registration_refuses_unadopted_and_model_failure(self):
         for stage, adopted in (('adoption', False), ('model', True)):
@@ -564,10 +565,10 @@ class NewCodexTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(result['stage'], 'permissions')
         self.assertIn('Full Access', result['error'])
-        self.assertIsNotNone(result['registration_error'])
+        self.assertIsNone(result['registration_error'])
         self.assertFalse(result['registered'])
         self.assertNotIn('secret', json.dumps(result))
-        self.assertEqual(register.call_count, 1)
+        self.assertEqual(register.call_count, 0)
 
     def test_issue44_registration_success_and_refusal_share_keys(self):
         with ModelDesktop() as desktop, patch.object(bridge.broker, 'request', return_value={}) as register:
@@ -579,7 +580,7 @@ class NewCodexTests(unittest.TestCase):
             code, refusal = self.cli_open(desktop, '--register', 'worker', '--project', 'demo')
         self.assertEqual(code, 1)
         self.assertEqual(set(success), set(refusal))
-        self.assertTrue(refusal['registered'])
+        self.assertFalse(refusal['registered'])
 
     def test_issue44_registration_invalid_pair_stops_before_creation(self):
         for extra in (('--register', 'worker'), ('--project', 'demo')):
@@ -605,9 +606,26 @@ class NewCodexTests(unittest.TestCase):
                                         '--new', '--cwd', self.root, '--state-dir', self.root])
         value = json.loads(out.getvalue())
         self.assertEqual(code, 1)
-        self.assertTrue(value['registered'])
+        self.assertFalse(value['registered'])
         self.assertEqual(value['stage'], 'permissions')
-        self.assertEqual(register.call_count, 1)
+        self.assertEqual(register.call_count, 0)
+
+    def test_issue137_v13_permission_update_and_stderr_confirmation(self):
+        with ModelDesktop(snapshot_version=13) as desktop, patch('sys.stderr', new_callable=io.StringIO) as err:
+            code, result = self.cli_open(desktop)
+        self.assertEqual(code, 0)
+        self.assertEqual(result['settings_update'], {'applied': True, 'resultType': 'success'})
+        self.assertEqual(err.getvalue(), 'Codex open confirmed: stage=complete approvalPolicy=never sandbox=dangerFullAccess\n')
+
+    def test_issue137_unknown_snapshot_version_fails_without_registration(self):
+        with ModelDesktop(snapshot_version=99) as desktop, patch('sys.stderr', new_callable=io.StringIO) as err, \
+                patch.object(bridge.broker, 'request') as register:
+            code, result = self.cli_open(desktop, '--register', 'worker', '--project', 'demo')
+        self.assertEqual(code, 1)
+        self.assertEqual(result['stage'], 'permissions')
+        self.assertFalse(result['registered'])
+        register.assert_not_called()
+        self.assertEqual(err.getvalue(), 'Codex open failed: stage=permissions approvalPolicy=None sandbox=None\n')
 
     def test_issue44_diagnostics_unknown_values_are_redacted(self):
         clean = codex_new.permission_diagnostics({'approvalPolicy': {'secret': '/private/config'},
