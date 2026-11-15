@@ -29,6 +29,7 @@ import service
 import usage
 import session_usage
 import wt
+import retros
 
 def envelope(m):
     return (f"[agent-bridge peer message | {m['sender']} -> {m['recipient']}]\n"
@@ -848,6 +849,55 @@ def close_session(route, timeout, archive=False):
             'note': f'{transport} routes have no provider session to close'}
 
 
+def save_retro(args, route=None):
+    state = broker_state_dir(args)
+    path = retros.store_path(state, args.project, args.store)
+    text_file = args.retro_file if route is not None else args.from_file
+    text = None
+    if text_file:
+        with Path(text_file).open(encoding='utf-8', newline='') as source:
+            text = source.read()
+    reason = args.no_retro if route is not None else None
+    # Validate the requirement before any provider read, write or notification.
+    row = retros.record(args.project, args.card, route['name'] if route else args.runner,
+                        None if route else args.model, route.get('session') if route else args.session,
+                        text=text, reason=reason, tower=args.tower, urgency=args.urgency, tags=args.tags)
+    target = retros.notify_route(state, args.project, args.notify)
+    if target and row['urgency'] in ('stop', 'repeat'):
+        routes = broker.request(args.socket, {'op':'routes', 'project':args.project})
+        names = {r['name'] for r in routes}
+        if target not in names or row['runner'] not in names:
+            raise ValueError('RETRO_NOTIFY_ROUTE_MISSING: notification needs registered runner and target routes')
+    if route is not None and text is not None:
+        reading = models.read(route, min(args.timeout, 10))
+        row['model'] = reading.get('model')
+        # Provider diagnostics never belong in the retro ledger.
+    retros.append(path, row)
+    result = {'retro_id':row['id'], 'store':str(path), 'notification':None}
+    if target and row['urgency'] in ('stop', 'repeat'):
+        excerpt = '\n'.join((row['text'] or row['no_retro']).splitlines()[:5])[:1000]
+        body = (f"Retro {row['urgency']}: card={row['card']} runner={row['runner']} "
+                f"tags={','.join(row['tags'])}\n{excerpt}")
+        try:
+            sent = broker.request(args.socket, {'op':'send', 'project':args.project,
+                       'sender':row['runner'], 'recipient':target, 'body':body, 'key':'retro-'+row['id']})
+            result['notification'] = {'id':sent['id'], 'state':sent['state']}
+            sent = push_if_peer(args.socket, sent)
+            result['notification']['state'] = sent['state']
+        except (ValueError, OSError) as error:
+            # Saved already: expose the receipt and never retry a possibly dispatched message.
+            result['notification'] = {**(result['notification'] or {}), 'error':str(error), 'retry':False}
+    return result
+
+
+def retro_command(args):
+    if args.retro_cmd == 'add':
+        return save_retro(args)
+    found = retros.rows(retros.store_path(broker_state_dir(args), args.project, args.store),
+                        args.project, args.since, getattr(args, 'tag', None), getattr(args, 'urgency', None))
+    return retros.tally(found) if args.retro_cmd == 'tally' else found
+
+
 def close_participant(args):
     if not 0 < args.timeout <= 600:
         raise ValueError('Timeout must be between 0 and 600 seconds')
@@ -855,7 +905,8 @@ def close_participant(args):
                   if r['name'] == args.name), None)
     if route is None:
         raise ValueError(f'No participant {args.name!r} is registered in project {args.project!r}')
-    result = {'name': args.name, 'project': args.project, 'transport': route['transport'],
+    receipt = save_retro(args, route)
+    result = {**receipt, 'name': args.name, 'project': args.project, 'transport': route['transport'],
               **close_session(route, args.timeout, archive=getattr(args, 'archive', False))}
     if args.keep_route:
         result['route_removed'] = False
@@ -978,6 +1029,26 @@ def main(argv=None):
     p.add_argument('--archive',action='store_true',help='Archive the finished session out of the active sidebar')
     p.add_argument('--keep-route',action='store_true',help='Close the session but keep the route registered')
     p.add_argument('--timeout',type=float,default=10)
+    g = p.add_mutually_exclusive_group()
+    g.add_argument('--retro-file');g.add_argument('--no-retro',metavar='REASON')
+    p.add_argument('--card',default=None)
+    p.add_argument('--tower');p.add_argument('--urgency',choices=['stop','repeat','note'],default='note')
+    p.add_argument('--tags',default='');p.add_argument('--notify');p.add_argument('--store');p.add_argument('--state-dir')
+    p = sub.add_parser('retro',help='Append and inspect project retrospectives')
+    retro_sub = p.add_subparsers(dest='retro_cmd',required=True)
+    for action in ('add','list','tally'):
+        r = retro_sub.add_parser(action)
+        r.add_argument('--project',required=True);r.add_argument('--store');r.add_argument('--state-dir')
+        r.add_argument('--json',action='store_true')
+        if action == 'add':
+            for field in ('card','runner','model','from-file','urgency','tags'):
+                r.add_argument('--'+field,required=True,**({'choices':['stop','repeat','note']} if field=='urgency' else {}))
+            r.add_argument('--tower');r.add_argument('--session',default=os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_CODE_SESSION_ID'))
+            r.add_argument('--notify')
+        else:
+            r.add_argument('--since')
+            if action == 'list':
+                r.add_argument('--tag');r.add_argument('--urgency',choices=['stop','repeat','note'])
     p = sub.add_parser('wake',help="Bring an idle-closed claude-peer session back in its own host; prints woken, already-live, unsupported, failed or uncertain")
     p.add_argument('name');p.add_argument('--project',required=True)
     p.add_argument('--timeout',type=float,default=sessions.WAKE_TIMEOUT,help='Seconds to wait for the woken session inbox')
@@ -1119,6 +1190,17 @@ def main(argv=None):
             if args.provider == 'codex':
                 result['model_source'] = source
             output(result)
+            return 0
+        if args.cmd=='retro':
+            result = retro_command(args)
+            if args.json or args.retro_cmd == 'add':
+                output(result)
+            elif args.retro_cmd == 'tally':
+                for row in result:
+                    print(f"{row['tag']}\t{row['count']}\t{row['first']}\t{row['last']}\t{', '.join(str(c) for c in row['cards'])}")
+            else:
+                for row in result:
+                    print(f"{row['time']} {row['urgency']} {row['card']} {row['runner']} [{','.join(row['tags'])}]\n{row['text'] if row['text'] is not None else row['no_retro']}")
             return 0
         if args.cmd=='close':
             output(close_participant(args))

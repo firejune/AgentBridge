@@ -483,3 +483,62 @@ and the [ccusage replay reader](https://github.com/ccusage/ccusage/blob/main/rus
 `ping` includes `checkpoint_last_save_seconds`, `checkpoint_max_save_seconds` and `checkpoint_bytes`: the last save attempt duration, the maximum since broker start (seconds, including failed attempts), and the payload bytes of the last successful `correspondence.json` save (excluding the metadata index). Without a checkpoint store, these are `null`, `0.0` and `0`. A save taking more than 1 second emits one volatile JSON stderr line (`checkpoint_save_slow`) with `duration_seconds`, `bytes` and `retained_count`; `bytes` still means the last successful payload on failure. Timing covers validation, serialization and durable writes, not mutation staging. The measurements reset on restart; save ordering, durability and delivery behavior are unchanged.
 
 Codex `open` / `register --new` does not register a route when permission verification fails. A one-line stderr summary reports success or failure, the stage, and the observed `approvalPolicy` and sandbox type.
+
+
+### Project retrospectives and closing (#139)
+
+`close NAME --project P` requires `--retro-file FILE` or `--no-retro "reason"`.
+Missing retros (`RETRO_REQUIRED`), blank files (`RETRO_EMPTY`) and blank opt-out
+reasons (`RETRO_REASON_EMPTY`) are refused before any provider action or route
+removal. Towers and HQ use an explicit `--no-retro` reason. Existing detach,
+archive, timeout and `--keep-route` behavior remains unchanged. A retro is saved
+before close, so a later provider refusal can leave a recorded retro; the receipt
+is not evidence that the session closed. Do not blindly repeat failed closes.
+
+```bash
+python3 "$bridge_cli" retro add --project P --card repo#139 --runner worker \
+  --model MODEL --from-file /absolute/retro.txt --urgency repeat --tags delivery,tests \
+  --session SESSION_ID --notify hq
+python3 "$bridge_cli" close worker --project P --retro-file /absolute/retro.txt \
+  --card repo#139 --urgency note --tags tests
+python3 "$bridge_cli" close tower --project P --no-retro "tower session"
+python3 "$bridge_cli" retro list --project P --tag tests --since 2026-11-01 --urgency repeat --json
+python3 "$bridge_cli" retro tally --project P --since 2026-11-01
+```
+
+Urgencies: **stop** means work stopped or a wrong thing shipped; **repeat** means
+the same failure was seen before; **note** covers everything else. The tag
+vocabulary is the caller's. `--tower` is optional. Close takes runner and session
+from the registered route and reads the model through the existing model adapter;
+an unavailable model is `unknown`. Opt-outs have null text and model, with the
+reason in `no_retro`. Close's optional `--card` defaults to null, never an inferred
+card. Standalone add takes `--session`, defaulting to `CODEX_THREAD_ID` or
+`CLAUDE_CODE_SESSION_ID` when available (otherwise null).
+
+Each project uses `<state-dir>/retros/<project>.jsonl`, with a 0600 file, exclusive
+append lock and fsync; readers take a shared lock. `--store FILE` overrides
+`AGENT_BRIDGE_RETRO_STORE`, which overrides that default. An override may share a
+file across projects; queries still filter by project. Project names must be a
+single ASCII name, not a path. `--state-dir DIR` must match the broker's custom
+state directory when it differs from the socket path with `.state` suffix.
+Entries are append-only, containing UTC time, project, tower, card, runner, model,
+urgency, tags, verbatim text and session ID. This separate local ledger intentionally
+retains retros; it is not bounded correspondence or part of the routing snapshot.
+Keep the ledger and session IDs out of Git unless the owner explicitly arranges
+private ledger storage. Add/close receipts expose the store path and record ID,
+not the retro text. `list` is the explicit local read command; `--json` prints full
+records. Tally prints tag, count, first/last date and unique cards. `--since` accepts
+an ISO date or timestamp (timezone-free values mean UTC).
+
+No HQ hierarchy is inferred. `--notify ROUTE` selects a registered route in the
+same project. The optional owner-edited `<state-dir>/policy.json` setting
+`{"retro_notify":{"P":"hq"}}` provides a per-project default. Other policy
+settings are preserved. Only **stop** and **repeat** send one message, using the
+registered runner as sender, with card, runner, urgency, tags and at most the first
+five lines / 1000 characters. **note** sends nothing. With no configured target,
+no message is sent. A missing notification sender/target is refused before saving
+or closing. Delivery is attempted once; its ID/state or error appears in the
+receipt. A notification error does not undo the saved retro or prevent close;
+inspect that receipt and message before any manual follow-up. Delivery acceptance
+is not HQ action. No other route receives the text. No broker changes or restart
+are needed: these commands use existing routes/send/unregister operations.

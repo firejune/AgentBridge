@@ -207,7 +207,7 @@ class CloseCommandTests(unittest.TestCase):
                 mock.patch.dict(os.environ, {'AGENT_BRIDGE_AGY_URL': fake.url, 'AGENT_BRIDGE_AGY_CSRF': CSRF}):
             codex_sid = str(uuid.uuid4())
             server.call('register', project='p', name='n', cwd=cwd, transport='codex', session=codex_sid)
-            code, out = run(['--socket', server.path, 'close', 'n', '--project', 'p'])
+            code, out = run(['--socket', server.path, 'close', 'n', '--project', 'p', '--no-retro', 'provider behavior fixture'])
             self.assertEqual(
                 (code, out['closed'], out['method'], out['archived'], out['resumable'], out['route_removed']),
                 (0, True, 'detach', False, True, True),
@@ -215,7 +215,7 @@ class CloseCommandTests(unittest.TestCase):
             self.assertEqual(server.call('routes', project='p'), [])
 
             server.call('register', project='p', name='j', cwd=cwd, transport='agy', session=fake.other_sid)
-            code_j, out_j = run(['--socket', server.path, 'close', 'j', '--project', 'p'])
+            code_j, out_j = run(['--socket', server.path, 'close', 'j', '--project', 'p', '--no-retro', 'provider behavior fixture'])
             self.assertEqual(
                 (code_j, out_j['closed'], out_j['method'], out_j['archived'], out_j['host'], out_j['resumable'], out_j['route_removed']),
                 (0, True, 'detach', False, 'agy', True, True),
@@ -226,7 +226,7 @@ class CloseCommandTests(unittest.TestCase):
 
             # Passing --archive archives both Antigravity and Codex sessions.
             server.call('register', project='p', name='j-arch', cwd=cwd, transport='agy', session=fake.other_sid)
-            code_ja, out_ja = run(['--socket', server.path, 'close', 'j-arch', '--project', 'p', '--archive'])
+            code_ja, out_ja = run(['--socket', server.path, 'close', 'j-arch', '--project', 'p', '--archive', '--no-retro', 'provider behavior fixture'])
             self.assertEqual(
                 (code_ja, out_ja['closed'], out_ja['method'], out_ja['archived'], out_ja['route_removed']),
                 (0, True, 'archive', True, True),
@@ -242,7 +242,7 @@ class CloseCommandTests(unittest.TestCase):
             os.chmod(state_db, 0o600)
             server.call('register', project='p', name='n-arch', cwd=cwd, transport='codex', session=codex_sid)
             with mock.patch.object(codex_preview, 'state_path', return_value=state_db):
-                code_na, out_na = run(['--socket', server.path, 'close', 'n-arch', '--project', 'p', '--archive'])
+                code_na, out_na = run(['--socket', server.path, 'close', 'n-arch', '--project', 'p', '--archive', '--no-retro', 'provider behavior fixture'])
             self.assertEqual(
                 (code_na, out_na['closed'], out_na['method'], out_na['archived'], out_na['route_removed']),
                 (0, True, 'archive', True, True),
@@ -256,9 +256,9 @@ class CloseCommandTests(unittest.TestCase):
         with RunningBroker() as server, tempfile.TemporaryDirectory() as cwd:
             server.call('register', project='p', name='w', cwd=cwd)
             server.call('register', project='p', name='k', cwd=cwd)
-            code, out = run(['--socket', server.path, 'close', 'w', '--project', 'p'])
+            code, out = run(['--socket', server.path, 'close', 'w', '--project', 'p', '--no-retro', 'provider behavior fixture'])
             self.assertEqual((code, out['closed'], out['route_removed']), (0, False, True))
-            code, out = run(['--socket', server.path, 'close', 'k', '--project', 'p', '--keep-route'])
+            code, out = run(['--socket', server.path, 'close', 'k', '--project', 'p', '--keep-route', '--no-retro', 'provider behavior fixture'])
             self.assertEqual((code, out['route_removed']), (0, False))
             real = bridge.broker.request
             def old(path, args, timeout=10):
@@ -266,10 +266,10 @@ class CloseCommandTests(unittest.TestCase):
                     raise ValueError('Unknown operation')
                 return real(path, args, timeout)
             with mock.patch.object(bridge.broker, 'request', side_effect=old):
-                code, out = run(['--socket', server.path, 'close', 'k', '--project', 'p'])
+                code, out = run(['--socket', server.path, 'close', 'k', '--project', 'p', '--no-retro', 'provider behavior fixture'])
             self.assertEqual((code, out['route_removed']), (0, False))
             self.assertIn('restart it', out['route_note'])
-            code, out = run(['--socket', server.path, 'close', 'gone', '--project', 'p'])
+            code, out = run(['--socket', server.path, 'close', 'gone', '--project', 'p', '--no-retro', 'provider behavior fixture'])
             self.assertEqual(code, 1)
 
 

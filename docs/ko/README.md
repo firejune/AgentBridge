@@ -107,7 +107,7 @@ python3 "$bridge_cli" reply MESSAGE_ID --key reply-001 --file /path/to/answer.tx
 
 ### 1. 세션 생명주기 (`sessions`, `open`, `register --new`, `close`)
 
-| 공급자 | 데스크톱 세션 열기 | IDE 세션 열기 (`--host ide`) | 세션 닫기 (`bridge.py close NAME --project P [--archive]`) |
+| 공급자 | 데스크톱 세션 열기 | IDE 세션 열기 (`--host ide`) | 세션 닫기 (`bridge.py close NAME --project P --retro-file FILE [--archive]`) |
 | --- | --- | --- | --- |
 | **Antigravity (`agy`)** | `language_server` / `agy --hub`(`StartCascade`)로 무인 생성 및 프로젝트·워크트리 환경 자동 연결 | 데스크톱과 동일 (`StartCascade` + 통합 허브 프로젝트·환경 자동 연결) | 기본은 대화 스택 유지(`--archive` 시 `{archived: true}` 보관) 후 라우트 제거 |
 | **Claude (`claude-peer`)** | `claude://code/new`로 첫 메시지를 채운 입력창을 열고 사용자의 Enter 대기 | IDE CLI + `<scheme>://anthropic.claude-code/open`으로 무인 생성 | CLI 프로세스에 `SIGTERM` 전송 후 기본은 대화 스택 유지(`--archive` 시 데스크톱 `isArchived: true` 보관) 및 라우트 제거 |
@@ -120,7 +120,7 @@ python3 "$bridge_cli" register codex-worker --project my-app --transport codex \
   --new --cwd /path/to/workspace --title "Worker" --model gpt-6.1-sol
 
 # 작업이 끝난 워커 세션 닫기 및 라우트 해제 (사이드바에서 숨기려면 --archive 추가):
-python3 "$bridge_cli" close agy-worker --project my-app [--archive]
+python3 "$bridge_cli" close agy-worker --project my-app --retro-file /absolute/retro.txt [--archive]
 
 # 유휴로 닫힌 Claude 데스크톱 세션 깨우기 (woken, already-live, unsupported, uncertain 중 하나를 출력):
 python3 "$bridge_cli" wake claude-tower --project my-app [--timeout 30]
@@ -229,3 +229,54 @@ python3 -m unittest discover -s tests -v
 `ping`은 `checkpoint_last_save_seconds`, `checkpoint_max_save_seconds`, `checkpoint_bytes`를 반환한다. 각각 마지막 저장 시도 시간, 브로커 시작 이후 최대 시간(실패한 시도 포함, 초), 마지막으로 성공한 `correspondence.json` 페이로드 크기(메타데이터 인덱스 제외, 바이트)다. 저장소가 없으면 각각 `null`, `0.0`, `0`이다. 저장이 1초를 넘으면 `checkpoint_save_slow` JSON 로그 한 줄을 stderr에 남긴다. `duration_seconds`, `bytes`, `retained_count`만 포함하며 실패 시 `bytes`는 마지막 성공 크기다. 시간에는 검증·직렬화·영속 쓰기가 포함되며 변경 상태 준비는 제외한다. 계측은 재시작하면 초기화되며 저장 순서·내구성·전달 동작은 바뀌지 않는다.
 
 Codex `open` / `register --new`는 권한 확인에 실패하면 라우트를 등록하지 않는다. 성공·실패 단계와 확인된 `approvalPolicy`, 샌드박스 유형을 stderr 한 줄에 출력한다.
+
+
+### 프로젝트 회고와 종료 (#139)
+
+`close NAME --project P`에는 `--retro-file FILE` 또는 `--no-retro "사유"`가
+필수다. 누락은 `RETRO_REQUIRED`, 빈 파일은 `RETRO_EMPTY`, 빈 사유는
+`RETRO_REASON_EMPTY`로 공급자 동작과 경로 삭제 전에 거절한다. 타워와 HQ는
+`--no-retro` 사유를 남긴다. 기존 detach/archive/timeout/`--keep-route`는 유지한다.
+회고를 먼저 저장하므로 이후 공급자 종료가 실패해도 기록은 남는다. 기록 영수증이
+종료 성공을 뜻하지 않으며 실패한 close를 무작정 반복하지 않는다.
+
+```bash
+python3 "$bridge_cli" retro add --project P --card repo#139 --runner worker \
+  --model MODEL --from-file /absolute/retro.txt --urgency repeat --tags delivery,tests \
+  --session SESSION_ID --notify hq
+python3 "$bridge_cli" close worker --project P --retro-file /absolute/retro.txt --card repo#139
+python3 "$bridge_cli" close tower --project P --no-retro "tower session"
+python3 "$bridge_cli" retro list --project P --tag tests --since 2026-11-01 --urgency repeat --json
+python3 "$bridge_cli" retro tally --project P --since 2026-11-01
+```
+
+긴급도는 **stop**(작업 중단 또는 잘못된 결과 출하), **repeat**(같은 실패 재발),
+**note**(그 외)다. 태그 어휘는 호출자가 정한다. `--tower`는 선택이다. close는
+등록 경로에서 runner/session을 가져오고 기존 모델 어댑터로 model을 읽으며 읽지
+못하면 `unknown`이다. opt-out은 text/model이 null이고 `no_retro`에 사유를 기록한다.
+close의 `--card`는 생략하면 null이며 추측하지 않는다. add의 `--session` 기본은
+`CODEX_THREAD_ID` 또는 `CLAUDE_CODE_SESSION_ID`이며 둘 다 없으면 null이다.
+
+기본 저장소는 `<state-dir>/retros/<project>.jsonl`이다. 파일 권한은 0600이며
+배타 잠금으로 append하고 fsync한다. 읽기는 공유 잠금을 쓴다. 우선순위는
+`--store FILE` > `AGENT_BRIDGE_RETRO_STORE` > 기본 경로다. 공유 파일에서도 조회는
+프로젝트별로 필터링한다. 프로젝트명은 단일 ASCII 이름이며 경로는 거절한다.
+커스텀 브로커 상태 경로는 `--state-dir DIR`로 맞춘다. 기본 상태 경로는 소켓 경로의
+접미사를 `.state`로 바꾼 것이다. UTC 시각·project·tower·card·runner·model·urgency·tags·
+원문 text·session ID를 수정 없는 줄로 저장한다. 이 로컬 원장은 bounded correspondence나
+routing snapshot과 별개로 보존된다. 소유자가 비공개 원장 저장을 정하지 않았다면
+원장과 세션 ID를 Git에 넣지 않는다. add/close 출력에는 원문 대신 경로·기록 ID를
+표시한다. `list`는 명시적인 로컬 조회이며 `--json`은 전체 기록을 출력한다.
+tally는 태그별 횟수·최초/최종 시각·중복 제거한 카드를 출력한다. `--since`는 ISO
+날짜/시각이고 시간대가 없으면 UTC다.
+
+HQ 계층을 추론하지 않는다. `--notify ROUTE`는 같은 프로젝트의 등록 경로를 고른다.
+소유자가 편집하는 `<state-dir>/policy.json`의 `{"retro_notify":{"P":"hq"}}`로
+프로젝트별 기본값을 둘 수 있다. 다른 설정은 바꾸지 않는다. **stop/repeat**만 등록된
+runner를 발신자로 한 번 전송하며 card·runner·urgency·tags와 첫 5줄/1000자 이내
+발췌를 보낸다. **note** 또는 대상 미설정은 전송하지 않는다. 알림 발신/수신 경로가
+없으면 저장·종료 전에 거절한다. 전송은 한 번만 시도하고 영수증에 ID/상태 또는 오류를
+표시한다. 알림 실패도 이미 저장한 회고를 되돌리거나 close를 막지는 않는다.
+수동 후속 조치 전에 영수증과 메시지를 확인한다. 전달 접수는 HQ의 조치 완료가 아니다.
+다른 경로로 원문을 보내지 않는다. 기존 routes/send/unregister를 쓰므로 브로커 변경이나
+재시작은 필요 없다.
