@@ -36,7 +36,7 @@ fall within their root, and retain their accepted mapping. Approve any alias
 changes separately. This config does not change the receiving agent's permissions.
 
 The facade reads this file once, at start. A change to `workspaces`,
-`pinned_sessions`, `inbox_enabled` or `events_enabled` takes effect only after the facade process
+`pinned_sessions`, `inbox_enabled`, `events_enabled` or `mcp_2026_enabled` takes effect only after the facade process
 is restarted; the broker does not need a restart. Until then a live session in a
 newly added workspace is not listed by `bridge_sessions_list`. Before restarting,
 check that no operation in the ledger is `accepted` or `running`. Inbox handles
@@ -306,6 +306,46 @@ silently ACK an existing pending response or replay an original request. Automat
 conversation wake/push is not provided by exposing these tools alone; the
 optional Events integration below supplies a separate notification path.
 
+## Optional MCP 2026 protocol
+
+`"mcp_2026_enabled": true` in the private Phase 1 config enables dual-era
+stdio handling. It defaults to false and does not enable Events or inbox tools.
+Legacy `initialize` negotiation and legacy result shapes remain available.
+This option changes no principal, workspace, scope, listener or authentication.
+
+For a modern request, send `params._meta` containing
+`"io.modelcontextprotocol/protocolVersion": "2026-07-28"` and an object
+`"io.modelcontextprotocol/clientCapabilities"` (an empty object is valid).
+Metadata is evaluated separately for each request; client identity and
+capabilities do not grant bridge authority. `server/discover` requires this
+metadata and returns supported versions and the currently enabled capabilities.
+Successful modern discovery, ping, tools and Events results contain
+`resultType: "complete"` and `_meta["io.modelcontextprotocol/serverInfo"]`.
+Modern discovery and tool-list results additionally contain `ttlMs: 0` and
+`cacheScope: "private"`: they are immediately stale and cannot be reused across
+authorization contexts. Legacy results keep their original shapes.
+Unsupported inline protocol versions return `-32022` with the supported modern
+version; malformed required metadata returns `-32602` before tool or callback
+work begins. Legacy versions remain available through `initialize`.
+
+The opt-in stdio reader accepts at most 16 in-flight envelopes (including the
+one serial handler), with a 1 MiB UTF-8 frame limit. Excess requests are refused
+without dispatch. `notifications/cancelled` marks a matching request before its
+receipt audit is written. Queued cancelled work is skipped; running work may
+finish and preserves any already accepted operation, but its response is
+suppressed. Cancellation never reverses dispatch or initiates a retry. IDs and
+cancellation state stay in memory. EOF drains accepted work; a handler still
+active after a 15-second shutdown wait prevents successful shutdown and keeps
+the Engine's database and owner lock open.
+
+This follows the [2026 stdio binding](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio)
+and [per-request versioning](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning).
+Official tunnel-client v0.0.21 forwards modern self-contained stdio requests
+without a legacy handshake, but this option does not change the tunnel's
+server-info advertisement or force ChatGPT task creation onto a modern path.
+No sampling, elicitation, task extension or notification stream is advertised.
+Actual Cloud subscription and wake behavior still require separate acceptance.
+
 ## Optional MCP Events
 
 Add `"events_enabled": true` to the approved private Phase 1 config only when
@@ -314,7 +354,8 @@ exposes no Events methods or capability; Phase 0 remains status-only. Events add
 no tool or scope: the inbox tool count remains eight. When enabled, initialize
 advertises both `capabilities.events: {}` and
 `capabilities.extensions["io.modelcontextprotocol/events"]: {}`. This does not
-change protocol-version negotiation or implement MCP 2. Preserve the existing
+change legacy protocol-version negotiation; modern handling is the separate
+`mcp_2026_enabled` option above. Preserve the existing
 owner/tunnel policy and wait until no ledger operation is `accepted` or `running`
 before restarting the corresponding facade to activate the configuration.
 
@@ -391,13 +432,14 @@ fsynced; the existing ledger lock keeps a single facade process. Record shapes:
   `ping`, `tools/list`, `tools/call`, `events/list`, `events/subscribe` and
   `events/unsubscribe`, plus `server/discover`, `resources/list`, `prompts/list`
   and `notifications/cancelled`; all others become `other`. Logging these names
-  does not implement unsupported methods; they retain their existing
-  method-not-found behavior. Tool names are one of the eight existing tools or
-  `other`. Initialize receipts also include normalized `requested_protocol`.
+  does not implement unsupported methods; `server/discover` is implemented only
+  by the separate modern opt-in. Tool names are one of the eight existing tools or
+  `other`. All request receipts include normalized `requested_protocol`, taken
+  from initialize parameters or the per-request protocol metadata.
 - `mcp_response`: a handler-produced response, not proof of transport delivery
   or client acceptance. It records UTC `at`, `type`, fixed `method`, fixed `tool` only for
   `tools/call`, `outcome` (`result` or `error`) and a known JSON-RPC integer
-  `error_code` (`-32700`, `-32600`, `-32601`, `-32602`, `-32603`, `-32015`)
+  `error_code` (`-32700`, `-32600`, `-32601`, `-32602`, `-32603`, `-32015`, `-32022`)
   or null. Only an initialize result includes
   `negotiated_protocol`. Protocol metadata uses the public versions `2024-11-05`,
   `2025-03-26`, `2025-06-18`, `2025-11-25`, `2026-07-28`, or normalized `absent`

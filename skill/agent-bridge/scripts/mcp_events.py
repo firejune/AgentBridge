@@ -181,11 +181,11 @@ class ArrivalAudit:
             record['method'] = fields.get('method') if fields.get('method') in self.METHODS else 'other'
             if record['method'] == 'tools/call':
                 record['tool'] = fields.get('tool') if fields.get('tool') in self.TOOLS else 'other'
-            if kind == 'mcp_request' and record['method'] == 'initialize':
+            if kind == 'mcp_request':
                 record['requested_protocol'] = self.protocol(fields.get('requested_protocol'))
             if kind == 'mcp_response':
                 record['outcome'] = 'error' if fields.get('outcome') == 'error' else 'result'
-                record['error_code'] = fields.get('error_code') if type(fields.get('error_code')) is int and fields['error_code'] in (-32700, -32600, -32601, -32602, -32603, -32015) else None
+                record['error_code'] = fields.get('error_code') if type(fields.get('error_code')) is int and fields['error_code'] in (-32700, -32600, -32601, -32602, -32603, -32015, -32022) else None
                 if record['method'] == 'initialize' and record['outcome'] == 'result':
                     record['negotiated_protocol'] = self.protocol(fields.get('negotiated_protocol'))
         elif kind == 'broker_message_observed':
@@ -386,8 +386,11 @@ class EventService:
         params = message.get('params')
         tool = params.get('name') if isinstance(params, dict) else None
         tool = tool if isinstance(tool, str) and tool in ArrivalAudit.TOOLS else 'other'
+        meta = params.get('_meta') if isinstance(params, dict) else None
+        protocol = (params.get('protocolVersion') if method == 'initialize' and isinstance(params, dict)
+                    else meta.get('io.modelcontextprotocol/protocolVersion') if isinstance(meta, dict) else None)
         self.audit.write('mcp_request', method=method, tool=tool,
-            requested_protocol=params.get('protocolVersion') if isinstance(params, dict) else None)
+            requested_protocol=protocol)
 
     def audit_response(self, message, response):
         if not isinstance(message, dict) or 'method' not in message or not isinstance(response, dict):

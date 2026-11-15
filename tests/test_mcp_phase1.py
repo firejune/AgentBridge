@@ -451,6 +451,20 @@ class PhaseTest(unittest.TestCase):
         with self.assertRaises(SystemExit),patch('sys.stderr',io.StringIO()):
             mcp_server.main(['--http','0','--phase1-config',str(p)])
 
+    def test_modern_protocol_flag_is_optional_and_strictly_boolean(self):
+        path = self.root/'modern-config.json'
+        for value in (False, True):
+            config = dict(self.config, mcp_2026_enabled=value)
+            path.write_text(json.dumps(config)); path.chmod(0o600)
+            self.assertIs(phase.load_config(path)['mcp_2026_enabled'], value)
+        for value in (None, 1, 'true', []):
+            config = dict(self.config, mcp_2026_enabled=value)
+            path.write_text(json.dumps(config)); path.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, 'mcp_2026_enabled'):
+                phase.load_config(path)
+            with self.assertRaisesRegex(ValueError, 'mcp_2026_enabled'):
+                phase.Engine(config, self.backend, start=False)
+
     def test_schema_contracts(self):
         if jsonschema:
             for tool in phase.TOOLS:

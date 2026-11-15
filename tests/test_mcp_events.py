@@ -3,6 +3,7 @@ import base64
 import copy
 import hashlib
 import hmac
+import io
 import json
 import os
 from pathlib import Path
@@ -133,6 +134,57 @@ class EventTests(unittest.TestCase):
         expected = 'v1,' + base64.b64encode(hmac.digest(b'k'*32, signed, 'sha256')).decode()
         self.assertEqual(headers['webhook-signature'], expected)
         self.assertEqual(headers['X-MCP-Subscription-Id'], result['id'])
+
+    def test_modern_events_keep_webhook_contract_and_normalized_receipts(self):
+        self.config['mcp_2026_enabled'] = True
+        meta = {'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+            'io.modelcontextprotocol/clientCapabilities': {}, 'private': 'do-not-persist-metadata'}
+        discover = self.rpc('server/discover', {'_meta': meta})['result']
+        self.assertEqual(discover['capabilities']['events'], {})
+        self.assertEqual(discover['capabilities']['extensions'], {'io.modelcontextprotocol/events': {}})
+        listed = self.rpc('events/list', {'_meta': meta})['result']
+        self.assertEqual(listed['events'], [events.CATALOG])
+        self.assertEqual(listed['resultType'], 'complete')
+        accepted = self.rpc('events/subscribe', dict(self.params, _meta=meta))['result']
+        self.assertEqual(accepted['resultType'], 'complete')
+        self.assertIsNone(accepted['cursor'])
+        self.assertEqual(len(self.callback.calls), 1)
+        stopped = self.rpc('events/unsubscribe', dict(self.params, _meta=meta,
+            delivery={key: value for key, value in self.params['delivery'].items() if key != 'secret'}))['result']
+        self.assertEqual(stopped['resultType'], 'complete')
+        self.assertEqual(len(self.service.subscriptions), 0)
+        bad = dict(meta, **{'io.modelcontextprotocol/protocolVersion': 'private-unsupported-version'})
+        self.assertEqual(self.rpc('events/subscribe', dict(self.params, _meta=bad))['error']['code'], -32022)
+        self.assertEqual(len(self.callback.calls), 1)
+        receipts = self.audit_records()
+        requests = [record for record in receipts if record['type'] == 'mcp_request']
+        self.assertEqual([record['requested_protocol'] for record in requests], ['2026-07-28']*4 + ['other'])
+        self.assertEqual(receipts[-1]['error_code'], -32022)
+        self.assertNotIn('private-unsupported-version', json.dumps(receipts))
+        self.assertNotIn('do-not-persist-metadata', json.dumps(receipts))
+        self.assertNotIn('do-not-persist-metadata', (self.engine.root/'events.json').read_text())
+
+    def test_modern_stdio_shutdown_retains_engine_ledger_while_handler_active(self):
+        self.config['mcp_2026_enabled'] = True
+        entered, release = threading.Event(), threading.Event()
+        request = {'jsonrpc': '2.0', 'id': 1, 'method': 'ping', 'params': {'_meta': {
+            'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+            'io.modelcontextprotocol/clientCapabilities': {}}}}
+        def blocking(*args, **kwargs):
+            entered.set(); release.wait(3)
+            return {'jsonrpc': '2.0', 'id': 1, 'result': {}}
+        try:
+            with patch.object(mcp_server, '_handle', blocking), patch.object(mcp_server, 'STDIO_SHUTDOWN_SECONDS', 0.02):
+                with self.assertRaisesRegex(RuntimeError, 'shutdown'):
+                    mcp_server.serve_stdio(self.running.path, io.StringIO(json.dumps(request)+'\n'), io.StringIO(), self.engine)
+                self.assertTrue(entered.is_set())
+                with self.assertRaisesRegex(RuntimeError, 'ledger remains owned'):
+                    self.engine.close()
+                with self.assertRaisesRegex(ValueError, 'already owns'):
+                    phase.Engine(self.config, phase.Backend(self.running.path), start=False)
+                self.assertEqual(self.engine.db.execute('SELECT 1').fetchone(), (1,))
+        finally:
+            release.set(); self.engine._mcp_stdio_worker.join(3)
 
     def test_repeat_subscribe_refresh_and_verification_cache(self):
         first = self.subscribe()

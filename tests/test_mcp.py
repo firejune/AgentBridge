@@ -6,7 +6,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 import urllib.error
 import urllib.request
 
@@ -137,6 +139,194 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(process.returncode,0,process.stderr)
         result = json.loads(process.stdout)['result']['structuredContent']
         self.assertEqual(result['data']['daemon_status'],'ready')
+
+
+class ModernProtocolTest(unittest.TestCase):
+    def setUp(self):
+        self.engine = SimpleNamespace(config={'mcp_2026_enabled': True}, events=None,
+                                      tools=lambda: mcp_server.TOOLS)
+
+    def request(self, method, mid=1, **params):
+        return {'jsonrpc': '2.0', 'id': mid, 'method': method, 'params': {
+            '_meta': {'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+                      'io.modelcontextprotocol/clientCapabilities': {}}, **params}}
+
+    def test_discovery_and_tools_need_no_initialize_and_legacy_stays_legacy(self):
+        result = mcp_server.handle(self.request('server/discover'), '/missing', self.engine)['result']
+        self.assertEqual(result['supportedVersions'], ['2026-07-28', *mcp_server.PROTOCOL_VERSIONS])
+        self.assertEqual(result['capabilities'], {'tools': {'listChanged': False}})
+        self.assertEqual(result['_meta']['io.modelcontextprotocol/serverInfo']['name'], 'agent-bridge')
+        self.assertEqual((result['ttlMs'], result['cacheScope']), (0, 'private'))
+        for method in ('ping', 'tools/list'):
+            modern = mcp_server.handle(self.request(method), '/missing', self.engine)['result']
+            self.assertEqual(modern['resultType'], 'complete')
+            if method == 'tools/list':
+                self.assertEqual((modern['ttlMs'], modern['cacheScope']), (0, 'private'))
+            else:
+                self.assertNotIn('ttlMs', modern)
+                self.assertNotIn('cacheScope', modern)
+        legacy_tools = mcp_server.handle({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'}, '/missing', self.engine)['result']
+        self.assertEqual(set(legacy_tools), {'tools'})
+        legacy = {'jsonrpc': '2.0', 'id': 2, 'method': 'initialize', 'params': {'protocolVersion': '2026-07-28'}}
+        result = mcp_server.handle(legacy, '/missing', self.engine)['result']
+        self.assertEqual(result['protocolVersion'], '2025-11-25')
+        self.assertNotIn('resultType', result)
+        self.assertEqual(mcp_server.handle({'jsonrpc': '2.0', 'id': 3, 'method': 'ping'}, '/missing', self.engine)['result'], {})
+        self.assertEqual(mcp_server.handle(self.request('initialize'), '/missing', self.engine)['error']['code'], -32601)
+        self.engine.config['mcp_2026_enabled'] = False
+        self.assertEqual(mcp_server.handle(self.request('server/discover'), '/missing', self.engine)['error']['code'], -32601)
+
+    def test_metadata_errors_prevent_tools_and_no_capabilities_are_inherited(self):
+        for value in (None, [], 'private-token'):
+            message = self.request('tools/call', name='bridge_status')
+            message['params']['_meta']['io.modelcontextprotocol/clientCapabilities'] = value
+            with patch.object(mcp_server, '_handle') as handler:
+                self.assertEqual(mcp_server.handle(message, '/missing', self.engine)['error']['code'], -32602)
+                handler.assert_not_called()
+        for params in ({}, {'_meta': None}, {'_meta': {}}, {'_meta': {'io.modelcontextprotocol/protocolVersion': False}}):
+            message = self.request('server/discover'); message['params'] = params
+            self.assertEqual(mcp_server.handle(message, '/missing', self.engine)['error']['code'], -32602)
+        message = self.request('tools/list')
+        message['params']['_meta']['io.modelcontextprotocol/protocolVersion'] = '2027-01-01'
+        response = mcp_server.handle(message, '/missing', self.engine)['error']
+        self.assertEqual(response['code'], -32022)
+        self.assertEqual(response['data']['requested'], '2027-01-01')
+        self.assertIn('2026-07-28', response['data']['supported'])
+        for key, value in [('io.modelcontextprotocol/clientInfo', None), ('progressToken', True)]:
+            message = self.request('tools/list'); message['params']['_meta'][key] = value
+            self.assertEqual(mcp_server.handle(message, '/missing', self.engine)['error']['code'], -32602)
+
+    def test_cancellation_suppresses_response_preserves_running_effect_and_skips_queued_effect(self):
+        entered, release = threading.Event(), threading.Event()
+        effects = []
+        original = mcp_server._handle
+        def blocking(message, path, engine, modern=False):
+            if message.get('method') == 'tools/call':
+                effects.append(message['id']); entered.set()
+                self.assertTrue(release.wait(3))
+                return {'jsonrpc': '2.0', 'id': message['id'], 'result': {'content': []}}
+            return original(message, path, engine, modern=modern)
+        class Reader:
+            def __init__(reader): reader.index = 0
+            def readline(reader, size):
+                reader.index += 1
+                if reader.index == 1: return json.dumps(self.request('tools/call', 'active')) + '\n'
+                if reader.index == 2:
+                    self.assertTrue(entered.wait(3))
+                    return json.dumps(self.request('tools/call', 'queued')) + '\n'
+                if reader.index in (3, 4):
+                    return json.dumps({'jsonrpc': '2.0', 'method': 'notifications/cancelled',
+                        'params': {'requestId': 'active' if reader.index == 3 else 'queued'}}) + '\n'
+                if reader.index == 5:
+                    release.set()
+                    return json.dumps(self.request('ping', 'after')) + '\n'
+                return ''
+        output = io.StringIO()
+        with patch.object(mcp_server, '_handle', blocking):
+            mcp_server.serve_stdio('/missing', Reader(), output, self.engine)
+        self.assertEqual(effects, ['active'])
+        self.assertEqual([row['id'] for row in map(json.loads, output.getvalue().splitlines())], ['after'])
+        self.assertFalse(self.engine._mcp_stdio_worker.is_alive())
+
+    def test_capacity_and_shutdown_are_bounded(self):
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+        def blocking(message, path, engine, modern=False):
+            calls.append(message['id']); entered.set(); release.wait(3)
+            return {'jsonrpc': '2.0', 'id': message['id'], 'result': {}}
+        class Reader:
+            def __init__(reader): reader.index = 0
+            def readline(reader, size):
+                reader.index += 1
+                if reader.index == 2: self.assertTrue(entered.wait(3))
+                if reader.index <= 3: return json.dumps(self.request('ping', reader.index)) + '\n'
+                release.set(); return ''
+        output = io.StringIO()
+        with patch.object(mcp_server, '_handle', blocking), patch.object(mcp_server, 'STDIO_CAPACITY', 2):
+            mcp_server.serve_stdio('/missing', Reader(), output, self.engine)
+        rows = list(map(json.loads, output.getvalue().splitlines()))
+        self.assertEqual(next(row for row in rows if row['id'] == 3)['error']['code'], -32603)
+        self.assertEqual(calls, [1, 2])
+        release.clear()
+        try:
+            with patch.object(mcp_server, '_handle', blocking), patch.object(mcp_server, 'STDIO_SHUTDOWN_SECONDS', 0.01):
+                with self.assertRaisesRegex(RuntimeError, 'shutdown'):
+                    mcp_server.serve_stdio('/missing', io.StringIO(json.dumps(self.request('ping')) + '\n'), io.StringIO(), self.engine)
+            self.assertTrue(self.engine._mcp_stdio_worker.is_alive())
+        finally:
+            release.set(); self.engine._mcp_stdio_worker.join(3)
+
+    def test_cancellation_is_effective_before_slow_receipt_audit(self):
+        entered, release, response_finished, written = (threading.Event() for _ in range(4))
+        def blocking(message, path, engine, modern=False):
+            if message.get('method') == 'tools/call':
+                entered.set(); self.assertTrue(release.wait(3))
+                return {'jsonrpc': '2.0', 'id': 1, 'result': {'content': []}}
+            return None
+        class Audit:
+            def audit_request(audit, message):
+                if message.get('method') == 'notifications/cancelled':
+                    release.set()
+                    self.assertTrue(response_finished.wait(3))
+                    self.assertFalse(written.wait(0.1), 'cancelled response escaped during receipt audit')
+            def audit_response(audit, message, response):
+                if message.get('method') == 'tools/call': response_finished.set()
+        class Output(io.StringIO):
+            def write(output, value): written.set(); return super().write(value)
+        class Reader:
+            def __init__(reader): reader.index = 0
+            def readline(reader, size):
+                reader.index += 1
+                if reader.index == 1: return json.dumps(self.request('tools/call'))+'\n'
+                if reader.index == 2:
+                    self.assertTrue(entered.wait(3))
+                    return json.dumps({'jsonrpc': '2.0', 'method': 'notifications/cancelled', 'params': {'requestId': 1}})+'\n'
+                return ''
+        self.engine.events = Audit()
+        output = Output()
+        try:
+            with patch.object(mcp_server, '_handle', blocking):
+                mcp_server.serve_stdio('/missing', Reader(), output, self.engine)
+        finally:
+            release.set(); self.engine._mcp_stdio_worker.join(3)
+        self.assertEqual(output.getvalue(), '')
+
+    def test_oversized_utf8_frame_is_drained_without_losing_next_request(self):
+        valid = {'jsonrpc': '2.0', 'id': 9, 'method': 'ping'}
+        output = io.StringIO()
+        with patch.object(mcp_server, 'MAX_BODY', 128):
+            mcp_server.serve_stdio('/missing', io.StringIO('é'*100+'\n'+json.dumps(valid)+'\n'), output, self.engine)
+        rows = list(map(json.loads, output.getvalue().splitlines()))
+        self.assertEqual(rows[0]['error']['code'], -32600)
+        self.assertEqual(rows[1], {'jsonrpc': '2.0', 'id': 9, 'result': {}})
+
+    def test_actual_stdio_process_discovers_calls_tools_and_retains_legacy_fallback(self):
+        with tempfile.TemporaryDirectory(prefix='ab-modern-', dir='/tmp') as temp:
+            root = Path(temp).resolve()
+            config = {'principal': 'test-owner', 'tunnel_id': 'test-tunnel', 'writes_enabled': True,
+                'mcp_2026_enabled': True, 'state_dir': str(root/'state'),
+                'scopes': ['bridge:read', 'bridge:session:create', 'bridge:message:send'],
+                'workspaces': {'test': {'cwd': str(root), 'root': str(root), 'project': 'test', 'ide': 'antigravity-ide'}}}
+            path = root/'config.json'; path.write_text(json.dumps(config)); path.chmod(0o600)
+            messages = [self.request('server/discover', 1), self.request('tools/list', 2),
+                self.request('tools/call', 3, name='bridge_status', arguments={}),
+                {'jsonrpc': '2.0', 'id': 4, 'method': 'initialize', 'params': {'protocolVersion': '2025-11-25'}},
+                {'jsonrpc': '2.0', 'id': 5, 'method': 'ping'}]
+            process = subprocess.run([sys.executable, str(Path(mcp_server.__file__)), '--socket', str(root/'absent.sock'),
+                '--phase1-config', str(path)], input=''.join(json.dumps(message)+'\n' for message in messages),
+                capture_output=True, text=True, timeout=10)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        rows = [json.loads(line) for line in process.stdout.splitlines()]
+        self.assertEqual([row['id'] for row in rows], [1, 2, 3, 4, 5])
+        self.assertEqual([row['result'].get('resultType') for row in rows], ['complete']*3 + [None, None])
+        self.assertEqual(len(rows[1]['result']['tools']), 5)
+        for row in rows[:2]:
+            self.assertEqual((row['result']['ttlMs'], row['result']['cacheScope']), (0, 'private'))
+        for row in rows[2:]:
+            self.assertNotIn('ttlMs', row['result'])
+            self.assertNotIn('cacheScope', row['result'])
+        self.assertTrue(rows[2]['result']['structuredContent']['ok'])
+        self.assertEqual(rows[3]['result']['protocolVersion'], '2025-11-25')
 
 
 class HttpTest(unittest.TestCase):

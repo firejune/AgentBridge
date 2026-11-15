@@ -369,7 +369,9 @@ class NewCodexTests(unittest.TestCase):
                 with ModelDesktop(model=codex_new.DEFAULT_MODEL, permissions=permissions,
                                   refuse_permissions=True) as desktop, \
                         self.assertRaises(codex_new.CreationError) as caught:
-                    self.open(desktop)
+                    # This checks mismatch formatting, not the 100ms deadline.
+                    # Allow the bounded permission-settle polls to finish.
+                    self.open(desktop, timeout=1)
                 self.assertTrue(caught.exception.uncertain)
                 self.assertEqual(caught.exception.stage, 'permissions')
                 self.assertIn('(mismatched fields: ' + expected + ')', str(caught.exception))

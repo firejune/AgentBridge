@@ -105,7 +105,7 @@ def load_config(path):
     if not stat.S_ISREG(s.st_mode) or s.st_uid != os.getuid() or stat.S_IMODE(s.st_mode) != 0o600:
         raise ValueError('Phase 1 configuration must be owner-only (0600)')
     config = json.loads(Path(path).read_text())
-    if set(config) - {'pinned_sessions', 'inbox_enabled', 'events_enabled'} != {'principal','scopes','workspaces','state_dir','tunnel_id','writes_enabled'}:
+    if set(config) - {'pinned_sessions', 'inbox_enabled', 'events_enabled', 'mcp_2026_enabled'} != {'principal','scopes','workspaces','state_dir','tunnel_id','writes_enabled'}:
         raise ValueError('Unexpected Phase 1 configuration fields')
     if config['writes_enabled'] is not True or not config['principal'] or not config['tunnel_id']:
         raise ValueError('An approved private tunnel owner mapping is required')
@@ -113,6 +113,8 @@ def load_config(path):
         raise ValueError('Phase 1 requires exactly the three bridge scopes')
     if type(config.get('inbox_enabled', False)) is not bool:
         raise ValueError('inbox_enabled must be a boolean')
+    if type(config.get('mcp_2026_enabled', False)) is not bool:
+        raise ValueError('mcp_2026_enabled must be a boolean')
     if type(config.get('events_enabled', False)) is not bool or (config.get('events_enabled') and not config.get('inbox_enabled')):
         raise ValueError('events_enabled requires inbox_enabled')
     validate_workspaces(config['workspaces'])
@@ -475,6 +477,8 @@ class Engine:
             raise ValueError('events_enabled requires inbox_enabled')
         if type(config.get('inbox_enabled', False)) is not bool:
             raise ValueError('inbox_enabled must be a boolean')
+        if type(config.get('mcp_2026_enabled', False)) is not bool:
+            raise ValueError('mcp_2026_enabled must be a boolean')
         self.config, self.backend = config, backend
         self.principal = config['principal']
         self.scopes = frozenset(config['scopes'])
@@ -536,6 +540,9 @@ class Engine:
             self.thread.start()
 
     def close(self):
+        worker = getattr(self, '_mcp_stdio_worker', None)
+        if worker is not None and worker.is_alive():
+            raise RuntimeError('MCP handler is still active; ledger remains owned')
         if self.events is not None:
             self.events.close()
         self.stop.set(); self.wake.set()
