@@ -13,6 +13,9 @@ import time
 import uuid
 
 MAX_FRAME = 1024 * 1024
+# Both versions retain the exact-owner snapshot envelope and permission fields.
+# Version 13 was measured against Desktop on 2026-11-15; unknown versions fail closed.
+SNAPSHOT_VERSIONS = (11, 13)
 
 
 class DeliveryError(ValueError):
@@ -156,7 +159,7 @@ class Client:
                 params = response.get('params')
                 if not isinstance(params, dict) or params.get('conversationId') != thread:
                     continue
-                if (response.get('sourceClientId') != owner or response.get('version') != 11
+                if (response.get('sourceClientId') != owner or response.get('version') not in SNAPSHOT_VERSIONS
                         or params.get('hostId') != 'local'
                         or not isinstance(response.get('targetClientIds'), list)
                         or self.client_id not in response['targetClientIds']):

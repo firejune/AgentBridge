@@ -169,7 +169,10 @@ def open_result():
 def permission_settings(client, sid, owner):
     # latestThreadSettings are the app's confirmed subsequent-turn inputs;
     # currentPermissions may still describe the last completed turn.
-    state = client.snapshot(sid, owner)
+    try:
+        state = client.snapshot(sid, owner)
+    except codex_live.DeliveryError:
+        raise CreationError('Exact Codex Desktop owner permission snapshot unavailable or unsupported') from None
     values = state.get('latestThreadSettings')
     if not isinstance(values, dict):
         raise CreationError('Exact Codex Desktop owner returned no next-turn permission settings')

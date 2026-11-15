@@ -267,7 +267,12 @@ class SnapshotDesktop(FakeDesktop):
                     'params':{'hostId':'local','conversationId':sid,'change':{'type':'snapshot',
                         'revision':1,'conversationState':{'id':sid,'latestThreadSettings':{'approvalPolicy':'never'}}}}}
         mode = self.snapshot_behavior
-        if mode == 'wrong-owner':response['sourceClientId']='different-owner'
+        if mode == 'recorded-v13':
+            response = json.loads((Path(__file__).parent / 'fixtures/codex_snapshot_v13.json').read_text())
+            response.update(sourceClientId=self.owner, targetClientIds=[request['sourceClientId']])
+            response['params']['conversationId'] = sid
+            response['params']['change']['conversationState']['id'] = sid
+        elif mode == 'wrong-owner':response['sourceClientId']='different-owner'
         elif mode == 'wrong-version':response['version']=12
         elif mode == 'wrong-destination':response['targetClientIds']=['other-client']
         elif mode == 'wrong-host':response['params']['hostId']='other-host'
@@ -287,6 +292,19 @@ class SnapshotDesktop(FakeDesktop):
 
 
 class CodexSnapshotTests(unittest.TestCase):
+    def test_issue137_recorded_v13_snapshot_permission_shape(self):
+        # Captured 2026-11-15 from Desktop; identities, roots and unrelated state removed.
+        sid = str(uuid.uuid4())
+        with SnapshotDesktop('recorded-v13', fragmented=True) as desktop:
+            with codex_live.Client(desktop.path, timeout=1) as client:
+                state = client.snapshot(sid, client.owner(sid))
+                settings = state['latestThreadSettings']
+                self.assertEqual(settings['approvalPolicy'], 'on-request')
+                self.assertEqual(settings['sandboxPolicy']['type'], 'workspaceWrite')
+                self.assertEqual(settings['activePermissionProfile']['id'], ':workspace')
+                self.assertFalse(client.mutation_sent)
+                self.assertTrue(desktop.unsubscribed.wait(.2))
+
     def test_exact_snapshot_and_unsubscribe_use_assigned_client_identity(self):
         sid=str(uuid.uuid4())
         with SnapshotDesktop('unrelated-then-snapshot',fragmented=True) as desktop:

@@ -1,0 +1,36 @@
+{
+  "type": "broadcast",
+  "method": "thread-stream-state-changed",
+  "version": 13,
+  "sourceClientId": "recorded-owner",
+  "targetClientIds": [
+    "recorded-follower"
+  ],
+  "params": {
+    "hostId": "local",
+    "conversationId": "00000000-0000-4000-8000-000000000137",
+    "change": {
+      "type": "snapshot",
+      "conversationState": {
+        "id": "00000000-0000-4000-8000-000000000137",
+        "latestThreadSettings": {
+          "approvalPolicy": "on-request",
+          "approvalsReviewer": "user",
+          "sandboxPolicy": {
+            "type": "workspaceWrite",
+            "writableRoots": [],
+            "networkAccess": false,
+            "excludeTmpdirEnvVar": false,
+            "excludeSlashTmp": false
+          },
+          "activePermissionProfile": {
+            "id": ":workspace",
+            "extends": null
+          },
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai"
+        }
+      }
+    }
+  }
+}
