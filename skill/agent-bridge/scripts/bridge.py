@@ -30,6 +30,7 @@ import usage
 import session_usage
 import wt
 import retros
+import receipts
 
 def envelope(m):
     return (f"[agent-bridge peer message | {m['sender']} -> {m['recipient']}]\n"
@@ -1049,6 +1050,14 @@ def main(argv=None):
             r.add_argument('--since')
             if action == 'list':
                 r.add_argument('--tag');r.add_argument('--urgency',choices=['stop','repeat','note'])
+    p = sub.add_parser('run',help='Capture a local command in an owner-private run receipt')
+    p.add_argument('--label',required=True);p.add_argument('--cwd');p.add_argument('--state-dir')
+    p.add_argument('command',nargs=argparse.REMAINDER)
+    p = sub.add_parser('handover',help='Verify receipt-backed rows before one peer message')
+    p.add_argument('action',nargs='?',choices=['check'])
+    p.add_argument('--rows',required=True);p.add_argument('--head',required=True);p.add_argument('--state-dir')
+    p.add_argument('--project');p.add_argument('--from',dest='sender');p.add_argument('--to',dest='recipient')
+    p.add_argument('--card');p.add_argument('--note-file')
     p = sub.add_parser('wake',help="Bring an idle-closed claude-peer session back in its own host; prints woken, already-live, unsupported, failed or uncertain")
     p.add_argument('name');p.add_argument('--project',required=True)
     p.add_argument('--timeout',type=float,default=sessions.WAKE_TIMEOUT,help='Seconds to wait for the woken session inbox')
@@ -1113,6 +1122,28 @@ def main(argv=None):
     observation = None
     creation_model_source = None
     try:
+        if args.cmd == 'run':
+            return receipts.run(broker_state_dir(args), args.label, args.cwd, args.command)
+        if args.cmd == 'handover':
+            checked = receipts.check(broker_state_dir(args), args.rows, args.head)
+            if args.action == 'check':
+                output({'verified': True, 'head': args.head, 'rows': checked})
+                return 0
+            if not all(getattr(args, name) and getattr(args, name).strip()
+                       for name in ('project', 'sender', 'recipient', 'card')):
+                raise ValueError('HANDOVER_UNVERIFIED: send requires --project, --from, --to and --card')
+            note = None
+            if args.note_file:
+                with Path(args.note_file).expanduser().open(encoding='utf-8', newline='') as source:
+                    note = source.read()
+            body = receipts.message(args.card, args.head, checked, note)
+            # Identical verified content has one durable broker idempotency key. No retry on uncertainty.
+            key_data = json.dumps([args.project, args.sender, args.recipient, body], ensure_ascii=False).encode('utf-8')
+            sent = broker.request(args.socket, {'op': 'send', 'project': args.project,
+                'sender': args.sender, 'recipient': args.recipient, 'body': body,
+                'key': 'handover-' + hashlib.sha256(key_data).hexdigest()})
+            output(push_if_peer(args.socket, sent))
+            return 0
         if ((args.cmd == 'open' and args.provider == 'codex') or
                 (args.cmd == 'register' and args.transport == 'codex' and args.new)):
             return open_codex_result(args)

@@ -542,3 +542,103 @@ receipt. A notification error does not undo the saved retro or prevent close;
 inspect that receipt and message before any manual follow-up. Delivery acceptance
 is not HQ action. No other route receives the text. No broker changes or restart
 are needed: these commands use existing routes/send/unregister operations.
+
+### Verified run receipts and handovers (#141)
+
+`run --label TEXT [--cwd DIR] [--state-dir DIR] -- COMMAND...` captures a local
+command without contacting the broker. `<state-dir>/receipts/<id>.json` records
+`schema: agent-bridge-run/1`, `id`, `label`, `argv`, `cwd`, UTC `started`/`finished`,
+`exit_code`, sibling `log`, `log_sha256`, `log_bytes`, `capture`, `log_order`, `head` and `dirty`.
+Git HEAD/dirty are sampled before the command; unavailable metadata is null, never
+inferred clean. This does not freeze the source tree. The command's exit status
+is returned (signals use 128 + signal), and the last stderr line is
+`RUN_RECEIPT: <id>`. No shell expansion is applied; use `sh -c` explicitly if needed.
+
+All TTY/redirection combinations preserve each child's stdio `isatty()` state.
+Stdin is inherited unchanged in every layout, including full TTY and piped input.
+The recorder does not read ahead, flush queued input or change original terminal
+settings. With TTY stdin the child retains the caller's session/process group;
+terminal SIGINT reaches it through that group and is not forwarded a second time.
+With TTY stdin, `kill -INT <recorder_pid>` targeting only the recorder is
+suppressed and does not interrupt the child; use terminal/group SIGINT instead.
+Each terminal output uses an output-only PTY with window-size propagation;
+outputs on the same terminal share one PTY. Each redirected output uses its own
+pipe and is teed to its original stdout or stderr destination. The intermediate
+PTY disables `OPOST` so the destination terminal applies line processing once.
+This supports ordinary `printf 'answer\n' | ...` from a terminal, and independent
+`>out 2>err` redirections.
+
+Receipts record `capture: routed` and `log_order`. Strict combined write order is
+guaranteed only for shared terminal output (`log_order: shared-pty`). For distinct
+pipes/terminals, the log records observed relay read order (`observed-read-order`);
+original global cross-stream write order cannot generally be recovered. Each
+stream retains its own byte order and fd routing. The log contains captured
+stdout/stderr only: input echo on the original terminal and explicit `/dev/tty`
+writes bypass capture. This foreground recorder does not implement full shell
+job control or record stdin independently. Output PTY log bytes are captured
+before destination-terminal line processing; child-emitted ANSI/CRLF are not
+stripped or normalized. A missing final stderr newline is added before the
+receipt marker so it starts on the last stderr line.
+
+Receipt/log files are 0600 under a 0700 receipts directory. Writers use
+`O_NOFOLLOW`, exclusive locks, `fchmod`, and file/directory `fsync` as retros do;
+readers use shared locks and reject symlinks/nonregular files. JSON is published
+only after capture finishes and the log is synced. Capture failure may leave an
+orphan log but no completed receipt. There is no automatic expiry: the owner
+manages these files privately. Logs can contain sensitive command output.
+
+A reference is a bridge id or a JSON path. Bridge logs are checked against their
+recorded byte count and SHA-256. The Nova pool shape reads integer `exitCode`,
+optional `sourceCommit` (full SHA or empty/absent = unknown), and **sibling
+`command.log`** beside `result.json`; remote `root`/`out` are not local log paths.
+A generic external JSON may instead supply integer `exit_code`, `log` (relative
+to that JSON or absolute), and optional `head`. External receipts have no required
+log hash. None of these formats authenticates provenance: the owner can edit
+files, and matching figures does not establish that a claim is meaningful.
+
+`handover check --rows FILE --head FULL_SHA [--state-dir DIR]` verifies locally,
+without a broker. Rows are a nonempty JSON list of
+`{claim, receipt, exit, figures:["literal text"]}`. An optional row `head` explicitly
+states another full SHA. Missing/unreadable receipts/logs, invalid shapes, exit
+mismatches, missing literal UTF-8 figures, known-head mismatches and native log
+hash/size mismatches refuse as `HANDOVER_UNVERIFIED: row N: ...` (one-based).
+Unknown recorded heads remain visibly unknown. No tests are chosen or run.
+
+`handover --project P --from RUNNER --to TOWER --card REF --head FULL_SHA --rows FILE
+[--note-file FILE] [--state-dir DIR]` checks every row before sending one existing
+broker message. Claim/figure/reference cells are JSON-quoted, preserving text and
+escaping table delimiters. Each row shows exit, verification scope, receipt kind,
+reference and stated/recorded HEAD; earlier/different heads are marked explicitly.
+The optional note follows verbatim under an **unverified free-text** separator.
+Only references and stated row content are sent, never receipt JSON or full logs.
+The message must fit 32768 UTF-8 bytes. Existing explicit routes are required;
+identical content has a deterministic broker idempotency key. Never retry an
+ambiguous dispatch. Delivery acceptance is not completion; no restart is needed.
+
+Worked example (replace `FULL_CURRENT_SHA` with the actual full commit SHA and
+`RECEIPT_ID` with the id printed by `run`; choose tests yourself):
+
+```bash
+bridge_cli="$HOME/.agents/skills/agent-bridge/scripts/bridge.py"
+lane="$HOME/.local/share/agent-bridge/bridge.state/example-141"
+mkdir -p "$lane"
+# In an ordinary terminal, all three stdio descriptors are TTYs.
+python3 "$bridge_cli" run --label stdin-smoke -- python3 -c \
+  'import sys; value=input("Value: "); print("INPUT="+value); print("checks=1")'
+# Enter probe-141. Copy the printed receipt id into this private rows file.
+cat > "$lane/rows.json" <<'JSON'
+[{"claim":"stdin smoke","receipt":"RECEIPT_ID","exit":0,"figures":["INPUT=probe-141","checks=1"]}]
+JSON
+python3 "$bridge_cli" handover check --head FULL_CURRENT_SHA --rows "$lane/rows.json"
+python3 "$bridge_cli" handover --project P --from runner --to tower --card repo#141 \
+  --head FULL_CURRENT_SHA --rows "$lane/rows.json"
+# Noninteractive input from the same terminal keeps child stdio False,True,True:
+printf 'probe-141\n' | python3 "$bridge_cli" run --label pipe-smoke -- python3 -c \
+  'import os,sys; print([os.isatty(i) for i in range(3)]); x=input(); print("INPUT="+x); sys.exit(7)'
+# Independent destinations stay separate; the log promises observed read order:
+printf 'probe-141\n' | python3 "$bridge_cli" run --label routed-smoke -- python3 -c \
+  'import sys; print("OUT="+input()); print("ERR",file=sys.stderr)' >"$lane/out" 2>"$lane/err"
+# A retrieved pool result can replace the receipt id with an absolute path to
+# result.json; keep its sibling command.log. An earlier run needs an explicit
+# row "head" when its sourceCommit differs. Empty sourceCommit stays unknown.
+```
