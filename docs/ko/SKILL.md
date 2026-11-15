@@ -173,7 +173,8 @@ python3 "$bridge_cli" usage --events
 ## 원격 MCP 파사드
 
 - 로컬 에이전트는 항상 `scripts/bridge.py` 파이썬 CLI를 직접 사용하며, 로컬 MCP 서버로 중복 등록하지 않는다.
-- `scripts/mcp_server.py`는 비공개 원격 터널(`stdio` 기반 `--phase1-config`) 단일 커넥터 전용이다: [mcp-phase1.md](../../skill/agent-bridge/references/mcp-phase1.md).
+- `scripts/mcp_server.py`는 비공개 원격 터널(`stdio` 기반 `--phase1-config`) 단일 커넥터 전용이다: [remote-mcp.md](../../skill/agent-bridge/references/remote-mcp.md).
+- 연결 서버가 MCP Events를 제공하고 대상 GPT/Dot 채팅에 활성 구독이 있으면 해당 알림이 채팅을 자동으로 깨운다. 독립 메시지는 inbox 도구로, `operation_id`가 있는 답장은 `bridge_operation_get`으로 읽는다. inbox 도구만으로 Events 지원을 판단하지 않는다. [배포 범위](../../skill/agent-bridge/references/remote-mcp.md#optional-mcp-events)를 참고한다.
 
 ## 실행 경계
 

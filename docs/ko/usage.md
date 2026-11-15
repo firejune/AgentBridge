@@ -309,7 +309,7 @@ Claude 데스크톱은 세션을 스스로 닫는다(앱 `main.log`에서 관찰
 
 ## 비공개 MCP 독립 inbox
 
-기존 CLI `inbox`·`ack` 의미는 그대로 유지된다. 비공개 MCP 파사드(`scripts/mcp_server.py`)에서 `--phase1-config`에 `"inbox_enabled": true`를 명시하면 `bridge_inbox_list`·`bridge_message_get`으로 독립(`reply_to: null`) 수신 메시지를 소비 없이 읽고, 처리 후 `bridge_message_ack`로 명시적으로 `done` 처리할 수 있다. 질문에 대한 답장(correlated reply)은 기존 `bridge_operation_get` 전용이다. 페이지네이션·용량·토큰 검증·배포 게이트는 [mcp-phase1.md](../../skill/agent-bridge/references/mcp-phase1.md#independent-inbox-issue-48-explicit-opt-in)를 따른다.
+기존 CLI `inbox`·`ack` 의미는 그대로 유지된다. 비공개 MCP 파사드(`scripts/mcp_server.py`)에서 `--phase1-config`에 `"inbox_enabled": true`를 명시하면 `bridge_inbox_list`·`bridge_message_get`으로 독립(`reply_to: null`) 수신 메시지를 소비 없이 읽고, 처리 후 `bridge_message_ack`로 명시적으로 `done` 처리할 수 있다. 질문에 대한 답장(correlated reply)은 기존 `bridge_operation_get` 전용이다. 페이지네이션·용량·토큰 검증·배포 게이트는 [remote-mcp.md](../../skill/agent-bridge/references/remote-mcp.md#independent-inbox-issue-48-explicit-opt-in)를 따른다. Events를 제공하는 연결 서버에 활성 GPT/Dot 구독이 있으면 채팅이 자동으로 깨어난다. 독립 메시지는 inbox로, `operation_id`가 있는 답장 알림은 `bridge_operation_get`으로 읽는다. [자동 알림](../../skill/agent-bridge/references/remote-mcp.md#optional-mcp-events)을 참고한다.
 
 ## 메시지 체크포인트 복원
 
