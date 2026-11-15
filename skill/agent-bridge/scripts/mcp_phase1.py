@@ -105,7 +105,7 @@ def load_config(path):
     if not stat.S_ISREG(s.st_mode) or s.st_uid != os.getuid() or stat.S_IMODE(s.st_mode) != 0o600:
         raise ValueError('Phase 1 configuration must be owner-only (0600)')
     config = json.loads(Path(path).read_text())
-    if set(config) - {'pinned_sessions', 'inbox_enabled'} != {'principal','scopes','workspaces','state_dir','tunnel_id','writes_enabled'}:
+    if set(config) - {'pinned_sessions', 'inbox_enabled', 'events_enabled'} != {'principal','scopes','workspaces','state_dir','tunnel_id','writes_enabled'}:
         raise ValueError('Unexpected Phase 1 configuration fields')
     if config['writes_enabled'] is not True or not config['principal'] or not config['tunnel_id']:
         raise ValueError('An approved private tunnel owner mapping is required')
@@ -113,6 +113,8 @@ def load_config(path):
         raise ValueError('Phase 1 requires exactly the three bridge scopes')
     if type(config.get('inbox_enabled', False)) is not bool:
         raise ValueError('inbox_enabled must be a boolean')
+    if type(config.get('events_enabled', False)) is not bool or (config.get('events_enabled') and not config.get('inbox_enabled')):
+        raise ValueError('events_enabled requires inbox_enabled')
     validate_workspaces(config['workspaces'])
     pinned_sessions(config)
     return config
@@ -469,6 +471,8 @@ class Engine:
     def __init__(self, config, backend, start=True):
         validate_workspaces(config['workspaces'])
         pinned_sessions(config)
+        if type(config.get('events_enabled', False)) is not bool or (config.get('events_enabled') and not config.get('inbox_enabled')):
+            raise ValueError('events_enabled requires inbox_enabled')
         if type(config.get('inbox_enabled', False)) is not bool:
             raise ValueError('inbox_enabled must be a boolean')
         self.config, self.backend = config, backend
@@ -516,11 +520,24 @@ class Engine:
         self.reply_watch_fast, self.reply_watch_slow = REPLY_WATCH_FAST, REPLY_WATCH_SLOW
         self.observe_at, self.watch_at = {}, {}  # Volatile schedules; a restart only reads sooner.
         self.recover()
+        self.events = None
+        if config.get('events_enabled', False):
+            if not config.get('inbox_enabled', False):
+                raise ValueError('events_enabled requires inbox_enabled')
+            from mcp_events import EventService
+            try:
+                self.events = EventService(self, start=start)
+            except BaseException:
+                self.db.close()
+                os.close(self.lock_fd)
+                raise
         if start:
             self.thread = threading.Thread(target=self.run, daemon=True, name='bridge-mcp-worker')
             self.thread.start()
 
     def close(self):
+        if self.events is not None:
+            self.events.close()
         self.stop.set(); self.wake.set()
         if self.thread:
             self.thread.join(timeout=195)

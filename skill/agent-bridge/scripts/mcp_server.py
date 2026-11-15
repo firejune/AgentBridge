@@ -40,7 +40,7 @@ def _compute_runtime_revision():
         if idx + 1 < len(parts) and re.fullmatch(r'[A-Za-z0-9._-]{7,64}', parts[idx + 1]):
             return parts[idx + 1]
     h = hashlib.sha256()
-    for name in ('mcp_server.py', 'mcp_phase1.py'):
+    for name in ('mcp_server.py', 'mcp_phase1.py', 'mcp_events.py'):
         candidate = here.with_name(name)
         if candidate.is_file():
             h.update(candidate.read_bytes())
@@ -117,10 +117,25 @@ def handle(message, path, engine=None):
         asked = params.get('protocolVersion')
         return {'jsonrpc': '2.0', 'id': mid, 'result': {
             'protocolVersion': asked if asked in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0],
-            'capabilities': {'tools': {'listChanged': False}},
+            'capabilities': dict({'tools': {'listChanged': False}},
+                **({'events': {}} if engine is not None and getattr(engine, 'events', None) is not None else {})),
             'serverInfo': {'name': 'agent-bridge', 'version': CONTRACT_VERSION}}}
     if method == 'ping':
         return {'jsonrpc': '2.0', 'id': mid, 'result': {}}
+    if method.startswith('events/') and engine is not None and getattr(engine, 'events', None) is not None:
+        from mcp_events import EventError
+        from mcp_phase1 import Fault
+        try:
+            result = engine.events.call(method, params)
+            return {'jsonrpc': '2.0', 'id': mid, 'result': result}
+        except EventError as exc:
+            response = error(mid, exc.code, exc.reason)
+            response['error']['data'] = {'reason': exc.reason}
+            return response
+        except Fault:
+            return error(mid, -32602, 'Event arguments are unavailable to this owner')
+        except Exception:
+            return error(mid, -32603, 'Event operation failed')
     if method == 'tools/list':
         return {'jsonrpc': '2.0', 'id': mid, 'result': {'tools': engine.tools() if engine else TOOLS}}
     if method == 'tools/call':
@@ -142,6 +157,9 @@ def handle(message, path, engine=None):
                                 enabled_tools=[t['name'] for t in enabled_defs],
                                 allowed_workspace_aliases=sorted(engine.config['workspaces']),
                                 capabilities=dict.fromkeys(data['capabilities'], True))
+                    if getattr(engine, 'events', None) is not None:
+                        data['capabilities']['events'] = True
+                        data['events'] = engine.events.health()
                     payload = {'ok': True, 'data': data}
                 except Fault as exc:
                     payload = {'ok': False, 'error': exc.payload}

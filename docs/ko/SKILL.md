@@ -174,6 +174,7 @@ python3 "$bridge_cli" usage --events
 
 - 로컬 에이전트는 항상 `scripts/bridge.py` 파이썬 CLI를 직접 사용하며, 로컬 MCP 서버로 중복 등록하지 않는다.
 - `scripts/mcp_server.py`는 비공개 원격 터널(`stdio` 기반 `--phase1-config`) 단일 커넥터 전용이다: [mcp-phase1.md](../../skill/agent-bridge/references/mcp-phase1.md).
+- 선택 설정 `events_enabled: true`는 `inbox_enabled: true`와 `bridge:read`가 필요하다. 서명된 `bridge.inbox.message.created` 웹훅은 짧은 검증용 읽기 후 지원되는 Work Cloud 소비자에게 알린다. 메시지 소비·ACK·본문 출력·본문 저장을 하지 않으며 처리 완료도 증명하지 않는다. 기존 inbox 목록·본문·ACK를 사용하고 알림 누락 후에는 새 목록을 조회한다. 이벤트 재생·웹훅 자동 재전송은 없다. 서명 키는 macOS Keychain에만, 한도가 있는 구독 메타데이터는 별도 소유자 전용 상태에 둔다. [Events 계약](../../skill/agent-bridge/references/mcp-phase1.md#optional-mcp-events)을 참고한다.
 
 ## 실행 경계
 

@@ -218,6 +218,8 @@ python3 "$bridge_cli" wt sweep --apply  # Remove eligible worktrees and branches
 
 Local agents (Claude Code, Codex, Antigravity) invoke `bridge.py` directly via the Python CLI and do not register a local MCP server. `skill/agent-bridge/scripts/mcp_server.py` is dedicated to remote MCP clients connecting through a private single-owner tunnel (`--phase1-config /absolute/private.json` over `stdio`), exposing session discovery/creation, message dispatch, and the optional independent inbox (`inbox_enabled: true`). Without `--phase1-config`, the server falls back to read-only `connectivity_only` (`bridge_status`). See [mcp-phase1.md](skill/agent-bridge/references/mcp-phase1.md) for the full contract.
 
+Optional `events_enabled: true` requires `inbox_enabled: true` and `bridge:read`. It exposes MCP Events methods for signed webhook notifications that an authorized session has new independent inbox mail; consumers still list, read and explicitly ACK through the inbox tools. Notifications have no replay or automatic delivery retries, so missed notifications require a fresh inbox scan. Signing keys live only in macOS Keychain; bounded subscription metadata lives separately from routing and correspondence. OpenAI documents Events for Work chats on ChatGPT web and desktop Work + Cloud, rather than local chat wake: see the [Events contract](skill/agent-bridge/references/mcp-phase1.md#optional-mcp-events) and [official guide](https://developers.openai.com/plugins/build/mcp-events).
+
 ## Development & Verification
 
 Run the full unit and integration test suite before committing any changes:

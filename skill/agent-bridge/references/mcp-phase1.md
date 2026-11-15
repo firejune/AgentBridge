@@ -36,7 +36,7 @@ fall within their root, and retain their accepted mapping. Approve any alias
 changes separately. This config does not change the receiving agent's permissions.
 
 The facade reads this file once, at start. A change to `workspaces`,
-`pinned_sessions` or `inbox_enabled` takes effect only after the facade process
+`pinned_sessions`, `inbox_enabled` or `events_enabled` takes effect only after the facade process
 is restarted; the broker does not need a restart. Until then a live session in a
 newly added workspace is not listed by `bridge_sessions_list`. Before restarting,
 check that no operation in the ledger is `accepted` or `running`. Inbox handles
@@ -294,8 +294,8 @@ Claude sessions or contact a real HQ/Nana inbox. The required full suite remains
 
 Actual HQ -> Nana acceptance, client tool exposure and deployment are **not run**
 by these tests. Owner actions, in order: (1) deploy the reviewed broker/facade code
-and coordinate any separately required broker upgrade, acknowledging that a
-broker restart loses pending correspondence; (2) add `inbox_enabled: true` to the
+and coordinate any separately required broker upgrade, preserving the private
+correspondence checkpoint and reconciling uncertain pre-restart ACKs; (2) add `inbox_enabled: true` to the
 approved private configuration without changing scopes or owner binding; (3)
 restart only the corresponding facade while preserving its ledger and the broker;
 (4) refresh/reconnect the intended client's tool list and verify eight tools;
@@ -303,5 +303,75 @@ restart only the corresponding facade while preserving its ledger and the broker
 it through Nana's direct tools, confirm sender still sees it unacknowledged, then
 explicitly ACK and verify the sender's `done`/`acknowledged_at` transition. Do not
 silently ACK an existing pending response or replay an original request. Automatic
-conversation wake/push needs separate host integration and is not provided by
-exposing these tools.
+conversation wake/push is not provided by exposing these tools alone; the
+optional Events integration below supplies a separate notification path.
+
+## Optional MCP Events
+
+Add `"events_enabled": true` to the approved private Phase 1 config only when
+`"inbox_enabled": true` and `bridge:read` are already enabled. Default/false
+exposes no Events methods or capability; Phase 0 remains status-only. Events add
+no tool or scope: the inbox tool count remains eight. Preserve the existing
+owner/tunnel policy and wait until no ledger operation is `accepted` or `running`
+before restarting the corresponding facade to activate the configuration.
+
+The implementation follows the [official MCP Events guide](https://developers.openai.com/plugins/build/mcp-events).
+Its documented consumer surfaces are Work chats on ChatGPT web, desktop Work +
+Cloud, and dots. This does not establish event support or automatic wake for a
+local desktop chat. Refresh the intended plugin's capabilities and verify a
+subscription and its actual consumer behavior separately from local tests.
+
+- `events/list` advertises `bridge.inbox.message.created`, with webhook delivery
+  and an optional `arguments.agent_session_id` filter. Omit the filter for all
+  owner-authorized sessions; use only facade-issued opaque `as_` IDs.
+- `events/subscribe` takes `name`, `arguments`, `delivery` (`mode: "webhook"`,
+  HTTPS `url`, `secret`) and optional `ttlMs` and `cursor`. The signing secret
+  must use `whsec_` plus a base64-encoded 24–64-byte key. The callback must pass
+  address validation and signed challenge verification before activation.
+  Repeating the same owner, callback, name and canonical arguments refreshes the
+  existing subscription. The response includes `id`, finite `refreshBefore`,
+  `cursor: null` and `truncated: false`. The default lease is one hour and the
+  maximum is 24 hours; `ttlMs: null` still grants the finite default lease.
+- `events/unsubscribe` takes the same `name`, canonical `arguments` and `delivery`
+  (`mode: "webhook"`, `url`), without a signing secret, and stops that subscription.
+  The returned subscription `id` is informational, not an unsubscribe argument.
+
+Notifications carry only `data: {"agent_session_id": "as_…"}` with the event
+envelope and `cursor: null`. They contain no message body, message handle,
+provider UUID or local path. Use `bridge_inbox_list`, `bridge_message_get` and
+explicit `bridge_message_ack` to consume independent mail. Correlated replies
+remain exclusively in `bridge_operation_get`. Notification delivery performs a
+bounded validation read (`inbox_get`, offset 0, `max_chars: 1`) to check unread
+owner/route/epoch access. It never consumes or ACKs mail, emits or persists the
+body, or sends or retries a bridge message. Agent-authored mail is data, not
+authorization.
+
+Webhook requests use Standard Webhooks signatures over the exact serialized
+body, event ID and signing timestamp. A `2xx` means callback receipt, not
+successful processing or downstream completion. Webhook delivery is attempted
+without automatic retries under the local no-retry policy; interrupted or failed
+notifications may be missed. This event has no replay: use a fresh inbox list
+after a gap, restart or reconnect, and guard downstream actions against duplicate
+processing. A subscription does not guarantee a conversation wake.
+
+The watch emits one callback attempt per new independent broker message for each
+matching subscription. Existing unread mail is not replayed when subscribing.
+The watch queue holds at most 128 events; overflow is a notification gap, while
+unread mail remains available through the inbox. `bridge_status` reports Events
+health in `data.events`, including watch gaps and callback failures.
+
+Subscriptions survive facade restart in bounded, owner-only
+`state_dir/events.json` (0600), separate from routing, correspondence and the
+operation ledger. Metadata is bound to the principal, tunnel, ledger namespace
+and configured policy. Policy changes revoke persisted subscriptions accepted
+under the old policy. Signing keys, including the previous key during a brief
+rotation window, live only in the macOS Keychain service
+`agent-bridge.mcp-events`; refresh replaces the key and temporarily signs with
+both keys. An unavailable Keychain fails closed; there is no plaintext fallback.
+This is the narrowly user-approved Events key storage exception, not permission
+to persist other credentials. Keep callback metadata and keys out of Git,
+routing/correspondence checkpoints and diagnostic bundles.
+
+Deployment, callback verification against ChatGPT, real notification acceptance
+and the consumer's response require a separately observed owner-authorized test.
+Do not infer them from unit tests or from exposing the Events capability.

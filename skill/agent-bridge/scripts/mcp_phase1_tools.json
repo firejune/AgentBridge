@@ -116,6 +116,9 @@
                   },
                   "durable_idempotency": {
                     "type": "boolean"
+                  },
+                  "events": {
+                    "type": "boolean"
                   }
                 },
                 "required": [
@@ -156,6 +159,52 @@
                   "operation_retention_hours",
                   "idempotency_retention_hours"
                 ],
+                "additionalProperties": false
+              },
+              "events": {
+                "type": "object",
+                "properties": {
+                  "active_subscriptions": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "watching_routes": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "queued_notifications": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "watch_gaps": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "callback_failures": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "last_error": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "replay_supported": {
+                    "type": "boolean",
+                    "const": false
+                  },
+                  "pending_key_deletions": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "uninitialized_agent_session_ids": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                },
                 "additionalProperties": false
               }
             },
