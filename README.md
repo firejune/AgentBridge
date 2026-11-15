@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/python-3.10%2B-38BDF8.svg?style=flat-square" alt="Python 3.10+" />
   <img src="https://img.shields.io/badge/dependencies-zero%20(stdlib)-30D158.svg?style=flat-square" alt="Zero Dependencies" />
   <img src="https://img.shields.io/badge/peers-claude--peer%20%C2%B7%20codex%20%C2%B7%20agy-FF6B4A.svg?style=flat-square" alt="Supported Peers" />
-  <img src="https://img.shields.io/badge/MCP-Phase%201%20%2B%20Inbox-A855F7.svg?style=flat-square" alt="MCP Phase 1" />
+  <img src="https://img.shields.io/badge/MCP-Remote%20%2B%20Inbox-A855F7.svg?style=flat-square" alt="Remote MCP" />
 </p>
 
 <p align="center">
@@ -24,7 +24,7 @@ Instead of spawning duplicate CLI processes or trapping agents in polling loops,
 | Overview & Quickstart | [README.md](README.md) | [docs/ko/README.md](docs/ko/README.md) |
 | Agent Skill Instructions | [skill/agent-bridge/SKILL.md](skill/agent-bridge/SKILL.md) | [docs/ko/SKILL.md](docs/ko/SKILL.md) |
 | Full CLI & Protocol Reference | [skill/agent-bridge/references/usage.md](skill/agent-bridge/references/usage.md) | [docs/ko/usage.md](docs/ko/usage.md) |
-| MCP Phase 1 Specification | [skill/agent-bridge/references/mcp-phase1.md](skill/agent-bridge/references/mcp-phase1.md) | — |
+| Remote MCP Reference | [skill/agent-bridge/references/remote-mcp.md](skill/agent-bridge/references/remote-mcp.md) | — |
 | Antigravity IDE Commands | — | [docs/ko/antigravity-commands.md](docs/ko/antigravity-commands.md) |
 
 ## Architecture & Transports
@@ -216,7 +216,7 @@ python3 "$bridge_cli" wt sweep --apply  # Remove eligible worktrees and branches
 
 ### 6. Remote MCP Facade (`mcp_server.py`)
 
-Local agents (Claude Code, Codex, Antigravity) invoke `bridge.py` directly via the Python CLI and do not register a local MCP server. `skill/agent-bridge/scripts/mcp_server.py` is dedicated to remote MCP clients connecting through a private single-owner tunnel (`--phase1-config /absolute/private.json` over `stdio`), exposing session discovery/creation, message dispatch, and the optional independent inbox (`inbox_enabled: true`). Without `--phase1-config`, the server falls back to read-only `connectivity_only` (`bridge_status`). See [mcp-phase1.md](skill/agent-bridge/references/mcp-phase1.md) for the full contract.
+Local agents (Claude Code, Codex, Antigravity) invoke `bridge.py` directly via the Python CLI and do not register a local MCP server. `skill/agent-bridge/scripts/mcp_server.py` is dedicated to remote MCP clients connecting through a private single-owner tunnel (`--phase1-config /absolute/private.json` over `stdio`), exposing session discovery/creation, message dispatch, and the optional independent inbox (`inbox_enabled: true`). Without `--phase1-config`, the server falls back to read-only `connectivity_only` (`bridge_status`). See [remote-mcp.md](skill/agent-bridge/references/remote-mcp.md) for the full contract. An active Events subscription on a capable connected deployment automatically starts the subscribed GPT/Dot chat when a matching notification arrives; the agent then reads inbox mail or the notified operation result. See [Events and deployment boundaries](skill/agent-bridge/references/remote-mcp.md#optional-mcp-events).
 
 ## Development & Verification
 
