@@ -218,6 +218,16 @@ python3 "$bridge_cli" wt sweep --apply  # Remove eligible worktrees and branches
 
 Independently keyed MCP messages may queue for the same authorized session while it works or awaits replies. One worker scans durable acceptance order and preserves submission order for each exact UUID and transport; other unblocked destinations can proceed while one destination is quarantined. Each operation keeps its own correlated reply and Events ID. Session `busy` is informational. `SESSION_BUSY` is reserved for ambiguous writes to the same exact UUID and transport; a missing result after confirmed submission does not block a new message. Unknown operations are never resent and still count toward the global 64 active/unknown limit.
 
+On 2026-11-15, a native ChatGPT Work + Cloud check accepted two separately keyed
+messages for the same authorized Codex session before either was answered. The
+first operation was running with no result when the second was accepted, and the
+working target received both requests. Operator replies in reverse order settled
+both operations with separate results. Native `bridge_operation_get` returned
+each complete result with its own marker and without the other. The change passed
+709 Nova tests in 94.617 s. This live check covers that configured Codex target; Claude and
+Antigravity busy facade cases use isolated tests, with their underlying CLI
+delivery paths unchanged.
+
 Local agents (Claude Code, Codex, Antigravity) invoke `bridge.py` directly via the Python CLI and do not register a local MCP server. `skill/agent-bridge/scripts/mcp_server.py` is dedicated to remote MCP clients connecting through a private single-owner tunnel (`--phase1-config /absolute/private.json` over `stdio`), exposing session discovery/creation, message dispatch, and the optional independent inbox (`inbox_enabled: true`). Without `--phase1-config`, the server falls back to read-only `connectivity_only` (`bridge_status`). See [mcp-phase1.md](skill/agent-bridge/references/mcp-phase1.md) for the full contract.
 
 Optional `events_enabled: true` requires `inbox_enabled: true` and `bridge:read`. It exposes MCP Events methods for signed webhook notifications that an authorized session has new independent inbox mail or a correlated reply captured in an operation result. Independent mail uses inbox list/get/explicit ACK; reply notifications include an opaque `operation_id` for `bridge_operation_get` and never enter inbox list/get/ACK. Notifications have no replay or automatic delivery retries, so after a gap, scan the inbox and query known operations. Signing keys live only in macOS Keychain; bounded subscription metadata lives separately from routing and correspondence. OpenAI documents Events for Work chats on ChatGPT web and desktop Work + Cloud, rather than local chat wake: see the [Events contract](skill/agent-bridge/references/mcp-phase1.md#optional-mcp-events) and [official guide](https://developers.openai.com/plugins/build/mcp-events).

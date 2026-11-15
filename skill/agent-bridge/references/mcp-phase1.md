@@ -77,6 +77,16 @@ routes must match before any provider write. Aliases cannot bypass an
 ambiguous write to that destination. A listed session state of `busy` is
 informational and does not itself refuse a message.
 
+On 2026-11-15, a native ChatGPT Work + Cloud check accepted two separately keyed
+messages for the same authorized Codex session before either was answered. The
+first operation was running with no result when the second was accepted, and the
+working target received both requests. Operator replies in reverse order settled
+both operations with separate results. Native `bridge_operation_get` returned
+each complete result with its own marker and without the other. The change passed
+709 Nova tests in 94.617 s. This live check covers that configured Codex target; Claude and
+Antigravity busy facade cases use isolated tests, with their underlying CLI
+delivery paths unchanged.
+
 The worker commits intent before create/post/push, saves returned UUID/message
 IDs before the next stage, and actually calls `bridge.push_if_peer` after broker
 `send`/`State.post`. It uses dedicated random routes, verifies exact UUID/cwd,
