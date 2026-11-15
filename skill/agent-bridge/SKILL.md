@@ -180,7 +180,7 @@ python3 "$bridge_cli" usage --events
 
 - Local agents always use `scripts/bridge.py` directly via the Python CLI; do not register `mcp_server.py` as a local MCP server.
 - `scripts/mcp_server.py` is for a single private remote tunnel (`--phase1-config` over `stdio`): see [mcp-phase1.md](references/mcp-phase1.md).
-- Opt-in `events_enabled: true` requires `inbox_enabled: true` and `bridge:read`. Signed `bridge.inbox.message.created` webhooks notify a supported Work Cloud consumer after a bounded validation read; they never consume or ACK mail, emit or persist its body, or prove processing. Use inbox list/get/ACK, including a fresh list after missed notifications. No event replay or automatic webhook retries. Signing keys use macOS Keychain only; bounded subscription metadata is separate owner-private state. See [Events](references/mcp-phase1.md#optional-mcp-events).
+- Opt-in `events_enabled: true` requires `inbox_enabled: true` and `bridge:read`. Signed `bridge.inbox.message.created` webhooks notify a supported Work Cloud consumer after a bounded validation read; they never consume or ACK mail, emit or persist its body, or prove processing. Independent mail uses inbox list/get/explicit ACK. The same event also covers captured correlated replies: when `operation_id` is present, use `bridge_operation_get`; replies stay outside the inbox. After a gap, scan the inbox and query known operations. Refresh the plugin catalog and existing task instructions for this branch. No event replay or automatic webhook retries. Signing keys use macOS Keychain only; bounded subscription metadata is separate owner-private state. See [Events](references/mcp-phase1.md#optional-mcp-events).
 
 ## Operational Boundaries
 

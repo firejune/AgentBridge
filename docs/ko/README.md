@@ -214,7 +214,9 @@ python3 "$bridge_cli" wt sweep --apply  # 대상 워크트리 및 브랜치 실�
 
 로컬 에이전트(Claude Code, Codex, Antigravity)는 로컬 MCP를 등록하지 않고 `bridge.py` 파이썬 CLI를 직접 사용한다. `skill/agent-bridge/scripts/mcp_server.py`는 비공개 단일 소유자 원격 터널(`stdio` 기반 `--phase1-config /absolute/private.json`) 전용 인터페이스로, 세션 조회·생성, 메시지 전송, 독립 수신함(`inbox_enabled: true`)을 단일 커넥터로 노출한다(`--phase1-config` 생략 시 읽기 전용 `bridge_status`만 응답). 자세한 계약은 [mcp-phase1.md](../../skill/agent-bridge/references/mcp-phase1.md)를 참고한다.
 
-선택 설정 `events_enabled: true`는 `inbox_enabled: true`와 `bridge:read`가 필요하다. MCP Events 메서드로 허용된 세션의 새 독립 수신함 메시지를 서명된 웹훅으로 알리며, 소비자는 기존 inbox 도구로 목록·본문을 읽고 명시적으로 ACK한다. 알림 재생·자동 재전송은 없으므로 누락된 알림은 새 inbox 조회로 확인한다. 서명 키는 macOS Keychain에만, 한도가 있는 구독 메타데이터는 라우팅·correspondence와 별도로 저장한다. OpenAI 공식 지원 화면은 ChatGPT 웹의 Work 채팅과 데스크톱의 Work + Cloud이며 로컬 채팅 깨우기를 뜻하지 않는다. [Events 계약](../../skill/agent-bridge/references/mcp-phase1.md#optional-mcp-events)과 [공식 안내](https://developers.openai.com/plugins/build/mcp-events)를 참고한다.
+선택 설정 `events_enabled: true`는 `inbox_enabled: true`와 `bridge:read`가 필요하다. MCP Events 메서드로 허용된 세션의 새 독립 수신함 메시지와 작업 결과로 저장된 답장을 서명된 웹훅으로 알린다. 독립 메시지는 기존 inbox 목록·본문·명시적 ACK를 사용하고, 답장 알림의 `operation_id`는 `bridge_operation_get`으로 읽는다. 답장은 inbox 목록·본문·ACK에 들어가지 않는다. 알림 재생·자동 재전송은 없으므로 누락 후에는 새 inbox 목록과 알고 있는 작업 결과를 조회한다. 서명 키는 macOS Keychain에만, 한도가 있는 구독 메타데이터는 라우팅·correspondence와 별도로 저장한다. OpenAI 공식 지원 화면은 ChatGPT 웹의 Work 채팅과 데스크톱의 Work + Cloud이며 로컬 채팅 깨우기를 뜻하지 않는다. [Events 계약](../../skill/agent-bridge/references/mcp-phase1.md#optional-mcp-events)과 [공식 안내](https://developers.openai.com/plugins/build/mcp-events)를 참고한다.
+
+이벤트 이름과 서버 구독 식별자는 유지된다. 플러그인 카탈로그를 새로 읽고 기존 작업 지시에 `operation_id`가 있으면 `bridge_operation_get`을 쓰도록 반영한다. 이전 스키마를 캐시한 호스트의 새 페이로드 수용 여부는 실제 환경에서 확인해야 한다.
 
 ## 개발 및 검증
 

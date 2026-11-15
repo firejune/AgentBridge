@@ -246,6 +246,17 @@ class PhaseTest(unittest.TestCase):
         self.engine.update(op,status='running',stage='posted',backend_id=m['id'],instance=self.backend.current)
         self.restart(); self.assertEqual(self.engine.operation(oid,'owner-a')['status'],'unknown')
         self.assertEqual(self.backend.pushes,0)
+
+    def test_restart_with_existing_reply_preserves_committed_success(self):
+        sid=self.create()['agent_session_id']; oid=self.send(sid)['data']['operation_id']; self.engine.tick()
+        op=self.engine.operation(oid,'owner-a')
+        self.backend.replies[op['backend_id']]=[{'id':'restart-answer','reply_to':op['backend_id'],
+            'created':'1','body':'reply present before facade restart'}]
+        self.restart()
+        result=self.engine.get({'operation_id':oid},'owner-a')
+        self.assertEqual(result['status'],'succeeded')
+        self.assertEqual(result['result']['text'],'reply present before facade restart')
+        self.assertEqual(self.backend.pushes,1)
     def test_evicted_message_unknown(self):
         sid=self.create()['agent_session_id']; oid=self.send(sid)['data']['operation_id']; self.engine.tick()
         self.engine.observe_retry_base=0; self.backend.messages.clear(); self.engine.tick()

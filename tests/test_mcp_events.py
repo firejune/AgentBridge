@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import queue
 import socket
 import sys
 import tempfile
@@ -98,6 +99,332 @@ class EventTests(unittest.TestCase):
 
     def applications(self):
         return [json.loads(body) for _, body, _ in self.callback.calls if 'eventId' in json.loads(body)]
+
+    def correlated(self, index=0, save_backend=True, body='private correlated answer'):
+        session = self.owned[index]
+        self.sequence += 1
+        with patch.object(self.engine.backend, 'availability', return_value='ready'):
+            accepted = self.engine.call('bridge_message_send', {'agent_session_id': session['id'],
+                'message': 'private parent request', 'idempotency_key': 'correlated-operation-' + str(self.sequence)})['data']
+        op = self.engine.operation(accepted['operation_id'], self.engine.principal)
+        parent = self.running.call('send', project='test-project', sender=session['sender'],
+            recipient=session['route'], body='private parent request', key='correlated-parent-' + str(self.sequence))
+        self.engine.update(op, status='running', stage='observing', instance=self.running.instance,
+            backend_id=parent['id'] if save_backend else None)
+        reply = self.running.call('reply', id=parent['id'], body=body, key='correlated-reply-' + str(self.sequence))
+        entry = self.engine.inbox_routes(self.engine.principal, session['id'])[0]
+        event = {'type': 'message', 'instance': self.running.instance, 'message': reply}
+        return op, parent, reply, entry, event
+
+    def drain_events(self):
+        while True:
+            try:
+                entry, event = self.service.pending.get_nowait()
+            except queue.Empty:
+                return
+            if event.get('type') == 'result_ready':
+                self.service.reply_ready(event)
+            else:
+                self.service.arrival(entry, event)
+
+    def test_reply_catalog_extends_data_without_changing_subscription_identity(self):
+        old_schema = {'type': 'object', 'properties': {'agent_session_id': {'type': 'string'}},
+            'required': ['agent_session_id'], 'additionalProperties': False}
+        schema = copy.deepcopy(events.CATALOG['payloadSchema'])
+        self.assertIn('bridge_operation_get', events.CATALOG['description'])
+        self.assertIn('operation_id', schema['properties'])
+        schema['properties'].pop('operation_id')
+        self.assertEqual(schema, old_schema)
+        first = self.subscribe()
+        self.service.close()
+        self.service = events.EventService(self.engine, self.keys, self.callback, start=False)
+        self.engine.events = self.service
+        self.assertIn(first['id'], self.service.subscriptions)
+        self.assertEqual(self.subscribe()['id'], first['id'])
+
+    def test_live_reply_then_capture_notifies_after_commit_without_inbox_consumption(self):
+        self.subscribe()
+        op, parent, reply, entry, event = self.correlated()
+        self.service.arrival(entry, event)
+        self.assertEqual(self.applications(), [])
+        self.assertNotIn('private correlated answer', repr(self.service.reply_arrivals))
+        original = self.service.result_ready
+        def committed(*args):
+            saved = self.engine.operation(op['operation_id'], self.engine.principal)
+            self.assertEqual((saved['status'], saved['text']), ('succeeded', 'private correlated answer'))
+            self.assertEqual(self.applications(), [])
+            original(*args)
+        with patch.object(self.service, 'result_ready', side_effect=committed):
+            self.engine.observe(op)
+        self.drain_events()
+        values = self.applications()
+        self.assertEqual(len(values), 1)
+        self.assertEqual(values[0]['data'], {'agent_session_id': self.sid, 'operation_id': op['operation_id']})
+        self.assertEqual(values[0]['timestamp'], reply['created'])
+        self.assertEqual(self.engine.call('bridge_inbox_list', {})['data']['messages'], [])
+        self.assertEqual(self.engine.get({'operation_id': op['operation_id']}, self.engine.principal)['result']['text'], 'private correlated answer')
+        self.assertNotIn('acknowledged_at', self.running.call('show', id=reply['id']))
+        for private in ('private correlated answer', parent['id'], reply['id'], op['operation_id']):
+            self.assertNotIn(private, self.service.path.read_text())
+            self.assertNotIn(private, json.dumps(self.audit_records()))
+        self.assertNotIn('private correlated answer', json.dumps(values))
+
+    def test_capture_before_live_watch_after_reply_cleanup_and_eviction(self):
+        self.subscribe()
+        op, _, reply, entry, event = self.correlated()
+        self.engine.observe(op)
+        self.assertEqual(self.running.call('show', id=reply['id'])['state'], 'done')
+        self.drain_events()
+        self.assertEqual(self.applications(), [])
+        # A captured terminal reply can be evicted before its queued live event
+        # is delivered; route/epoch validation must not depend on its payload.
+        for index in range(65):
+            message = self.running.call('send', project='test-project', sender=self.owned[0]['route'],
+                recipient=self.owned[0]['sender'], body='filler', key='evict-' + str(index))
+            self.running.call('resolve', id=message['id'], state='done', note='isolated eviction fixture')
+        with self.assertRaises(ValueError):
+            self.running.call('show', id=reply['id'])
+        self.service.arrival(entry, event)
+        self.assertEqual(len(self.applications()), 1)
+
+    def test_live_reply_before_backend_id_commit_is_matched_later(self):
+        self.subscribe()
+        op, parent, _, entry, event = self.correlated(save_backend=False)
+        self.service.arrival(entry, event)
+        self.assertEqual(self.applications(), [])
+        self.engine.update(op, backend_id=parent['id'])
+        self.engine.observe(op)
+        self.drain_events()
+        self.assertEqual(len(self.applications()), 1)
+
+    def test_result_commit_failure_does_not_publish_ready_marker(self):
+        self.subscribe()
+        op, parent, reply, entry, event = self.correlated()
+        self.service.arrival(entry, event)
+        with patch.object(self.engine, 'update', side_effect=OSError('planted result commit failure')):
+            with self.assertRaises(OSError):
+                self.engine.settle(op, [reply], parent=parent)
+        self.assertTrue(self.service.pending.empty())
+        self.assertEqual(self.applications(), [])
+        self.assertEqual(self.engine.operation(op['operation_id'], self.engine.principal)['status'], 'running')
+
+    def test_hook_failure_and_full_queue_cannot_change_durable_success(self):
+        for mode in ('raises', 'full'):
+            with self.subTest(mode=mode):
+                op, _, _, _, _ = self.correlated()
+                if mode == 'raises':
+                    with patch.object(self.service, 'result_ready', side_effect=RuntimeError('planted hook error')):
+                        self.engine.observe(op)
+                else:
+                    with patch.object(self.service.pending, 'put_nowait', side_effect=queue.Full):
+                        self.engine.observe(op)
+                self.assertEqual(self.engine.operation(op['operation_id'], self.engine.principal)['status'], 'succeeded')
+                self.assertEqual(self.applications(), [])
+
+    def test_cleanup_failure_still_notifies_once_without_callback_retry(self):
+        self.subscribe()
+        op, _, reply, entry, event = self.correlated()
+        self.service.arrival(entry, event)
+        with patch.object(self.engine.backend, 'retire_reply', side_effect=OSError('planted cleanup failure')):
+            self.engine.observe(op)
+        self.callback.code = 503
+        self.drain_events()
+        self.engine.tick()
+        self.service.arrival(entry, event)
+        self.drain_events()
+        self.assertEqual(len(self.applications()), 1)
+        self.assertEqual(self.service.health()['callback_failures'], 1)
+        self.assertEqual(self.running.call('show', id=reply['id'])['state'], 'done')
+
+    def test_late_reply_success_watch_uses_same_live_postcommit_contract(self):
+        self.subscribe()
+        op, _, _, entry, event = self.correlated()
+        self.engine.fail(op)
+        self.service.arrival(entry, event)
+        self.engine.watch_reply(op)
+        self.drain_events()
+        self.assertEqual(len(self.applications()), 1)
+        self.assertEqual(self.engine.operation(op['operation_id'], self.engine.principal)['status'], 'succeeded')
+
+    def test_reply_requires_both_live_and_captured_evidence_and_never_replays(self):
+        self.subscribe()
+        op, _, _, entry, event = self.correlated()
+        self.engine.observe(op)
+        self.drain_events()
+        self.service.close()
+        self.service = events.EventService(self.engine, self.keys, self.callback, start=False)
+        self.engine.events = self.service
+        self.engine.recover()
+        self.engine.tick()
+        self.service.arrival(entry, event)
+        self.drain_events()
+        self.assertEqual(self.applications(), [])
+        self.assertEqual(self.service.reply_results, {})
+
+    def test_orphan_blank_and_uncaptured_late_replies_do_not_notify(self):
+        self.subscribe()
+        op, parent, reply, entry, event = self.correlated()
+        self.service.arrival(entry, event)
+        with patch.object(self.engine.backend, 'observe', return_value=(parent, [dict(reply, body='   ')])):
+            self.engine.observe(op)
+        self.drain_events()
+        self.assertEqual(self.applications(), [])
+        self.engine.fail(op, unknown=False)
+        op2, _, _, entry2, event2 = self.correlated()
+        self.engine.observe(op2)
+        self.drain_events()
+        later = self.running.call('reply', id=op2['backend_id'], body='uncaptured late answer', key='late-not-captured')
+        self.service.arrival(entry2, dict(event2, message=later))
+        orphan = dict(event['message'], id='orphan', reply_to='unknown-parent')
+        self.service.arrival(entry, dict(event, message=orphan))
+        self.assertEqual(self.applications(), [])
+
+    def test_reply_refuses_wrong_owner_parent_route_slot_and_expired_operation(self):
+        self.subscribe()
+        for mutation in ('owner', 'parent_route', 'reply_route', 'slot', 'expired'):
+            with self.subTest(mutation=mutation):
+                op, parent, reply, entry, event = self.correlated()
+                self.engine.observe(op)
+                marker_entry, marker = self.service.pending.get_nowait()
+                self.assertIsNone(marker_entry)
+                if mutation == 'owner':
+                    self.engine.update(op, principal='another-owner')
+                    with self.engine.transaction():
+                        self.engine.db.execute('UPDATE operations SET principal=? WHERE id=?', ('another-owner', op['operation_id']))
+                elif mutation == 'parent_route':
+                    marker['return_route']['name'] = 'wrong-parent-return-route'
+                elif mutation == 'reply_route':
+                    marker['reply_route']['name'] = 'wrong-captured-reply-route'
+                elif mutation == 'slot':
+                    marker['agent_session_id'] = self.owned[1]['id']
+                else:
+                    self.engine.update(op, expired=True)
+                self.service.reply_ready(marker)
+                self.service.arrival(entry, event)
+                self.assertEqual(self.applications(), [])
+
+    def test_reply_refuses_changed_route_broker_epoch_and_unexpected_validation_result(self):
+        self.subscribe()
+        for mutation in ('route', 'epoch', 'success', 'other_error'):
+            with self.subTest(mutation=mutation):
+                op, _, _, entry, event = self.correlated()
+                self.engine.observe(op)
+                self.drain_events()
+                if mutation == 'route':
+                    self.running.call('register', project='test-project', name=entry['route']['name'], cwd='/tmp', transport='realtime')
+                    self.service.arrival(entry, event)
+                    self.running.call('register', project='test-project', name=entry['route']['name'], cwd=self.root, transport='realtime')
+                elif mutation == 'epoch':
+                    original = self.engine.inbox_rpc
+                    def restarted(name, principal, routes, instance, **fields):
+                        return original(name, principal, routes, 'another-instance', **fields)
+                    with patch.object(self.engine, 'inbox_rpc', side_effect=restarted):
+                        self.service.arrival(entry, event)
+                elif mutation == 'success':
+                    with patch.object(self.engine, 'inbox_rpc', return_value={'body':'unexpected private body'}):
+                        self.service.arrival(entry, event)
+                else:
+                    with patch.object(self.engine, 'inbox_rpc', side_effect=phase.Fault('BACKEND_UNAVAILABLE')):
+                        self.service.arrival(entry, event)
+                self.assertEqual(self.applications(), [])
+
+    def test_reply_lease_filter_old_arrival_and_scope_revocation(self):
+        accepted = self.subscribe()
+        for mutation in ('other_session', 'old', 'lease', 'scope'):
+            with self.subTest(mutation=mutation):
+                op, _, _, entry, event = self.correlated(index=1 if mutation == 'other_session' else 0)
+                self.engine.observe(op)
+                self.drain_events()
+                if mutation == 'old':
+                    event['message']['created'] = '2000-01-01T00:00:00Z'
+                elif mutation == 'lease':
+                    self.service.subscriptions[accepted['id']]['expires'] = time.time() - 1
+                elif mutation == 'scope':
+                    self.engine.scopes = frozenset()
+                self.service.arrival(entry, event)
+                self.assertEqual(self.applications(), [])
+                self.service.subscriptions[accepted['id']]['expires'] = time.time() + 60
+
+    def test_reply_evidence_caches_are_bounded_and_metadata_only(self):
+        op, _, _, entry, event = self.correlated()
+        self.engine.observe(op)
+        _, marker = self.service.pending.get_nowait()
+        for index in range(events.MAX_REPLY_EVIDENCE + 1):
+            sample = dict(event, message=dict(event['message'], id='reply-' + str(index)))
+            self.service.arrival(entry, sample)
+            self.service.reply_ready(dict(marker, reply_id='captured-' + str(index)))
+        self.assertEqual(len(self.service.reply_arrivals), 128)
+        self.assertEqual(len(self.service.reply_results), 128)
+        self.assertNotIn('private correlated answer', repr(self.service.reply_arrivals))
+        self.assertNotIn('private correlated answer', repr(self.service.reply_results))
+        self.assertEqual(self.service.health()['watch_gaps'], 2)
+
+    def test_real_broker_watch_matches_committed_correlated_reply(self):
+        self.service.close()
+        self.service = events.EventService(self.engine, self.keys, self.callback, start=True)
+        self.engine.events = self.service
+        self.subscribe()
+        op, _, reply, _, _ = self.correlated()
+        self.engine.observe(op)
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline and not self.applications():
+            time.sleep(.02)
+        self.assertEqual(len(self.applications()), 1)
+        self.assertEqual(self.applications()[0]['data'], {'agent_session_id': self.sid, 'operation_id': op['operation_id']})
+        self.assertEqual(self.engine.get({'operation_id': op['operation_id']}, self.engine.principal)['result']['text'], 'private correlated answer')
+        self.assertNotIn('acknowledged_at', self.running.call('show', id=reply['id']))
+
+    def test_postcommit_hook_does_not_wait_for_event_delivery_lock(self):
+        op, parent, reply, _, _ = self.correlated()
+        self.engine.observe(op)
+        finished = threading.Event()
+        def ready():
+            self.service.result_ready(op, parent, [reply])
+            finished.set()
+        with self.service.lock:
+            worker = threading.Thread(target=ready)
+            worker.start()
+            self.assertTrue(finished.wait(1), 'Post-commit hook blocked behind event delivery')
+        worker.join(2)
+
+    def test_recovery_on_initialized_engine_captures_without_notification_marker(self):
+        self.subscribe()
+        op, _, reply, entry, event = self.correlated()
+        self.service.arrival(entry, event)
+        with patch.object(self.service, 'result_ready', wraps=self.service.result_ready) as hook:
+            self.engine.recover()
+            hook.assert_not_called()
+        self.drain_events()
+        self.assertEqual(self.applications(), [])
+        result = self.engine.get({'operation_id': op['operation_id']}, self.engine.principal)
+        self.assertEqual((result['status'], result['result']['text']), ('succeeded', 'private correlated answer'))
+        self.assertEqual(self.running.call('show', id=reply['id'])['state'], 'done')
+
+    def test_keychain_delay_rechecks_reply_route_and_restarted_broker_before_callback(self):
+        self.subscribe()
+        for mutation in ('route', 'broker'):
+            with self.subTest(mutation=mutation), RunningBroker(max_messages=64) as replacement:
+                for session in self.owned:
+                    for name in (session['route'], session['sender']):
+                        replacement.call('register', project='test-project', name=name, cwd=self.root, transport='realtime')
+                op, _, _, entry, event = self.correlated()
+                self.engine.observe(op)
+                self.drain_events()
+                original_get, original_path = self.keys.get, self.engine.backend.path
+                def delayed_key(account):
+                    value = original_get(account)
+                    if mutation == 'route':
+                        self.running.call('register', project='test-project', name=entry['route']['name'], cwd='/tmp', transport='realtime')
+                    else:
+                        self.engine.backend.path = replacement.path
+                    return value
+                try:
+                    with patch.object(self.keys, 'get', side_effect=delayed_key):
+                        self.service.arrival(entry, event)
+                finally:
+                    self.engine.backend.path = original_path
+                    self.running.call('register', project='test-project', name=entry['route']['name'], cwd=self.root, transport='realtime')
+                self.assertEqual(self.applications(), [])
 
     def test_default_off_and_scope(self):
         self.assertIn('events', self.rpc('initialize')['result']['capabilities'])

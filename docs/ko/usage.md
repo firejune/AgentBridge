@@ -368,3 +368,5 @@ fork·subagent는 `subagent_history_start_ordinal` 경계 또는 부모 snapshot
 `ping`은 `checkpoint_last_save_seconds`, `checkpoint_max_save_seconds`, `checkpoint_bytes`를 반환한다. 각각 마지막 저장 시도 시간, 브로커 시작 이후 최대 시간(실패한 시도 포함, 초), 마지막으로 성공한 `correspondence.json` 페이로드 크기(메타데이터 인덱스 제외, 바이트)다. 저장소가 없으면 각각 `null`, `0.0`, `0`이다. 저장이 1초를 넘으면 `checkpoint_save_slow` JSON 로그 한 줄을 stderr에 남긴다. `duration_seconds`, `bytes`, `retained_count`만 포함하며 실패 시 `bytes`는 마지막 성공 크기다. 시간에는 검증·직렬화·영속 쓰기가 포함되며 변경 상태 준비는 제외한다. 계측은 재시작하면 초기화되며 저장 순서·내구성·전달 동작은 바뀌지 않는다.
 
 Codex `open` / `register --new`는 권한 확인에 실패하면 라우트를 등록하지 않는다. 성공·실패 단계와 확인된 `approvalPolicy`, 샌드박스 유형을 stderr 한 줄에 출력한다.
+
+선택 설정 `events_enabled: true`의 `bridge.inbox.message.created`는 새 독립 메시지와 작업 결과로 저장된 답장을 같은 구독으로 알린다. `operation_id`가 있으면 `bridge_operation_get`, 없으면 inbox 목록·본문 도구를 사용한다. 답장을 inbox로 읽거나 ACK하지 않는다. 실제 수신 이벤트와 결과 저장이 모두 확인된 답장만 알리며 재생·자동 재전송은 없다. 누락 후에는 새 inbox 목록과 알고 있는 작업 결과를 조회한다. 기존 플러그인 카탈로그와 작업 지시를 갱신하고 [Events 계약](../../skill/agent-bridge/references/mcp-phase1.md#optional-mcp-events)의 실제 수용 절차를 따른다.

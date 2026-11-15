@@ -523,8 +523,8 @@ class Engine:
         self.observe_retry_limit, self.observe_retry_base = OBSERVE_RETRY_LIMIT, OBSERVE_RETRY_BASE
         self.reply_watch_fast, self.reply_watch_slow = REPLY_WATCH_FAST, REPLY_WATCH_SLOW
         self.observe_at, self.watch_at = {}, {}  # Volatile schedules; a restart only reads sooner.
-        self.recover()
         self.events = None
+        self.recover()
         if config.get('events_enabled', False):
             if not config.get('inbox_enabled', False):
                 raise ValueError('events_enabled requires inbox_enabled')
@@ -753,7 +753,7 @@ class Engine:
                 if op['kind'] == 'message_send' and op['backend_id']:
                     # Durable, so a read retried on a later tick keeps the recovery rule.
                     self.update(op, recovered=True)
-                    self.observe(op)
+                    self.observe(op,notify_events=False)
                 else:
                     self.fail(op)
 
@@ -874,7 +874,7 @@ class Engine:
         self.registered(op,session)
         return self.get({'operation_id':oid},self.principal)
 
-    def observe(self, op):
+    def observe(self, op, notify_events=True):
         try:
             try:
                 # Read-only broker calls. A failure here says nothing about the message.
@@ -890,7 +890,7 @@ class Engine:
                 self.fail(op); return
             self.observe_at.pop(op['operation_id'],None)
             self.update(op,backend_message_state=state,observe_errors=0)
-            if self.settle(op,replies):
+            if self.settle(op,replies,parent=message,notify_events=notify_events):
                 return
             if state=='failed':
                 self.fail(op,'BACKEND_UNAVAILABLE',False)
@@ -908,7 +908,7 @@ class Engine:
         self.update(op,observe_errors=count,error=describe(error))
         self.observe_at[op['operation_id']] = time.monotonic()+self.observe_retry_base*2**(count-1)
 
-    def settle(self, op, replies, late=False):
+    def settle(self, op, replies, late=False, parent=None, notify_events=True):
         replies = [r for r in replies if r.get('reply_to') == op['backend_id'] and isinstance(r.get('body'),str) and r['body'].strip()]
         if not replies:
             return False
@@ -926,6 +926,15 @@ class Engine:
                       'finished_epoch':time.time()}
         self.update(op,status='succeeded',stage='complete',text=text,result={'type':'message_result'},
                     pending_reply_cleanup=[r['id'] for r in replies],**fields)
+        # The result is committed before notifying Events. Only a live watch can
+        # supply the other half of this volatile rendezvous; recovery and cleanup
+        # never synthesize notifications. Notification failure cannot undo success.
+        if notify_events:
+            try:
+                if self.events is not None:
+                    self.events.result_ready(op,parent,replies)
+            except Exception:
+                pass
         self.cleanup_replies(op)
         return True
 
@@ -944,8 +953,8 @@ class Engine:
         try:
             if self.backend.instance()!=op['instance']:
                 self.update(op,reply_watch_closed='instance_changed'); return
-            _,replies = self.backend.observe(op['backend_id'])
-            self.settle(op,replies,late=True)
+            parent,replies = self.backend.observe(op['backend_id'])
+            self.settle(op,replies,late=True,parent=parent)
         except ValueError as error:
             if str(error)==UNKNOWN_MESSAGE:
                 self.update(op,reply_watch_closed='message_unknown')
