@@ -103,15 +103,23 @@ def error(mid, code, message):
 
 def handle(message, path, engine=None):
     """One JSON-RPC message in, one response or None (notification/response) out."""
+    if engine is not None and getattr(engine, 'events', None) is not None:
+        engine.events.audit_request(message)
     if not isinstance(message, dict) or message.get('jsonrpc') != '2.0':
         return error(None, -32600, 'Invalid Request: one JSON-RPC 2.0 object; batches are not supported')
     if 'method' not in message:
         return None  # a client response; this server sends no requests
     method, mid = message['method'], message.get('id')
     if 'id' not in message:
+        if isinstance(method, str) and method in ('events/list', 'events/subscribe', 'events/unsubscribe'):
+            if engine is not None and getattr(engine, 'events', None) is not None:
+                engine.events.invalid_request(method)
         return None
     params = message.get('params') or {}
     if not isinstance(method, str) or not isinstance(params, dict):
+        if isinstance(method, str) and method in ('events/list', 'events/subscribe', 'events/unsubscribe'):
+            if engine is not None and getattr(engine, 'events', None) is not None:
+                engine.events.invalid_request(method)
         return error(mid, -32600, 'Invalid Request')
     if method == 'initialize':
         asked = params.get('protocolVersion')

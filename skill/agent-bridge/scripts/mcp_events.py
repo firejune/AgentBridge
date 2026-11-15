@@ -4,11 +4,13 @@ Only webhook keys may enter Keychain. No credentials, signed inbox handles,
 message bodies or event streams are written to the subscription metadata file.
 """
 import base64
+import copy
 import hashlib
 import hmac
 import http.client
 import ipaddress
 import json
+import math
 import os
 import queue
 from pathlib import Path
@@ -16,6 +18,7 @@ import secrets
 import select
 import shlex
 import socket
+import stat
 import ssl
 import subprocess
 import threading
@@ -29,6 +32,17 @@ NAME = 'bridge.inbox.message.created'
 MAX_SUBSCRIPTIONS = 64
 DEFAULT_TTL_MS = 3600000
 MAX_TTL_MS = 86400000
+EVENT_METHODS = ('events/list', 'events/subscribe', 'events/unsubscribe')
+REQUEST_STAGES = ('received', 'authorize', 'validate', 'resolve_routes',
+    'verify_callback', 'start_watchers', 'reserve_key_reference', 'store_signing_key',
+    'persist_subscription', 'persist_unsubscribe', 'cleanup_keys', 'complete')
+REQUEST_REASONS = frozenset(('events_disabled', 'invalid_request', 'invalid_event',
+    'invalid_arguments', 'invalid_delivery', 'invalid_callback_url',
+    'invalid_signing_secret', 'replay_unavailable', 'invalid_lifetime',
+    'subscription_capacity', 'non_public_callback', 'response_too_large',
+    'callback_failed', 'challenge_failed', 'keychain_unavailable',
+    'inbox_watch_unavailable', 'inbox_route_changed', 'owner_or_route_unavailable',
+    'storage_failed', 'event_operation_failed'))
 CATALOG = {'name': NAME, 'description': 'A new independent message arrived in your authorized Agent Bridge inbox. Read and explicitly acknowledge it using the inbox tools.',
     'delivery': ['webhook'], 'inputSchema': {'type': 'object', 'properties': {
         'agent_session_id': {'type': 'string'}}, 'additionalProperties': False},
@@ -134,12 +148,98 @@ class HTTPSCallback:
             raise EventError(-32015, 'callback_failed') from None
 
 
+class ArrivalAudit:
+    """Two bounded owner-private files; fixed receipt metadata only."""
+    METHODS = ('initialize', 'notifications/initialized', 'ping', 'tools/list', 'tools/call', *EVENT_METHODS, 'other')
+    TOOLS = ('bridge_status', 'bridge_sessions_list', 'bridge_session_create',
+        'bridge_message_send', 'bridge_operation_get', 'bridge_inbox_list',
+        'bridge_message_get', 'bridge_message_ack', 'other')
+
+    def __init__(self, root, max_bytes=1024 * 1024):
+        self.path = Path(root) / 'events-audit.jsonl'
+        self.previous = Path(root) / 'events-audit.jsonl.1'
+        self.max_bytes = max_bytes
+        self.lock = threading.Lock()
+        self.failures = 0
+
+    @staticmethod
+    def private(info):
+        return stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600
+
+    def write(self, kind, **fields):
+        record = {'at': timestamp(time.time()), 'type': kind}
+        if kind == 'mcp_request':
+            record['method'] = fields.get('method') if fields.get('method') in self.METHODS else 'other'
+            if record['method'] == 'tools/call':
+                record['tool'] = fields.get('tool') if fields.get('tool') in self.TOOLS else 'other'
+        elif kind == 'broker_message_observed':
+            record['correlated'] = fields.get('correlated') is True
+        elif kind == 'event_request_outcome':
+            record.update(method=fields.get('method') if fields.get('method') in EVENT_METHODS else 'other',
+                stage=fields.get('stage') if fields.get('stage') in REQUEST_STAGES else 'received',
+                outcome='accepted' if fields.get('outcome') == 'accepted' else 'failed',
+                code=fields.get('code') if type(fields.get('code')) is int and fields['code'] in (-32600, -32601, -32602, -32603, -32015) else None,
+                reason=fields.get('reason') if isinstance(fields.get('reason'), str) and fields['reason'] in REQUEST_REASONS else None)
+        else:
+            return
+        data = (canonical(record) + '\n').encode()
+        with self.lock:
+            try:
+                self.append(data)
+            except Exception:
+                # Preserve request behavior when diagnostics storage fails.
+                # Never retain exception text or recursively log this failure.
+                self.failures += 1
+
+    def append(self, data):
+        if len(data) > self.max_bytes:
+            raise OSError('Audit record exceeds capacity')
+        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        try:
+            info = os.fstat(fd)
+            if not self.private(info) or info.st_size > self.max_bytes:
+                raise OSError('Private bounded audit file required')
+            if info.st_size + len(data) > self.max_bytes:
+                os.close(fd); fd = None
+                if self.previous.exists() or self.previous.is_symlink():
+                    if not self.private(self.previous.lstat()):
+                        raise OSError('Private audit rotation required')
+                os.replace(self.path, self.previous)
+                fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError('Incomplete audit write')
+                view = view[written:]
+            os.fsync(fd)
+            directory = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def health(self):
+        with self.lock:
+            return {'audit_write_failures': self.failures,
+                'audit_last_error': 'audit_write_failed' if self.failures else None}
+
+
 class EventService:
     def __init__(self, engine, keys=None, callback=None, start=True):
         self.engine = engine
         self.keys = keys if keys is not None else Keychain()
         self.callback = callback if callback is not None else HTTPSCallback()
         self.lock = threading.RLock()
+        self.request_lock = threading.Lock()
+        self.audit = ArrivalAudit(engine.root)
+        self.request_diagnostics = {'started_at': timestamp(time.time()), 'methods': {
+            method: {'received_count': 0, 'accepted_count': 0, 'failed_count': 0,
+                'last_received_at': None, 'last_stage': None, 'last_outcome': None,
+                'last_failure': None} for method in EVENT_METHODS}}
         self.stop = threading.Event()
         self.watchers = {}
         self.delivered = set()
@@ -212,7 +312,7 @@ class EventService:
                 or 'bridge:read' not in self.engine.scopes):
             raise EventError(-32601, 'events_disabled')
 
-    def identity(self, params):
+    def identity(self, params, request=None):
         if params.get('name') != NAME or not isinstance(params.get('arguments', {}), dict):
             raise EventError(-32602, 'invalid_event')
         arguments = params.get('arguments', {})
@@ -231,14 +331,17 @@ class EventService:
                 raise ValueError()
         except (ValueError, TypeError):
             raise EventError(-32602, 'invalid_callback_url') from None
+        self.request_stage(request, 'resolve_routes')
         self.engine.inbox_routes(self.engine.principal, arguments.get('agent_session_id'))
         sid = 'sub_' + hashlib.sha256(canonical([self.binding, NAME, arguments, url]).encode()).hexdigest()
         return sid, arguments, url
 
     def health(self):
+        with self.request_lock:
+            requests = copy.deepcopy(self.request_diagnostics)
         with self.lock:
             active = sum(sub['expires'] > time.time() for sub in self.subscriptions.values())
-            return dict(self.diagnostics, active_subscriptions=active,
+            return dict(self.diagnostics, **self.audit.health(), request_diagnostics=requests, active_subscriptions=active,
                 watching_routes=sum(thread.is_alive() and ready.is_set() for thread, ready, _ in self.watchers.values()),
                 uninitialized_agent_session_ids=list(self.uninitialized),
                 pending_key_deletions=len(self.retired_keys),
@@ -259,8 +362,106 @@ class EventService:
             'X-MCP-Subscription-Id': sid}
         return self.callback(url, body, headers)
 
+    def audit_request(self, message):
+        if not isinstance(message, dict) or 'method' not in message:
+            return
+        method = message.get('method')
+        method = method if isinstance(method, str) and method in ArrivalAudit.METHODS else 'other'
+        params = message.get('params')
+        tool = params.get('name') if isinstance(params, dict) else None
+        tool = tool if isinstance(tool, str) and tool in ArrivalAudit.TOOLS else 'other'
+        self.audit.write('mcp_request', method=method, tool=tool)
+
+    def observed_message(self, event):
+        message = event.get('message')
+        self.audit.write('broker_message_observed', correlated=
+            isinstance(message, dict) and message.get('reply_to') is not None)
+
+    def request_begin(self, method):
+        if method not in EVENT_METHODS:
+            return None
+        request = {'method': method, 'stage': 'received'}
+        with self.request_lock:
+            info = self.request_diagnostics['methods'][method]
+            info['received_count'] += 1
+            info.update(last_received_at=timestamp(time.time()), last_stage='received',
+                last_outcome='processing')
+        return request
+
+    def request_stage(self, request, stage):
+        if request is None:
+            return
+        if stage not in REQUEST_STAGES:
+            raise ValueError('Unknown MCP Events request stage')
+        request['stage'] = stage
+        with self.request_lock:
+            self.request_diagnostics['methods'][request['method']]['last_stage'] = stage
+
+    def request_finish(self, request, failure=None):
+        if request is None:
+            return
+        with self.request_lock:
+            info = self.request_diagnostics['methods'][request['method']]
+            if failure is None:
+                info['accepted_count'] += 1
+                info.update(last_stage='complete', last_outcome='accepted')
+            else:
+                code, reason = failure
+                # Do not retain arbitrary exception fields, even from EventError.
+                code = code if type(code) is int and code in (-32600, -32601, -32602, -32603, -32015) else -32603
+                reason = reason if isinstance(reason, str) and reason in REQUEST_REASONS else 'event_operation_failed'
+                info['failed_count'] += 1
+                info.update(last_stage=request['stage'], last_outcome='failed',
+                    last_failure={'at': timestamp(time.time()), 'code': code,
+                        'reason': reason, 'stage': request['stage']})
+            audit = {'method': request['method'], 'stage': info['last_stage'],
+                'outcome': info['last_outcome'], 'code': None if failure is None else code,
+                'reason': None if failure is None else reason}
+        self.audit.write('event_request_outcome', **audit)
+
+    def invalid_request(self, method):
+        request = self.request_begin(method)
+        self.request_stage(request, 'validate')
+        self.request_finish(request, (-32600, 'invalid_request'))
+
     def call(self, method, params):
+        request = self.request_begin(method)
+        try:
+            result = self._call(method, params, request)
+        except EventError as error:
+            self.request_finish(request, (error.code, error.reason))
+            raise
+        except Exception as error:
+            from mcp_phase1 import Fault
+            if isinstance(error, Fault):
+                failure = (-32602, 'owner_or_route_unavailable')
+            elif request is not None and request['stage'] == 'verify_callback':
+                failure = (-32603, 'callback_failed')
+            elif request is not None and request['stage'] == 'store_signing_key':
+                failure = (-32603, 'keychain_unavailable')
+            elif request is not None and request['stage'] in (
+                    'reserve_key_reference', 'persist_subscription', 'persist_unsubscribe', 'cleanup_keys'):
+                failure = (-32603, 'storage_failed')
+            else:
+                failure = (-32603, 'event_operation_failed')
+            self.request_finish(request, failure)
+            raise
+        self.request_finish(request)
+        return result
+
+    def _call(self, method, params, request):
+        self.request_stage(request, 'authorize')
         self.authorize()
+        self.request_stage(request, 'validate')
+        # MCP RequestParams permits an optional metadata object. Treat it as
+        # transport metadata, never as identity, authority or subscription state.
+        if '_meta' in params and not isinstance(params['_meta'], dict):
+            raise EventError(-32602, 'invalid_arguments')
+        if '_meta' in params and 'progressToken' in params['_meta']:
+            token = params['_meta']['progressToken']
+            if type(token) not in (str, int, float) or (type(token) is float and not math.isfinite(token)):
+                raise EventError(-32602, 'invalid_arguments')
+        params = {key: value for key, value in params.items() if key != '_meta'}
         if method == 'events/list':
             if params:
                 raise EventError(-32602, 'invalid_arguments')
@@ -272,15 +473,17 @@ class EventService:
             allowed |= {'cursor', 'ttlMs'}
         if set(params) - allowed:
             raise EventError(-32602, 'invalid_arguments')
-        sid, arguments, url = self.identity(params)
+        sid, arguments, url = self.identity(params, request)
         with self.lock:
             if method == 'events/unsubscribe':
+                self.request_stage(request, 'validate')
                 if set(params['delivery']) != {'mode', 'url'}:
                     raise EventError(-32602, 'invalid_delivery')
                 old = self.subscriptions.pop(sid, None)
                 before = list(self.retired_keys)
                 if old is not None:
                     self.retire(old)
+                self.request_stage(request, 'persist_unsubscribe')
                 try:
                     self.save()
                 except Exception:
@@ -288,8 +491,10 @@ class EventService:
                     if old is not None:
                         self.subscriptions[sid] = old
                     raise
+                self.request_stage(request, 'cleanup_keys')
                 self.cleanup_keys()
                 return {}
+            self.request_stage(request, 'validate')
             delivery = params['delivery']
             if set(delivery) != {'mode', 'url', 'secret'}:
                 raise EventError(-32602, 'invalid_delivery')
@@ -305,6 +510,7 @@ class EventService:
                 raise EventError(-32603, 'subscription_capacity')
             verification_key = (url, hashlib.sha256(secret.encode()).hexdigest())
             if self.verified.get(verification_key, 0) <= time.time():
+                self.request_stage(request, 'verify_callback')
                 challenge = secrets.token_urlsafe(32)
                 code, response = self.signed(sid, url, secret,
                     {'type': 'verification', 'challenge': challenge}, 'verify_' + secrets.token_hex(16))
@@ -321,12 +527,15 @@ class EventService:
             # Watch before granting a lease; no arrival after the accepted
             # subscription is lost to starting the listener asynchronously.
             if self.started:
+                self.request_stage(request, 'start_watchers')
                 self.ensure_watchers(arguments)
             key_ref = sid + '_' + secrets.token_hex(8)
             # Record a key reference before touching the second durable store.
             # A crash or failed final commit leaves a recoverable cleanup task.
             self.retired_keys.append(key_ref)
+            self.request_stage(request, 'reserve_key_reference')
             self.save()
+            self.request_stage(request, 'store_signing_key')
             try:
                 self.keys.put(key_ref, secret)
             except Exception:
@@ -344,6 +553,7 @@ class EventService:
             self.retired_keys.remove(key_ref)
             if old is not None and old.get('previous_key_ref'):
                 self.retired_keys.append(old['previous_key_ref'])
+            self.request_stage(request, 'persist_subscription')
             try:
                 self.save()
             except Exception:
@@ -356,6 +566,7 @@ class EventService:
                     self.subscriptions[sid] = old
                 # The first metadata commit still holds this pending reference.
                 raise
+            self.request_stage(request, 'cleanup_keys')
             self.cleanup_keys()
             return {'id': sid, 'refreshBefore': timestamp(expiration), 'cursor': None, 'truncated': False}
 
@@ -452,6 +663,7 @@ class EventService:
                         if event.get('type') == 'subscribed':
                             ready.set()
                         elif event.get('type') == 'message':
+                            self.observed_message(event)
                             try:
                                 self.pending.put_nowait((entry, event))
                             except queue.Full:

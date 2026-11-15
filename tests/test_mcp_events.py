@@ -4,10 +4,12 @@ import copy
 import hashlib
 import hmac
 import json
+import os
 from pathlib import Path
 import socket
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch, Mock
@@ -382,6 +384,254 @@ class EventTests(unittest.TestCase):
             properties = tool['outputSchema']['properties']['data']['properties']
             self.assertIn('events', properties)
             self.assertEqual(set(payload['data']['events']) - set(properties['events']['properties']), set())
+            try:
+                import jsonschema
+            except ImportError:
+                pass
+            else:
+                jsonschema.validate(payload, tool['outputSchema'])
+
+
+    def test_request_diagnostics_track_received_success_and_failed_native_calls(self):
+        initial = self.service.health()['request_diagnostics']
+        self.assertTrue(initial['started_at'].endswith('Z'))
+        self.assertEqual(set(initial['methods']), set(events.EVENT_METHODS))
+        self.assertTrue(all(slot['received_count'] == 0 for slot in initial['methods'].values()))
+        self.rpc('events/list')
+        self.rpc('events/subscribe', {})
+        self.subscribe()
+        params = copy.deepcopy(self.params)
+        params['delivery'].pop('secret')
+        self.rpc('events/unsubscribe', params)
+        methods = self.service.health()['request_diagnostics']['methods']
+        self.assertEqual((methods['events/list']['received_count'], methods['events/list']['accepted_count']), (1, 1))
+        slot = methods['events/subscribe']
+        self.assertEqual((slot['received_count'], slot['accepted_count'], slot['failed_count']), (2, 1, 1))
+        self.assertEqual((slot['last_stage'], slot['last_outcome']), ('complete', 'accepted'))
+        self.assertEqual(slot['last_failure']['reason'], 'invalid_event')
+        self.assertTrue(slot['last_received_at'].endswith('Z'))
+        self.assertEqual(methods['events/unsubscribe']['accepted_count'], 1)
+
+    def test_failed_callback_stage_visible_without_retaining_exception_text(self):
+        sensitive = 'private-url-whsec-keyref-message-id-cursor-DO-NOT-RETAIN'
+        observed = []
+        def failing_callback(*args):
+            observed.append(self.service.health()['request_diagnostics']['methods']['events/subscribe'])
+            raise RuntimeError(sensitive)
+        self.service.callback = failing_callback
+        result = self.rpc('events/subscribe', self.params)
+        self.assertEqual(result['error']['code'], -32603)
+        self.assertEqual(observed[0]['last_stage'], 'verify_callback')
+        self.assertEqual(observed[0]['last_outcome'], 'processing')
+        health = self.service.health()
+        failure = health['request_diagnostics']['methods']['events/subscribe']['last_failure']
+        self.assertEqual((failure['code'], failure['reason'], failure['stage']), (-32603, 'callback_failed', 'verify_callback'))
+        self.assertNotIn(sensitive, json.dumps(health))
+        self.assertNotIn(self.params['delivery']['url'], json.dumps(health))
+        self.assertNotIn(self.secret, json.dumps(health))
+        self.assertFalse(self.service.path.exists())
+
+    def test_request_failure_diagnostics_distinguish_validation_routes_keys_and_storage(self):
+        self.params['delivery']['secret'] = 'not-a-key'
+        self.rpc('events/subscribe', self.params)
+        slot = self.service.health()['request_diagnostics']['methods']['events/subscribe']
+        self.assertEqual((slot['last_failure']['reason'], slot['last_failure']['stage']), ('invalid_signing_secret', 'validate'))
+        self.params['delivery']['secret'] = self.secret
+        with patch.object(self.engine, 'inbox_routes', side_effect=phase.Fault('NOT_FOUND')):
+            self.rpc('events/subscribe', self.params)
+        failure = self.service.health()['request_diagnostics']['methods']['events/subscribe']['last_failure']
+        self.assertEqual((failure['reason'], failure['stage']), ('owner_or_route_unavailable', 'resolve_routes'))
+        with patch.object(self.service, 'save', side_effect=OSError('private storage path')):
+            self.rpc('events/subscribe', self.params)
+        failure = self.service.health()['request_diagnostics']['methods']['events/subscribe']['last_failure']
+        self.assertEqual((failure['reason'], failure['stage']), ('storage_failed', 'reserve_key_reference'))
+        with patch.object(self.keys, 'put', side_effect=RuntimeError('private keychain data')):
+            self.rpc('events/subscribe', self.params)
+        failure = self.service.health()['request_diagnostics']['methods']['events/subscribe']['last_failure']
+        self.assertEqual((failure['reason'], failure['stage']), ('keychain_unavailable', 'store_signing_key'))
+        self.assertNotIn('private', json.dumps(self.service.health()))
+
+    def test_request_diagnostics_never_persist_and_reset_on_facade_restart(self):
+        self.rpc('events/list')
+        self.rpc('events/subscribe', {})
+        self.assertFalse(self.service.path.exists())
+        self.subscribe()
+        saved = self.service.path.read_text()
+        self.assertNotIn('request_diagnostics', saved)
+        self.assertNotIn('last_failure', saved)
+        self.service.close()
+        self.service = events.EventService(self.engine, self.keys, self.callback, start=False)
+        self.engine.events = self.service
+        methods = self.service.health()['request_diagnostics']['methods']
+        self.assertTrue(all(slot['received_count'] == slot['accepted_count'] == slot['failed_count'] == 0 for slot in methods.values()))
+        self.assertTrue(all(slot['last_failure'] is None for slot in methods.values()))
+
+    def test_request_diagnostics_bounded_and_normalize_untrusted_event_errors(self):
+        sensitive = 'https://private.example/whsec_secret_raw_cursor_handle'
+        for _ in range(4):
+            self.rpc('events/unrecognized-' + sensitive, {})
+        with patch.object(self.service, '_call', side_effect=events.EventError(-99999, sensitive)):
+            self.rpc('events/subscribe', self.params)
+        health = self.service.health()
+        methods = health['request_diagnostics']['methods']
+        self.assertEqual(set(methods), set(events.EVENT_METHODS))
+        self.assertEqual(methods['events/subscribe']['last_failure']['code'], -32603)
+        self.assertEqual(methods['events/subscribe']['last_failure']['reason'], 'event_operation_failed')
+        self.assertNotIn(sensitive, json.dumps(health))
+        health['request_diagnostics']['methods']['events/subscribe']['received_count'] = 999
+        self.assertEqual(self.service.health()['request_diagnostics']['methods']['events/subscribe']['received_count'], 1)
+
+    def test_invalid_native_envelopes_are_counted_without_side_effects(self):
+        result = mcp_server.handle({'jsonrpc': '2.0', 'id': 1, 'method': 'events/subscribe',
+            'params': ['private data']}, self.running.path, self.engine)
+        self.assertEqual(result['error']['code'], -32600)
+        self.assertIsNone(mcp_server.handle({'jsonrpc': '2.0', 'method': 'events/subscribe',
+            'params': self.params}, self.running.path, self.engine))
+        slot = self.service.health()['request_diagnostics']['methods']['events/subscribe']
+        self.assertEqual((slot['received_count'], slot['failed_count'], slot['accepted_count']), (2, 2, 0))
+        self.assertEqual(slot['last_failure']['reason'], 'invalid_request')
+        self.assertFalse(self.service.path.exists())
+        self.assertEqual(self.callback.calls, [])
+
+    def test_native_request_meta_is_accepted_ignored_and_not_persisted(self):
+        sensitive = 'private-progress-cursor-delivery-secret-DO-NOT-RETAIN'
+        metadata = {'progressToken': sensitive, 'trace': {'callback': sensitive}, 'principal': 'another-owner'}
+        self.assertIn('result', self.rpc('events/list', {'_meta': metadata}))
+        self.params['_meta'] = metadata
+        result = self.subscribe()
+        params = copy.deepcopy(self.params)
+        params['delivery'].pop('secret')
+        self.assertEqual(self.rpc('events/unsubscribe', params)['result'], {})
+        self.assertNotIn(sensitive, self.service.path.read_text())
+        self.assertNotIn(sensitive, json.dumps(self.service.health()))
+        self.assertNotIn(sensitive, repr(self.callback.calls))
+        self.assertEqual(set(self.service.health()['request_diagnostics']['methods']), set(events.EVENT_METHODS))
+        for method in events.EVENT_METHODS:
+            bad = {'_meta': []} if method == 'events/list' else dict(params, _meta=[])
+            self.assertEqual(self.rpc(method, bad)['error']['code'], -32602)
+        self.assertEqual(self.rpc('events/list', {'unexpected': True, '_meta': {}})['error']['code'], -32602)
+        self.assertEqual(self.rpc('events/subscribe', dict(self.params, unexpected=True))['error']['code'], -32602)
+
+
+    def audit_records(self):
+        records = []
+        for path in (self.service.audit.previous, self.service.audit.path):
+            if path.exists():
+                records.extend(json.loads(line) for line in path.read_text().splitlines())
+        return records
+
+    def test_audit_records_incoming_methods_and_whitelisted_tools_only(self):
+        sensitive = 'private-url-whsec-keyref-message-id-cursor-DO-NOT-LOG'
+        self.rpc('initialize', {'private': sensitive})
+        self.rpc('tools/call', {'name': 'bridge_status', 'arguments': {'private': sensitive}})
+        self.rpc('tools/call', {'name': sensitive, 'arguments': {'private': sensitive}})
+        self.rpc(sensitive, {'private': sensitive})
+        self.rpc('events/subscribe', {'_meta': {'private': sensitive}})
+        records = self.audit_records()
+        arrivals = [record for record in records if record['type'] == 'mcp_request']
+        self.assertEqual([record['method'] for record in arrivals], ['initialize', 'tools/call', 'tools/call', 'other', 'events/subscribe'])
+        self.assertEqual([record.get('tool') for record in arrivals], [None, 'bridge_status', 'other', None, None])
+        self.assertTrue(all(record['at'].endswith('Z') for record in records))
+        self.assertNotIn(sensitive, json.dumps(records))
+        self.assertEqual(self.service.audit.path.stat().st_mode & 0o777, 0o600)
+        outcome = next(record for record in records if record['type'] == 'event_request_outcome')
+        self.assertEqual((outcome['stage'], outcome['code'], outcome['reason']), ('validate', -32602, 'invalid_event'))
+        self.assertEqual(set(outcome), {'at', 'type', 'method', 'stage', 'outcome', 'code', 'reason'})
+
+    def test_audit_persists_receipts_but_not_volatile_counters_across_restart(self):
+        self.rpc('events/list')
+        before = self.service.audit.path.read_bytes()
+        self.service.close()
+        self.service = events.EventService(self.engine, self.keys, self.callback, start=False)
+        self.engine.events = self.service
+        self.assertEqual(self.service.audit.path.read_bytes(), before)
+        methods = self.service.health()['request_diagnostics']['methods']
+        self.assertEqual(methods['events/list']['received_count'], 0)
+        self.assertNotIn('received_count', before.decode())
+
+    def test_audit_failure_is_visible_and_preserves_existing_request_behavior(self):
+        sensitive = 'private storage exception with callbackURL and key'
+        with patch.object(self.service.audit, 'append', side_effect=OSError(sensitive)):
+            result = self.rpc('events/list')
+        self.assertIn('result', result)
+        health = self.service.health()
+        self.assertEqual(health['audit_write_failures'], 2)
+        self.assertEqual(health['audit_last_error'], 'audit_write_failed')
+        self.assertEqual(health['request_diagnostics']['methods']['events/list']['accepted_count'], 1)
+        self.assertNotIn(sensitive, json.dumps(health))
+        self.assertFalse(self.service.audit.path.exists())
+
+    def test_audit_rotation_is_bounded_private_and_thread_safe(self):
+        root = Path(self.root) / 'isolated-audit'
+        root.mkdir(mode=0o700)
+        audit = events.ArrivalAudit(root, max_bytes=512)
+        threads = [threading.Thread(target=lambda: [audit.write('mcp_request', method='tools/call', tool='bridge_status') for _ in range(10)]) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(audit.health()['audit_write_failures'], 0)
+        self.assertEqual(set(path.name for path in root.iterdir()), {'events-audit.jsonl', 'events-audit.jsonl.1'})
+        for path in (audit.path, audit.previous):
+            self.assertLessEqual(path.stat().st_size, 512)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertTrue(all(json.loads(line)['method'] == 'tools/call' for line in path.read_text().splitlines()))
+
+    def test_audit_refuses_symlinks_without_touching_target(self):
+        target = Path(self.root) / 'do-not-touch'
+        target.write_text('original')
+        self.service.audit.path.symlink_to(target)
+        result = self.rpc('events/list')
+        self.assertIn('result', result)
+        self.assertEqual(target.read_text(), 'original')
+        self.assertEqual(self.service.health()['audit_write_failures'], 2)
+
+    def test_audit_fifo_without_reader_fails_promptly_and_keeps_request_working(self):
+        os.mkfifo(self.service.audit.path, 0o600)
+        results = []
+        worker = threading.Thread(target=lambda: results.append(self.rpc('events/list')), daemon=True)
+        worker.start()
+        worker.join(timeout=1)
+        blocked = worker.is_alive()
+        if blocked:
+            # Release the planted FIFO before failing, so the negative control
+            # cannot strand a blocked test thread or hang the suite.
+            reader = os.open(self.service.audit.path, os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                worker.join(timeout=2)
+            finally:
+                os.close(reader)
+        self.assertFalse(blocked, 'Audit blocked on a FIFO without a reader')
+        self.assertFalse(worker.is_alive())
+        self.assertIn('result', results[0])
+        self.assertEqual(self.service.health()['audit_write_failures'], 2)
+
+    def test_existing_watch_audits_independent_and_correlated_messages_without_bodies(self):
+        self.service.close()
+        self.service = events.EventService(self.engine, self.keys, self.callback, start=True)
+        self.engine.events = self.service
+        self.subscribe()
+        self.send()
+        session = self.owned[0]
+        parent = self.running.call('send', project='test-project', sender=session['sender'],
+            recipient=session['route'], body='private parent body', key='audit-parent')
+        self.running.call('reply', id=parent['id'], project='test-project', body='private reply body', key='audit-reply')
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            observed = [record for record in self.audit_records() if record['type'] == 'broker_message_observed']
+            if {record['correlated'] for record in observed} == {False, True} and self.applications():
+                break
+            time.sleep(.02)
+        self.assertEqual({record['correlated'] for record in observed}, {False, True})
+        self.assertTrue(all(set(record) == {'at', 'type', 'correlated'} for record in observed))
+        raw = json.dumps(self.audit_records())
+        self.assertNotIn('private parent body', raw)
+        self.assertNotIn('private reply body', raw)
+        self.assertNotIn(parent['id'], raw)
+        self.assertNotIn(self.params['delivery']['url'], raw)
+        self.assertNotIn(self.secret, raw)
+        self.assertEqual(len(self.applications()), 1)
 
 
 

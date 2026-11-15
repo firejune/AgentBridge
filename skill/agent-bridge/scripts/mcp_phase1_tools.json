@@ -203,6 +203,187 @@
                     "items": {
                       "type": "string"
                     }
+                  },
+                  "request_diagnostics": {
+                    "type": "object",
+                    "properties": {
+                      "started_at": {
+                        "type": "string",
+                        "format": "date-time"
+                      },
+                      "methods": {
+                        "type": "object",
+                        "propertyNames": {
+                          "enum": [
+                            "events/list",
+                            "events/subscribe",
+                            "events/unsubscribe"
+                          ]
+                        },
+                        "required": [
+                          "events/list",
+                          "events/subscribe",
+                          "events/unsubscribe"
+                        ],
+                        "additionalProperties": {
+                          "type": "object",
+                          "properties": {
+                            "received_count": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "accepted_count": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "failed_count": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "last_received_at": {
+                              "type": [
+                                "string",
+                                "null"
+                              ],
+                              "format": "date-time"
+                            },
+                            "last_stage": {
+                              "type": [
+                                "string",
+                                "null"
+                              ],
+                              "enum": [
+                                "received",
+                                "authorize",
+                                "validate",
+                                "resolve_routes",
+                                "verify_callback",
+                                "start_watchers",
+                                "reserve_key_reference",
+                                "store_signing_key",
+                                "persist_subscription",
+                                "persist_unsubscribe",
+                                "cleanup_keys",
+                                "complete",
+                                null
+                              ]
+                            },
+                            "last_outcome": {
+                              "type": [
+                                "string",
+                                "null"
+                              ],
+                              "enum": [
+                                "processing",
+                                "accepted",
+                                "failed",
+                                null
+                              ]
+                            },
+                            "last_failure": {
+                              "type": [
+                                "object",
+                                "null"
+                              ],
+                              "properties": {
+                                "at": {
+                                  "type": "string",
+                                  "format": "date-time"
+                                },
+                                "code": {
+                                  "type": "integer",
+                                  "enum": [
+                                    -32600,
+                                    -32601,
+                                    -32602,
+                                    -32603,
+                                    -32015
+                                  ]
+                                },
+                                "reason": {
+                                  "type": "string",
+                                  "enum": [
+                                    "events_disabled",
+                                    "invalid_request",
+                                    "invalid_event",
+                                    "invalid_arguments",
+                                    "invalid_delivery",
+                                    "invalid_callback_url",
+                                    "invalid_signing_secret",
+                                    "replay_unavailable",
+                                    "invalid_lifetime",
+                                    "subscription_capacity",
+                                    "non_public_callback",
+                                    "response_too_large",
+                                    "callback_failed",
+                                    "challenge_failed",
+                                    "keychain_unavailable",
+                                    "inbox_watch_unavailable",
+                                    "inbox_route_changed",
+                                    "owner_or_route_unavailable",
+                                    "storage_failed",
+                                    "event_operation_failed"
+                                  ]
+                                },
+                                "stage": {
+                                  "type": "string",
+                                  "enum": [
+                                    "received",
+                                    "authorize",
+                                    "validate",
+                                    "resolve_routes",
+                                    "verify_callback",
+                                    "start_watchers",
+                                    "reserve_key_reference",
+                                    "store_signing_key",
+                                    "persist_subscription",
+                                    "persist_unsubscribe",
+                                    "cleanup_keys",
+                                    "complete"
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "at",
+                                "code",
+                                "reason",
+                                "stage"
+                              ],
+                              "additionalProperties": false
+                            }
+                          },
+                          "required": [
+                            "received_count",
+                            "accepted_count",
+                            "failed_count",
+                            "last_received_at",
+                            "last_stage",
+                            "last_outcome",
+                            "last_failure"
+                          ],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
+                    "required": [
+                      "started_at",
+                      "methods"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "audit_write_failures": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "audit_last_error": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "enum": [
+                      "audit_write_failed",
+                      null
+                    ]
                   }
                 },
                 "additionalProperties": false

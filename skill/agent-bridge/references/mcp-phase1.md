@@ -360,6 +360,52 @@ The watch queue holds at most 128 events; overflow is a notification gap, while
 unread mail remains available through the inbox. `bridge_status` reports Events
 health in `data.events`, including watch gaps and callback failures.
 
+`data.events.request_diagnostics` is volatile: `started_at` marks its observation
+window, and `methods` has only the fixed `events/list`, `events/subscribe` and
+`events/unsubscribe` slots. Each reports `received_count`, `accepted_count`,
+`failed_count`, `last_received_at`, `last_stage`, `last_outcome` and nullable
+`last_failure` (`at`, `code`, `reason`, `stage`). Stages identify authorization,
+validation, route resolution, callback verification, watcher setup, key storage,
+subscription persistence and cleanup. Outcomes are `processing`, `accepted`,
+`failed` or null. A later success retains the last failure and its original time.
+There are no raw parameters, callback URLs, keys or key references, IDs, or
+request history in these diagnostics; nothing is persisted, and facade restart
+resets the window. They cannot reconstruct attempts from before that window.
+For a controlled attempt against the same facade, a received-count increase
+shows the request reached Agent Bridge; an unchanged count shows no method
+arrival observed in that window. Neither proves a host task was saved, its
+notification was processed, or a conversation woke. Host-side errors still need
+the exact controlled response: inspect the response body's status (including
+`ERROR`) even when an outer wrapper reports `isError: false`.
+
+The separately user-approved receipt audit persists only bounded metadata in
+`state_dir/events-audit.jsonl` and its rotated `events-audit.jsonl.1`, each at most
+1 MiB and an owner-only 0600 regular file. Writes and rotation are serialized and
+fsynced; the existing ledger lock keeps a single facade process. Record shapes:
+
+- `mcp_request`: UTC `at`, `type`, fixed `method`, and fixed `tool` only for
+  `tools/call`. Known methods are `initialize`, `notifications/initialized`,
+  `ping`, `tools/list`, `tools/call`, `events/list`, `events/subscribe` and
+  `events/unsubscribe`; all others become `other`. Tool names are one of the
+  eight existing tools or `other`.
+- `event_request_outcome`: UTC `at`, `type`, fixed `method`, `stage`, `outcome`,
+  normalized JSON-RPC integer `code` or null, and fixed `reason` or null.
+- `broker_message_observed`: UTC `at`, `type` and boolean `correlated`. This
+  receipt is written before the correlated-message filter only when an already
+  active Events watcher observes a broker message. It adds no watchers and has
+  no backfill; it is not a complete broker arrival log.
+
+The audit contains no raw arguments, bodies, callback URLs, keys or key
+references, live provider IDs, paths, sockets, handles or cursors. It is separate
+from routing and correspondence and does not persist the volatile request
+counters above. Rotation bounds retained history; it cannot establish what
+happened before logging began or outside active watcher coverage. Request
+receipt, request outcome and broker observation are separate evidence; none
+proves callback delivery or consumer processing. There is no per-callback
+delivery trace in this audit. Audit write failure does not change request
+behavior; volatile `data.events.audit_write_failures` and `audit_last_error`
+(`"audit_write_failed"` or null) disclose logging failures.
+
 Subscriptions survive facade restart in bounded, owner-only
 `state_dir/events.json` (0600), separate from routing, correspondence and the
 operation ledger. Metadata is bound to the principal, tunnel, ledger namespace
