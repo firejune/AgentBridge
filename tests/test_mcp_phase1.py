@@ -178,7 +178,165 @@ class PhaseTest(unittest.TestCase):
         sent=self.send(sid); again=self.send(sid)
         self.assertTrue(again['data']['replayed']); self.assertEqual(sent['data']['operation_id'],again['data']['operation_id'])
         self.assertEqual(self.send(sid,text='different')['error']['code'],'IDEMPOTENCY_CONFLICT')
-        self.assertEqual(self.send(sid,key='other_message_0001')['error']['code'],'SESSION_BUSY')
+        self.assertTrue(self.send(sid,key='other_message_0001')['ok'])
+
+    def test_distinct_keys_queue_fifo_and_keep_independent_out_of_order_replies(self):
+        sid=self.create()['agent_session_id']
+        submitted=[]
+        original=self.backend.post
+        def post(op, session):
+            submitted.append(op['message'])
+            return original(op, session)
+        self.backend.post=post
+        accepted=[self.send(sid,key='queued_message_%04d'%i,text='message %d'%i)['data'] for i in range(3)]
+        self.engine.tick()
+        self.assertEqual(submitted,['message 0','message 1','message 2'])
+        ops=[self.engine.operation(a['operation_id'],'owner-a') for a in accepted]
+        self.assertEqual(len({o['backend_id'] for o in ops}),3)
+        self.assertTrue(all(o['stage']=='observing' and o['status']=='running' for o in ops))
+        for i in (2,0,1):
+            op=ops[i]
+            self.backend.replies[op['backend_id']]=[
+                {'id':'wrong','reply_to':ops[(i+1)%3]['backend_id'],'created':0,'body':'wrong answer'},
+                {'id':'reply%d'%i,'reply_to':op['backend_id'],'created':1,'body':'answer %d'%i}]
+            self.engine.tick()
+            self.assertEqual(self.engine.get({'operation_id':op['operation_id']},'owner-a')['result']['text'],'answer %d'%i)
+        self.assertEqual((self.backend.posts,self.backend.pushes),(3,3))
+
+    def test_concurrent_distinct_keys_and_replay_at_global_capacity(self):
+        sid=self.create()['agent_session_id']
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results=list(pool.map(lambda i:self.send(sid,key='concurrent_send_%04d'%i),range(64)))
+        self.assertTrue(all(r['ok'] for r in results))
+        self.assertEqual(len({r['data']['operation_id'] for r in results}),64)
+        self.assertEqual(self.send(sid,key='over_capacity_00001')['error']['code'],'CAPACITY_EXCEEDED')
+        self.assertTrue(self.send(sid,key='concurrent_send_0000')['data']['replayed'])
+        self.assertEqual(self.send(sid,key='concurrent_send_0000',text='changed')['error']['code'],'IDEMPOTENCY_CONFLICT')
+        self.assertEqual((self.backend.posts,self.backend.pushes),(0,0))
+
+    def test_accept_during_push_queues_until_serial_dispatch_returns(self):
+        sid=self.create()['agent_session_id']; entered=threading.Event(); release=threading.Event()
+        original=self.backend.push
+        def push(message, session):
+            entered.set()
+            if not release.wait(3): raise RuntimeError('test did not release push')
+            return original(message, session)
+        self.backend.push=push
+        first=self.send(sid)['data']
+        thread=threading.Thread(target=self.engine.tick); thread.start()
+        try:
+            self.assertTrue(entered.wait(3))
+            second=self.send(sid,key='during_push_000001')['data']
+            self.assertEqual(self.engine.operation(first['operation_id'],'owner-a')['stage'],'push_intent')
+            self.assertEqual(self.engine.operation(second['operation_id'],'owner-a')['stage'],'queued')
+            self.assertEqual((self.backend.posts,self.backend.pushes),(1,0))
+        finally:
+            release.set(); thread.join(3)
+        self.engine.tick()
+        self.assertEqual((self.backend.posts,self.backend.pushes),(2,2))
+
+    def test_busy_created_and_pinned_sessions_accept_all_provider_types(self):
+        for agent_type in phase.AGENT_TYPES:
+            with self.subTest(agent_type=agent_type):
+                self.config['workspaces']['test']['agent_type']=agent_type
+                sid=self.create('create_busy_'+agent_type+'_001')['agent_session_id']
+                self.backend.availability=lambda s:'busy'
+                self.assertTrue(self.send(sid,key='busy_created_'+agent_type)['ok'])
+                self.engine.tick()
+                pinned=self.grant()
+                self.config['pinned_sessions']['hq']['agent_type']=agent_type
+                pinned=next(iter(phase.pinned_sessions(self.config)))
+                self.assertTrue(self.send(pinned,key='busy_pinned_'+agent_type+'_001')['ok'])
+                self.engine.tick()
+        self.assertEqual((self.backend.posts,self.backend.pushes),(6,6))
+
+    def test_unknown_quarantines_queued_alias_until_read_only_reply_settles(self):
+        sid=self.grant()
+        grant=dict(self.config['pinned_sessions']['hq'],route='alias-route')
+        self.config['pinned_sessions']['alias']=grant
+        alias=next(s for s in phase.pinned_sessions(self.config) if s!=sid)
+        first=self.send(sid)['data']; second=self.send(alias,key='alias_queued_00001')['data']
+        self.backend.crash='push'; self.engine.tick()
+        first_op=self.engine.operation(first['operation_id'],'owner-a')
+        self.assertEqual(first_op['status'],'unknown')
+        self.assertEqual(self.engine.operation(second['operation_id'],'owner-a')['stage'],'queued')
+        self.assertEqual((self.backend.posts,self.backend.pushes),(1,1))
+        self.assertEqual(self.send(alias,key='alias_blocked_0001')['error']['code'],'SESSION_BUSY')
+        self.assertTrue(self.send(sid)['data']['replayed'])
+        self.assertEqual(self.send(sid,text='changed')['error']['code'],'IDEMPOTENCY_CONFLICT')
+        self.restart(); self.engine.tick()
+        self.assertEqual((self.backend.posts,self.backend.pushes),(1,1))
+        self.backend.replies[first_op['backend_id']]=[{'id':'late','reply_to':first_op['backend_id'],'created':1,'body':'delivered'}]
+        self.backend.crash=None; self.engine.watch_at.clear(); self.engine.tick()
+        self.assertEqual(self.engine.operation(first['operation_id'],'owner-a')['status'],'succeeded')
+        self.assertEqual(self.engine.operation(second['operation_id'],'owner-a')['stage'],'observing')
+        self.assertEqual((self.backend.posts,self.backend.pushes),(2,2))
+
+    def test_restart_queued_messages_preserves_fifo_without_repeating_dispatch(self):
+        sid=self.create()['agent_session_id']
+        first=self.send(sid)['data']; self.engine.tick()
+        second=self.send(sid,key='restart_queued_0001')['data']
+        self.restart(); self.engine.tick(); self.restart(); self.engine.tick()
+        self.assertEqual((self.backend.posts,self.backend.pushes),(2,2))
+        self.assertEqual(self.engine.operation(first['operation_id'],'owner-a')['stage'],'observing')
+        self.assertEqual(self.engine.operation(second['operation_id'],'owner-a')['stage'],'observing')
+
+    def test_unknown_result_allows_new_message_without_resending_old_message(self):
+        sid=self.create()['agent_session_id']; first=self.send(sid)['data']; self.engine.tick()
+        op=self.engine.operation(first['operation_id'],'owner-a')
+        self.engine.fail(op)
+        self.assertTrue(self.send(sid,key='unknown_result_new1')['ok'])
+        self.engine.tick(); self.restart(); self.engine.tick()
+        self.assertEqual(self.engine.operation(first['operation_id'],'owner-a')['status'],'unknown')
+        self.assertEqual((self.backend.posts,self.backend.pushes),(2,2))
+
+    def test_unsafe_unknown_classification_and_transport_identity(self):
+        sid=self.grant(); accepted=self.send(sid)['data']
+        op=self.engine.operation(accepted['operation_id'],'owner-a')
+        destination=op['destination']
+        for stage, state, backend_id in (
+                ('post_intent',None,None),('posted','pending','known'),
+                ('push_intent','submitted','known'),('observing','uncertain','known'),
+                ('observing','dispatching','known'),('observing','submitted',None)):
+            with self.subTest(stage=stage,state=state,backend_id=backend_id):
+                self.engine.update(op,status='unknown',stage=stage,backend_message_state=state,backend_id=backend_id)
+                self.assertEqual(self.send(sid,key='unsafe_classification')['error']['code'],'SESSION_BUSY')
+        # Provider identities remain distinct even when UUID strings coincide.
+        self.config['pinned_sessions']['other']=dict(self.config['pinned_sessions']['hq'],
+            route='other-provider',agent_type='agy')
+        other=next(s for s in phase.pinned_sessions(self.config) if s!=sid)
+        self.assertTrue(self.send(other,key='different_transport')['ok'])
+        # A current grant cannot prove a legacy write's original transport.
+        op.pop('destination'); self.engine.update(op)
+        self.assertIsNone(self.engine.operation_destination(op))
+        self.assertEqual(self.send(sid,key='legacy_quarantine_1')['error']['code'],'SESSION_BUSY')
+
+    def test_effective_transport_is_snapshotted_and_retargeting_refuses_dispatch(self):
+        sid=self.grant()
+        transport=['agy']
+        self.backend.session_transport=lambda session:transport[0]
+        first=self.send(sid)['data']
+        op=self.engine.operation(first['operation_id'],'owner-a')
+        self.assertEqual(op['destination'],{'uuid':self.config['pinned_sessions']['hq']['uuid'],'transport':'agy'})
+        transport[0]='claude-peer'
+        self.engine.tick()
+        saved=self.engine.operation(first['operation_id'],'owner-a')
+        self.assertEqual((saved['status'],saved['failure']['code']),('failed','BACKEND_UNAVAILABLE'))
+        self.assertEqual((self.backend.posts,self.backend.pushes),(0,0))
+
+    def test_legacy_unsafe_identity_cannot_follow_current_transport_past_alias_quarantine(self):
+        sid=self.grant(); current=['agy']
+        self.backend.session_transport=lambda s:s['transport'] if s.get('explicit_type') else current[0]
+        accepted=self.send(sid)['data']; op=self.engine.operation(accepted['operation_id'],'owner-a')
+        op.pop('destination'); self.engine.update(op,status='unknown',stage='post_intent')
+        current[0]='claude-peer'
+        self.config['pinned_sessions']['original']=dict(self.config['pinned_sessions']['hq'],
+            route='original-transport',agent_type='agy')
+        alias=next(s for s in phase.pinned_sessions(self.config) if s!=sid)
+        self.assertEqual(self.send(alias,key='legacy_original_alias')['error']['code'],'SESSION_BUSY')
+        # Result uncertainty is independent of identity recovery: no old write is retried.
+        self.engine.update(op,stage='observing',backend_id='known',backend_message_state='submitted')
+        self.assertTrue(self.send(alias,key='legacy_result_alias')['ok'])
     def test_post_push_reply_and_immutable_pagination(self):
         sid=self.create()['agent_session_id']; accepted=self.send(sid,text='  exact 한글  ')['data']
         self.engine.tick(); self.assertEqual((self.backend.posts,self.backend.pushes),(1,1))
@@ -239,7 +397,7 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(self.backend.pushes,1)
         self.backend.current='restarted'; self.engine.tick()
         self.assertEqual(self.engine.operation(oid,'owner-a')['status'],'unknown')
-        self.assertEqual(self.send(sid,key='new_message_00001')['error']['code'],'SESSION_BUSY')
+        self.assertTrue(self.send(sid,key='new_message_00001')['ok'])
     def test_posted_restart_is_unknown_not_pushed(self):
         sid=self.create()['agent_session_id']; oid=self.send(sid)['data']['operation_id']
         op=self.engine.operation(oid,'owner-a'); m=self.backend.post(op,{})
@@ -347,7 +505,8 @@ class PhaseTest(unittest.TestCase):
                 closed=self.engine.operation(oid,'owner-a')
                 self.assertEqual(closed['status'],state); code=closed['failure']['code']
                 if state=='unknown':
-                    self.assertEqual(self.send(sid,key='blocked_message_001')['error']['code'],'SESSION_BUSY')
+                    self.assertTrue(self.send(sid,key='independent_message_001')['ok'])
+                    self.engine.tick()
                 counts=(self.backend.posts,self.backend.pushes)
                 self.engine.watch_at.clear(); self.engine.tick()
                 self.assertEqual(self.engine.operation(oid,'owner-a')['status'],state)
@@ -504,6 +663,36 @@ def sessions_ide():
 
 
 class BrokerIntegrationTest(unittest.TestCase):
+    def test_implicit_pin_retarget_during_dispatch_never_redirects_provider_write(self):
+        for boundary in ('availability','post','push'):
+            with self.subTest(boundary=boundary), RunningBroker() as running, tempfile.TemporaryDirectory(dir='/tmp') as temp:
+                root=str(Path(temp).resolve()); uuid_value=str(uuid.uuid4())
+                config={'principal':'test-owner','tunnel_id':'isolated-retarget','writes_enabled':True,
+                    'scopes':list(set(phase.SCOPES.values())),'state_dir':root+'/state',
+                    'workspaces':{'test':{'cwd':root,'root':root,'project':'mcp-test','ide':sessions_ide()}},
+                    'pinned_sessions':{'hq':{'uuid':uuid_value,'cwd':root,'project':'mcp-test',
+                        'route':'hq','authorized_at':phase.stamp()}}}
+                running.call('register',project='mcp-test',name='hq',cwd=root,transport='agy',session=uuid_value)
+                backend=phase.Backend(running.path); engine=phase.Engine(config,backend,start=False)
+                self.addCleanup(engine.close)
+                row={'id':uuid_value,'cwd':root,'status':'running'}
+                with patch.object(phase.sessions,'resolve_agy_peer',return_value=row), \
+                     patch.object(phase.sessions,'resolve_codex_peer',return_value=row), \
+                     patch.object(phase.bridge,'push_if_peer') as provider_write:
+                    sid=next(iter(phase.pinned_sessions(config)))
+                    accepted=engine.call('bridge_message_send',{'agent_session_id':sid,
+                        'message':'must stay on original provider','idempotency_key':'dispatch_retarget_001'})['data']
+                    original=getattr(backend,boundary)
+                    def retarget(*args, **kwargs):
+                        if boundary=='availability':
+                            result=original(*args,**kwargs)
+                        running.call('register',project='mcp-test',name='hq',cwd=root,transport='codex',session=uuid_value)
+                        return result if boundary=='availability' else original(*args,**kwargs)
+                    setattr(backend,boundary,retarget)
+                    engine.tick()
+                    provider_write.assert_not_called()
+                    self.assertNotEqual(engine.operation(accepted['operation_id'],'test-owner')['stage'],'observing')
+
     def test_real_broker_post_push_and_correlated_reply(self):
         with RunningBroker() as running, tempfile.TemporaryDirectory(prefix='mcp-',dir='/tmp') as temp:
             root=str(Path(temp).resolve())

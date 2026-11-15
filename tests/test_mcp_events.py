@@ -169,6 +169,24 @@ class EventTests(unittest.TestCase):
             self.assertNotIn(private, json.dumps(self.audit_records()))
         self.assertNotIn('private correlated answer', json.dumps(values))
 
+    def test_same_session_operations_notify_and_settle_independently_out_of_order(self):
+        self.subscribe()
+        first=self.correlated(body='first answer')
+        second=self.correlated(body='second answer')
+        for op, parent, reply, entry, event in (second,first):
+            self.service.arrival(entry,event)
+            self.engine.observe(op)
+            self.drain_events()
+        values=self.applications()
+        self.assertEqual([v['data'] for v in values],[
+            {'agent_session_id':self.sid,'operation_id':second[0]['operation_id']},
+            {'agent_session_id':self.sid,'operation_id':first[0]['operation_id']}])
+        self.assertEqual(len({v['eventId'] for v in values}),2)
+        for bundle, text in ((first,'first answer'),(second,'second answer')):
+            self.assertEqual(self.engine.get({'operation_id':bundle[0]['operation_id']},
+                self.engine.principal)['result']['text'],text)
+        self.assertEqual(self.engine.call('bridge_inbox_list',{})['data']['messages'],[])
+
     def test_capture_before_live_watch_after_reply_cleanup_and_eviction(self):
         self.subscribe()
         op, _, reply, entry, event = self.correlated()

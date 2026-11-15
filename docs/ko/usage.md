@@ -309,6 +309,8 @@ Claude 데스크톱은 세션을 스스로 닫는다(앱 `main.log`에서 관찰
 
 ## 비공개 MCP 독립 inbox
 
+같은 허용 세션이 작업 중이거나 답장을 기다려도 서로 다른 키의 MCP 메시지를 접수한다. 단일 워커는 원장의 접수 순서로 훑고 같은 UUID·transport 대상 안에서 전송 순서를 지킨다. 한 대상이 격리돼 있어도 다른 차단되지 않은 대상은 진행할 수 있다. 답장과 Events ID는 각 작업에 따로 연결한다. 세션의 `busy`는 상태 정보다. `SESSION_BUSY`는 같은 UUID·transport의 불명확한 쓰기만 격리하며, 전송 확인 후 결과를 읽지 못한 작업은 새 메시지를 막지 않는다. unknown 작업은 재전송하지 않고 전체 active/unknown 64개 한도에는 계속 포함한다.
+
 기존 CLI `inbox`·`ack` 의미는 그대로 유지된다. 비공개 MCP 파사드(`scripts/mcp_server.py`)에서 `--phase1-config`에 `"inbox_enabled": true`를 명시하면 `bridge_inbox_list`·`bridge_message_get`으로 독립(`reply_to: null`) 수신 메시지를 소비 없이 읽고, 처리 후 `bridge_message_ack`로 명시적으로 `done` 처리할 수 있다. 질문에 대한 답장(correlated reply)은 기존 `bridge_operation_get` 전용이다. 페이지네이션·용량·토큰 검증·배포 게이트는 [mcp-phase1.md](../../skill/agent-bridge/references/mcp-phase1.md#independent-inbox-issue-48-explicit-opt-in)를 따른다.
 
 ## 메시지 체크포인트 복원

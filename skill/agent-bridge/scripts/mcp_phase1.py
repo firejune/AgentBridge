@@ -443,6 +443,9 @@ class Backend:
         return m
 
     def push(self, message, session):
+        route = message.get('route', {})
+        if (route.get('session'), route.get('transport')) != (session['uuid'], self.session_transport(session)):
+            raise ValueError('Unexpected message route')
         self.check(session)
         return bridge.push_if_peer(self.path, message)
 
@@ -565,7 +568,39 @@ class Engine:
 
     def rows(self):
         with self.lock:
-            return [json.loads(r[0]) for r in self.db.execute('SELECT doc FROM operations')]
+            return [json.loads(r[0]) for r in self.db.execute('SELECT doc FROM operations ORDER BY rowid')]
+
+    def destination(self, session):
+        transport = (self.backend.session_transport(session) if hasattr(self.backend, 'session_transport')
+                     else session.get('transport', AGENT_TRANSPORTS.get(session.get('agent_type', 'claude'))))
+        return {'uuid': session['uuid'], 'transport': transport}
+
+    def operation_destination(self, op):
+        if op.get('destination'):
+            return op['destination']
+        if op['status'] != 'accepted':
+            # A current implicit grant cannot prove a legacy write's original
+            # transport. Its route may have changed since that write began.
+            return None
+        try:
+            # Queued legacy work has not attempted any external effect yet.
+            return self.destination(self.session(op['agent_session_id'], op['principal']))
+        except Exception:
+            return None  # An unidentifiable legacy intent cannot safely be bypassed.
+
+    def blocked(self, ops, destination, queued=False):
+        for other in ops:
+            if other['kind'] != 'message_send':
+                continue
+            delivered = (other.get('stage') == 'observing' and other.get('backend_id')
+                         and other.get('backend_message_state') in ('submitted','received','in_progress','answered','done'))
+            # Unknown *results* after confirmed submission do not reserve a write slot.
+            # Incomplete/uncertain writes and unidentifiable legacy records still do.
+            unsafe = (other['status'] == 'unknown' and not delivered) or (queued and (
+                other['status'] == 'accepted' or (other['status'] == 'running' and not delivered)))
+            if unsafe and self.operation_destination(other) in (None, destination):
+                return True
+        return False
 
     def save(self, op):
         op['updated_at'] = max(op['updated_at'], stamp())
@@ -692,15 +727,15 @@ class Engine:
             if self.stop.is_set():
                 raise Fault('BACKEND_UNAVAILABLE')
             ops = self.rows()
-            if not creating and any(o['agent_session_id']==args['agent_session_id'] and o['status'] in ACTIVE
-                                    and o['kind']=='message_send' for o in ops):
+            destination = self.destination(session) if not creating else None
+            if not creating and self.blocked(ops, destination):
                 raise Fault('SESSION_BUSY')
             if sum(o['status'] in ACTIVE for o in ops) >= 64 or (self.root/'ledger.sqlite3').stat().st_size >= 64*1024*1024:
                 raise Fault('CAPACITY_EXCEEDED')
             try:
                 self.backend.instance()
                 if not creating and (not (session.get('registered') or session.get('discovered'))
-                                     or self.backend.availability(session) not in (('ready','busy') if (session.get('pinned') or session.get('discovered')) else ('ready',))):
+                                     or self.backend.availability(session) not in ('ready','busy')):
                     raise ValueError('Unavailable dedicated session')
             except Exception:
                 raise Fault('BACKEND_UNAVAILABLE') from None
@@ -719,6 +754,7 @@ class Engine:
                 op.update(alias=args['workspace_alias'],workspace=dict(self.config['workspaces'][args['workspace_alias']]),agent_type=agent_type)
             else:
                 op['message'] = args['message']
+                op['destination'] = destination
             self.db.execute('INSERT INTO operations VALUES (?,?,?,?,?,?)',
                             (op['operation_id'],principal,tool,key_hash,payload_hash,json.dumps(op)))
         self.wake.set()
@@ -793,7 +829,21 @@ class Engine:
                 self.allowed({'alias':op['alias'],'workspace':op['workspace']})
             else:
                 session = self.session(op['agent_session_id'],op['principal']); self.allowed(session)
-                if self.backend.availability(session) not in (('ready','busy') if (session.get('pinned') or session.get('discovered')) else ('ready',)):
+                destination = self.destination(session)
+                if op.get('destination', destination) != destination:
+                    raise Fault('BACKEND_UNAVAILABLE')
+                # Keep the accepted effective provider fixed through availability,
+                # route checks, broker post, returned-route validation and push.
+                session = dict(session, transport=destination['transport'],
+                               agent_type=TRANSPORT_AGENTS[destination['transport']], explicit_type=True)
+                earlier = []
+                for other in self.rows():
+                    if other['operation_id'] == op['operation_id']:
+                        break
+                    earlier.append(other)
+                if self.blocked(earlier, destination, queued=True):
+                    return  # Still unattempted: never write past an ambiguous intent.
+                if self.backend.availability(session) not in ('ready','busy'):
                     raise Fault('BACKEND_UNAVAILABLE')
         except Exception:
             self.fail(op,'BACKEND_UNAVAILABLE',unknown=False); return
@@ -822,7 +872,7 @@ class Engine:
             finally:
                 os.close(fd)
         else:
-            self.update(op,status='running',stage='post_intent',instance=instance)
+            self.update(op,status='running',stage='post_intent',instance=instance,destination=destination)
             message = self.backend.post(op,session)
             self.update(op,stage='posted',backend_id=message['id'],backend_message_state=message['state'])
             if self.backend.instance() != instance:

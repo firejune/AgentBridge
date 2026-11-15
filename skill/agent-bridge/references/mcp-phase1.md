@@ -57,12 +57,25 @@ operation/key hashes, exact accepted payloads and fixed correlated replies.
 It is not a modification to the broker's persistence policy. Treat it as private
 conversation data; do not put it in Git or include it in diagnostic bundles.
 
-An immediate transaction reserves an operation and session busy slot before
-returning accepted. Same principal/tool/key+payload returns the original IDs/time;
+An immediate transaction reserves each operation before returning accepted.
+Independently keyed messages may queue for the same exact authorized session,
+including a busy provider or an earlier operation waiting for its reply.
+Same principal/tool/key+payload returns the original IDs/time;
 changed payload conflicts. A single worker per ledger is enforced with an OS
 lock. All facade ledgers for this OS user share a host creation lock; independent
 human/CLI IDE operations can still race, in which case the native creation
 adapter refuses ambiguity. Create and send are separate operations.
+
+The single worker scans queued messages in durable insertion order and preserves
+submission order within each exact destination UUID and transport, without waiting
+for earlier replies. Other unblocked destinations may proceed while one destination
+is quarantined. Every message retains its own operation/request ID,
+broker key, exact reply correlation and optional Events notification. An accepted
+message snapshots the destination UUID and effective transport; that provider is
+fixed through availability, broker route checks, post and push. Returned broker
+routes must match before any provider write. Aliases cannot bypass an
+ambiguous write to that destination. A listed session state of `busy` is
+informational and does not itself refuse a message.
 
 The worker commits intent before create/post/push, saves returned UUID/message
 IDs before the next stage, and actually calls `bridge.push_if_peer` after broker
@@ -102,7 +115,20 @@ Queued operations have no external intent and may resume. Anything with a
 persisted intent is never blindly replayed. For a known message on the same broker
 instance, recovery observes only; missing IDs, eviction, broker restart, pending
 or dispatching ambiguity become `unknown`. A reply body can settle a known message.
-Unknown message operations block further sends to that owned session.
+Only ambiguous writes quarantine new sends with `SESSION_BUSY` to the same exact
+UUID and transport. The worker also leaves already accepted later messages queued
+without post/push intent while an earlier write remains ambiguous. A known message
+at `observing` with last confirmed state `submitted`, `received`, `in_progress`,
+`answered` or `done` has completed submission: an `unknown` result caused by failed
+reads or a broker instance change does not block a separately keyed new message.
+Missing IDs, incomplete intent stages, `pending`, `dispatching`, `uncertain` or
+unidentifiable legacy intent records remain quarantined. Same-key replay/conflict
+is checked before quarantine or capacity admission. Unknown operations retain their
+capacity slot and are never resent. A legacy unsafe intent without a destination
+snapshot conservatively blocks admission and later dispatch: a current implicit
+grant cannot prove its original transport. Legacy confirmed submissions still
+permit independent new messages. Queued legacy work has no external intent and
+snapshots its effective destination before starting its first dispatch.
 
 Reading a known message is not a delivery outcome (issue #134). While an operation
 is `running`, a failed read (broker timeout, disconnect, unreadable reply) leaves
@@ -115,8 +141,8 @@ record as `error` / `observe_errors`; they are never part of a tool result.
 A closed `unknown` or `failed` message operation with a known message is still
 read on the same broker instance: every 5 s for 10 minutes after it closed, then
 every 60 s. A correlated reply settles it as `succeeded` (the previous status and
-code stay on the ledger as `settled_after`), resolves the reply, and frees the
-session. The caller reads it with `bridge_operation_get` on the same
+code stay on the ledger as `settled_after`), resolves the reply, and clears any
+write quarantine for that operation. The caller reads it with `bridge_operation_get` on the same
 `operation_id`. This watch only reads: it never posts, pushes or resends, and it
 ends on a broker instance change, when the broker no longer knows the message, or
 when the record expires. Correlated replies stay out of the independent inbox. No tool
