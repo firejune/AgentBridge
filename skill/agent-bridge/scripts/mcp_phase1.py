@@ -36,6 +36,15 @@ AGENT_TYPES = ('claude', 'agy', 'codex')
 AGENT_TRANSPORTS = {'claude': 'claude-peer', 'agy': 'agy', 'codex': 'codex'}
 TRANSPORT_AGENTS = {'claude-peer': 'claude', 'agy': 'agy', 'codex': 'codex'}
 ACTIVE = ('accepted', 'running', 'unknown')
+# Exact broker wire refusals only. The production E31 embedded broker predates
+# TTL mode, so the facade must not depend on newer broker module constants.
+MESSAGE_CAPACITY_ERRORS = frozenset((
+    'In-memory message limit reached: no evictable terminal messages; pending or protected work is retained',
+    'Active-message limit reached: TTL or protected work prevents safe cleanup; inspect retention --live; no messages evicted before TTL',
+))
+CAPACITY_FAILURE_MESSAGE = 'Broker message capacity is full; the message was not posted or delivered.'
+REPLY_NOT_RETAINED_MESSAGE = 'The reply is no longer retained.'
+MESSAGE_NOT_RETAINED_MESSAGE = 'The message is no longer retained.'
 STATES = {'pending','dispatching','submitted','received','in_progress','answered','done','failed','uncertain'}
 RETENTION = 720 * 3600  # Detailed records >=168h, full keys >=720h; tombstones never deleted.
 MAX_RESULT = 1024 * 1024
@@ -774,8 +783,8 @@ class Engine:
             if alias != session['alias']:
                 raise Fault('WORKSPACE_NOT_ALLOWED')
 
-    def fail(self, op, code='DELIVERY_UNKNOWN', unknown=True, error=None, **fields):
-        failure = Fault(code).payload
+    def fail(self, op, code='DELIVERY_UNKNOWN', unknown=True, error=None, message=None, **fields):
+        failure = Fault(code, message).payload
         failure['operation_id'] = op['operation_id']
         if error is not None:
             fields['error'] = error
@@ -873,7 +882,14 @@ class Engine:
                 os.close(fd)
         else:
             self.update(op,status='running',stage='post_intent',instance=instance,destination=destination)
-            message = self.backend.post(op,session)
+            try:
+                message = self.backend.post(op,session)
+            except ValueError as error:
+                # Only an exact admission refusal proves no post took place.
+                if str(error) not in MESSAGE_CAPACITY_ERRORS:
+                    raise
+                self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=CAPACITY_FAILURE_MESSAGE)
+                return
             self.update(op,stage='posted',backend_id=message['id'],backend_message_state=message['state'])
             if self.backend.instance() != instance:
                 self.fail(op); return
@@ -926,15 +942,32 @@ class Engine:
 
     def observe(self, op, notify_events=True):
         try:
+            same = False
             try:
                 # Read-only broker calls. A failure here says nothing about the message.
                 same = self.backend.instance()==op['instance']
                 if same:
                     message,replies = self.backend.observe(op['backend_id'])
+                    if not isinstance(message, dict) or message.get('id') != op['backend_id']:
+                        raise ValueError('Unexpected message identifier')
                     state = message['state']
                     if state not in STATES:
                         raise ValueError('Unknown message state')
             except Exception as error:
+                if (same and isinstance(error, ValueError) and str(error) == UNKNOWN_MESSAGE
+                        and op.get('stage') == 'observing'
+                        and op.get('backend_message_state') in ('submitted', 'received', 'in_progress', 'answered', 'done')):
+                    # A restart between the initial epoch check and missing
+                    # read is still ambiguous, including an unreadable recheck.
+                    try:
+                        still_same = self.backend.instance() == op['instance']
+                    except Exception:
+                        still_same = False
+                    if still_same:
+                        self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=MESSAGE_NOT_RETAINED_MESSAGE)
+                    else:
+                        self.fail(op)
+                    return
                 self.observe_error(op,error); return
             if not same:
                 self.fail(op); return
@@ -942,7 +975,11 @@ class Engine:
             self.update(op,backend_message_state=state,observe_errors=0)
             if self.settle(op,replies,parent=message,notify_events=notify_events):
                 return
-            if state=='failed':
+            if state == 'answered':
+                # Answered proves a correlated reply existed. The original late
+                # watch can still settle a later result without any resend.
+                self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=REPLY_NOT_RETAINED_MESSAGE)
+            elif state=='failed':
                 self.fail(op,'BACKEND_UNAVAILABLE',False)
             elif state=='uncertain' or (op.get('recovered') and state in ('pending','dispatching')):
                 self.fail(op)

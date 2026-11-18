@@ -337,6 +337,145 @@ class PhaseTest(unittest.TestCase):
         # Result uncertainty is independent of identity recovery: no old write is retried.
         self.engine.update(op,stage='observing',backend_id='known',backend_message_state='submitted')
         self.assertTrue(self.send(alias,key='legacy_result_alias')['ok'])
+    def test_definite_broker_capacity_refusal_fails_without_push_and_releases_target(self):
+        for index, reason in enumerate(sorted(phase.MESSAGE_CAPACITY_ERRORS)):
+            with self.subTest(reason=reason):
+                sid = self.create('create_capacity_%02d' % index)['agent_session_id']
+                oid = self.send(sid, key='capacity_message_%02d' % index)['data']['operation_id']
+                pushes = self.backend.pushes
+                with patch.object(self.backend, 'post', side_effect=ValueError(reason)) as post:
+                    self.engine.tick()
+                    self.assertEqual(post.call_count, 1)
+                operation = self.call('bridge_operation_get', operation_id=oid)['data']
+                self.assertEqual(operation['status'], 'failed')
+                self.assertEqual(operation['failure']['code'], 'BACKEND_UNAVAILABLE')
+                self.assertEqual(operation['failure']['message'], phase.CAPACITY_FAILURE_MESSAGE)
+                self.assertEqual(self.backend.pushes, pushes)
+                self.assertIsNone(self.engine.operation(oid, 'owner-a')['backend_id'])
+                replay = self.send(sid, key='capacity_message_%02d' % index)
+                self.assertTrue(replay['data']['replayed'])
+                self.engine.tick()
+                self.assertEqual(self.backend.pushes, pushes)
+                self.assertTrue(self.send(sid, key='after_capacity_%02d' % index)['ok'])
+                self.engine.tick()
+                self.assertEqual(self.backend.pushes, pushes + 1)
+
+
+    def test_ambiguous_post_errors_remain_unknown_without_retry_and_hold_target(self):
+        errors = (TimeoutError('response lost'), OSError('disconnected'),
+                  ValueError('unrecognized post response'))
+        for index, error in enumerate(errors):
+            with self.subTest(error=type(error).__name__):
+                sid = self.create('create_ambiguous_%02d' % index)['agent_session_id']
+                oid = self.send(sid, key='ambiguous_message_%02d' % index)['data']['operation_id']
+                pushes = self.backend.pushes
+                with patch.object(self.backend, 'post', side_effect=error) as post:
+                    self.engine.tick()
+                    self.engine.tick()
+                    self.assertEqual(post.call_count, 1)
+                operation = self.call('bridge_operation_get', operation_id=oid)['data']
+                self.assertEqual(operation['status'], 'unknown')
+                self.assertEqual(operation['failure']['code'], 'DELIVERY_UNKNOWN')
+                self.assertEqual(self.backend.pushes, pushes)
+                self.assertEqual(self.send(sid, key='after_ambiguous_%02d' % index)['error']['code'], 'SESSION_BUSY')
+
+
+    def test_answered_without_retained_reply_releases_target_and_late_watch_settles(self):
+        sid, oid, mid = self.observing()
+        self.backend.messages[mid]['state'] = 'answered'
+        self.engine.tick()
+        op = self.call('bridge_operation_get', operation_id=oid)['data']
+        self.assertEqual((op['status'], op['failure']['code'], op['failure']['message']),
+                         ('failed', 'BACKEND_UNAVAILABLE', phase.REPLY_NOT_RETAINED_MESSAGE))
+        self.assertTrue(self.send(sid, key='after_lost_reply_001')['ok'])
+        # A later reply is observed without replaying the original post/push.
+        self.reply(mid, 'retained later answer')
+        self.engine.tick()
+        result = self.call('bridge_operation_get', operation_id=oid)['data']
+        self.assertEqual((result['status'], result['result']['text']), ('succeeded', 'retained later answer'))
+        self.assertEqual(self.engine.operation(oid, 'owner-a')['settled_after'],
+                         {'status': 'failed', 'code': 'BACKEND_UNAVAILABLE'})
+        self.assertEqual((self.backend.posts, self.backend.pushes), (2, 2))  # New explicit operation only.
+
+
+    def test_exact_missing_delivered_message_releases_target_without_replay(self):
+        sid, oid, mid = self.observing()
+        with patch.object(self.backend, 'observe', side_effect=ValueError(phase.UNKNOWN_MESSAGE)):
+            self.engine.tick()
+            self.engine.tick()
+        operation = self.call('bridge_operation_get', operation_id=oid)['data']
+        self.assertEqual((operation['status'], operation['failure']['code'], operation['failure']['message']),
+                         ('failed', 'BACKEND_UNAVAILABLE', phase.MESSAGE_NOT_RETAINED_MESSAGE))
+        self.assertEqual((self.backend.posts, self.backend.pushes), (1, 1))
+        self.assertTrue(self.send(sid, key='after_lost_message_1')['ok'])
+
+
+    def test_missing_message_epoch_race_or_unreadable_recheck_remains_unknown(self):
+        for index, changed in enumerate(('new-instance', TimeoutError('epoch unavailable'))):
+            with self.subTest(changed=type(changed).__name__):
+                sid, oid, mid = self.observing('missing_epoch_%02d' % index)
+                with patch.object(self.backend, 'instance', side_effect=[self.backend.current, changed]), patch.object(self.backend, 'observe', side_effect=ValueError(phase.UNKNOWN_MESSAGE)):
+                    self.engine.tick()
+                operation = self.call('bridge_operation_get', operation_id=oid)['data']
+                self.assertEqual((operation['status'], operation['failure']['code']), ('unknown', 'DELIVERY_UNKNOWN'))
+                self.assertFalse(self.engine.blocked([self.engine.operation(oid, 'owner-a')],
+                                                     self.engine.destination(self.engine.session(sid, 'owner-a'))))
+        self.assertEqual((self.backend.posts, self.backend.pushes), (2, 2))
+
+
+    def test_wrong_answered_parent_is_not_classified_as_missing_reply(self):
+        sid, oid, mid = self.observing()
+        self.engine.observe_retry_limit = 1
+        with patch.object(self.backend, 'observe', return_value=({'id': 'wrong-parent', 'state': 'answered'}, [])):
+            self.engine.tick()
+        operation = self.call('bridge_operation_get', operation_id=oid)['data']
+        self.assertEqual((operation['status'], operation['failure']['code']), ('unknown', 'DELIVERY_UNKNOWN'))
+        self.assertEqual((self.backend.posts, self.backend.pushes), (1, 1))
+
+
+    def test_missing_message_without_confirmed_delivery_remains_ambiguous(self):
+        sid, oid, mid = self.observing()
+        op = self.engine.operation(oid, 'owner-a')
+        self.engine.update(op, stage='posted', backend_message_state='pending')
+        self.engine.observe_retry_limit = 1
+        with patch.object(self.backend, 'observe', side_effect=ValueError(phase.UNKNOWN_MESSAGE)):
+            self.engine.tick()
+        operation = self.call('bridge_operation_get', operation_id=oid)['data']
+        self.assertEqual((operation['status'], operation['failure']['code']), ('unknown', 'DELIVERY_UNKNOWN'))
+        self.assertEqual(self.send(sid, key='still_ambiguous_001')['error']['code'], 'SESSION_BUSY')
+        self.assertEqual((self.backend.posts, self.backend.pushes), (1, 1))
+
+
+    def test_exact_capacity_wire_matches_legacy_embedded_broker_without_new_import(self):
+        self.assertFalse(hasattr(broker, 'MESSAGE_CAPACITY_ERRORS'))
+        state = broker.State(max_messages=1)
+        for name in ('alpha', 'beta'):
+            state.action(dict(op='register', project='synthetic', name=name, cwd='/tmp'))
+        args = dict(op='send', project='synthetic', sender='alpha', recipient='beta', body='synthetic', key='first')
+        state.action(args)
+        with self.assertRaises(ValueError) as caught:
+            state.action(dict(args, key='second'))
+        self.assertIn(str(caught.exception), phase.MESSAGE_CAPACITY_ERRORS)
+        self.assertEqual(len(phase.MESSAGE_CAPACITY_ERRORS), 2)
+        self.assertIn('Active-message limit reached: TTL or protected work prevents safe cleanup; inspect retention --live; no messages evicted before TTL', phase.MESSAGE_CAPACITY_ERRORS)
+
+    def test_late_retention_result_preserves_event_parent_and_committed_notification(self):
+        sid, oid, mid = self.observing()
+        self.backend.messages[mid]['state'] = 'answered'
+        with patch.object(self.engine, 'events') as events:
+            self.engine.tick()
+            self.assertEqual(self.engine.operation(oid, 'owner-a')['status'], 'failed')
+            events.result_ready.assert_not_called()
+            self.reply(mid, 'retained late result')
+            self.engine.tick()
+            events.result_ready.assert_called_once()
+            operation, parent, replies = events.result_ready.call_args.args
+            self.assertEqual(parent['id'], mid)
+            self.assertEqual(replies[0]['body'], 'retained late result')
+            self.assertEqual(operation['status'], 'succeeded')
+            self.assertEqual(self.engine.operation(oid, 'owner-a')['status'], 'succeeded')
+        self.assertEqual((self.backend.posts, self.backend.pushes), (1, 1))
+
     def test_post_push_reply_and_immutable_pagination(self):
         sid=self.create()['agent_session_id']; accepted=self.send(sid,text='  exact 한글  ')['data']
         self.engine.tick(); self.assertEqual((self.backend.posts,self.backend.pushes),(1,1))
@@ -344,7 +483,7 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(op['message'],'  exact 한글  ')
         self.assertEqual(self.call('bridge_operation_get',operation_id=oid)['data']['status'],'running')
         self.backend.messages[op['backend_id']]['state']='answered'; self.engine.tick()
-        self.assertEqual(self.engine.operation(oid,'owner-a')['status'],'running')
+        self.assertEqual(self.engine.operation(oid,'owner-a')['status'],'failed')
         self.backend.replies[op['backend_id']]=[{'id':'b','created':'2','reply_to':op['backend_id'],'body':'🌈끝'},{'id':'a','created':'1','reply_to':op['backend_id'],'body':'한글'}]
         self.engine.tick(); first=self.call('bridge_operation_get',operation_id=oid,max_chars=3)['data']['result']
         self.assertEqual(first['text'],'한글\n');self.assertTrue(first['has_more'])
