@@ -208,6 +208,8 @@ python3 "$bridge_cli" wt sweep --apply  # 대상 워크트리 및 브랜치 실�
 ### 5. 라우팅 영속화 및 선택적 `launchd` 서비스
 
 - **소유자 전용 메시지·라우팅 저장**. 재시작은 브로커의 종료 메시지 제거·보호 규칙에 따라 라우트와 메시지를 복원하며, 낮춘 한도를 넘는 보호 메시지는 유지하고 stderr와 `ping.correspondence_over_limit`에 표시한다. 필드·한도·손실 진단은 [저장 계약](../../skill/agent-bridge/references/usage.md#correspondence-storage-issue-94)을 따른다.
+- **선택적 TTL**. `serve --retention-ttl`은 조건을 충족한 명시적 단방향·완료 메시지의 본문을 24시간, 조회·중복 방지용 축약 영수증을 7일간 보존한다. 만료돼도 전달 상태와 보호 작업은 유지한다. 먼저 `retention --dry-run`과 `retention --live`로 개수를 확인하고 즉시 여유가 없으면 엄격한 적용을 보류한다. 완료 시각 준비가 필요하면 문서의 `serve --retention-prepare` 절차를 따른다. [TTL 정책과 적용 절차](usage.md#선택적-메시지-ttl-issue-105)를 참고한다.
+- 서비스 모드는 `install-service --retention-prepare|--retention-ttl` 중 하나로 지정한다. 먼저 LaunchAgents 밖의 새 경로에 `--generate-only --plist PATH`로 생성해 검토한다. 기존 plist를 덮어쓰지 않으므로 모드 전환은 제거·재설치 일정을 조율한다.
 - **선택적 macOS `launchd` 관리**: 자동 기동 서비스는 기본 꺼짐 상태다. `install-service`(검토용 파일 생성은 `--generate-only --plist PATH`)와 `uninstall-service`로 `KeepAlive` 에이전트를 관리한다.
 
 ### 6. 원격 MCP 파사드 (`mcp_server.py`)

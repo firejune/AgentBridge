@@ -179,6 +179,47 @@ class PhaseTest(unittest.TestCase):
         self.assertTrue(again['data']['replayed']); self.assertEqual(sent['data']['operation_id'],again['data']['operation_id'])
         self.assertEqual(self.send(sid,text='different')['error']['code'],'IDEMPOTENCY_CONFLICT')
         self.assertEqual(self.send(sid,key='other_message_0001')['error']['code'],'SESSION_BUSY')
+    def test_definite_broker_capacity_refusal_fails_without_push_and_releases_target(self):
+        for index, reason in enumerate(sorted(broker.MESSAGE_CAPACITY_ERRORS)):
+            with self.subTest(reason=reason):
+                sid = self.create('create_capacity_%02d' % index)['agent_session_id']
+                oid = self.send(sid, key='capacity_message_%02d' % index)['data']['operation_id']
+                pushes = self.backend.pushes
+                with patch.object(self.backend, 'post', side_effect=ValueError(reason)) as post:
+                    self.engine.tick()
+                    self.assertEqual(post.call_count, 1)
+                operation = self.call('bridge_operation_get', operation_id=oid)['data']
+                self.assertEqual(operation['status'], 'failed')
+                self.assertEqual(operation['failure']['code'], 'BACKEND_UNAVAILABLE')
+                self.assertEqual(operation['failure']['message'], phase.CAPACITY_FAILURE_MESSAGE)
+                self.assertEqual(self.backend.pushes, pushes)
+                self.assertIsNone(self.engine.operation(oid, 'owner-a')['backend_id'])
+                replay = self.send(sid, key='capacity_message_%02d' % index)
+                self.assertTrue(replay['data']['replayed'])
+                self.engine.tick()
+                self.assertEqual(self.backend.pushes, pushes)
+                self.assertTrue(self.send(sid, key='after_capacity_%02d' % index)['ok'])
+                self.engine.tick()
+                self.assertEqual(self.backend.pushes, pushes + 1)
+
+    def test_ambiguous_post_errors_remain_unknown_without_retry_and_hold_target(self):
+        errors = (TimeoutError('response lost'), OSError('disconnected'),
+                  ValueError('unrecognized post response'))
+        for index, error in enumerate(errors):
+            with self.subTest(error=type(error).__name__):
+                sid = self.create('create_ambiguous_%02d' % index)['agent_session_id']
+                oid = self.send(sid, key='ambiguous_message_%02d' % index)['data']['operation_id']
+                pushes = self.backend.pushes
+                with patch.object(self.backend, 'post', side_effect=error) as post:
+                    self.engine.tick()
+                    self.engine.tick()
+                    self.assertEqual(post.call_count, 1)
+                operation = self.call('bridge_operation_get', operation_id=oid)['data']
+                self.assertEqual(operation['status'], 'unknown')
+                self.assertEqual(operation['failure']['code'], 'DELIVERY_UNKNOWN')
+                self.assertEqual(self.backend.pushes, pushes)
+                self.assertEqual(self.send(sid, key='after_ambiguous_%02d' % index)['error']['code'], 'SESSION_BUSY')
+
     def test_post_push_reply_and_immutable_pagination(self):
         sid=self.create()['agent_session_id']; accepted=self.send(sid,text='  exact 한글  ')['data']
         self.engine.tick(); self.assertEqual((self.backend.posts,self.backend.pushes),(1,1))

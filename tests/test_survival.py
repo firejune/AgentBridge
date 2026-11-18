@@ -1,6 +1,6 @@
 """Issue #5 bars. All subprocesses use disposable sockets and routing state."""
 import asyncio
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from copy import deepcopy
 import io
 import errno
@@ -1167,6 +1167,52 @@ class ServiceTests(unittest.TestCase):
                     service.uninstall(socket_path+'-other', str(Path(root) / 'state'), path, generate_only=True)
                 service.uninstall(socket_path, str(Path(root) / 'state'), path, generate_only=True)
                 self.assertFalse(path.exists())
+
+    def test_retention_mode_generation_and_exact_removal_never_load(self):
+        with tempfile.TemporaryDirectory(prefix='ab-retention-plist-', dir='/tmp') as root, patch.object(service, 'launchctl', side_effect=AssertionError('No service calls')):
+            for mode in ('retention_prepare', 'retention_ttl'):
+                path = Path(root) / (mode + '.plist')
+                options = {mode: True}
+                service.install(root + '/b.sock', root + '/state', path, generate_only=True, max_messages=5, **options)
+                config = plistlib.loads(path.read_bytes())
+                self.assertEqual(config['ProgramArguments'][-3:], ['--max-messages', '5', '--' + mode.replace('_', '-')])
+                with self.assertRaises(FileExistsError):
+                    service.install(root + '/b.sock', root + '/state', path, generate_only=True, **options)
+                service.uninstall(root + '/b.sock', root + '/state', path, generate_only=True)
+                self.assertFalse(path.exists())
+            with self.assertRaisesRegex(ValueError, 'mutually exclusive'):
+                service.configuration(root + '/b.sock', root + '/state', 5, True, True)
+            with self.assertRaisesRegex(ValueError, '2048'):
+                service.configuration(root + '/b.sock', root + '/state', 2049, retention_ttl=True)
+
+    def test_uninstall_refuses_arbitrary_appended_options_or_invalid_retention(self):
+        with tempfile.TemporaryDirectory(prefix='ab-retention-identity-', dir='/tmp') as root, patch.object(service, 'launchctl', side_effect=AssertionError('No service calls')):
+            config = service.configuration(root + '/b.sock', root + '/state', 5)
+            prefix = config['ProgramArguments'][:-1]
+            path = Path(root) / 'review.plist'
+            tails = [['0'], ['-1'], ['5.0'], ['+5'], ['05'], [5],
+                     ['5', '--unknown'], ['5', '--retention-ttl', '--retention-prepare'],
+                     ['2049', '--retention-ttl']]
+            for suffix in tails:
+                with self.subTest(suffix=suffix):
+                    path.write_bytes(plistlib.dumps(dict(config, ProgramArguments=prefix + suffix)))
+                    with self.assertRaisesRegex(ValueError, 'does not match'):
+                        service.uninstall(root + '/b.sock', root + '/state', path, generate_only=True)
+                    self.assertTrue(path.exists())
+            changed = prefix.copy()
+            changed[1] += '-other'
+            path.write_bytes(plistlib.dumps(dict(config, ProgramArguments=changed + ['5', '--retention-prepare'])))
+            with self.assertRaisesRegex(ValueError, 'does not match'):
+                service.uninstall(root + '/b.sock', root + '/state', path, generate_only=True)
+
+    def test_cli_generate_only_retention_modes_remain_review_only(self):
+        with tempfile.TemporaryDirectory(prefix='ab-retention-cli-', dir='/tmp') as root, patch.object(service, 'launchctl', side_effect=AssertionError('No service calls')):
+            for flag in ('--retention-prepare', '--retention-ttl'):
+                path = Path(root) / (flag[2:] + '.plist')
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(bridge.main(['--socket', root + '/b.sock', 'install-service', '--state-dir', root + '/state', '--plist', str(path), '--generate-only', flag]), 0)
+                self.assertEqual(plistlib.loads(path.read_bytes())['ProgramArguments'][-1], flag)
+                self.assertFalse(Path(root + '/state').exists())
 
     def test_cli_generate_only_plist_is_valid_on_macos(self):
         with tempfile.TemporaryDirectory(prefix='ab5-plist-', dir='/tmp') as root:

@@ -19,6 +19,7 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import route_store
 import message_store
+import retention
 import usage
 import provider_failures
 import codex_failures
@@ -57,6 +58,11 @@ def route_key(route):
 
 
 TERMINAL_STATES = frozenset(('done', 'answered', 'failed'))
+LEGACY_CAPACITY_ERROR = ('In-memory message limit reached: no evictable terminal messages; '
+                         'pending or protected work is retained')
+TTL_CAPACITY_ERROR = ('Active-message limit reached: TTL or protected work prevents safe cleanup; '
+                      'inspect retention --live; no messages evicted before TTL')
+MESSAGE_CAPACITY_ERRORS = frozenset((LEGACY_CAPACITY_ERROR, TTL_CAPACITY_ERROR))
 GUARDED_CLAIM_WINDOW = 10
 CLAIM_RELEASE_NOTE = 'Claude claim response was lost. The claim was released before any peer write.'
 
@@ -86,10 +92,13 @@ def guarded_claim_fields(args):
 
 
 def public_message(message):
-    if 'dispatch_claim' not in message and 'dispatch_claim_deadline' not in message:
+    if ('dispatch_claim' not in message and 'dispatch_claim_deadline' not in message
+            and 'reply_deadline_at' not in message):
         return message
-    return {key:value for key,value in message.items()
-            if key not in ('dispatch_claim', 'dispatch_claim_deadline')}
+    result = {key:value for key,value in message.items()
+              if key not in ('dispatch_claim', 'dispatch_claim_deadline')}
+    result.update(retention.request_status(message, time.time()))
+    return result
 
 
 class BrokerResponseError(ValueError):
@@ -97,11 +106,18 @@ class BrokerResponseError(ValueError):
 
 
 class State:
-    def __init__(self, max_messages=2048, store=None):
+    def __init__(self, max_messages=2048, store=None, retention_ttl=False, retention_prepare=False):
         if max_messages < 1:
             raise ValueError('Message retention size must be positive')
         self.instance = str(uuid.uuid4())
         self.max_messages = max_messages
+        if retention_ttl and max_messages > 2048:
+            raise ValueError('TTL active-message limit cannot exceed 2048')
+        if retention_ttl and retention_prepare:
+            raise ValueError('Retention prepare and TTL modes are mutually exclusive')
+        self.retention_ttl = retention_ttl
+        self.retention_prepare = retention_prepare
+        self.compact_messages = {}
         self.endpoints, self.channels, self.messages, self.keys = {}, {}, {}, {}
         self.events = deque(maxlen=1024)
         self.sequence = 0
@@ -119,13 +135,14 @@ class State:
             self.correspondence = message_store.MessageStore(store.directory, max_messages)
             saved = self.correspondence.load()
             self.messages = {m['id']: m for m in saved['messages']}
+            self.compact_messages = {m['id']: m for m in saved['compact']}
             self.keys = {key: (intent, mid) for key, intent, mid in saved['keys']}
             self.inbox_receipts = {tuple(key): value for key, value in saved['receipts']}
             self.inbox_snapshots = saved['snapshots']
-            before = self.messages.copy()
+            before = deepcopy(self.messages)
             self.make_room(restoring=True)
             dropped = [message_store.loss_identity(m) for mid, m in before.items()
-                       if mid not in self.messages]
+                       if mid not in self.messages and mid not in self.compact_messages]
             if dropped:
                 self.correspondence.record_loss('message retention limit reduced; oldest unguarded terminal messages evicted', dropped)
             if len(self.messages) > self.max_messages:
@@ -133,12 +150,15 @@ class State:
                                       kept=len(self.messages), limit=self.max_messages)),
                       file=sys.stderr, flush=True)
             reply_parents = {m['reply_to'] for m in self.messages.values()}
-            for mid, message in self.messages.items():
+            for mid, message in (self.messages | self.compact_messages).items():
                 self.answers[mid] = asyncio.Event()
                 if mid in reply_parents:
                     self.answers[mid].set()
                 if message['state'] == 'dispatching':
                     message.update(state='uncertain', note='Broker restarted during delivery; resolve explicitly')
+            # Every broker epoch reconciles the checkpoint and metadata index,
+            # including removal of receipts/snapshots bound to the retired epoch.
+            # Periodic no-op sweeps still avoid cloning and checkpoint writes.
             self.correspondence.save(self)
         # Volatile endpoint history distinguishes unused inbox pins from removed
         # return routes. Restored endpoints are already initialized this epoch.
@@ -165,6 +185,13 @@ class State:
         return item
 
     def make_room(self, parent=None, *, restoring=False):
+        if self.retention_prepare:
+            self.sweep_retention(parent=parent)
+        if self.retention_ttl:
+            self.sweep_retention(parent=parent)
+            if not restoring and len(self.messages) >= self.max_messages:
+                raise ValueError(TTL_CAPACITY_ERROR)
+            return
         target = self.max_messages if restoring else self.max_messages - 1
         if len(self.messages) <= target:
             return
@@ -193,17 +220,48 @@ class State:
             else:
                 if restoring:
                     break  # Lowering a setting cannot discard protected mail.
-                raise ValueError('In-memory message limit reached: no evictable terminal messages; '
-                                 'pending or protected work is retained')
+                raise ValueError(LEGACY_CAPACITY_ERROR)
         for mid in evicted:
             del self.messages[mid]
             self.answers.pop(mid, None)
-        self.keys = {key: value for key, value in self.keys.items() if value[1] in remaining}
+        self.keys = {key: value for key, value in self.keys.items()
+                     if value[1] in remaining or value[1] in self.compact_messages}
+
+    def retention_plan(self, current=None, parent=None):
+        return retention.plan(self.messages, self.compact_messages, self.waiters,
+                              time.time() if current is None else current, self.max_messages, parent)
+
+    def retention_changes(self, planned):
+        return bool(planned['adopt'] or self.retention_ttl and (planned['drop'] or planned['compact']))
+
+    def sweep_retention(self, current=None, parent=None, planned=None):
+        if not self.retention_ttl and not self.retention_prepare:
+            return False
+        current = time.time() if current is None else current
+        planned = self.retention_plan(current, parent) if planned is None else planned
+        if not self.retention_changes(planned):
+            return False
+        for mid, since in planned['adopt'].items():
+            self.messages[mid]['retention_adopted_at'] = since
+        if self.retention_ttl:
+            for mid in planned['drop']:
+                del self.compact_messages[mid]
+                self.answers.pop(mid, None)
+            for mid in planned['compact']:
+                self.compact_messages[mid] = retention.compact_message(self.messages.pop(mid), current, planned['anchors'][mid])
+            retained = self.messages.keys() | self.compact_messages.keys()
+            compacted = set(planned['compact'])
+            self.keys = {key: ({'fingerprint': retention.fingerprint(intent)}
+                               if mid in compacted else intent, mid)
+                         for key, (intent, mid) in self.keys.items() if mid in retained}
+        return True
 
     def get(self, mid):
-        if mid not in self.messages:
-            raise ValueError('Unknown message; broker may have restarted')
-        return self.messages[mid]
+        if mid in self.messages:
+            return self.messages[mid]
+        if mid in self.compact_messages:
+            return self.compact_messages[mid]
+        raise ValueError('Unknown message; broker may have restarted')
 
     def delivery_blockers(self):
         blockers = {}
@@ -270,6 +328,16 @@ class State:
     def status(self, m, state, note=None, event=None):
         m.update(state=state,note=note)
         entry = {'state':state,'note':note,'at':now()}
+        if state in ('done', 'answered'):
+            m.setdefault('completed_at', time.time())
+        if state == 'received' or (state == 'submitted' and m['route']['transport'] in retention.PUSH_TRANSPORTS):
+            m.setdefault('delivered_at', time.time())
+        if state == 'pending':
+            m.pop('delivered_at', None)
+        if m.get('body_expired'):
+            # A late answer changes correlation metadata, never recreates content.
+            m['events'] = []
+            m['note'] = None
         if state == 'dispatching':
             m['dispatch_started_at'] = entry['at']
         else:
@@ -292,9 +360,21 @@ class State:
             raise ValueError('Provide an idempotency key of at most 256 characters')
         intent = {k:args.get(k) for k in ('project','sender','recipient','channel','sender_channel','body','key')}
         intent['reply_to'] = reply_to
+        one_way = args.get('one_way', False)
+        deadline = args.get('reply_deadline_seconds')
+        if type(one_way) is not bool:
+            raise ValueError('one_way must be boolean')
+        if deadline is not None and (not retention.valid_time(deadline) or deadline > retention.LOOKUP_TTL):
+            raise ValueError('Reply deadline must be positive and at most 604800 seconds')
+        if one_way and (deadline is not None or reply_to):
+            raise ValueError('One-way intent cannot include a reply deadline or be a reply')
+        if one_way:
+            intent['one_way'] = True
+        if deadline is not None:
+            intent['reply_deadline_seconds'] = deadline
         if key in self.keys:
             original_intent, mid = self.keys[key]
-            if original_intent != intent:
+            if not retention.matches(original_intent, intent):
                 raise ValueError('Idempotency key already used with different content')
             return self.get(mid)
         if reply_to:
@@ -315,11 +395,16 @@ class State:
              'return_route':origin,'channel':destination.get('channel'),
              'sender_channel':origin.get('channel'),'body':body,'reply_to':reply_to,
              'state':'pending','created':now(),'events':[],'note':None}
+        if one_way:
+            m['one_way'] = True
+        if deadline is not None:
+            m['reply_deadline_at'] = time.time() + deadline
         self.messages[mid] = m
         self.keys[key] = (intent,mid)
         self.answers[mid] = asyncio.Event()
         self.publish(m,'message')
         if reply_to:
+            parent['last_reply_at'] = time.time()
             self.status(parent,'answered',mid)
             if self.pending_publications is None:
                 self.answers[reply_to].set()
@@ -422,6 +507,8 @@ class State:
         slot = selected.get(route_key(message['route']))
         if slot is None or message['reply_to'] is not None:
             raise ValueError('NOT_FOUND')
+        if message.get('body_expired'):
+            raise ValueError('MESSAGE_BODY_EXPIRED')
         if op == 'inbox_get':
             offset, count = args.get('offset', 0), args.get('max_chars', 8000)
             if type(offset) is not int or not 0 <= offset <= len(message['body']) or type(count) is not int or not 1 <= count <= 16000:
@@ -453,21 +540,35 @@ class State:
     def action(self, args):
         # Stage mutations in isolation. A failed durable write must not acknowledge
         # an ACK, publish an event, wake a waiter or leave a half-posted reply.
-        mutations = ('send', 'reply', 'ack', 'progress', 'resolve', 'claim', 'finish',
+        mutations = ('send', 'send-with-retention', 'reply', 'ack', 'progress', 'resolve', 'claim', 'finish',
                      'claim-guarded', 'release-claim', 'note-pending',
-                     'inbox_ack', 'provider-failure', 'provider-retry')
+                     'inbox_ack', 'provider-failure', 'provider-retry', 'retention-sweep')
+        planned = None
+        planned_at = None
+        if args['op'] == 'retention-sweep':
+            if not self.retention_ttl and not self.retention_prepare:
+                return {'changed': False}
+            planned_at = time.time()
+            planned = self.retention_plan(planned_at)
+            if not self.retention_changes(planned):
+                return {'changed': False}  # No deep copy or checkpoint write on an idle tick.
         if self.correspondence is None or args['op'] not in mutations:
+            if planned is not None:
+                return {'changed': self.sweep_retention(planned_at, planned=planned)}
             return self.apply_action(args)
         staged = copy(self)
-        for field in ('messages', 'keys', 'inbox_receipts', 'inbox_snapshots'):
+        for field in ('messages', 'compact_messages', 'keys', 'inbox_receipts', 'inbox_snapshots'):
             setattr(staged, field, deepcopy(getattr(self, field)))
         staged.answers = self.answers.copy()
         staged.pending_publications = []
-        result = staged.apply_action(args)
+        result = ({'changed': staged.sweep_retention(planned_at, planned=planned)}
+                  if planned is not None else staged.apply_action(args))
+        if args['op'] == 'retention-sweep' and not result['changed']:
+            return result
         if args['op'] in ('provider-failure', 'provider-retry', 'release-claim', 'note-pending') and not staged.pending_publications:
             return result  # A no-op needs no repeated checkpoint write.
         self.correspondence.save(staged)
-        for field in ('messages', 'keys', 'inbox_receipts', 'inbox_snapshots', 'answers'):
+        for field in ('messages', 'compact_messages', 'keys', 'inbox_receipts', 'inbox_snapshots', 'answers'):
             setattr(self, field, getattr(staged, field))
         for message, kind in staged.pending_publications:
             self.publish(message, kind)
@@ -549,6 +650,13 @@ class State:
 
     def apply_action(self, args):
         op = args['op']
+        if op == 'retention-plan':
+            return dict(self.retention_plan()['counts'], dry_run=True, live_waiters_visible=True,
+                        active_waits=sum(self.waiters.values()), retention_ttl_enabled=self.retention_ttl,
+                        retention_prepare_enabled=self.retention_prepare,
+                        retention_mode='ttl' if self.retention_ttl else 'prepare' if self.retention_prepare else 'legacy')
+        if op == 'retention-sweep':
+            return {'changed': self.sweep_retention()}
         if op == 'provider-failure':
             return public_message(self.provider_failure(args['expected_route'], args['source_message_id'], args['failure']))
         if op == 'provider-retry':
@@ -559,6 +667,9 @@ class State:
             return {'instance':self.instance,'messages':len(self.messages),'subscribers':len(self.subscribers),
                     'correspondence_lost': bool(self.correspondence and self.correspondence.loss),
                     'correspondence_over_limit': len(self.messages) > self.max_messages,
+                    'retention_ttl_enabled': self.retention_ttl,
+                    'retention_prepare_enabled': self.retention_prepare, 'retention_protocol': 1,
+                    'compact_receipts': len(self.compact_messages),
                     'checkpoint_last_save_seconds': self.correspondence.last_save_seconds if self.correspondence else None,
                     'checkpoint_max_save_seconds': self.correspondence.max_save_seconds if self.correspondence else 0.0,
                     'checkpoint_bytes': self.correspondence.checkpoint_bytes if self.correspondence else 0,
@@ -626,7 +737,7 @@ class State:
                 raise ValueError('Channel missing or generation changed')
             item = dict(item, active=False, generation=item['generation']+1)
             return self.routing_change('channels', (args['project'],args['name']), item)
-        if op in ('send','reply'):
+        if op in ('send','send-with-retention','reply'):
             return public_message(self.post(args, args.get('id') if op=='reply' else None))
         if op == 'show':
             message = public_message(self.get(args['id']))
@@ -635,7 +746,7 @@ class State:
             return message
         if op == 'conversation':
             cid = self.get(args['id'])['conversation']
-            return [public_message(m) for m in self.messages.values() if m['conversation']==cid]
+            return [public_message(m) for m in (self.messages | self.compact_messages).values() if m['conversation']==cid]
         if op == 'inbox':
             if not args.get('name') and not args.get('channel'):
                 raise ValueError('Select a recipient or channel')
@@ -650,6 +761,8 @@ class State:
                     and (args.get('all') or m['state'] not in ('done','answered'))]
         if op in ('ack','progress','resolve','claim','claim-guarded','release-claim','note-pending','finish'):
             m = self.get(args['id'])
+            if m.get('body_expired'):
+                raise ValueError('Message body expired; only lookup and correlated replies remain available')
             if op == 'note-pending':
                 # Annotate a message only while it is still pending: never rewrite a claim
                 # another caller took meanwhile, and never change its state.
@@ -670,6 +783,8 @@ class State:
                 self.status(m, 'pending', CLAIM_RELEASE_NOTE, 'push_failed')
                 return {'released':True}
             if op in ('claim', 'claim-guarded'):
+                if retention.request_status(m, time.time()).get('request_status') == 'expired':
+                    raise ValueError('Request reply deadline expired; delivery is not retried')
                 if m['state']!='pending':
                     raise ValueError('Only pending messages may be delivered')
                 destination = delivery_destination(m['route'])
@@ -729,7 +844,7 @@ async def write(writer, payload):
 
 async def wait_answer(state, args, reader):
     mid = args['id']
-    state.get(mid)
+    message = state.get(mid)
     timeout = args.get('timeout',60)
     if not 0 < timeout <= 3600:
         raise ValueError('Timeout must be between 0 and 3600 seconds')
@@ -740,7 +855,8 @@ async def wait_answer(state, args, reader):
         if pending[1] in done:
             return None
         replies = [public_message(m) for m in state.messages.values() if m['reply_to']==mid]
-        return {'id':mid,'timed_out':not bool(replies),'replies':replies}
+        return ({'id':mid,'timed_out':not bool(replies),'replies':replies}
+                | ({'body_expired': True} if message.get('body_expired') else {}))
     finally:
         for task in pending:
             task.cancel()
@@ -787,11 +903,21 @@ async def watch(state, args, reader, writer):
         await asyncio.gather(disconnected,return_exceptions=True)
 
 
+async def retention_loop(state):
+    while True:
+        await asyncio.sleep(60)
+        try:
+            state.action({'op': 'retention-sweep'})
+        except (ValueError, OSError):
+            # Fixed count-only diagnostic; never reveal routes, bodies or IDs.
+            print(json.dumps({'event': 'retention_sweep_failed'}), file=sys.stderr, flush=True)
+
+
 async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DEFAULT_INTERVAL_MINUTES,
                 codex_executable='codex', claude_live=True,
                 codex_failure_interval=codex_failures.DEFAULT_INTERVAL,
                 retry_backoff=provider_failures.DEFAULT_BACKOFF, retry_cap=provider_failures.DEFAULT_CAP,
-                agy_failure_interval=agy_live.DEFAULT_FAILURE_INTERVAL):
+                agy_failure_interval=agy_live.DEFAULT_FAILURE_INTERVAL, retention_ttl=False, retention_prepare=False):
     retry_policy = provider_failures.retry_policy(retry_backoff, retry_cap)
     if type(codex_failure_interval) is not int or codex_failure_interval < 0:
         raise ValueError('Codex failure observation interval must be a nonnegative integer')
@@ -810,13 +936,16 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
     collectors = []
     failure_observer = None
     agy_failure_observer = None
+    retention_task = None
     try:
         if path.exists():
             if not stat.S_ISSOCK(path.stat().st_mode):
                 raise ValueError('Refusing to replace a non-socket file')
             path.unlink()
         store = route_store.RouteStore(state_dir or path.with_suffix('.state'))
-        state = State(max_messages, store)
+        state = State(max_messages, store, retention_ttl=retention_ttl, retention_prepare=retention_prepare)
+        if retention_ttl or retention_prepare:
+            retention_task = asyncio.create_task(retention_loop(state))
         if codex_failure_interval:
             failure_observer = asyncio.create_task(
                 codex_failures.observe_codex_failures(state, codex_failure_interval, retry_policy))
@@ -887,7 +1016,7 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
         await asyncio.gather(*active,return_exceptions=True)
         await server.wait_closed()
     finally:
-        for observer in (failure_observer, agy_failure_observer):
+        for observer in (failure_observer, agy_failure_observer, retention_task):
             if observer is not None:
                 observer.cancel()
                 await asyncio.gather(observer, return_exceptions=True)

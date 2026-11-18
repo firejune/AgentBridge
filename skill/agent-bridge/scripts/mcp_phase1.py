@@ -36,6 +36,7 @@ AGENT_TYPES = ('claude', 'agy', 'codex')
 AGENT_TRANSPORTS = {'claude': 'claude-peer', 'agy': 'agy', 'codex': 'codex'}
 TRANSPORT_AGENTS = {'claude-peer': 'claude', 'agy': 'agy', 'codex': 'codex'}
 ACTIVE = ('accepted', 'running', 'unknown')
+CAPACITY_FAILURE_MESSAGE = 'Broker message capacity is full; the message was not posted or delivered.'
 STATES = {'pending','dispatching','submitted','received','in_progress','answered','done','failed','uncertain'}
 RETENTION = 720 * 3600  # Detailed records >=168h, full keys >=720h; tombstones never deleted.
 MAX_RESULT = 1024 * 1024
@@ -714,8 +715,8 @@ class Engine:
             if alias != session['alias']:
                 raise Fault('WORKSPACE_NOT_ALLOWED')
 
-    def fail(self, op, code='DELIVERY_UNKNOWN', unknown=True, error=None, **fields):
-        failure = Fault(code).payload
+    def fail(self, op, code='DELIVERY_UNKNOWN', unknown=True, error=None, message=None, **fields):
+        failure = Fault(code, message).payload
         failure['operation_id'] = op['operation_id']
         if error is not None:
             fields['error'] = error
@@ -799,7 +800,15 @@ class Engine:
                 os.close(fd)
         else:
             self.update(op,status='running',stage='post_intent',instance=instance)
-            message = self.backend.post(op,session)
+            try:
+                message = self.backend.post(op,session)
+            except ValueError as error:
+                # Only these exact broker admission refusals prove no post took
+                # place. Disconnects, timeouts and other errors remain ambiguous.
+                if str(error) not in broker.MESSAGE_CAPACITY_ERRORS:
+                    raise
+                self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=CAPACITY_FAILURE_MESSAGE)
+                return
             self.update(op,stage='posted',backend_id=message['id'],backend_message_state=message['state'])
             if self.backend.instance() != instance:
                 self.fail(op); return

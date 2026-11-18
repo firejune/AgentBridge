@@ -212,6 +212,8 @@ python3 "$bridge_cli" wt sweep --apply  # Remove eligible worktrees and branches
 ### 5. Broker Persistence & Optional `launchd` Supervision
 
 - **Private durable correspondence and routing**. Restart restores owner-private routing and mail with the broker’s terminal-eviction guards, retaining protected mail above a lowered limit and reporting that excess through stderr and `ping.correspondence_over_limit`. See [correspondence storage](skill/agent-bridge/references/usage.md#correspondence-storage-issue-94) for fields, limits and loss diagnostics.
+- **Opt-in TTL**. `serve --retention-ttl` keeps eligible explicit one-way/completed bodies for 24 hours and compact lookup/deduplication receipts for seven days. Delivery state and protected work survive expiry. First inspect counts with `retention --dry-run` and `retention --live`; hold strict rollout if capacity has no immediate headroom. Use the documented `serve --retention-prepare` warm-up when completion timestamps need adoption. See [TTL policy and rollout](skill/agent-bridge/references/usage.md#opt-in-correspondence-ttl-issue-105).
+- **Service retention modes**. `install-service --retention-prepare|--retention-ttl` selects one mutually exclusive broker mode. Review with `--generate-only --plist /absolute/review/agent.plist` outside LaunchAgents first. Installation never overwrites an existing plist. Coordinate uninstall/reinstall to switch modes.
 - **Optional macOS launchd service**: Supervision is off by default. Use `install-service` (or `--generate-only --plist PATH` to inspect without loading) and `uninstall-service` to manage a `KeepAlive` launch agent.
 
 ### 6. Remote MCP Facade (`mcp_server.py`)

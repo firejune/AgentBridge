@@ -77,6 +77,9 @@ def reply_command(m, path):
 
 
 def peer_text(m, path, escape_peer=True):
+    if m.get('one_way') is True:
+        body = envelope(m).rstrip('\n') + '\n\nOne-way message; no reply requested.'
+        return PEER_CLOSE_TAG.sub('<\\\\', body) if escape_peer else body
     body = (envelope(m).rstrip('\n')+'\n\n'
             'Answer through the bridge, not SendMessage (SendMessage cannot reach a bridge address). '
             'Write the answer to a file (or use --file - with stdin) and run:\n'
@@ -961,7 +964,10 @@ def main(argv=None):
     parser.add_argument('--socket',default=str(broker.DEFAULT_SOCKET))
     sub = parser.add_subparsers(dest='cmd',required=True)
     p = sub.add_parser('serve',help='Run the local broker in the foreground')
-    p.add_argument('--max-messages',type=int,default=2048,help='Retained messages; evict oldest unprotected done/answered/failed first')
+    p.add_argument('--max-messages',type=int,default=2048,help='Active-message cap; TTL mode refuses admission when no safely expired body exists')
+    retention_mode = p.add_mutually_exclusive_group()
+    retention_mode.add_argument('--retention-prepare',action='store_true',help='Warm up legacy timestamps without TTL deletion; current admission policy remains')
+    retention_mode.add_argument('--retention-ttl',action='store_true',help='Opt in: compact safe bodies after 24h; retain lookup/dedup routes 7d (run retention --dry-run first)')
     p.add_argument('--state-dir',help='Private routing snapshot directory (default: socket path with .state suffix)')
     p.add_argument('--usage-interval',type=int,default=usage.DEFAULT_INTERVAL_MINUTES,
                    help=f'Minutes between limit reads (0 = off, minimum {usage.MIN_INTERVAL_MINUTES})')
@@ -976,6 +982,12 @@ def main(argv=None):
                    help='Maximum accepted continuation attempts in a failure episode')
     p.add_argument('--no-claude-live',dest='claude_live',action='store_false',
                    help='Read the Claude Code login from its ~/.claude.json cache only; never read its Keychain token')
+    p = sub.add_parser('retention',help='Read-only counts-only retention preflight; never deletes or changes routing')
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument('--dry-run',action='store_true',help='Read checkpoint only; live waiters are invisible, counts are upper bounds')
+    g.add_argument('--live',action='store_true',help='Use running broker planner including active waits')
+    p.add_argument('--state-dir')
+    p.add_argument('--max-messages',type=int,default=2048)
     p = sub.add_parser('session-usage', help='Read one local session record; starts no turn')
     p.add_argument('name', nargs='?'); p.add_argument('--project')
     p.add_argument('--provider', choices=['codex', 'claude', 'agy']); p.add_argument('--id')
@@ -996,6 +1008,9 @@ def main(argv=None):
         p.add_argument('--generate-only',action='store_true',help='Write/remove the plist only; never call launchctl')
         if cmd == 'install-service':
             p.add_argument('--max-messages',type=int,default=2048)
+            mode = p.add_mutually_exclusive_group()
+            mode.add_argument('--retention-prepare',action='store_true',help='Generate service arguments for non-deleting timestamp warm-up')
+            mode.add_argument('--retention-ttl',action='store_true',help='Generate service arguments for opt-in TTL cleanup')
     p = sub.add_parser('register')
     p.add_argument('name');p.add_argument('--project',required=True)
     p.add_argument('--transport',choices=['realtime','codex','claude','claude-peer','agy'],default='realtime')
@@ -1097,6 +1112,10 @@ def main(argv=None):
         g = p.add_mutually_exclusive_group(required=True)
         g.add_argument('--to',dest='recipient');g.add_argument('--channel')
         p.add_argument('--file',required=True);p.add_argument('--key',required=True)
+        g = p.add_mutually_exclusive_group()
+        if cmd == 'send':
+            g.add_argument('--one-way',action='store_true',help='Explicitly no answer requested; safe body TTL begins at proven delivery')
+        g.add_argument('--reply-deadline',dest='reply_deadline_seconds',type=float,help='Explicit reply lifetime in seconds (max 604800); local wait timeout is separate')
         p.add_argument('--state-dir',help=USAGE_STATE_HELP)
         if cmd=='ask':
             p.add_argument('--timeout',type=float,default=60)
@@ -1159,7 +1178,16 @@ def main(argv=None):
                                      args.codex_failure_interval,
                                      tuple(int(value) for value in args.provider_retry_backoff.split(',')),
                                      args.provider_retry_cap,
-                                     args.agy_failure_interval))
+                                     args.agy_failure_interval, args.retention_ttl, args.retention_prepare))
+            return 0
+        if args.cmd == 'retention':
+            if args.live:
+                output(broker.request(args.socket, {'op': 'retention-plan'}))
+            else:
+                if not 1 <= args.max_messages <= 2048:
+                    raise ValueError('TTL active-message limit must be 1..2048')
+                store = broker.message_store.MessageStore(broker_state_dir(args), args.max_messages)
+                output(store.retention_dry_run())
             return 0
         if args.cmd == 'session-usage':
             if args.name:
@@ -1212,7 +1240,7 @@ def main(argv=None):
             fields = dict(socket=args.socket, state_dir=args.state_dir, plist=args.plist,
                           generate_only=args.generate_only)
             if args.cmd == 'install-service':
-                fields['max_messages'] = args.max_messages
+                fields.update(max_messages=args.max_messages, retention_prepare=args.retention_prepare, retention_ttl=args.retention_ttl)
             output((service.install if args.cmd == 'install-service' else service.uninstall)(**fields))
             return 0
         if args.cmd=='open':
@@ -1301,6 +1329,10 @@ def main(argv=None):
             return 1 if result['state'] in ('failed','uncertain') else 0
         fields = {k:v for k,v in vars(args).items() if k not in ('cmd','socket','file','discover','new','title','model','codex_mode','state_dir','no_model') and not (k=='timeout' and args.cmd=='register')}
         fields['op'] = {'stop':'shutdown','ask':'send'}.get(args.cmd,args.cmd)
+        if args.cmd in ('send','ask') and (fields.get('one_way') or fields.get('reply_deadline_seconds') is not None):
+            # A distinct operation is rejected before mutation by older brokers,
+            # including when the broker restarts between separate CLI calls.
+            fields['op'] = 'send-with-retention'
         if args.cmd in ('send','ask','reply'):
             fields['body'] = sys.stdin.read() if args.file=='-' else Path(args.file).read_text(encoding='utf-8')
         if args.cmd in ('wait','ask') and not 0<args.timeout<=3600:
