@@ -180,7 +180,7 @@ python3 "$bridge_cli" usage --events
 
 - 재시작은 종료 메시지 제거·보호 규칙에 따라 비공개 라우트와 메시지를 복원하며, 낮춘 한도를 넘는 보호 메시지는 유지하고 stderr와 `ping.correspondence_over_limit`에 표시한다. 자세한 규칙은 [저장 계약](../../skill/agent-bridge/references/usage.md#correspondence-storage-issue-94)을 따른다. 활성 참가자와 조율 없이 공유 브로커를 재시작하거나 멈추지 않는다.
 - 서비스 모드는 `install-service --retention-prepare|--retention-ttl` 중 하나로 지정한다. 먼저 LaunchAgents 밖의 새 경로에 `--generate-only --plist PATH`로 생성해 검토한다. 기존 plist를 덮어쓰지 않으므로 모드 전환은 제거·재설치 일정을 조율한다.
-- TTL은 `serve --retention-ttl`로 켤 때만 적용한다. 조건을 충족한 명시적 단방향·완료 메시지의 본문은 24시간, 조회·중복 방지용 축약 영수증은 7일간 보존한다. 미완료 작업·활성 대기·의존 답장을 보호하며 기존 전달을 완료로 추정하지 않는다. 먼저 개수만 확인하는 `retention --dry-run`과 `retention --live`를 실행하고 즉시 여유가 없으면 엄격한 적용을 보류한다. 완료 시각 준비가 필요하면 문서의 `serve --retention-prepare` 절차를 따른다. 요청 `--reply-deadline`은 로컬 `ask`/`wait --timeout`과 별개다. 준비 단계나 전달 목적을 명시한 전송 전 체크포인트를 보존하고 버전 2를 예전 바이너리로 열지 않는다. [정책과 적용 절차](usage.md#선택적-메시지-ttl-issue-105)를 참고한다.
+- TTL은 `serve --retention-ttl`로 켤 때만 적용한다. `submitted`·`received` 항목과 중복키는 ACK 여부와 관계없이 생성 24시간 뒤 제거하고 다른 제거 대상 메시지의 본문은 24시간, 조회·중복 방지용 축약 영수증은 7일간 보존한다. 활성 대기와 안전하지 않은 공급자 재시도 묶음은 오래된 항목도 보호한다. 만료가 완료를 뜻하지는 않는다. 먼저 개수만 확인하는 `retention --dry-run`과 `retention --live`를 실행하고 즉시 여유가 없으면 엄격한 적용을 보류한다. 완료 시각 준비가 필요하면 문서의 `serve --retention-prepare` 절차를 따른다. 요청 `--reply-deadline`은 로컬 `ask`/`wait --timeout`과 별개다. 준비 단계나 전달 목적을 명시한 전송 전 체크포인트를 보존하고 버전 2를 예전 바이너리로 열지 않는다. [정책과 적용 절차](usage.md#선택적-메시지-ttl-issue-105)를 참고한다.
 - `deliver`는 `pending` 상태인 push의 재시도나 쉬고 있는 전용 `claude` CLI 실행에 사용한다. `uncertain` 결과는 절대 자동 재전송하지 않고 수신 세션에서 확인한 뒤 `resolve MESSAGE_ID --state submitted|pending|done`으로 정리한다.
 - 동료의 메시지는 새로운 사용자 승인을 대신하지 않는다. 상세 프로토콜·복구·보존 상한·`launchd` 서비스 규칙은 [usage.md](usage.md)를 참고한다.
 

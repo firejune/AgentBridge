@@ -56,9 +56,34 @@ def request_status(message, current):
             'late_reply': bool(late)}
 
 
+def provider_sources(messages, compact):
+    return {control.get('source_message_id')
+            for message in (*messages.values(), *compact.values())
+            if (control := message.get('provider_retry')) is not None
+            and control['status'] != 'recovered'}
+
+
+def removal_protection(message, waiters, sources, parent=None):
+    mid = message['id']
+    if mid == parent or waiters.get(mid) or waiters.get(message.get('reply_to')):
+        return 'active_wait_or_reply'
+    if (message.get('provider_retry', {}).get('status', 'recovered') != 'recovered'
+            or mid in sources):
+        return 'provider_episode'
+    return None
+
+
+def age_removable(message, waiters, sources, current, parent=None):
+    created = timestamp(message.get('created'))
+    return (message['state'] in ('submitted', 'received') and created is not None
+            and current - created >= BODY_TTL
+            and removal_protection(message, waiters, sources, parent) is None)
+
+
 def plan(messages, compact, waiters, current, limit, parent=None):
     """Return IDs privately; callers expose only ``counts``. Never modifies inputs."""
-    adopt, candidates, reasons, anchors = {}, [], Counter(), {}
+    adopt, candidates, reasons, anchors, remove = {}, [], Counter(), {}, []
+    sources = provider_sources(messages, compact)
     # A retained answer must remain observable until explicitly completed. Its
     # ancestor stays intact too; a wait may attach after the answer was posted.
     children = {}
@@ -68,6 +93,16 @@ def plan(messages, compact, waiters, current, limit, parent=None):
     for mid, message in messages.items():
         reason = None
         state = message['state']
+        created = timestamp(message.get('created'))
+        if state in ('submitted', 'received') and created is not None and current - created >= BODY_TTL:
+            # These two states have a direct age limit, independent of receipt
+            # capacity, completion, ACKs, deadlines or optional reply retention.
+            reason = removal_protection(message, waiters, sources, parent)
+            if reason:
+                reasons[reason] += 1
+            else:
+                remove.append(mid)
+            continue
         one_way_delivered = (message.get('one_way') is True
             and (state == 'received' or state == 'submitted'
                  and message['route']['transport'] in PUSH_TRANSPORTS))
@@ -119,13 +154,13 @@ def plan(messages, compact, waiters, current, limit, parent=None):
     if len(selected) < len(candidates):
         reasons['compact_capacity'] += len(candidates) - len(selected)
     counts = dict(active_messages=len(messages), compact_receipts=len(compact),
-                  would_compact=len(selected), would_forget=len(drop),
+                  would_compact=len(selected), would_forget=len(drop), would_remove=len(remove),
                   legacy_adoptions=len(adopt), protected=dict(sorted(reasons.items())),
-                  free_slots_after=max(0, limit - len(messages) + len(selected)),
-                  admission_blocked=len(messages) - len(selected) >= limit,
+                  free_slots_after=max(0, limit - len(messages) + len(selected) + len(remove)),
+                  admission_blocked=len(messages) - len(selected) - len(remove) >= limit,
                   body_ttl_seconds=BODY_TTL, lookup_ttl_seconds=LOOKUP_TTL,
                   compact_limit=MAX_COMPACT, compact_record_bytes_limit=MAX_COMPACT_BYTES)
-    return dict(adopt=adopt, compact=selected, drop=drop, counts=counts,
+    return dict(adopt=adopt, compact=selected, drop=drop, remove=remove, counts=counts,
                 anchors={mid: anchors[mid] for mid in selected})
 
 

@@ -2,10 +2,12 @@
 import asyncio
 from contextlib import redirect_stdout
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 import io
 import json
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 import uuid
@@ -17,6 +19,7 @@ import broker
 import message_store
 import retention
 import route_store
+from support import RunningBroker
 
 CLOCK = 2_000_000_000
 
@@ -24,6 +27,7 @@ CLOCK = 2_000_000_000
 class RetentionTTLTests(unittest.TestCase):
     def setUp(self):
         self.clock = patch.object(broker.time, 'time', return_value=CLOCK).start()
+        patch.object(broker, 'now', side_effect=lambda: datetime.fromtimestamp(self.clock.return_value, timezone.utc).isoformat()).start()
         self.addCleanup(patch.stopall)
         self.state = broker.State(3, retention_ttl=True)
         self.register(self.state)
@@ -47,11 +51,10 @@ class RetentionTTLTests(unittest.TestCase):
         self.clock.return_value = CLOCK + elapsed
         return self.call('retention-sweep')
 
-    def test_ttl_is_from_completion_not_creation_and_default_send_expects_reply(self):
+    def test_terminal_body_ttl_still_uses_completion_not_creation(self):
         message = self.send()
         self.clock.return_value += retention.BODY_TTL * 3
         self.call('ack', id=message['id'])
-        self.assertFalse(self.call('retention-sweep')['changed'])
         self.complete(message)
         self.assertFalse(self.sweep(retention.BODY_TTL * 4 - 1)['changed'])
         self.assertTrue(self.sweep(retention.BODY_TTL * 4)['changed'])
@@ -63,23 +66,93 @@ class RetentionTTLTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'different content'):
             self.call('send', project='demo', sender='alpha', recipient='beta', body='other', key='q')
 
-    def test_one_way_real_time_needs_ack_push_needs_known_finish(self):
-        message = self.send(one_way=True)
-        self.sweep(retention.BODY_TTL * 2)
-        self.assertIn(message['id'], self.state.messages)
-        self.call('resolve', id=message['id'], state='submitted', note='manual acceptance only')
-        self.sweep(retention.BODY_TTL * 4)
-        self.assertIn(message['id'], self.state.messages)
-        self.call('ack', id=message['id'])
-        self.sweep(retention.BODY_TTL * 5)
-        self.assertIn(message['id'], self.state.compact_messages)
-        self.clock.return_value = CLOCK
-        message = self.send('push', one_way=True)
-        self.state.messages[message['id']]['route'].update(transport='codex', session=str(uuid.uuid4()))
-        self.call('claim', id=message['id'])
-        self.call('finish', id=message['id'], state='submitted', event='pushed')
+    def test_old_submitted_and_received_are_removed_regardless_of_intent(self):
+        for state, fields in (('submitted', {}), ('received', {}), ('submitted', {'one_way': True})):
+            with self.subTest(state=state, fields=fields):
+                self.state = broker.State(3, retention_ttl=True)
+                self.register(self.state)
+                self.clock.return_value = CLOCK
+                message = self.send(**fields)
+                self.call('resolve', id=message['id'], state='submitted', note='Synthetic acceptance')
+                if state == 'received':
+                    self.clock.return_value = CLOCK + retention.BODY_TTL - 1
+                    self.call('ack', id=message['id'])
+                self.assertFalse(self.sweep(retention.BODY_TTL - 1)['changed'])
+                self.assertTrue(self.sweep(retention.BODY_TTL)['changed'])
+                self.assertNotIn(message['id'], self.state.messages)
+                self.assertNotIn(message['id'], self.state.compact_messages)
+                self.assertNotIn('q', self.state.keys)
+                with self.assertRaisesRegex(ValueError, 'Unknown message'):
+                    self.call('reply', id=message['id'], body='late answer', key='late')
+
+    def test_age_removal_ignores_optional_reply_dependencies_but_keeps_live_wait(self):
+        parent = self.send('parent')
+        reply = self.call('reply', id=parent['id'], body='unconsumed answer', key='answer')
+        self.call('ack', id=reply['id'])
+        self.state.waiters[parent['id']] = 1
         self.sweep(retention.BODY_TTL)
-        self.assertIn(message['id'], self.state.compact_messages)
+        self.assertIn(reply['id'], self.state.messages)
+        del self.state.waiters[parent['id']]
+        self.sweep(retention.BODY_TTL)
+        self.assertNotIn(reply['id'], self.state.messages)
+        self.assertIn(parent['id'], self.state.messages)
+
+    def test_live_wait_and_provider_source_are_preserved_until_released(self):
+        source = self.send('source')
+        self.call('resolve', id=source['id'], state='submitted', note='Synthetic source')
+        control = self.send('control')
+        self.state.messages[control['id']]['provider_retry'] = {'status': 'reserved', 'source_message_id': source['id']}
+        self.sweep(retention.BODY_TTL)
+        self.assertIn(source['id'], self.state.messages)
+        self.state.messages[control['id']]['provider_retry']['status'] = 'recovered'
+        self.state.waiters[source['id']] = 1
+        self.sweep(retention.BODY_TTL)
+        self.assertIn(source['id'], self.state.messages)
+        del self.state.waiters[source['id']]
+        self.sweep(retention.BODY_TTL)
+        self.assertNotIn(source['id'], self.state.messages)
+        self.assertIn(control['id'], self.state.messages)
+
+    def test_age_removal_frees_capacity_without_compact_quota(self):
+        terminal = self.send('terminal')
+        self.complete(terminal)
+        for key in ('submitted', 'received'):
+            message = self.send(key)
+            self.call('resolve', id=message['id'], state='submitted', note='Synthetic acceptance')
+            if key == 'received':
+                self.call('ack', id=message['id'])
+        self.clock.return_value += retention.BODY_TTL
+        with patch.object(retention, 'MAX_COMPACT', 0):
+            plan = self.call('retention-plan')
+            self.assertEqual((plan['would_remove'], plan['would_compact'], plan['free_slots_after']), (2, 0, 2))
+            self.assertFalse(plan['admission_blocked'])
+            admitted = self.send('new')
+        self.assertEqual(set(self.state.messages), {terminal['id'], admitted['id']})
+        self.assertEqual(set(self.state.keys), {'terminal', 'new'})
+        self.assertEqual(self.state.compact_messages, {})
+
+    def test_stale_removal_plan_rechecks_state_age_wait_and_episode(self):
+        message = self.send()
+        self.call('ack', id=message['id'])
+        self.clock.return_value += retention.BODY_TTL
+        planned = self.state.retention_plan()
+        self.assertEqual(planned['remove'], [message['id']])
+        for change in ('state', 'created', 'wait', 'provider'):
+            with self.subTest(change=change):
+                row = self.state.messages[message['id']]
+                original = deepcopy(row)
+                if change == 'state':
+                    row['state'] = 'in_progress'
+                elif change == 'created':
+                    row['created'] = broker.now()
+                elif change == 'wait':
+                    self.state.waiters[row['id']] = 1
+                else:
+                    row['provider_retry'] = {'status': 'uncertain'}
+                self.assertFalse(self.state.sweep_retention(planned=planned))
+                self.assertIn(row['id'], self.state.messages)
+                self.state.messages[row['id']] = original
+                self.state.waiters.clear()
 
     def test_no_oldest_eviction_before_ttl_and_clear_capacity_reason(self):
         for key in ('a', 'b', 'c'):
@@ -119,25 +192,16 @@ class RetentionTTLTests(unittest.TestCase):
         self.sweep(retention.BODY_TTL * 4)
         self.assertIn(message['id'], self.state.messages)
 
-    def test_deadline_separate_from_wait_and_completion_late_reply_pinned(self):
-        message = self.send(reply_deadline_seconds=60)
+    def test_received_deadline_request_uses_created_age_and_loses_late_route(self):
+        message = self.send(reply_deadline_seconds=retention.LOOKUP_TTL)
         self.call('ack', id=message['id'])
-        self.sweep(61)
-        self.assertEqual(self.call('show', id=message['id'])['request_status'], 'expired')
-        self.assertEqual(self.state.messages[message['id']]['state'], 'received')
-        self.sweep(60 + retention.BODY_TTL)
-        self.assertIn(message['id'], self.state.compact_messages)
-        frozen = deepcopy(message['return_route'])
-        self.call('unregister', project='demo', name='alpha')
-        reply = self.call('reply', id=message['id'], body='late answer', key='late')
-        self.assertEqual(reply['route'], frozen)
-        status = self.call('show', id=message['id'])
-        self.assertEqual(status['request_status'], 'expired')
-        self.assertTrue(status['late_reply'])
-        self.assertTrue(status['body_expired'])
-        self.assertEqual(next(m for m in self.call('conversation', id=message['id']) if m['id'] == reply['id'])['body'], 'late answer')
-        with self.assertRaisesRegex(ValueError, 'body expired'):
-            self.call('resolve', id=message['id'], state='done', note='Do not mutate compact rows')
+        self.sweep(retention.BODY_TTL - 1)
+        self.assertEqual(self.call('show', id=message['id'])['request_status'], 'open')
+        self.sweep(retention.BODY_TTL)
+        with self.assertRaisesRegex(ValueError, 'Unknown message'):
+            self.call('show', id=message['id'])
+        with self.assertRaisesRegex(ValueError, 'Unknown message'):
+            self.call('reply', id=message['id'], body='late answer', key='late')
 
     def test_expired_pending_is_durable_and_claim_is_refused(self):
         message = self.send(reply_deadline_seconds=10)
@@ -229,8 +293,9 @@ class RetentionTTLTests(unittest.TestCase):
 
     def test_compact_parent_wait_observes_live_late_child(self):
         message = self.send(reply_deadline_seconds=1)
-        self.call('ack', id=message['id'])
-        self.sweep(retention.BODY_TTL + 1)
+        self.clock.return_value = CLOCK + 2
+        self.complete(message)
+        self.sweep(retention.BODY_TTL + 2)
         reply = self.call('reply', id=message['id'], body='late', key='late')
         async def run():
             reader = asyncio.StreamReader()
@@ -271,11 +336,55 @@ class RetentionCheckpointTests(unittest.TestCase):
         self.assertTrue(self.call('show', id=message['id'])['body_expired'])
         self.assertFalse(self.call('retention-sweep')['changed'])
 
+    def test_age_removal_is_atomic_then_noop_and_key_can_be_reused_explicitly(self):
+        message = self.send()
+        self.call('ack', id=message['id'])
+        before = self.state.correspondence.path.read_bytes()
+        self.clock.return_value += retention.BODY_TTL
+        with patch.object(self.state.correspondence, 'save', side_effect=OSError('synthetic failed save')):
+            with self.assertRaises(OSError):
+                self.call('retention-sweep')
+        self.assertIn(message['id'], self.state.messages)
+        self.assertIn('q', self.state.keys)
+        self.assertEqual(self.state.correspondence.path.read_bytes(), before)
+        self.assertTrue(self.call('retention-sweep')['changed'])
+        raw = json.loads(self.state.correspondence.path.read_text())
+        self.assertEqual((raw['messages'], raw['keys'], raw['compact']), ([], [], []))
+        with patch.object(self.state.correspondence, 'save') as save:
+            self.assertFalse(self.call('retention-sweep')['changed'])
+            save.assert_not_called()
+        self.assertNotEqual(self.send()['id'], message['id'])
+
+    def test_age_read_only_restore_and_prepare_have_no_false_loss(self):
+        message = self.send()
+        self.call('ack', id=message['id'])
+        self.clock.return_value += retention.BODY_TTL
+        before = self.state.correspondence.path.read_bytes()
+        counts = self.state.correspondence.retention_dry_run()
+        self.assertEqual(counts['would_remove'], 1)
+        self.assertEqual(counts['free_slots_after'], 3)
+        self.assertEqual(self.state.correspondence.path.read_bytes(), before)
+        self.state = broker.State(3, self.routes, retention_prepare=True)
+        self.assertIn(message['id'], self.state.messages)
+        self.assertFalse(self.call('retention-sweep')['changed'])
+        with patch.object(message_store.MessageStore, 'record_loss', side_effect=AssertionError('Not accidental loss')):
+            self.state = broker.State(3, self.routes, retention_ttl=True)
+        self.assertNotIn(message['id'], self.state.messages)
+        self.assertFalse(self.call('ping')['correspondence_lost'])
+        self.assertFalse((self.routes.directory / 'correspondence-lost.json').exists())
+
     def test_durable_late_reply_preserves_compaction_anchor_and_pinned_route(self):
         message = self.send(reply_deadline_seconds=1)
         self.call('ack', id=message['id'])
         original_route = deepcopy(message['return_route'])
-        self.sweep(retention.BODY_TTL + 1)
+        # A receipt produced by the earlier deadline policy remains readable;
+        # the new active-row age rule must not rewrite existing compact mail.
+        self.clock.return_value = CLOCK + retention.BODY_TTL + 1
+        self.state.compact_messages[message['id']] = retention.compact_message(
+            self.state.messages.pop(message['id']), self.clock.return_value, CLOCK + 1)
+        intent, mid = self.state.keys['q']
+        self.state.keys['q'] = ({'fingerprint': retention.fingerprint(intent)}, mid)
+        self.state.correspondence.save(self.state)
         compact = self.call('show', id=message['id'])
         anchor = compact['body_ttl_anchor_at']
         self.assertEqual(anchor, CLOCK + 1)
@@ -434,6 +543,71 @@ class RetentionCLITests(unittest.TestCase):
         self.assertEqual(request.call_count, 1)
         self.assertEqual(request.call_args.args[1]['op'], 'send-with-retention')
         self.assertTrue(request.call_args.args[1]['one_way'])
+
+    @staticmethod
+    def old_created_broker(mode='--retention-ttl'):
+        runner = RunningBroker(max_messages=1)
+        runner.usage.append(mode)
+        start = runner.start
+        popen = subprocess.Popen
+        old = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        code = "import broker,bridge; broker.now=lambda: " + repr(old) + "; raise SystemExit(bridge.main())"
+        def start_with_old_created():
+            def launch(arguments, **kwargs):
+                return popen([arguments[0], '-c', code, *arguments[2:]], **kwargs)
+            with patch.object(subprocess, 'Popen', side_effect=launch):
+                start()
+        runner.start = start_with_old_created
+        return runner
+
+    @staticmethod
+    def cli(runner, *arguments, body=None):
+        return subprocess.run([sys.executable, bridge.__file__, '--socket', runner.path, *arguments],
+                              input=body, capture_output=True, text=True, timeout=5)
+
+    def test_real_cli_age_preflight_and_pre_admission_without_compaction(self):
+        with self.old_created_broker() as runner:
+            runner.register_pair()
+            old = self.cli(runner, 'send', '--project', 'demo', '--from', 'alpha', '--to', 'beta', '--key', 'old', '--file', '-', body='synthetic old body')
+            self.assertEqual(old.returncode, 0, old.stdout + old.stderr)
+            mid = json.loads(old.stdout)['id']
+            self.assertEqual(self.cli(runner, 'ack', mid).returncode, 0)
+            checkpoint = Path(runner.state_dir) / 'correspondence.json'
+            before = checkpoint.read_bytes()
+            for flags in (('--live',), ('--dry-run', '--state-dir', runner.state_dir, '--max-messages', '1')):
+                result = self.cli(runner, 'retention', *flags)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                counts = json.loads(result.stdout)
+                self.assertEqual((counts['would_remove'], counts['free_slots_after']), (1, 1))
+                self.assertEqual(checkpoint.read_bytes(), before)
+            self.assertEqual(self.cli(runner, 'show', mid).returncode, 0)
+            admitted = self.cli(runner, 'send', '--project', 'demo', '--from', 'alpha', '--to', 'beta', '--key', 'new', '--file', '-', body='new pending body')
+            self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
+            self.assertEqual(self.cli(runner, 'show', mid).returncode, 1)
+            late = self.cli(runner, 'reply', mid, '--key', 'late', '--file', '-', body='late answer')
+            self.assertEqual(late.returncode, 1)
+            self.assertIn('Unknown message', late.stdout)
+            saved = json.loads(checkpoint.read_text())
+            self.assertEqual([m['id'] for m in saved['messages']], [json.loads(admitted.stdout)['id']])
+            self.assertEqual([key for key, _, _ in saved['keys']], ['new'])
+            self.assertEqual(saved['compact'], [])
+
+    def test_real_cli_prepare_then_ttl_restore_removes_without_loss(self):
+        with self.old_created_broker('--retention-prepare') as runner:
+            runner.register_pair()
+            result = self.cli(runner, 'send', '--project', 'demo', '--from', 'alpha', '--to', 'beta', '--key', 'old', '--file', '-', body='old prepared body')
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            mid = json.loads(result.stdout)['id']
+            self.assertEqual(self.cli(runner, 'ack', mid).returncode, 0)
+            runner.call('retention-sweep')
+            self.assertEqual(self.cli(runner, 'show', mid).returncode, 0)
+            runner.usage[runner.usage.index('--retention-prepare')] = '--retention-ttl'
+            runner.restart()
+            self.assertEqual(self.cli(runner, 'show', mid).returncode, 1)
+            ping = runner.call('ping')
+            self.assertEqual(ping['messages'], 0)
+            self.assertFalse(ping['correspondence_lost'])
+            self.assertFalse((Path(runner.state_dir) / 'correspondence-lost.json').exists())
 
     def test_live_plan_only_uses_read_only_op(self):
         with patch.object(bridge.broker, 'request', return_value={'dry_run': True}) as request, redirect_stdout(io.StringIO()):

@@ -143,7 +143,7 @@ class State:
             self.make_room(restoring=True)
             dropped = [message_store.loss_identity(m) for mid, m in before.items()
                        if mid not in self.messages and mid not in self.compact_messages]
-            if dropped:
+            if dropped and not self.retention_ttl:
                 self.correspondence.record_loss('message retention limit reduced; oldest unguarded terminal messages evicted', dropped)
             if len(self.messages) > self.max_messages:
                 print(json.dumps(dict(correspondence_over_limit=self.correspondence.path.name,
@@ -232,7 +232,7 @@ class State:
                               time.time() if current is None else current, self.max_messages, parent)
 
     def retention_changes(self, planned):
-        return bool(planned['adopt'] or self.retention_ttl and (planned['drop'] or planned['compact']))
+        return bool(planned['adopt'] or self.retention_ttl and (planned['drop'] or planned['compact'] or planned['remove']))
 
     def sweep_retention(self, current=None, parent=None, planned=None):
         if not self.retention_ttl and not self.retention_prepare:
@@ -243,7 +243,18 @@ class State:
             return False
         for mid, since in planned['adopt'].items():
             self.messages[mid]['retention_adopted_at'] = since
+        removed = []
         if self.retention_ttl:
+            sources = retention.provider_sources(self.messages, self.compact_messages)
+            for mid in planned['remove']:
+                message = self.messages.get(mid)
+                # A reused plan must never remove work that since advanced or
+                # acquired a waiter/provider dependency before the write.
+                if message is not None and retention.age_removable(
+                        message, self.waiters, sources, current, parent):
+                    del self.messages[mid]
+                    self.answers.pop(mid, None)
+                    removed.append(mid)
             for mid in planned['drop']:
                 del self.compact_messages[mid]
                 self.answers.pop(mid, None)
@@ -254,7 +265,7 @@ class State:
             self.keys = {key: ({'fingerprint': retention.fingerprint(intent)}
                                if mid in compacted else intent, mid)
                          for key, (intent, mid) in self.keys.items() if mid in retained}
-        return True
+        return bool(planned['adopt'] or self.retention_ttl and (removed or planned['drop'] or planned['compact']))
 
     def get(self, mid):
         if mid in self.messages:

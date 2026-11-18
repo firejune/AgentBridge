@@ -967,7 +967,7 @@ def main(argv=None):
     p.add_argument('--max-messages',type=int,default=2048,help='Active-message cap; TTL mode refuses admission when no safely expired body exists')
     retention_mode = p.add_mutually_exclusive_group()
     retention_mode.add_argument('--retention-prepare',action='store_true',help='Warm up legacy timestamps without TTL deletion; current admission policy remains')
-    retention_mode.add_argument('--retention-ttl',action='store_true',help='Opt in: compact safe bodies after 24h; retain lookup/dedup routes 7d (run retention --dry-run first)')
+    retention_mode.add_argument('--retention-ttl',action='store_true',help='Opt in: remove submitted/received after 24h from creation; compact completed bodies with 7d lookup (preflight first)')
     p.add_argument('--state-dir',help='Private routing snapshot directory (default: socket path with .state suffix)')
     p.add_argument('--usage-interval',type=int,default=usage.DEFAULT_INTERVAL_MINUTES,
                    help=f'Minutes between limit reads (0 = off, minimum {usage.MIN_INTERVAL_MINUTES})')
@@ -1114,7 +1114,7 @@ def main(argv=None):
         p.add_argument('--file',required=True);p.add_argument('--key',required=True)
         g = p.add_mutually_exclusive_group()
         if cmd == 'send':
-            g.add_argument('--one-way',action='store_true',help='Explicitly no answer requested; safe body TTL begins at proven delivery')
+            g.add_argument('--one-way',action='store_true',help='Explicitly no answer requested')
         g.add_argument('--reply-deadline',dest='reply_deadline_seconds',type=float,help='Explicit reply lifetime in seconds (max 604800); local wait timeout is separate')
         p.add_argument('--state-dir',help=USAGE_STATE_HELP)
         if cmd=='ask':

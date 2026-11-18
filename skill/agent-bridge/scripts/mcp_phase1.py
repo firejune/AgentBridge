@@ -37,6 +37,8 @@ AGENT_TRANSPORTS = {'claude': 'claude-peer', 'agy': 'agy', 'codex': 'codex'}
 TRANSPORT_AGENTS = {'claude-peer': 'claude', 'agy': 'agy', 'codex': 'codex'}
 ACTIVE = ('accepted', 'running', 'unknown')
 CAPACITY_FAILURE_MESSAGE = 'Broker message capacity is full; the message was not posted or delivered.'
+REPLY_NOT_RETAINED_MESSAGE = 'The reply is no longer retained.'
+MESSAGE_NOT_RETAINED_MESSAGE = 'The message is no longer retained.'
 STATES = {'pending','dispatching','submitted','received','in_progress','answered','done','failed','uncertain'}
 RETENTION = 720 * 3600  # Detailed records >=168h, full keys >=720h; tombstones never deleted.
 MAX_RESULT = 1024 * 1024
@@ -861,15 +863,32 @@ class Engine:
 
     def observe(self, op):
         try:
+            same = False
             try:
                 # Read-only broker calls. A failure here says nothing about the message.
                 same = self.backend.instance()==op['instance']
                 if same:
                     message,replies = self.backend.observe(op['backend_id'])
+                    if not isinstance(message, dict) or message.get('id') != op['backend_id']:
+                        raise ValueError('Unexpected message identifier')
                     state = message['state']
                     if state not in STATES:
                         raise ValueError('Unknown message state')
             except Exception as error:
+                if (same and isinstance(error, ValueError) and str(error) == UNKNOWN_MESSAGE
+                        and op.get('stage') == 'observing'
+                        and op.get('backend_message_state') in ('submitted', 'received', 'in_progress', 'answered', 'done')):
+                    # A restart between the initial epoch check and missing
+                    # read is still ambiguous, including an unreadable recheck.
+                    try:
+                        still_same = self.backend.instance() == op['instance']
+                    except Exception:
+                        still_same = False
+                    if still_same:
+                        self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=MESSAGE_NOT_RETAINED_MESSAGE)
+                    else:
+                        self.fail(op)
+                    return
                 self.observe_error(op,error); return
             if not same:
                 self.fail(op); return
@@ -877,7 +896,12 @@ class Engine:
             self.update(op,backend_message_state=state,observe_errors=0)
             if self.settle(op,replies):
                 return
-            if state=='failed':
+            if state == 'answered':
+                # Answered proves that a correlated reply once existed. Losing
+                # that result must release the target; the late watch may still
+                # settle another retained reply without any resend.
+                self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=REPLY_NOT_RETAINED_MESSAGE)
+            elif state=='failed':
                 self.fail(op,'BACKEND_UNAVAILABLE',False)
             elif state=='uncertain' or (op.get('recovered') and state in ('pending','dispatching')):
                 self.fail(op)
