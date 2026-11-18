@@ -117,7 +117,7 @@ python3 "$bridge_cli" reply MESSAGE_ID --key reply-001 --file /path/to/answer.tx
 # Open without registering, or open + register in one command:
 python3 "$bridge_cli" open --provider agy --host ide --cwd /path/to/workspace --title "Worker"
 python3 "$bridge_cli" register codex-worker --project my-app --transport codex \
-  --new --cwd /path/to/workspace --title "Worker" --model gpt-6.1-sol
+  --new --cwd /path/to/workspace --title "Worker" --model gpt-6.2-sol
 
 # Close a finished worker session and remove its route (pass --archive to hide from sidebar):
 python3 "$bridge_cli" close agy-worker --project my-app --retro-file /absolute/retro.txt [--archive]

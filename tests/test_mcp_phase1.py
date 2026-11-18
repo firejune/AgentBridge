@@ -479,6 +479,32 @@ def sessions_ide():
 
 
 class BrokerIntegrationTest(unittest.TestCase):
+    def test_codex_creation_uses_shared_default_and_owner_overrides(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            state = root / 'broker.state'
+            state.mkdir()
+            backend = phase.Backend(str(root / 'broker.sock'))
+            sid = str(uuid.uuid4())
+            workspace = {'cwd': str(root), 'agent_type': 'codex'}
+            for env_model, policy_model, expected in (
+                    (None, None, 'gpt-6.2-sol'),
+                    (None, 'gpt-6.1-sol', 'gpt-6.1-sol'),
+                    ('gpt-6.1-sol', 'owner-model', 'gpt-6.1-sol')):
+                with self.subTest(env=env_model, policy=policy_model):
+                    (state / 'policy.json').write_text(json.dumps({
+                        'defaults': {'codex': policy_model} if policy_model else {}, 'deny': {}}))
+                    env = dict(os.environ)
+                    env.pop('AGENT_BRIDGE_CODEX_MODEL', None)
+                    if env_model is not None:
+                        env['AGENT_BRIDGE_CODEX_MODEL'] = env_model
+                    with patch.dict(os.environ, env, clear=True), \
+                            patch.object(phase.sessions, 'open_session',
+                                         return_value={'session': {'id': sid}}) as opening:
+                        self.assertEqual(backend.create(workspace), sid)
+                    opening.assert_called_once_with('codex', cwd=str(root), model=expected,
+                                                    host='desktop', timeout=180)
+
     def test_real_broker_post_push_and_correlated_reply(self):
         with RunningBroker() as running, tempfile.TemporaryDirectory(prefix='mcp-',dir='/tmp') as temp:
             root=str(Path(temp).resolve())
