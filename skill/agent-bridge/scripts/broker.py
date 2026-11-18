@@ -450,14 +450,81 @@ class State:
         self.status(message, 'done', 'Explicit MCP inbox acknowledgement')
         return dict(result)
 
+    def archive_correspondence(self, args):
+        """Internal close --archive operation; routing and correspondence commit separately."""
+        expected = args['expected_route']
+        key = (expected['project'], expected['name'])
+        if self.endpoints.get(key) != expected:
+            raise ValueError('Archive route is missing or changed')
+        transport, sid, cwd = (expected.get(field) for field in ('transport', 'session', 'cwd'))
+        if transport not in ('codex', 'claude-peer', 'agy') or str(uuid.UUID(sid)) != sid or not cwd:
+            raise ValueError('Archive cleanup requires a provider session UUID and workspace')
+        def matches(route):
+            # Names, projects and channel generations can be reused. Only the
+            # frozen provider identity plus workspace establish archive scope.
+            return (route.get('transport'), route.get('session'), route.get('cwd')) == (transport, sid, cwd)
+        selected = {mid for mid, m in self.messages.items()
+                    if any(matches(m[field]) for field in ('route', 'return_route'))}
+        active = {mid for mid, m in self.messages.items()
+                  if m['state'] == 'dispatching' or self.waiters.get(mid)
+                  or m.get('provider_retry', {}).get('status') == 'reserved'}
+        # A live wait must keep both its parent and any already-arrived reply.
+        active.update(mid for mid, m in self.messages.items() if self.waiters.get(m['reply_to']))
+        active.update(m['reply_to'] for mid, m in self.messages.items() if self.waiters.get(mid))
+        protected = selected & (active | {mid for mid, m in self.messages.items() if m['state'] == 'uncertain'})
+        if args.get('check_only') is True:
+            if selected & active:
+                raise ValueError('Archive cleanup blocked by an active delivery, provider continuation or wait')
+            return dict(supported=True, matched=len(selected), retained=len(protected))
+        if args.get('archived') is not True:
+            raise ValueError('Archive cleanup requires confirmed provider archival')
+        removed = selected - protected
+        self.messages = {mid: m for mid, m in self.messages.items() if mid not in removed}
+        self.answers = {mid: event for mid, event in self.answers.items() if mid not in removed}
+        self.keys = {key: value for key, value in self.keys.items() if value[1] not in removed}
+        self.inbox_receipts = {key: value for key, value in self.inbox_receipts.items() if key[2] not in removed}
+        # Invalidating a whole affected snapshot preserves offsets for all surviving
+        # snapshots; filtering individual items would silently move cursor offsets.
+        self.inbox_snapshots = {key: value for key, value in self.inbox_snapshots.items()
+                                if not any(item['id'] in removed for item in value['items'])}
+        return dict(removed=len(removed), retained=len(protected), complete=not protected)
+
+    def purge_archive_events(self, removed):
+        def mark(event):
+            if event.get('message', {}).get('id') in removed:
+                event['_archive_purged'] = True
+        for event in self.events:
+            mark(event)
+        self.events = deque((event for event in self.events if not event.get('_archive_purged')), maxlen=1024)
+        for sub in self.subscribers:
+            for event in sub.get('backlog', ()):
+                mark(event)
+            task = sub.get('next_event')
+            if task is not None and task.done() and not task.cancelled() and task.exception() is None:
+                mark(task.result())
+            queued = []
+            while not sub['queue'].empty():
+                event = sub['queue'].get_nowait()
+                mark(event)
+                if not event.get('_archive_purged'):
+                    queued.append(event)
+            for event in queued:
+                sub['queue'].put_nowait(event)
+
     def action(self, args):
         # Stage mutations in isolation. A failed durable write must not acknowledge
         # an ACK, publish an event, wake a waiter or leave a half-posted reply.
         mutations = ('send', 'reply', 'ack', 'progress', 'resolve', 'claim', 'finish',
                      'claim-guarded', 'release-claim', 'note-pending',
-                     'inbox_ack', 'provider-failure', 'provider-retry')
-        if self.correspondence is None or args['op'] not in mutations:
+                     'inbox_ack', 'provider-failure', 'provider-retry', 'archive-correspondence')
+        if args['op'] == 'archive-correspondence' and args.get('check_only') is True:
             return self.apply_action(args)
+        if self.correspondence is None or args['op'] not in mutations:
+            before = set(self.messages) if args['op'] == 'archive-correspondence' else set()
+            result = self.apply_action(args)
+            if args['op'] == 'archive-correspondence':
+                self.purge_archive_events(before - self.messages.keys())
+            return result
         staged = copy(self)
         for field in ('messages', 'keys', 'inbox_receipts', 'inbox_snapshots'):
             setattr(staged, field, deepcopy(getattr(self, field)))
@@ -467,8 +534,11 @@ class State:
         if args['op'] in ('provider-failure', 'provider-retry', 'release-claim', 'note-pending') and not staged.pending_publications:
             return result  # A no-op needs no repeated checkpoint write.
         self.correspondence.save(staged)
+        removed = self.messages.keys() - staged.messages.keys() if args['op'] == 'archive-correspondence' else set()
         for field in ('messages', 'keys', 'inbox_receipts', 'inbox_snapshots', 'answers'):
             setattr(self, field, getattr(staged, field))
+        if args['op'] == 'archive-correspondence':
+            self.purge_archive_events(removed)
         for message, kind in staged.pending_publications:
             self.publish(message, kind)
             if message['state'] == 'answered':
@@ -549,6 +619,8 @@ class State:
 
     def apply_action(self, args):
         op = args['op']
+        if op == 'archive-correspondence':
+            return self.archive_correspondence(args)
         if op == 'provider-failure':
             return public_message(self.provider_failure(args['expected_route'], args['source_message_id'], args['failure']))
         if op == 'provider-retry':
@@ -592,8 +664,13 @@ class State:
             return [x for (p,_),x in self.endpoints.items() if p==args['project']]
         if op == 'codex-routes':
             return [route for route in self.endpoints.values() if route['transport'] == 'codex']
-        if op == 'unregister':
+        if op in ('unregister', 'unregister-archived'):
             key = (args['project'], args['name'])
+            # A separate wire operation prevents an older broker from ignoring
+            # expected_route and removing a replacement endpoint by name.
+            if op == 'unregister-archived' and (args.get('archived') is not True
+                    or self.endpoints.get(key) != args.get('expected_route')):
+                raise ValueError('Confirmed archive endpoint is missing or changed')
             if key not in self.endpoints:
                 raise ValueError(f'No participant {args["name"]!r} is registered in project {args["project"]!r}')
             owned = sorted(name for (project,name),item in self.channels.items()
@@ -762,19 +839,25 @@ async def watch(state, args, reader, writer):
             raise ValueError('Event cursor is outside retained history; inspect inbox')
     sub = {'route':route_key(route),'queue':asyncio.Queue(maxsize=128),'overflow':False}
     backlog = [event for event in state.events if cursor is not None and event['seq']>cursor and state.matches(sub,event)]
+    sub['backlog'] = backlog
     state.subscribers.append(sub)  # Register before yielding to avoid a subscribe/send race.
     disconnected = asyncio.create_task(reader.read(1))
     try:
         await write(writer,{'type':'subscribed','instance':state.instance,'seq':state.sequence,'route':route})
         for event in backlog:
-            await write(writer,event)
+            if not event.get('_archive_purged'):
+                await write(writer,event)
+        sub['backlog'] = []
         while True:
             next_event = asyncio.create_task(sub['queue'].get())
+            sub['next_event'] = next_event
             try:
                 done,_ = await asyncio.wait([disconnected,next_event],return_when=asyncio.FIRST_COMPLETED)
                 if disconnected in done:
                     return
                 event = next_event.result()
+                if event.get('_archive_purged'):
+                    continue
                 await write(writer,event)
                 if 'error' in event:
                     return

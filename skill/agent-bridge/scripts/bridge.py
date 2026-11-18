@@ -906,18 +906,50 @@ def close_participant(args):
                   if r['name'] == args.name), None)
     if route is None:
         raise ValueError(f'No participant {args.name!r} is registered in project {args.project!r}')
+    archive = getattr(args, 'archive', False)
+    if archive:
+        try:
+            broker.request(args.socket, {'op':'archive-correspondence', 'expected_route':route, 'check_only':True})
+        except ValueError as error:
+            if str(error) == 'Unknown operation':
+                raise ValueError('Archive cleanup is unsupported by the running broker; upgrade it before archiving') from None
+            raise
     receipt = save_retro(args, route)
     result = {**receipt, 'name': args.name, 'project': args.project, 'transport': route['transport'],
-              **close_session(route, args.timeout, archive=getattr(args, 'archive', False))}
+              **close_session(route, args.timeout, archive=archive)}
+    if archive:
+        if result.get('archived') is not True:
+            result.update(correspondence_removed=False, cleanup_error='Provider archival was not confirmed', route_removed=False)
+            return result
+        try:
+            cleanup = broker.request(args.socket, {'op':'archive-correspondence', 'expected_route':route, 'archived':True})
+            result['correspondence_cleanup'] = cleanup
+            if not cleanup['complete']:
+                result['cleanup_error'] = 'Archive confirmed; protected correspondence remains (active or uncertain delivery/wait)'
+        except (ValueError, OSError, subprocess.TimeoutExpired) as error:
+            # Provider archival already succeeded. Do not turn partial success into
+            # a generic error or retry an ambiguously accepted purge.
+            uncertain = isinstance(error, (OSError, subprocess.TimeoutExpired, broker.BrokerResponseError))
+            result.update(cleanup_error=str(error), cleanup_uncertain=uncertain, route_removed=False)
+            result['correspondence_cleanup'] = {'confirmed':False, 'state':'unknown' if uncertain else 'rejected'}
+            return result
     if args.keep_route:
         result['route_removed'] = False
         return result
     try:
-        broker.request(args.socket,{'op':'unregister','project':args.project,'name':args.name})
+        broker.request(args.socket,{'op':'unregister-archived' if archive else 'unregister',
+                                   'project':args.project,'name':args.name,
+                                   **({'expected_route':route, 'archived':True} if archive else {})})
         result['route_removed'] = True
-    except ValueError as error:
+    except (ValueError, OSError, subprocess.TimeoutExpired) as error:
+        if not archive and not isinstance(error, ValueError):
+            raise  # Ordinary close preserves its existing I/O error behavior.
         result['route_removed'] = False
-        result['route_note'] = ('The running broker predates route removal; restart it to pick up this version'
+        if archive:
+            result['route_error'] = str(error)
+            result.setdefault('cleanup_error', 'Archive confirmed; route removal was not confirmed')
+        result['route_note'] = (('The running broker lacks guarded archive route removal; upgrade it before removing the route'
+                                 if archive else 'The running broker predates route removal; restart it to pick up this version')
                                 if str(error) == 'Unknown operation' else str(error))
     return result
 
@@ -1027,7 +1059,7 @@ def main(argv=None):
     p.add_argument('--timeout',type=float,default=30);p.add_argument('--state-dir')
     p = sub.add_parser('close',help="Close a participant's session without deleting it, then remove its route")
     p.add_argument('name');p.add_argument('--project',required=True)
-    p.add_argument('--archive',action='store_true',help='Archive the finished session out of the active sidebar')
+    p.add_argument('--archive',action='store_true',help='Archive the finished session and delete its unprotected retained broker mail (provider transcript kept)')
     p.add_argument('--keep-route',action='store_true',help='Close the session but keep the route registered')
     p.add_argument('--timeout',type=float,default=10)
     g = p.add_mutually_exclusive_group()
@@ -1234,8 +1266,9 @@ def main(argv=None):
                     print(f"{row['time']} {row['urgency']} {row['card']} {row['runner']} [{','.join(row['tags'])}]\n{row['text'] if row['text'] is not None else row['no_retro']}")
             return 0
         if args.cmd=='close':
-            output(close_participant(args))
-            return 0
+            result = close_participant(args)
+            output(result)
+            return 1 if result.get('cleanup_error') else 0
         if args.cmd=='wake':
             result = wake_participant(args)
             output(result)

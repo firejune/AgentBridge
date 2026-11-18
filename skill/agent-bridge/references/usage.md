@@ -278,17 +278,19 @@ python3 "$bridge_cli" resolve MESSAGE_ID --state done --note 'Completed'
 ## Closing a Session
 
 ```bash
-python3 "$bridge_cli" close NAME --project PROJECT [--keep-route] [--timeout 10]
+python3 "$bridge_cli" close NAME --project PROJECT [--archive] [--keep-route] [--timeout 10]
 ```
 
-`close` stops or archives the session behind a registered route and removes the route via `unregister` (unless `--keep-route`). It never deletes data and never retries:
+Confirmed `close --archive` also deletes the archived session's unprotected retained broker correspondence, freeing message capacity; provider transcripts stay intact. Cleanup matches frozen transport, session UUID and workspace on either endpoint, including aliases, and never bulk-cleans past archives. Ordinary `close` keeps broker mail; `--keep-route` keeps routing but still performs archive mail cleanup. The CLI preflights broker support before archival and checks the route again afterward. Active delivery/continuation/wait blocks preflight; activity racing archival and uncertain delivery records are retained and counted. Affected inbox snapshots expire; unrelated mail, correlations and notes remain. Cleanup and route removal commit separately: partial cleanup or an unconfirmed cleanup/removal returns exit 1 with the confirmed archive result and cleanup counts/error. No automatic retry occurs. Upgrade an older broker before using this behavior.
+
+`close` stops or archives the session behind a registered route and removes the route via `unregister` (unless `--keep-route`). Provider transcripts are preserved; delivery is never retried:
 
 | Transport / Host | Action | Observed Behavior | Undo / Resume |
 | --- | --- | --- | --- |
 | `claude-peer` (`claude-vscode`) | `SIGTERM` to the exact registered PID; waits up to `--timeout` | Process exits within ~1 s (`resumable: true`), freeing ~310 MB RSS; tab shows exit code 143 | Typing in the tab resumes the same `sessionId` under a new PID |
 | `claude-peer` (`claude-desktop`) | Same (`SIGTERM`) | Process exits within ~3 s; app shows "session interrupted" | Sending a message in the session resumes the same `sessionId` |
-| `agy` (Desktop & IDE) | Refused while `running`; sends `UpdateConversationAnnotations {archived: true}` and verifies readback | Conversation leaves the IDE panel / Desktop sidebar | Restore from archive in the UI |
-| `codex` | `unsupported` (nothing sent) | Desktop IPC exposes no archive/unload request | — |
+| `agy` (Desktop & IDE) | Refused while `running`; detaches by default; `--archive` updates archived annotations and verifies readback | Default keeps the conversation; archive hides it from the active sidebar | Resume the same conversation, or restore from archive in the UI |
+| `codex` | Detaches by default; `--archive` marks the exact workspace-matched thread archived and notifies Desktop | Default keeps the thread; archive hides it from the active sidebar | Resume the same thread, or restore from archive in the UI |
 | `realtime` / `claude` | Route removal only | — | — |
 
 ## Waking an Idle-Closed Claude Session (issue #115)
@@ -491,7 +493,7 @@ Codex `open` / `register --new` does not register a route when permission verifi
 Missing retros (`RETRO_REQUIRED`), blank files (`RETRO_EMPTY`) and blank opt-out
 reasons (`RETRO_REASON_EMPTY`) are refused before any provider action or route
 removal. Towers and HQ use an explicit `--no-retro` reason. Existing detach,
-archive, timeout and `--keep-route` behavior remains unchanged. A retro is saved
+timeout and `--keep-route` routing behavior remains unchanged; confirmed archive also cleans retained broker mail. A retro is saved
 before close, so a later provider refusal can leave a recorded retro; the receipt
 is not evidence that the session closed. Do not blindly repeat failed closes.
 

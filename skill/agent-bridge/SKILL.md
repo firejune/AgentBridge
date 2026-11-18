@@ -138,6 +138,8 @@ python3 "$bridge_cli" reply REQUEST_ID --key UNIQUE_REPLY_KEY --file /absolute/a
 python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.txt [--archive] [--keep-route] [--timeout 10]
 ```
 
+Confirmed `close --archive` also deletes the archived session's unprotected retained broker correspondence, freeing message capacity; provider transcripts stay intact. Cleanup matches frozen transport, session UUID and workspace on either endpoint, including aliases, and never bulk-cleans past archives. Ordinary `close` keeps broker mail; `--keep-route` keeps routing but still performs archive mail cleanup. The CLI preflights broker support before archival and checks the route again afterward. Active delivery/continuation/wait blocks preflight; activity racing archival and uncertain delivery records are retained and counted. Affected inbox snapshots expire; unrelated mail, correlations and notes remain. Cleanup and route removal commit separately: partial cleanup or an unconfirmed cleanup/removal returns exit 1 with the confirmed archive result and cleanup counts/error. No automatic retry occurs. Upgrade an older broker before using this behavior.
+
 - 📬 **Always report results back on the channel the task came in on** via `bridge.py reply`, including when blocked. Issue or PR comments do not replace the bridge reply.
 - `ack` and `progress` report receipt and status, not final answers. Exit code 2 from `ask` or `wait` means the wait timed out — run `wait REQUEST_ID` again rather than resending.
 - `close` stops or detaches the session while keeping it in the active conversation history (`archived: false`, `resumable: true`) by default across all three providers (Claude sends `SIGTERM` to the background CLI process, Antigravity verifies the turn is idle and detaches, and Codex detaches the thread). Pass `--archive` to also archive the conversation out of the active sidebar (`archived: true`). Do not close sessions you did not open unless instructed by the owner or HQ.
@@ -249,7 +251,7 @@ Codex `open` / `register --new` does not register a route when permission verifi
 Missing retros (`RETRO_REQUIRED`), blank files (`RETRO_EMPTY`) and blank opt-out
 reasons (`RETRO_REASON_EMPTY`) are refused before any provider action or route
 removal. Towers and HQ use an explicit `--no-retro` reason. Existing detach,
-archive, timeout and `--keep-route` behavior remains unchanged. A retro is saved
+timeout and `--keep-route` routing behavior remains unchanged; confirmed archive also cleans retained broker mail. A retro is saved
 before close, so a later provider refusal can leave a recorded retro; the receipt
 is not evidence that the session closed. Do not blindly repeat failed closes.
 

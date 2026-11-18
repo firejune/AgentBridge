@@ -132,6 +132,8 @@ python3 "$bridge_cli" reply REQUEST_ID --key UNIQUE_REPLY_KEY --file /absolute/a
 python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.txt [--archive] [--keep-route] [--timeout 10]
 ```
 
+`close --archive`가 보관 완료를 확인하면 해당 세션의 보호되지 않은 브로커 보관 서신도 삭제해 메시지 용량을 확보한다. 공급자 대화 원문은 유지한다. 동결된 양쪽 주소의 transport·세션 UUID·작업 경로로 별칭까지 대조하며, 과거 보관 세션을 일괄 삭제하지 않는다. 일반 `close`는 서신을 유지하고, `--keep-route`는 라우트만 유지하므로 보관 서신 정리는 수행한다. 공급자 작업 전에 브로커 지원 여부와 활성 전달·이어하기·대기를 검사하고 보관 후 라우트를 다시 확인한다. 보관 도중 시작된 활성 작업과 전달 불확실 서신은 보존하고 개수를 보고한다. 삭제 메시지를 포함한 받은편지함 스냅샷은 만료시키며 무관한 서신·상관관계·메모는 유지한다. 서신 정리와 라우트 제거는 별도 저장이다. 일부 보존 또는 정리·제거 미확인은 보관 완료 결과와 정리 개수·오류를 출력하고 종료 코드 1로 끝나며 자동 재시도하지 않는다. 구버전 브로커는 먼저 업그레이드해야 한다.
+
 - 📬 **작업이 끝나면 반드시 그 작업이 들어온 채널로 결과를 보고한다** — 브릿지로 받은 일은 그 메시지에 `bridge.py reply`로 답하며, 막혀서 멈춘 경우에도 동일하게 보고한다. 이슈·PR 코멘트가 브릿지 답장을 대신하지 않는다.
 - `ack`와 `progress`는 수신 확인·진행 보고이며 최종 답변이 아니다. `ask`/`wait`의 종료 코드 2는 대기 시간 초과이므로 요청을 다시 보내지 말고 같은 ID로 `wait`한다.
 - `close`는 기본적으로 세 공급자 모두 세션을 삭제하거나 아카이빙하지 않고 대화 스택에 그대로 남긴 채(`archived: false`, `resumable: true`) 세션/라우트를 종료하며(Claude: 백그라운드 CLI 프로세스에 `SIGTERM` 전송, Antigravity: 대기 상태 확인 후 분리, Codex: 스레드 분리 및 라우트 제거), `--archive` 옵션을 주면 사이드바에서 보관 처리(`archived: true`)까지 함께 수행한다. 소유자나 HQ의 지시 없이 내가 열지 않은 세션을 닫지 않는다.
@@ -226,7 +228,7 @@ Codex `open` / `register --new`는 권한 확인에 실패하면 라우트를 �
 `close NAME --project P`에는 `--retro-file FILE` 또는 `--no-retro "사유"`가
 필수다. 누락은 `RETRO_REQUIRED`, 빈 파일은 `RETRO_EMPTY`, 빈 사유는
 `RETRO_REASON_EMPTY`로 공급자 동작과 경로 삭제 전에 거절한다. 타워와 HQ는
-`--no-retro` 사유를 남긴다. 기존 detach/archive/timeout/`--keep-route`는 유지한다.
+`--no-retro` 사유를 남긴다. 기존 detach/timeout/`--keep-route` 라우팅은 유지하며, 보관 확인 후 브로커 보관 서신도 정리한다.
 회고를 먼저 저장하므로 이후 공급자 종료가 실패해도 기록은 남는다. 기록 영수증이
 종료 성공을 뜻하지 않으며 실패한 close를 무작정 반복하지 않는다.
 

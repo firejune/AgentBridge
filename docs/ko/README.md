@@ -126,6 +126,8 @@ python3 "$bridge_cli" close agy-worker --project my-app --retro-file /absolute/r
 python3 "$bridge_cli" wake claude-tower --project my-app [--timeout 30]
 ```
 
+`close --archive`가 보관 완료를 확인하면 해당 세션의 보호되지 않은 브로커 보관 서신도 삭제해 메시지 용량을 확보한다. 공급자 대화 원문은 유지한다. 동결된 양쪽 주소의 transport·세션 UUID·작업 경로로 별칭까지 대조하며, 과거 보관 세션을 일괄 삭제하지 않는다. 일반 `close`는 서신을 유지하고, `--keep-route`는 라우트만 유지하므로 보관 서신 정리는 수행한다. 공급자 작업 전에 브로커 지원 여부와 활성 전달·이어하기·대기를 검사하고 보관 후 라우트를 다시 확인한다. 보관 도중 시작된 활성 작업과 전달 불확실 서신은 보존하고 개수를 보고한다. 삭제 메시지를 포함한 받은편지함 스냅샷은 만료시키며 무관한 서신·상관관계·메모는 유지한다. 서신 정리와 라우트 제거는 별도 저장이다. 일부 보존 또는 정리·제거 미확인은 보관 완료 결과와 정리 개수·오류를 출력하고 종료 코드 1로 끝나며 자동 재시도하지 않는다. 구버전 브로커는 먼저 업그레이드해야 한다.
+
 Claude 데스크톱은 세션을 스스로 닫는다. 화면에 안 보이는 세션은 마지막 턴 뒤 900초가 지나면 멈추고, 메모리가 부족하면 가장 오래 쉰 세션을 내린다. 그러면 CLI가 끝나고 레지스트리 기록과 inbox 소켓이 사라진다. 이런 라우트로 `claude-peer` push가 오면 브릿지가 먼저 세션을 깨운다. 데스크톱 메타데이터에서 `cliSessionId`로 찾은 `claude://claude.ai/epitaxy/<local_id>`를 열면, 앱이 같은 세션 ID와 대화 기록을 새 PID로 이어 받는다. 새 inbox 소켓이 뜨면 메시지를 한 번만 push한다. 그때까지 메시지는 `dispatching`이고, 다른 결과면 아무것도 보내지 않은 채 `pending`으로 돌아간다. 브릿지는 스스로 다시 열거나 다시 보내지 않는다. `bridge.py wake NAME --project P`는 같은 단계를 명시적으로 한다. 링크를 열면 앱이 그 세션으로 포커스를 옮기고 앞으로 올 수 있다. 예약 작업 세션(앱이 세션 간 메시징을 끈 채 띄운다)과 IDE 세션은 `unsupported`다.
 
 `bridge.py remap`은 브로커의 모든 프로젝트에서 보관되지 않은 등록 Codex 세션을 다시 연다. 저장된 작업 디렉터리를 확인하고 Desktop 소유자가 이미 붙은 세션은 건너뛴다. 결과는 엔드포인트별로 출력한다. 세션을 다시 열 때 Codex Desktop이 화면 앞으로 올 수 있다. UUID와 대기 중인 메시지는 그대로 유지한다.
@@ -236,7 +238,7 @@ Codex `open` / `register --new`는 권한 확인에 실패하면 라우트를 �
 `close NAME --project P`에는 `--retro-file FILE` 또는 `--no-retro "사유"`가
 필수다. 누락은 `RETRO_REQUIRED`, 빈 파일은 `RETRO_EMPTY`, 빈 사유는
 `RETRO_REASON_EMPTY`로 공급자 동작과 경로 삭제 전에 거절한다. 타워와 HQ는
-`--no-retro` 사유를 남긴다. 기존 detach/archive/timeout/`--keep-route`는 유지한다.
+`--no-retro` 사유를 남긴다. 기존 detach/timeout/`--keep-route` 라우팅은 유지하며, 보관 확인 후 브로커 보관 서신도 정리한다.
 회고를 먼저 저장하므로 이후 공급자 종료가 실패해도 기록은 남는다. 기록 영수증이
 종료 성공을 뜻하지 않으며 실패한 close를 무작정 반복하지 않는다.
 

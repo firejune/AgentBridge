@@ -275,17 +275,19 @@ python3 "$bridge_cli" resolve MESSAGE_ID --state done --note '결과 확인 완�
 ## 세션 닫기
 
 ```bash
-python3 "$bridge_cli" close NAME --project PROJECT [--keep-route] [--timeout 10]
+python3 "$bridge_cli" close NAME --project PROJECT [--archive] [--keep-route] [--timeout 10]
 ```
 
-`close`는 등록된 라우트의 세션을 멈추거나 보관한 뒤 브로커의 `unregister`로 라우트를 지운다(`--keep-route`면 라우트 유지). 데이터를 영구 삭제하거나 재시도하지 않는다:
+`close --archive`가 보관 완료를 확인하면 해당 세션의 보호되지 않은 브로커 보관 서신도 삭제해 메시지 용량을 확보한다. 공급자 대화 원문은 유지한다. 동결된 양쪽 주소의 transport·세션 UUID·작업 경로로 별칭까지 대조하며, 과거 보관 세션을 일괄 삭제하지 않는다. 일반 `close`는 서신을 유지하고, `--keep-route`는 라우트만 유지하므로 보관 서신 정리는 수행한다. 공급자 작업 전에 브로커 지원 여부와 활성 전달·이어하기·대기를 검사하고 보관 후 라우트를 다시 확인한다. 보관 도중 시작된 활성 작업과 전달 불확실 서신은 보존하고 개수를 보고한다. 삭제 메시지를 포함한 받은편지함 스냅샷은 만료시키며 무관한 서신·상관관계·메모는 유지한다. 서신 정리와 라우트 제거는 별도 저장이다. 일부 보존 또는 정리·제거 미확인은 보관 완료 결과와 정리 개수·오류를 출력하고 종료 코드 1로 끝나며 자동 재시도하지 않는다. 구버전 브로커는 먼저 업그레이드해야 한다.
+
+`close`는 등록된 라우트의 세션을 멈추거나 보관한 뒤 브로커의 `unregister`로 라우트를 지운다(`--keep-route`면 라우트 유지). 공급자 대화 원문을 유지하고 전달을 재시도하지 않는다:
 
 | Transport / Host | 동작 | 관찰된 결과 | 되돌리기 / 재개 |
 | --- | --- | --- | --- |
 | `claude-peer` (`claude-vscode`) | 등록된 정확한 PID에 `SIGTERM`, `--timeout`까지 대기 | 약 1초 내 종료(`resumable: true`), RSS 약 310 MB 해제, 탭에 종료 코드 143 표시 | 그 탭에 입력하면 같은 `sessionId`가 새 PID로 이어짐 |
 | `claude-peer` (`claude-desktop`) | 같음 (`SIGTERM`) | 약 3초 내 종료, 앱에 「세션이 중단되었습니다」 표시 | 그 세션에 메시지를 보내면 같은 `sessionId`로 이어짐 |
-| `agy` (데스크톱 · IDE) | `running`이면 거부, 대기 중일 때 `UpdateConversationAnnotations {archived: true}` 전송 후 재조회 | 에이전트 패널·데스크톱 사이드바에서 보관 처리됨 | UI 보관함에서 복원 |
-| `codex` | `unsupported` (아무것도 보내지 않음) | 데스크톱 IPC에 외부 보관·언로드 요청 없음 | — |
+| `agy` (데스크톱 · IDE) | `running`이면 거부, 기본은 분리, `--archive`면 보관 속성 변경 후 재조회 | 기본은 대화 유지, 보관 시 활성 사이드바에서 숨김 | 같은 대화에서 재개하거나 UI 보관함에서 복원 |
+| `codex` | 기본은 분리, `--archive`면 작업 경로가 일치하는 정확한 스레드 보관 및 데스크톱 알림 | 기본은 스레드 유지, 보관 시 활성 사이드바에서 숨김 | 같은 스레드에서 재개하거나 UI 보관함에서 복원 |
 | `realtime` / `claude` | 라우트만 제거 | — | — |
 
 ## 유휴로 닫힌 Claude 세션 깨우기 (이슈 #115)
@@ -375,7 +377,7 @@ Codex `open` / `register --new`는 권한 확인에 실패하면 라우트를 �
 `close NAME --project P`에는 `--retro-file FILE` 또는 `--no-retro "사유"`가
 필수다. 누락은 `RETRO_REQUIRED`, 빈 파일은 `RETRO_EMPTY`, 빈 사유는
 `RETRO_REASON_EMPTY`로 공급자 동작과 경로 삭제 전에 거절한다. 타워와 HQ는
-`--no-retro` 사유를 남긴다. 기존 detach/archive/timeout/`--keep-route`는 유지한다.
+`--no-retro` 사유를 남긴다. 기존 detach/timeout/`--keep-route` 라우팅은 유지하며, 보관 확인 후 브로커 보관 서신도 정리한다.
 회고를 먼저 저장하므로 이후 공급자 종료가 실패해도 기록은 남는다. 기록 영수증이
 종료 성공을 뜻하지 않으며 실패한 close를 무작정 반복하지 않는다.
 
