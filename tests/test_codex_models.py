@@ -235,7 +235,7 @@ class CodexModelsTest(unittest.TestCase):
             self.assertEqual(codex_new.resolve_model(model, env, policy), expected)
             self.assertEqual(models.default_model('codex', model, policy, env), expected)
             self.assertEqual(policy, before)
-        self.assertEqual(codex_new.resolve_model(None, {}, self.policy), (SOL, 'default'))
+        self.assertEqual(codex_new.resolve_model(None, {}, self.policy), ('gpt-6.2-sol', 'default'))
         with self.assertRaisesRegex(codex_new.CreationError, 'set but empty'):
             codex_new.resolve_model(None, {codex_new.MODEL_ENV: ' '}, policy)
 
@@ -253,7 +253,7 @@ class CodexModelsTest(unittest.TestCase):
                     ('flag-sol', 'env-sol', 'policy-sol', 'flag-sol', '--model'),
                     (None, 'env-sol', 'policy-sol', 'env-sol', codex_new.MODEL_ENV),
                     (None, None, 'policy-sol', 'policy-sol', 'policy'),
-                    (None, None, None, SOL, 'default')):
+                    (None, None, None, 'gpt-6.2-sol', 'default')):
                 with self.subTest(register=registering, source=source):
                     (self.state / 'policy.json').write_text(json.dumps({
                         'defaults': {'codex': default} if default else {}, 'deny': {'codex': [ASTRA]}}))

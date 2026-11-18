@@ -183,7 +183,7 @@ class NewCodexTests(unittest.TestCase):
     def test_omitted_model_requests_default_not_app_default_and_full_access(self):
         with ModelDesktop(model='app-default',permissions=full_permissions()) as desktop:
             result = self.open(desktop)
-        self.assertEqual(codex_new.DEFAULT_MODEL,'gpt-6.1-sol')
+        self.assertEqual(codex_new.DEFAULT_MODEL,'gpt-6.2-sol')
         self.assertTrue(any(method=='model/list' for method,_,_ in self.calls))
         create = next(params for method,params,_ in self.calls if method=='thread/start')
         self.assertEqual(create['model'],codex_new.DEFAULT_MODEL)

@@ -117,7 +117,7 @@ python3 "$bridge_cli" reply MESSAGE_ID --key reply-001 --file /path/to/answer.tx
 # 단독 생성 또는 생성과 동시에 브로커 등록:
 python3 "$bridge_cli" open --provider agy --host ide --cwd /path/to/workspace --title "Worker"
 python3 "$bridge_cli" register codex-worker --project my-app --transport codex \
-  --new --cwd /path/to/workspace --title "Worker" --model gpt-6.1-sol
+  --new --cwd /path/to/workspace --title "Worker" --model gpt-6.2-sol
 
 # 작업이 끝난 워커 세션 닫기 및 라우트 해제 (사이드바에서 숨기려면 --archive 추가):
 python3 "$bridge_cli" close agy-worker --project my-app --retro-file /absolute/retro.txt [--archive]

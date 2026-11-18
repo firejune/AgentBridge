@@ -9,7 +9,7 @@ from pathlib import Path
 POLICY_FILE = 'policy.json'
 # Seed from the owner's rule of 2026-10-23; applies only while no policy file exists.
 SEED_DENY = {'codex': ['gpt-6-astra']}
-DEFAULT_MODELS = {'codex': 'gpt-6.1-sol'}
+DEFAULT_MODELS = {'codex': 'gpt-6.2-sol'}
 
 
 def load_policy(state_dir):

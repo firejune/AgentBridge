@@ -197,7 +197,7 @@ python3 "$bridge_cli" register codex-worker --project PROJECT --transport codex 
 
 - **무인 인계 흐름**: 설치된 CLI의 `app-server --stdio` JSON-RPC로 영속 대화를 하나 만들고 `thread/name/set`으로 실제 이름을 저장한 뒤, `codex://threads/UUID`를 열어 데스크톱 앱이 인계받게 한다. 정확한 IPC 소유자가 `supportsUntrustedAppInput`을 광고하고 대화를 재개했는지 확인한 뒤 등록한다. **Enter 입력, 가짜 사용자 프롬프트, 모델 턴, UI 자동화가 필요 없다.**
 - **모델 및 권한 검증**:
-  - 모델 선택 순서: `--model` > `AGENT_BRIDGE_CODEX_MODEL` > `policy.json` `defaults.codex` > `gpt-6.1-sol` (앱 기본 모델이나 `gpt-6-astra`는 코딩 세션에 사용하지 않음). 데스크톱 소유자의 설정 재조회로 일치를 확인한다.
+  - 모델 선택 순서: `--model` > `AGENT_BRIDGE_CODEX_MODEL` > `policy.json` `defaults.codex` > `gpt-6.2-sol` (앱 기본 모델이나 `gpt-6-astra`는 코딩 세션에 사용하지 않음). 데스크톱 소유자의 설정 재조회로 일치를 확인한다.
   - 항상 Full Access 프로필(`:danger-full-access`, `approvalPolicy: never`, `dangerFullAccess` 샌드박스)을 요청하고 데스크톱 소유자의 `latestThreadSettings` 스냅샷에서 재확인한다.
 - **중복 생성 방지**: `--title`이 있는 일반 `open --provider codex`는 보관되지 않은 저장 세션에서 동일한 제목과 정규화한 `cwd`를 검사해 일치 항목이 있으면 종료 코드 1·`stage: "duplicate"`(`existing_sessions`)로 거부한다. `open --new` 또는 `register --new`는 중복 검사를 건너뛴다.
 - **출력 JSON 필드**: `created`, `adopted`, `registered`, `uncertain`, `stage`, `error`, `registration_error`, `warning`, `session`, `owner`, `url`, `model`, `model_source`, `creator_settings`, `permission_settings`, `permission_settings_source`, `settings_update`, `existing_sessions`를 고정 키로 반환한다. 실패하거나 `uncertain`인 생성을 자동 재시도하지 않는다.
@@ -270,7 +270,7 @@ python3 "$bridge_cli" resolve MESSAGE_ID --state done --note '결과 확인 완�
 | --- | --- | --- | --- |
 | **Antigravity (`agy`)** | 마지막 generator `plannerConfig` (`GetCascadeTrajectoryGeneratorMetadata`, `generatorMetadataOffset` 꼬리 조회) | 대기 중일 때만 허용. 기존 플래너 설정(`knowledgeConfig` 등)을 복사해 `requestedModel`만 바꿔 빈 `SendUserCascadeMessage`로 1회 호출(실제 턴: generator 2–8개, 10–90초) 후 `generators_spent`·`busy_after` 보고 | `open` / `register --new --model` (데스크톱 서버, `--host ide`면 IDE 서버) |
 | **Claude (`claude-peer`)** | 대화 기록의 최근 assistant `message.model` | **데스크톱**: `policy.json`에 지정된 사령탑(`{"command_post": {"claude": "<경로>"}}`)으로 중계해 `mcp__ccd_session_mgmt__set_session_model`을 호출하고 `bridge-model-reply: {"model", "changed", "applies"}`로 응답. **VS Code / IDE**: `unsupported (STOP)` | `unsupported (STOP)` — 입력창 또는 IDE 모델 선택기 사용 |
-| **Codex (`codex`)** | 정확한 데스크톱 소유자의 재개된 **다음 턴 설정** (`latestThreadSettings`) | `model/list` 광고 여부 확인 후 정확한 소유자에게 `thread-follower-update-thread-settings`로 `{model: M}`만 전송하고 재조회로 검증. 활성 턴을 끊지 않음 (`codex-model`은 폐기 예정 UUID 별칭) | `open` / `register --new`: `--model` > `AGENT_BRIDGE_CODEX_MODEL` > `policy.json` `defaults.codex` > `gpt-6.1-sol` |
+| **Codex (`codex`)** | 정확한 데스크톱 소유자의 재개된 **다음 턴 설정** (`latestThreadSettings`) | `model/list` 광고 여부 확인 후 정확한 소유자에게 `thread-follower-update-thread-settings`로 `{model: M}`만 전송하고 재조회로 검증. 활성 턴을 끊지 않음 (`codex-model`은 폐기 예정 UUID 별칭) | `open` / `register --new`: `--model` > `AGENT_BRIDGE_CODEX_MODEL` > `policy.json` `defaults.codex` > `gpt-6.2-sol` |
 
 ## 세션 닫기
 
