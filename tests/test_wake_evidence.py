@@ -10,6 +10,7 @@ from unittest import mock
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import bridge
+import delivery
 import message_store
 import peer_wake
 import sessions
@@ -41,7 +42,7 @@ class WakeEvidenceTests(WakeFixture):
         self.metadata()
         with RunningBroker() as server, self.env(), \
                 mock.patch.object(sessions,'open_url_background',self.opener()), \
-                mock.patch.object(bridge,'TITLE_WAIT',0.0):
+                mock.patch.object(delivery,'TITLE_WAIT',0.0):
             message = self.send(server)
             self.assertEqual(bridge.push(server.path,message,wake_timeout=2)['state'],'submitted')
             server.call('reply',id=message['id'],project='demo',body='Answer',key='r1')
@@ -63,7 +64,7 @@ class WakeEvidenceTests(WakeFixture):
         self.metadata()
         with RunningBroker() as server, self.env(), \
                 mock.patch.object(sessions,'open_url_background',refuse), \
-                mock.patch.object(bridge,'push_frame') as frame:
+                mock.patch.object(delivery,'push_frame') as frame:
             message = self.send(server)
             with self.assertRaises(bridge.PushFailed) as caught:
                 bridge.push(server.path,message,wake_timeout=2)
@@ -95,7 +96,7 @@ class WakeEvidenceTests(WakeFixture):
         opener = mock.Mock(side_effect=refuse)
         with RunningBroker() as server, self.env(), \
                 mock.patch.object(sessions,'open_url_background',opener), \
-                mock.patch.object(bridge,'push_frame') as frame:
+                mock.patch.object(delivery,'push_frame') as frame:
             message = self.send(server)
             with self.assertRaises(bridge.PushFailed):
                 bridge.push(server.path,message,wake_timeout=2)
@@ -107,7 +108,7 @@ class WakeEvidenceTests(WakeFixture):
             frame.assert_not_called()
 
     def test_each_wake_is_one_numbered_entry(self):
-        with RunningBroker() as server, self.env(), mock.patch.object(bridge,'push_frame'):
+        with RunningBroker() as server, self.env(), mock.patch.object(delivery,'push_frame'):
             message = self.send(server)
             for _ in range(2):  # No Desktop session maps to it: unsupported, nothing opened.
                 with self.assertRaises(bridge.PushFailed):
@@ -121,7 +122,7 @@ class WakeEvidenceTests(WakeFixture):
         self.metadata()
         with RunningBroker() as server, self.env(), \
                 mock.patch.object(sessions,'open_url_background',self.opener(socket=False)), \
-                mock.patch.object(bridge,'push_frame'):
+                mock.patch.object(delivery,'push_frame'):
             message = self.send(server)
             with self.assertRaises(bridge.PushFailed):
                 bridge.push(server.path,message,wake_timeout=0.2)
@@ -133,7 +134,7 @@ class WakeEvidenceTests(WakeFixture):
 
     def test_live_push_records_no_wake(self):
         self.fakes.append(FakeClaude(self.temp.name,self.sid,extra=DESKTOP))
-        with RunningBroker() as server, self.env(), mock.patch.object(bridge,'TITLE_WAIT',0.0):
+        with RunningBroker() as server, self.env(), mock.patch.object(delivery,'TITLE_WAIT',0.0):
             message = self.send(server)
             bridge.push(server.path,message)
             self.assertNotIn('wakes',server.call('show',id=message['id']))

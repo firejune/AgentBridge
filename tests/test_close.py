@@ -3,6 +3,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -353,6 +354,9 @@ class CloseCodexTests(unittest.TestCase):
                              (0, 'submitted', False))
             self.assertEqual(deliver.call_args.args[0]['session'], self.operator_sid)
             self.assertIn('close-operator ' + mid, deliver.call_args.args[2])
+            self.assertEqual(shlex.split(deliver.call_args.args[2].splitlines()[1]),
+                             [sys.executable, str(Path(bridge.__file__).resolve()),
+                              '--socket', self.server.path, 'close-operator', mid])
             status, recovered = self.close('--archive', '--handoff')
             self.assertEqual(status, 0)
             self.assertEqual(recovered, {k: v for k, v in prepared.items()

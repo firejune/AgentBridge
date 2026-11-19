@@ -323,6 +323,13 @@ class MessageStore:
                 except (OSError, ValueError):
                     pass  # A diagnostic cannot change durable acceptance.
 
+    def update_save_status(self, saved):
+        """Copy a worker's finished save status on the broker loop."""
+        self.retained_limit = saved.retained_limit
+        self.last_save_seconds = saved.last_save_seconds
+        self.max_save_seconds = saved.max_save_seconds
+        self.checkpoint_bytes = saved.checkpoint_bytes
+
     def _save(self, state):
         compact = [message_record(m) for m in state.compact_messages.values()]
         if len(compact) > retention.MAX_COMPACT or any(len(encoded(m)) > retention.MAX_COMPACT_BYTES for m in compact):

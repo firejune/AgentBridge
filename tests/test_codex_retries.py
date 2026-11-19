@@ -281,7 +281,7 @@ class RetryTests(unittest.TestCase):
     def test_restart_during_reservation_stops_without_provider_read(self):
         self.step()
         self.now = 115
-        self.monitor.action(self.root(), 'reserve', fingerprint=self.control()['fingerprint'])
+        asyncio.run(self.monitor.action(self.root(), 'reserve', fingerprint=self.control()['fingerprint']))
         with patch.object(route_store, 'verify_route', return_value=None):
             restored = broker.State(store=self.store)
         monitor = adapter.RetryMonitor(restored, shared.retry_policy(), clock=lambda: self.now)
@@ -297,7 +297,7 @@ class RetryTests(unittest.TestCase):
         self.now = 115
         with patch.object(self.state.correspondence, 'save', side_effect=OSError('fixture disk failure')):
             with self.assertRaises(OSError):
-                self.monitor.action(self.root(), 'reserve', fingerprint=self.control()['fingerprint'])
+                asyncio.run(self.monitor.action(self.root(), 'reserve', fingerprint=self.control()['fingerprint']))
         self.assertEqual(self.state.messages, before)
         self.assertEqual(self.control()['status'], 'waiting')
 
@@ -329,6 +329,49 @@ class RetryTests(unittest.TestCase):
         asyncio.run(cancel())
         self.assertEqual(self.sent, [])
         self.assertEqual(self.control()['status'], 'waiting')
+
+    def test_cancel_during_reservation_save_reconciles_without_a_provider_write(self):
+        self.step()
+        self.now = 115
+        release = threading.Event()
+        write = message_store.atomic_write
+
+        def send(session, owner, turn_id, fingerprint, reserve):
+            reserve()
+            self.sent.append(turn_id)
+            return 'late-turn'
+
+        async def cancel():
+            loop = asyncio.get_running_loop()
+            started = asyncio.Event()
+
+            def pause(path, data):
+                if path == self.state.correspondence.path and b'"status": "reserved"' in data:
+                    loop.call_soon_threadsafe(started.set)
+                    if not release.wait(5):
+                        raise AssertionError('test did not release the checkpoint worker')
+                write(path, data)
+
+            with patch.object(adapter, 'read_codex_observation',
+                              return_value=dict(owner='fixture-owner', snapshot=snapshot())), \
+                    patch.object(adapter, 'resume_failed_turn', side_effect=send), \
+                    patch.object(message_store, 'atomic_write', side_effect=pause):
+                task = asyncio.create_task(self.monitor.check_route(self.route))
+                try:
+                    await asyncio.wait_for(started.wait(), 5)
+                    self.assertEqual(self.control()['status'], 'waiting')
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    self.assertFalse(task.done())
+                finally:
+                    release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, 5)
+
+        asyncio.run(cancel())
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.control()['status'], 'uncertain')
+        self.assertEqual(self.control()['attempts'], 0)
 
     def test_retry_checkpoint_rejects_diagnostics_and_keeps_only_normalized_state(self):
         self.step()
@@ -366,7 +409,7 @@ class RetryTests(unittest.TestCase):
     def test_bridge_delivery_cannot_interleave_with_reserved_continuation(self):
         self.step()
         self.now = 115
-        self.monitor.action(self.root(), 'reserve', fingerprint=self.control()['fingerprint'])
+        asyncio.run(self.monitor.action(self.root(), 'reserve', fingerprint=self.control()['fingerprint']))
         incoming = self.state.action(dict(op='send', project='demo', sender='parent', recipient='worker',
                                           body='new input', key='during-reservation'))
         with self.assertRaisesRegex(ValueError, 'reserved provider continuation'):

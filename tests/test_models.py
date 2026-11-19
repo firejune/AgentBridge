@@ -10,6 +10,7 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skill/agent-bridge/scripts'))
 import agy_live
 import bridge
+import delivery
 import codex_new
 import models
 import sessions
@@ -527,7 +528,7 @@ class ClaudeDesktopRelayCommandTest(unittest.TestCase):
                                                                'applies': 'next turn'})
                 bridge.broker.request(path, {'op': 'reply', 'id': m['id'], 'body': line, 'key': 'reply-' + m['id']})
                 return {**m, 'state': 'submitted'}
-            with patch.object(bridge, 'push', side_effect=command_post), \
+            with patch.object(delivery, 'push', side_effect=command_post), \
                     patch.object(models, 'claude_host', return_value='claude-desktop'), \
                     patch.object(models, 'desktop_session', return_value=None):
                 code, out = run(['--socket', broker.path, 'model', 'worker', '--project', 'demo',
@@ -549,7 +550,7 @@ class ClaudeDesktopRelayCommandTest(unittest.TestCase):
                             session=sid)
             Path(broker.state_dir).mkdir(parents=True, exist_ok=True)
             Path(broker.state_dir, 'policy.json').write_text('{"command_post": {"claude": "hq"}}')
-            with patch.object(bridge, 'push') as pushed, \
+            with patch.object(delivery, 'push') as pushed, \
                     patch.object(models, 'claude_host', return_value='claude-desktop'):
                 code, out = run(['--socket', broker.path, 'model', 'worker', '--project', 'demo',
                                  '--set', 'claude-sonnet-5-5', '--state-dir', broker.state_dir])

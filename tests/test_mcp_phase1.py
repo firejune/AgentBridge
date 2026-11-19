@@ -1,9 +1,11 @@
-"""No real session discovery, IDE opening, or peer delivery in these tests."""
+"""MCP tests use disposable brokers and fake providers."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
 import io
 import json
 from pathlib import Path
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -15,8 +17,10 @@ import uuid
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'skill/agent-bridge/scripts'))
 import mcp_phase1 as phase
 import mcp_server
+import bridge
 import broker
 from support import RunningBroker
+from test_codex_live import FakeDesktop
 try:
     import jsonschema
 except ImportError:
@@ -724,9 +728,9 @@ class PhaseTest(unittest.TestCase):
 
                 def reject(message, session):
                     self.backend.pushes += 1
-                    failure = dict(message, state='failed', reason=phase.bridge.ARCHIVED_REASON)
+                    failure = dict(message, state='failed', reason=phase.delivery.ARCHIVED_REASON)
                     self.backend.messages[message['id']] = failure
-                    raise phase.bridge.PushFailed('archived', failure)
+                    raise phase.delivery.PushFailed('archived', failure)
 
                 if mode == 'push':
                     with patch.object(self.backend, 'push', side_effect=reject):
@@ -734,13 +738,13 @@ class PhaseTest(unittest.TestCase):
                 else:
                     self.engine.tick()
                     mid = self.engine.operation(oid, 'owner-a')['backend_id']
-                    self.backend.messages[mid].update(state='failed', reason=phase.bridge.ARCHIVED_REASON)
+                    self.backend.messages[mid].update(state='failed', reason=phase.delivery.ARCHIVED_REASON)
                     self.engine.tick()
                 self.restart()
                 result = self.call('bridge_operation_get', operation_id=oid)['data']
                 self.assertEqual((result['status'], result['backend_message_state']), ('failed', 'failed'))
                 self.assertEqual(result['failure']['code'], 'BACKEND_UNAVAILABLE')
-                self.assertEqual(result['failure']['message'], phase.bridge.codex_live.ThreadArchived.MESSAGE)
+                self.assertEqual(result['failure']['message'], phase.codex_live.ThreadArchived.MESSAGE)
                 counts = (self.backend.posts, self.backend.pushes)
                 self.assertTrue(self.send(sid, key=key)['data']['replayed'])
                 self.engine.tick()
@@ -1020,6 +1024,75 @@ def sessions_ide():
 
 
 class BrokerIntegrationTest(unittest.TestCase):
+    def test_facade_import_does_not_load_cli(self):
+        scripts = str(Path(mcp_server.__file__).resolve().parent)
+        code = """
+import sys
+sys.path.insert(0, sys.argv[1])
+import mcp_server
+import mcp_phase1
+assert 'bridge' not in sys.modules
+"""
+        result = subprocess.run([sys.executable, '-I', '-c', code, scripts],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cli_and_mcp_dispatch_over_disposable_sockets(self):
+        with RunningBroker() as running, FakeDesktop() as desktop:
+            cwd = str(Path(running.temp.name).resolve())
+            sid = str(uuid.uuid4())
+            project = 'mcp-test'
+            running.call('register', project=project, name='sender', cwd=cwd, transport='realtime')
+            running.call('register', project=project, name='worker', cwd=cwd,
+                         transport='codex', session=sid)
+            config = {
+                'principal': 'test-owner', 'tunnel_id': 'isolated-socket-test', 'writes_enabled': True,
+                'scopes': list(set(phase.SCOPES.values())), 'state_dir': cwd + '/mcp',
+                'workspaces': {'test': {'cwd': cwd, 'root': cwd, 'project': project, 'agent_type': 'codex'}},
+                'pinned_sessions': {'worker': {'uuid': sid, 'cwd': cwd, 'project': project,
+                                               'route': 'worker', 'authorized_at': phase.stamp(),
+                                               'agent_type': 'codex'}},
+            }
+            engine = phase.Engine(config, phase.Backend(running.path), start=False)
+            try:
+                missing_store = Path(cwd) / 'missing.sqlite'
+                row = {'id': sid, 'cwd': cwd, 'status': 'idle'}
+                with patch.dict(os.environ, {'AGENT_BRIDGE_CODEX_IPC': desktop.path}), \
+                        patch.object(phase.delivery.codex_preview, 'state_path', return_value=missing_store), \
+                        patch.object(phase.sessions, 'resolve_codex_peer', return_value=row):
+                    output = io.StringIO()
+                    with patch.object(sys, 'stdin', io.StringIO('CLI fixture')), redirect_stdout(output):
+                        code = bridge.main(['--socket', running.path, 'send', '--project', project,
+                                            '--from', 'sender', '--to', 'worker', '--file', '-', '--key', 'direct'])
+                    self.assertEqual(code, 0, output.getvalue())
+                    direct = json.loads(output.getvalue())
+                    self.assertEqual(running.call('show', id=direct['id'])['state'], 'submitted')
+
+                    target = next(iter(phase.pinned_sessions(config)))
+                    response = mcp_server.handle({
+                        'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                        'params': {'name': 'bridge_message_send', 'arguments': {
+                            'agent_session_id': target, 'message': 'MCP fixture',
+                            'idempotency_key': 'disposable_socket_01',
+                        }},
+                    }, running.path, engine)
+                    accepted = response['result']['structuredContent']['data']
+                    engine.tick()
+                    op = engine.operation(accepted['operation_id'], 'test-owner')
+                    self.assertEqual((op['status'], op['backend_message_state']), ('running', 'submitted'))
+                    self.assertEqual(running.call('show', id=op['backend_id'])['state'], 'submitted')
+
+                writes = [call['params'] for call in desktop.calls
+                          if call.get('method') == 'thread-follower-steer-turn']
+                self.assertEqual(len(writes), 2)
+                for write, message_id, body in zip(
+                        writes, (direct['id'], op['backend_id']), ('CLI fixture', 'MCP fixture')):
+                    self.assertEqual((write['conversationId'], write['input']), (sid, []))
+                    self.assertIn(message_id, write['toolOutput']['output'])
+                    self.assertIn(body, write['toolOutput']['output'])
+            finally:
+                engine.close()
+
     def test_codex_creation_uses_shared_default_and_owner_overrides(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()
@@ -1061,7 +1134,7 @@ class BrokerIntegrationTest(unittest.TestCase):
                 row={'id':uuid_value,'cwd':root,'status':'running'}
                 with patch.object(phase.sessions,'resolve_agy_peer',return_value=row), \
                      patch.object(phase.sessions,'resolve_codex_peer',return_value=row), \
-                     patch.object(phase.bridge,'push_if_peer') as provider_write:
+                     patch.object(phase.delivery,'push_if_peer') as provider_write:
                     sid=next(iter(phase.pinned_sessions(config)))
                     args={'agent_session_id':sid, 'message':'must stay on original provider',
                           'idempotency_key':'dispatch_retarget_001'}
@@ -1097,7 +1170,7 @@ class BrokerIntegrationTest(unittest.TestCase):
             sid=str(uuid.uuid4())
             row={'id':sid,'cwd':root,'status':'idle'}
             try:
-                with patch.object(phase.sessions,'open_session',return_value={'session':row}) as opening, patch.object(phase.sessions,'resolve_claude_peer',return_value=row), patch.object(phase.bridge,'new_session_policy'):
+                with patch.object(phase.sessions,'open_session',return_value={'session':row}) as opening, patch.object(phase.sessions,'resolve_claude_peer',return_value=row), patch.object(phase.models,'new_session_policy'):
                     accepted=engine.call('bridge_session_create',{'workspace_alias':'test','idempotency_key':'integrate_create01'})['data'];engine.tick()
                     op=engine.operation(accepted['operation_id'],'test-owner');self.assertEqual(op['status'],'succeeded')
                     opening.assert_called_once()
@@ -1106,7 +1179,7 @@ class BrokerIntegrationTest(unittest.TestCase):
                         self.assertEqual(m['route']['session'],sid)
                         running.call('claim',id=m['id'])
                         return running.call('finish',id=m['id'],state='submitted',event='pushed')
-                    with patch.object(phase.bridge,'push_if_peer',side_effect=mock_peer) as pushing:
+                    with patch.object(phase.delivery,'push_if_peer',side_effect=mock_peer) as pushing:
                         engine.tick();pushing.assert_called_once()
                     op=engine.operation(sent['operation_id'],'test-owner');self.assertEqual(op['status'],'running')
                     running.call('reply',id=op['backend_id'],body='actual correlated reply',key='reply-key')
@@ -1117,7 +1190,7 @@ class BrokerIntegrationTest(unittest.TestCase):
                     # the reply arrives pending, and a later read attaches and resolves it.
                     engine.observe_retry_limit=1
                     late=engine.call('bridge_message_send',{'agent_session_id':op['agent_session_id'],'message':'again','idempotency_key':'integrate_message2'})['data']
-                    with patch.object(phase.bridge,'push_if_peer',side_effect=mock_peer), patch.object(backend,'observe',side_effect=TimeoutError('timed out')):
+                    with patch.object(phase.delivery,'push_if_peer',side_effect=mock_peer), patch.object(backend,'observe',side_effect=TimeoutError('timed out')):
                         engine.tick()
                     op=engine.operation(late['operation_id'],'test-owner')
                     self.assertEqual((op['status'],op['backend_message_state'],op['error']['type']),('unknown','submitted','TimeoutError'))
@@ -1243,7 +1316,7 @@ class BrokerIntegrationTest(unittest.TestCase):
                         running.call('claim', id=m['id'])
                         return running.call('finish', id=m['id'], state='submitted', event='pushed')
 
-                    with patch.object(phase.bridge, 'push_if_peer', side_effect=mock_peer) as pushing:
+                    with patch.object(phase.delivery, 'push_if_peer', side_effect=mock_peer) as pushing:
                         engine.tick()
                         pushing.assert_called_once()
 
@@ -1267,7 +1340,7 @@ class ReviewRegressionTest(unittest.TestCase):
                     'workspaces':{'test':{'cwd':root,'root':root,'project':'test-project','ide':sessions_ide()}}}
             row={'id':str(uuid.uuid4()),'cwd':root,'status':'idle'}
             try:
-                with patch.object(phase.sessions,'open_session',return_value={'session':row}), patch.object(phase.sessions,'resolve_claude_peer',return_value=row), patch.object(phase.bridge,'new_session_policy'):
+                with patch.object(phase.sessions,'open_session',return_value={'session':row}), patch.object(phase.sessions,'resolve_claude_peer',return_value=row), patch.object(phase.models,'new_session_policy'):
                     for n in range(ledgers):
                         c=dict(config,state_dir=root+'/ledger'+str(n))
                         e=phase.Engine(c,phase.Backend(running.path),start=False); engines.append(e)
@@ -1280,7 +1353,7 @@ class ReviewRegressionTest(unittest.TestCase):
                         def push(path,m):
                             running.call('claim',id=m['id'])
                             return running.call('finish',id=m['id'],state='submitted')
-                        with patch.object(phase.bridge,'push_if_peer',side_effect=push):e.tick()
+                        with patch.object(phase.delivery,'push_if_peer',side_effect=push):e.tick()
                         op=e.operation(a['operation_id'],'same-owner')
                         self.assertEqual(op['status'],'running')
                         r=running.call('reply',id=op['backend_id'],body='answer',key='reply-'+str(n))

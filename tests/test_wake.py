@@ -14,6 +14,7 @@ import uuid
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import bridge
+import delivery
 import sessions
 from support import RunningBroker
 from test_peer import FakeClaude
@@ -170,7 +171,7 @@ class WakePushTests(WakeFixture):
         self.metadata()
         with RunningBroker() as server, self.env(), \
                 mock.patch.object(sessions,'open_url_background',self.opener()), \
-                mock.patch.object(bridge,'TITLE_WAIT',0.0):
+                mock.patch.object(delivery,'TITLE_WAIT',0.0):
             message = self.send(server)
             self.assertEqual(message['state'],'pending')
             result = bridge.push_if_peer(server.path,message)
@@ -193,7 +194,7 @@ class WakePushTests(WakeFixture):
         self.metadata()
         with RunningBroker() as server, self.env(), \
                 mock.patch.object(sessions,'open_url_background',self.opener(socket=False)), \
-                mock.patch.object(bridge,'push_frame') as frame:
+                mock.patch.object(delivery,'push_frame') as frame:
             message = self.send(server)
             with self.assertRaises(bridge.PushFailed) as caught:
                 bridge.push(server.path,message,wake_timeout=0.2)
@@ -212,7 +213,7 @@ class WakePushTests(WakeFixture):
             raise subprocess.TimeoutExpired(['open','-g',url],10)
         with RunningBroker() as server, self.env(), \
                 mock.patch.object(sessions,'open_url_background',hang), \
-                mock.patch.object(bridge,'push_frame') as frame:
+                mock.patch.object(delivery,'push_frame') as frame:
             message = self.send(server)
             with self.assertRaises(bridge.PushFailed) as caught:
                 bridge.push(server.path,message,wake_timeout=2)
@@ -237,7 +238,7 @@ class WakePushTests(WakeFixture):
             subprocess.run([sys.executable,'-c','import time; time.sleep(30)'],timeout=timeout)
         with RunningBroker() as server, self.env(), \
                 mock.patch.object(sessions,'open_url_background',blocking), \
-                mock.patch.object(bridge,'push_frame') as frame:
+                mock.patch.object(delivery,'push_frame') as frame:
             message = self.send(server)
             started = time.monotonic()
             with self.assertRaises(bridge.PushFailed) as caught:
@@ -263,7 +264,7 @@ class WakePushTests(WakeFixture):
             self.assertEqual((stored['state'],stored['events'][-1]['event']),('pending','push_failed'))
         self.fakes.append(FakeClaude(self.temp.name,self.sid,extra=DESKTOP))
         with RunningBroker() as server, self.env(), \
-                mock.patch.object(bridge,'push_frame',side_effect=KeyboardInterrupt):
+                mock.patch.object(delivery,'push_frame',side_effect=KeyboardInterrupt):
             message = self.send(server)
             with self.assertRaises(KeyboardInterrupt):
                 bridge.push(server.path,message,wake_timeout=2)
@@ -294,7 +295,7 @@ class WakePushTests(WakeFixture):
             self.assertEqual(self.urls,[])
             wake.assert_not_called()
             # A short budget shrinks the wait below wake_timeout, keeping PEER_IO_TIMEOUT for the push.
-            with mock.patch.object(bridge,'TITLE_WAIT',0.0):
+            with mock.patch.object(delivery,'TITLE_WAIT',0.0):
                 result = bridge.push(server.path,message,deadline=time.monotonic()+bridge.PEER_IO_TIMEOUT+3)
             self.assertEqual(result['state'],'submitted')
             self.assertLessEqual(wake.call_args.kwargs['timeout'],3)
@@ -304,7 +305,7 @@ class WakePushTests(WakeFixture):
         self.metadata()
         with RunningBroker() as server, self.env(), \
                 mock.patch.object(sessions,'open_url_background',self.opener()), \
-                mock.patch.object(bridge,'TITLE_WAIT',0.0):
+                mock.patch.object(delivery,'TITLE_WAIT',0.0):
             result = bridge.push_if_peer(server.path,self.send(server))
             self.assertEqual(result['state'],'submitted')
             self.assertNotIn('wake',result)
@@ -349,7 +350,7 @@ class WaitBehindWakeTests(WakeFixture):
         self.metadata()
         with RunningBroker() as server, self.env(), \
                 mock.patch.object(sessions,'open_url_background',self.slow()), \
-                mock.patch.object(bridge,'TITLE_WAIT',0.0):
+                mock.patch.object(delivery,'TITLE_WAIT',0.0):
             first, second = self.two(server)
             results = []
             with mock.patch.object(bridge.broker,'request',wraps=bridge.broker.request) as calls:
@@ -374,7 +375,7 @@ class WaitBehindWakeTests(WakeFixture):
         self.metadata()
         with RunningBroker() as server, self.env(), \
                 mock.patch.object(sessions,'open_url_background',self.slow(socket=False)), \
-                mock.patch.object(bridge,'push_frame') as frame:
+                mock.patch.object(delivery,'push_frame') as frame:
             first, second = self.two(server)
             results = []
             thread = self.first_in_thread(server,first,results)
@@ -396,7 +397,7 @@ class WaitBehindWakeTests(WakeFixture):
         self.metadata()
         with RunningBroker() as server, self.env(), \
                 mock.patch.object(sessions,'open_url_background',self.opener()), \
-                mock.patch.object(bridge,'push_frame') as frame:
+                mock.patch.object(delivery,'push_frame') as frame:
             first, second = self.two(server)
             server.call('claim',id=first['id'])
             server.call('finish',id=first['id'],state='uncertain',note='bytes may have reached the receiver')
@@ -417,7 +418,7 @@ class WaitBehindWakeTests(WakeFixture):
         self.metadata()
         with RunningBroker() as server, self.env(), \
                 mock.patch.object(sessions,'open_url_background',self.opener()), \
-                mock.patch.object(bridge,'push_frame') as frame:
+                mock.patch.object(delivery,'push_frame') as frame:
             first, second = self.two(server)
             server.call('claim',id=first['id'])
             server.call('finish',id=first['id'],state='uncertain',note='bytes may have reached the receiver')
@@ -450,7 +451,7 @@ class WaitBehindWakeTests(WakeFixture):
     def test_note_is_durable_while_the_message_stays_pending(self):
         self.metadata()
         with RunningBroker() as server, self.env(), \
-                mock.patch.object(bridge,'push_frame') as frame:
+                mock.patch.object(delivery,'push_frame') as frame:
             first, second = self.two(server)
             server.call('claim',id=first['id'])
             server.call('finish',id=first['id'],state='uncertain',note='bytes may have reached the receiver')

@@ -155,13 +155,13 @@ class NoticeTests(unittest.TestCase):
         self.state.keys.clear()
         async def run():
             finished = asyncio.Event()
-            original_action = self.state.action
-            def action(args):
-                result = original_action(args)
+            original_action = self.state.action_async
+            async def action(args):
+                result = await original_action(args)
                 finished.set()
                 return result
             with patch.object(provider_failures, 'read_codex_failure', return_value=self.failure) as read, \
-                    patch.object(self.state, 'action', side_effect=action):
+                    patch.object(self.state, 'action_async', side_effect=action):
                 task = asyncio.create_task(provider_failures.observe_codex_failures(self.state, .001))
                 try:
                     await asyncio.wait_for(finished.wait(), 2)
@@ -206,21 +206,16 @@ class NoticeTests(unittest.TestCase):
     def test_observer_normal_path_and_race_use_fixtures_only(self):
         async def run(race=False):
             finished = asyncio.Event()
-            loop = asyncio.get_running_loop()
-            original_action = self.state.action
-            def action(args):
-                result = original_action(args)
-                finished.set()
-                return result
-            def read(*args):
-                if args[0] != self.session:
-                    loop.call_soon_threadsafe(finished.set)
-                    return None
+            original_action = self.state.action_async
+            async def action(args):
                 if race:
                     self.state.endpoints[('demo', 'worker')] = dict(self.route, session=str(uuid.uuid4()))
-                return self.failure
-            with patch.object(provider_failures, 'read_codex_failure', side_effect=read), \
-                    patch.object(self.state, 'action', side_effect=action):
+                try:
+                    return await original_action(args)
+                finally:
+                    finished.set()
+            with patch.object(provider_failures, 'read_codex_failure', return_value=self.failure), \
+                    patch.object(self.state, 'action_async', side_effect=action):
                 task = asyncio.create_task(provider_failures.observe_codex_failures(self.state, .001))
                 try:
                     await asyncio.wait_for(finished.wait(), 2)

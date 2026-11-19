@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skill/agent-bridge/scripts'))
 import bridge
+import delivery
 import codex_live
 import codex_new
 import usage
@@ -193,9 +194,9 @@ class NoTurnTests(Base):
         with patch.object(codex_live, 'deliver', side_effect=forbidden), \
                 patch.object(codex_live, 'Client', side_effect=forbidden), \
                 patch.object(codex_new, 'create', side_effect=forbidden, create=True), \
-                patch.object(bridge, 'push_codex', side_effect=forbidden), \
-                patch.object(bridge, 'push', side_effect=forbidden), \
-                patch.object(bridge, 'push_agy', side_effect=forbidden):
+                patch.object(delivery, 'push_codex', side_effect=forbidden), \
+                patch.object(delivery, 'push', side_effect=forbidden), \
+                patch.object(delivery, 'push_agy', side_effect=forbidden):
             collector = usage.Collector(self.store, 5, str(stub.path), clock=lambda: T0)
             collector.cycle()
         self.assertEqual(stub.methods(), ['initialize', 'initialized', 'account/rateLimits/read'])

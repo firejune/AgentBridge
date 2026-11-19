@@ -6,7 +6,6 @@ never logs or persists the language_server CSRF token.
 """
 from datetime import datetime, timezone
 import asyncio
-import concurrent.futures
 import hashlib
 import json
 import os
@@ -1631,18 +1630,18 @@ class AgyRetryMonitor:
         self.cached_steps = {}
         self._woken_in_pass = set()
 
-    def action(self, notice, action, **fields):
-        return self.state.action(dict(op='provider-retry', id=notice['id'], action=action,
-                                      at=self.clock(), **fields))
+    async def action(self, notice, action, *, admit=None, **fields):
+        return await self.state.action_async(dict(op='provider-retry', id=notice['id'], action=action,
+                                                  at=self.clock(), **fields), admit=admit)
 
-    def stop(self, notice, event, kind):
-        return self.action(notice, 'stop', event=event, kind=kind)
+    async def stop(self, notice, event, kind):
+        return await self.action(notice, 'stop', event=event, kind=kind)
 
     async def check_route(self, route, servers=None):
         import codex_failures
         notice = codex_failures.retry_notice(self.state, route)
         if notice and notice['provider_retry']['status'] == 'reserved':
-            self.stop(notice, provider_failures.UNCERTAIN, 'broker_restarted_during_reservation')
+            await self.stop(notice, provider_failures.UNCERTAIN, 'broker_restarted_during_reservation')
             return
         sid = str(uuid.UUID(route['session']))
         if servers is None:
@@ -1663,7 +1662,7 @@ class AgyRetryMonitor:
         if notice and notice['provider_retry']['status'] == 'accepted':
             failed_step_count = int(notice['provider_retry']['turn_id'].split(':', 1)[1]) + 1
             if status != 'running' and step_count <= failed_step_count:
-                self.stop(notice, provider_failures.UNCERTAIN, 'wake_not_accepted')
+                await self.stop(notice, provider_failures.UNCERTAIN, 'wake_not_accepted')
                 return
             if status != 'idle':
                 return
@@ -1671,12 +1670,12 @@ class AgyRetryMonitor:
         # 2. Never inspect or wake while RUNNING (including internal attempts 1-8).
         if status != 'idle':
             if notice and notice['provider_retry']['status'] == 'waiting':
-                self.stop(notice, provider_failures.UNSAFE, 'native_retry_or_changed_turn')
+                await self.stop(notice, provider_failures.UNSAFE, 'native_retry_or_changed_turn')
             return
 
         if step_count < 1:
             if notice and notice['provider_retry']['status'] == 'waiting':
-                self.stop(notice, provider_failures.UNSAFE, 'native_retry_or_changed_turn')
+                await self.stop(notice, provider_failures.UNSAFE, 'native_retry_or_changed_turn')
             return
 
         # 3. Fetch the tail step only when IDLE and stepCount changed.
@@ -1690,25 +1689,25 @@ class AgyRetryMonitor:
 
         if classified is None or classified['outcome'] in ('transient_attempt', 'non_terminal'):
             if notice and notice['provider_retry']['status'] in ('waiting', 'accepted'):
-                self.stop(notice, provider_failures.UNSAFE, 'native_retry_or_changed_turn')
+                await self.stop(notice, provider_failures.UNSAFE, 'native_retry_or_changed_turn')
             return
 
         if classified['outcome'] == 'non_error':
             if notice and classified['turn_id'] != json.loads(notice['body'])['turn_id']:
-                self.action(notice, 'reset', turn_id=classified['turn_id'])
+                await self.action(notice, 'reset', turn_id=classified['turn_id'])
             elif notice and notice['provider_retry']['status'] == 'waiting':
-                self.stop(notice, provider_failures.UNSAFE, 'native_retry_or_changed_turn')
+                await self.stop(notice, provider_failures.UNSAFE, 'native_retry_or_changed_turn')
             return
 
         failure = dict(kind=classified['kind'], failed_at=classified['failed_at'],
                        turn_id=classified['turn_id'], error_id=classified['error_id'])
         source = codex_failures.last_sender_message(self.state, route)
-        detected = self.state.action(dict(op='provider-failure', expected_route=route,
+        detected = await self.state.action_async(dict(op='provider-failure', expected_route=route,
             source_message_id=source['id'] if source else None, failure=failure))
 
         if classified['outcome'] == 'notify_only':
             if notice and notice['provider_retry']['status'] in ('waiting', 'accepted'):
-                self.stop(notice, provider_failures.UNSAFE, 'non_wake_terminal_error')
+                await self.stop(notice, provider_failures.UNSAFE, 'non_wake_terminal_error')
             return
 
         if self.policy is None:
@@ -1716,27 +1715,27 @@ class AgyRetryMonitor:
 
         fingerprint = agy_fingerprint(sid, classified)
         if notice is None or notice['provider_retry']['status'] == 'recovered':
-            notice = self.action(detected, 'arm', fingerprint=fingerprint,
+            notice = await self.action(detected, 'arm', fingerprint=fingerprint,
                                  backoff=list(self.policy.backoff), cap=self.policy.cap)
 
         if classified['outcome'] == 'unsafe':
-            self.stop(notice, provider_failures.UNSAFE, classified.get('reason') or 'unsafe_tail_step')
+            await self.stop(notice, provider_failures.UNSAFE, classified.get('reason') or 'unsafe_tail_step')
             return
 
         control = notice['provider_retry']
         if self.state.correspondence is not None and self.state.correspondence.loss:
-            self.stop(notice, provider_failures.UNCERTAIN, 'correspondence_checkpoint_lost')
+            await self.stop(notice, provider_failures.UNCERTAIN, 'correspondence_checkpoint_lost')
             return
 
         if control['status'] == 'accepted':
-            notice = self.action(notice, 'wait', failure=failure, fingerprint=fingerprint)
+            notice = await self.action(notice, 'wait', failure=failure, fingerprint=fingerprint)
             control = notice['provider_retry']
 
         if control['status'] != 'waiting':
             return
 
         if control['turn_id'] != failure['turn_id'] or control['fingerprint'] != fingerprint:
-            self.stop(notice, provider_failures.UNSAFE, 'intervening_input_or_changed_step')
+            await self.stop(notice, provider_failures.UNSAFE, 'intervening_input_or_changed_step')
             return
 
         if self.clock() < control['next_at']:
@@ -1744,46 +1743,23 @@ class AgyRetryMonitor:
 
         loop = asyncio.get_running_loop()
         cancelled = threading.Event()
-        def reserve():
-            if cancelled.is_set():
-                raise codex_failures.RetryRefused('continuation_cancelled')
-            future = concurrent.futures.Future()
-            def commit():
-                if not future.set_running_or_notify_cancel():
-                    return
-                try:
-                    if cancelled.is_set():
-                        raise codex_failures.RetryRefused('continuation_cancelled')
-                    future.set_result(self.action(notice, 'reserve', fingerprint=control['fingerprint']))
-                except BaseException as error:
-                    future.set_exception(error)
-            loop.call_soon_threadsafe(commit)
-            try:
-                reservation = future.result(timeout=5)
-                if cancelled.is_set():
-                    raise codex_failures.RetryRefused('continuation_cancelled')
-                return reservation
-            except TimeoutError:
-                future.cancel()
-                raise
+        reserve = codex_failures.reservation_callback(loop, cancelled, self.action, notice, control['fingerprint'])
         try:
             accepted = await asyncio.to_thread(wake_failed_turn, notice['return_route'],
                                                control['turn_id'], control['fingerprint'], reserve)
             current = self.state.get(notice['id'])
-            self.action(current, 'finish', reservation_id=current['provider_retry']['reservation_id'],
+            await self.action(current, 'finish', reservation_id=current['provider_retry']['reservation_id'],
                         outcome='accepted', turn_id=accepted)
             self._woken_in_pass.add(sid)
         except codex_failures.RetryRefused as error:
-            self.stop(self.state.get(notice['id']), provider_failures.UNSAFE, str(error))
+            await self.stop(self.state.get(notice['id']), provider_failures.UNSAFE, str(error))
         except DeliveryError as error:
             event = provider_failures.UNCERTAIN if error.uncertain else provider_failures.UNSAFE
-            self.stop(self.state.get(notice['id']), event,
+            await self.stop(self.state.get(notice['id']), event,
                       'delivery_outcome_unknown' if error.uncertain else 'continuation_prewrite_failed')
         except asyncio.CancelledError:
             cancelled.set()
-            current = self.state.get(notice['id'])
-            if current['provider_retry']['status'] == 'reserved':
-                self.stop(current, provider_failures.UNCERTAIN, 'continuation_cancelled')
+            await codex_failures.stop_cancelled_reservation(self.state, notice, self.action)
             raise
 
     async def check_routes(self, routes=None):
@@ -1798,7 +1774,7 @@ class AgyRetryMonitor:
             notice = codex_failures.retry_notice(self.state, route)
             if notice and notice['provider_retry']['status'] == 'reserved':
                 try:
-                    self.stop(notice, provider_failures.UNCERTAIN, 'broker_restarted_during_reservation')
+                    await self.stop(notice, provider_failures.UNCERTAIN, 'broker_restarted_during_reservation')
                 except (ValueError, OSError, TypeError, KeyError, AttributeError):
                     pass
                 continue

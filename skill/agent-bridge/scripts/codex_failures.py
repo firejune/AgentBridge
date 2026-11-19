@@ -4,7 +4,6 @@ from datetime import datetime, timezone
 import math
 import hashlib
 import json
-import concurrent.futures
 import time
 import uuid
 import threading
@@ -307,18 +306,18 @@ class RetryMonitor:
         self.state, self.policy, self.clock = state, policy, clock
         self.owners = {}
 
-    def action(self, notice, action, **fields):
-        return self.state.action(dict(op='provider-retry', id=notice['id'], action=action,
-                                      at=self.clock(), **fields))
+    async def action(self, notice, action, *, admit=None, **fields):
+        return await self.state.action_async(dict(op='provider-retry', id=notice['id'], action=action,
+                                                  at=self.clock(), **fields), admit=admit)
 
-    def stop(self, notice, event, kind):
-        return self.action(notice, 'stop', event=event, kind=kind)
+    async def stop(self, notice, event, kind):
+        return await self.action(notice, 'stop', event=event, kind=kind)
 
     async def check_route(self, route):
         self.owners = {mid: owner for mid, owner in self.owners.items() if mid in self.state.messages}
         notice = retry_notice(self.state, route)
         if notice and notice['provider_retry']['status'] == 'reserved':
-            self.stop(notice, provider_failures.UNCERTAIN, 'broker_restarted_during_reservation')
+            await self.stop(notice, provider_failures.UNCERTAIN, 'broker_restarted_during_reservation')
             return
         observation = await asyncio.to_thread(read_codex_observation, route['session'])
         snapshot, owner = observation['snapshot'], observation['owner']
@@ -326,80 +325,93 @@ class RetryMonitor:
         if (notice and isinstance(turn, dict) and turn.get('turnId')
                 and turn['turnId'] != json.loads(notice['body'])['turn_id']
                 and turn.get('status') in ('completed', 'interrupted')):
-            self.action(notice, 'reset', turn_id=turn['turnId'])
+            await self.action(notice, 'reset', turn_id=turn['turnId'])
             return
         failure = terminal_failure(snapshot)
         if failure is None:
             if notice and notice['provider_retry']['status'] == 'waiting':
-                self.stop(notice, provider_failures.UNSAFE, 'native_retry_or_changed_turn')
+                await self.stop(notice, provider_failures.UNSAFE, 'native_retry_or_changed_turn')
             return
         source = last_sender_message(self.state, route)
-        detected = self.state.action(dict(op='provider-failure', expected_route=route,
+        detected = await self.state.action_async(dict(op='provider-failure', expected_route=route,
             source_message_id=source['id'] if source else None, failure=failure))
         if notice is None or notice['provider_retry']['status'] == 'recovered':
-            notice = self.action(detected, 'arm', fingerprint=snapshot_fingerprint(snapshot),
+            notice = await self.action(detected, 'arm', fingerprint=snapshot_fingerprint(snapshot),
                                  backoff=list(self.policy.backoff), cap=self.policy.cap)
         control = notice['provider_retry']
         if self.state.correspondence is not None and self.state.correspondence.loss:
-            self.stop(notice, provider_failures.UNCERTAIN, 'correspondence_checkpoint_lost')
+            await self.stop(notice, provider_failures.UNCERTAIN, 'correspondence_checkpoint_lost')
             return
         if control['status'] == 'accepted':
             if failure['turn_id'] != control['turn_id']:
-                self.stop(notice, provider_failures.UNSAFE, 'newer_turn')
+                await self.stop(notice, provider_failures.UNSAFE, 'newer_turn')
                 return
-            notice = self.action(notice, 'wait', failure=failure, fingerprint=snapshot_fingerprint(snapshot))
+            notice = await self.action(notice, 'wait', failure=failure, fingerprint=snapshot_fingerprint(snapshot))
             control = notice['provider_retry']
         if control['status'] != 'waiting':
             return
         pinned = self.owners.setdefault(notice['id'], owner)
         refusal = retry_refusal(snapshot, control['turn_id'], control['fingerprint'])
         if pinned != owner or refusal:
-            self.stop(notice, provider_failures.UNSAFE, refusal or 'desktop_owner_changed')
+            await self.stop(notice, provider_failures.UNSAFE, refusal or 'desktop_owner_changed')
             return
         if self.clock() < control['next_at']:
             return
         loop = asyncio.get_running_loop()
         cancelled = threading.Event()
-        def reserve():
-            if cancelled.is_set():
-                raise RetryRefused('continuation_cancelled')
-            future = concurrent.futures.Future()
-            def commit():
-                if not future.set_running_or_notify_cancel():
-                    return
-                try:
-                    if cancelled.is_set():
-                        raise RetryRefused('continuation_cancelled')
-                    future.set_result(self.action(notice, 'reserve', fingerprint=control['fingerprint']))
-                except BaseException as error:
-                    future.set_exception(error)
-            loop.call_soon_threadsafe(commit)
-            try:
-                reservation = future.result(timeout=5)
-                if cancelled.is_set():
-                    raise RetryRefused('continuation_cancelled')
-                return reservation
-            except TimeoutError:
-                future.cancel()
-                raise
+        reserve = reservation_callback(loop, cancelled, self.action, notice, control['fingerprint'])
         try:
             accepted = await asyncio.to_thread(resume_failed_turn, route['session'], pinned,
                                                control['turn_id'], control['fingerprint'], reserve)
             current = self.state.get(notice['id'])
-            self.action(current, 'finish', reservation_id=current['provider_retry']['reservation_id'],
+            await self.action(current, 'finish', reservation_id=current['provider_retry']['reservation_id'],
                         outcome='accepted', turn_id=accepted)
         except RetryRefused as error:
-            self.stop(self.state.get(notice['id']), provider_failures.UNSAFE, str(error))
+            await self.stop(self.state.get(notice['id']), provider_failures.UNSAFE, str(error))
         except codex_live.DeliveryError as error:
             event = provider_failures.UNCERTAIN if error.uncertain else provider_failures.UNSAFE
-            self.stop(self.state.get(notice['id']), event,
+            await self.stop(self.state.get(notice['id']), event,
                       'delivery_outcome_unknown' if error.uncertain else 'continuation_prewrite_failed')
         except asyncio.CancelledError:
             cancelled.set()
-            current = self.state.get(notice['id'])
-            if current['provider_retry']['status'] == 'reserved':
-                self.stop(current, provider_failures.UNCERTAIN, 'continuation_cancelled')
+            await stop_cancelled_reservation(self.state, notice, self.action)
             raise
+
+
+def reservation_callback(loop, cancelled, action, notice, fingerprint):
+    """Keep a provider worker parked until its broker reservation is durable."""
+    def check_cancelled():
+        if cancelled.is_set():
+            raise RetryRefused('continuation_cancelled')
+
+    def reserve():
+        check_cancelled()
+        future = asyncio.run_coroutine_threadsafe(
+            action(notice, 'reserve', fingerprint=fingerprint, admit=check_cancelled), loop)
+        try:
+            reservation = future.result(timeout=5)
+        except TimeoutError:
+            cancelled.set()
+            future.cancel()
+            raise
+        check_cancelled()
+        return reservation
+
+    return reserve
+
+
+async def stop_cancelled_reservation(state, notice, action):
+    def require_reservation():
+        if state.get(notice['id'])['provider_retry']['status'] != 'reserved':
+            raise RetryRefused('continuation_cancelled')
+
+    # A cancelled observer can lose its reply while the reservation still
+    # commits. Test its status after that earlier commit has settled.
+    try:
+        await action(notice, 'stop', event=provider_failures.UNCERTAIN,
+                     kind='continuation_cancelled', admit=require_reservation)
+    except RetryRefused:
+        pass
 
 
 async def observe_codex_failures(state, interval, policy=None):
@@ -421,7 +433,7 @@ async def observe_codex_failures(state, interval, policy=None):
             try:
                 failure = await asyncio.to_thread(read_codex_failure, route['session'])
                 if failure is not None:
-                    state.action(dict(op='provider-failure', expected_route=route,
+                    await state.action_async(dict(op='provider-failure', expected_route=route,
                                       source_message_id=source_id, failure=failure))
             except (ValueError, OSError, TypeError, KeyError, AttributeError):
                 # Transport loss or unsupported state is never a provider fault.

@@ -1129,7 +1129,7 @@ class AgyProviderFailureTests(unittest.TestCase):
             asyncio.run(monitor2.check_route(route2))
             root2 = codex_failures.retry_notice(state2, route2)
             now[0] = 105.0
-            monitor2.action(root2, 'reserve', fingerprint=root2['provider_retry']['fingerprint'])
+            asyncio.run(monitor2.action(root2, 'reserve', fingerprint=root2['provider_retry']['fingerprint']))
         with mock.patch.object(route_store, 'verify_route', return_value=None):
             restored = broker.State(store=store2)
         restored_monitor = agy_live.AgyRetryMonitor(restored, policy=policy, clock=lambda: now[0])
