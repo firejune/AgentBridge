@@ -408,7 +408,7 @@ async def observe_codex_failures(state, interval, policy=None):
     while True:
         await asyncio.sleep(interval)
         for route in list(state.endpoints.values()):
-            if route['transport'] != 'codex':
+            if route['transport'] != 'codex' or 'closing' in route:
                 continue
             if monitor is not None:
                 try:

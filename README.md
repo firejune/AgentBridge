@@ -111,6 +111,8 @@ python3 "$bridge_cli" reply MESSAGE_ID --key reply-001 --file /path/to/answer.tx
 
 ## Core Capabilities
 
+If saved metadata confirms that the exact Codex recipient is archived, the CLI reports `state: "failed"` and `reason: "archived"` and exits 1 before contacting Desktop.
+
 ### 1. Session Lifecycle (`sessions`, `open`, `register --new`, `close`)
 
 | Provider | Open Desktop Session | Open IDE Session (`--host ide`) | Close (`bridge.py close NAME --project P --retro-file FILE [--archive]`) |
@@ -131,6 +133,10 @@ python3 "$bridge_cli" close agy-worker --project my-app --retro-file /absolute/r
 # Bring an idle-closed Claude Desktop session back (prints woken, already-live, unsupported or uncertain):
 python3 "$bridge_cli" wake claude-tower --project my-app [--timeout 30]
 ```
+
+After archive is confirmed, the broker removes eligible retained correspondence for the exact session, including aliases, and expires inbox snapshots affected by removal. Provider transcripts remain available. Ordinary close preserves correspondence. Direct archive with `--keep-route` still cleans correspondence.
+
+For a native Codex Desktop archive, explicitly request `close --archive --handoff`. Archive the exact thread in Desktop or use an enrolled operator, then verify completion with `close --finish CLOSE_ID --expect-session UUID`. [Closing a session](skill/agent-bridge/references/usage.md#closing-a-session).
 
 Claude Desktop closes sessions on its own: a hidden session is paused 900 s after its last turn, and the longest-idle session is evicted under memory pressure. The CLI exits and its registry record and inbox socket go away. A `claude-peer` push to such a route wakes it first. The bridge opens `claude://claude.ai/epitaxy/<local_id>` (found in the Desktop metadata by `cliSessionId`), the app resumes the same session ID and transcript under a new PID, and the message is pushed once when the new inbox socket appears. Until then it stays `dispatching`; any other outcome returns it to `pending` with nothing sent. The bridge never reopens or resends on its own. Each wake outcome a push reports is kept with the message as `wakes` (newest last, at most 10) in normalized form only: `state` (`woken`, `already-live`, `unsupported`, `failed` when the opener reported the link was not opened, `uncertain`), a fixed `code` (for example `opener_failed`, `no_desktop_session`, `archived`, `scheduled_task`, `budget_spent`, `record_timeout`, `inbox_timeout`, `host_mismatch`), `elapsed`, `at`, `source` and `attempt`. It survives restarts, the answer and completion; the free-text reason stays in the volatile note and event stream. `bridge.py wake NAME --project P` does the same step explicitly. Opening the link focuses that session in the app and can bring the app forward. Scheduled-task sessions (the app starts them with cross-session messaging off) and IDE sessions are `unsupported`.
 
@@ -226,7 +232,11 @@ python3 "$bridge_cli" wt sweep --apply  # Remove eligible worktrees and branches
 
 A confirmed route/session conflict before broker posting returns `BACKEND_UNAVAILABLE` with a fixed `ROUTE_CHANGED:` message. Initial acceptance returns a tool error without creating an operation; a conflict detected after acceptance ends that operation as `failed`, releasing its slot. The facade never remaps or resends. A route mismatch discovered after the broker send was attempted remains `unknown`.
 
-Local agents (Claude Code, Codex, Antigravity) invoke `bridge.py` directly via the Python CLI and do not register a local MCP server. `skill/agent-bridge/scripts/mcp_server.py` is dedicated to remote MCP clients connecting through a private single-owner tunnel (`--phase1-config /absolute/private.json` over `stdio`), exposing session discovery/creation, message dispatch, and the optional independent inbox (`inbox_enabled: true`). Without `--phase1-config`, the server falls back to read-only `connectivity_only` (`bridge_status`). See [remote-mcp.md](skill/agent-bridge/references/remote-mcp.md) for the full contract. An active Events subscription on a capable connected deployment automatically starts the subscribed GPT/Dot chat when a matching notification arrives; the agent then reads inbox mail or the notified operation result. See [Events and deployment boundaries](skill/agent-bridge/references/remote-mcp.md#optional-mcp-events).
+Local agents (Claude Code, Codex, Antigravity) invoke `bridge.py` directly via the Python CLI and do not register a local MCP server. `skill/agent-bridge/scripts/mcp_server.py` is dedicated to remote MCP clients connecting through a private single-owner tunnel (`--phase1-config /absolute/private.json` over `stdio`), exposing session discovery/creation, message dispatch, and the optional independent inbox (`inbox_enabled: true`). Without `--phase1-config`, the server falls back to read-only `connectivity_only` (`bridge_status`). See [remote-mcp.md](skill/agent-bridge/references/remote-mcp.md) for the full contract.
+
+Independently keyed MCP requests can queue for the same authorized session while it is busy or awaiting replies. Submission order is preserved per exact UUID and transport. Each operation retains its own result. An ambiguous write quarantines only that destination and can return `SESSION_BUSY`. Unknown operations are never resent and count toward the 64 active/unknown operation limit.
+
+Remote MCP Events require `events_enabled: true`, `inbox_enabled: true` and `bridge:read`. A matching signed `bridge.inbox.message.created` webhook can wake a supported ChatGPT Work chat on web or Desktop Work with Cloud selected. Read a captured reply with `bridge_operation_get` when the event carries `operation_id`. Read independent mail with the inbox tools and ACK it explicitly. After a gap, list the inbox and query known operations. Notifications have no replay or automatic retry. [Events contract and setup](skill/agent-bridge/references/remote-mcp.md#optional-mcp-events).
 
 ## Development & Verification
 
@@ -250,8 +260,7 @@ Codex `open` / `register --new` does not register a route when permission verifi
 `close NAME --project P` requires `--retro-file FILE` or `--no-retro "reason"`.
 Missing retros (`RETRO_REQUIRED`), blank files (`RETRO_EMPTY`) and blank opt-out
 reasons (`RETRO_REASON_EMPTY`) are refused before any provider action or route
-removal. Towers and HQ use an explicit `--no-retro` reason. Existing detach,
-archive, timeout and `--keep-route` behavior remains unchanged. A retro is saved
+removal. Towers and HQ use an explicit `--no-retro` reason. A retro is saved
 before close, so a later provider refusal can leave a recorded retro; the receipt
 is not evidence that the session closed. Do not blindly repeat failed closes.
 

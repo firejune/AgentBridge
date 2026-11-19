@@ -111,6 +111,17 @@ def channel_record(item):
     return result
 
 
+def endpoint_record(item):
+    result = route_record(item)
+    if 'closing' in item:
+        close_id = item['closing']
+        if (result['transport'] != 'codex' or not isinstance(close_id, str)
+                or str(uuid.UUID(close_id)) != close_id):
+            raise ValueError('Invalid Codex close generation')
+        result['closing'] = close_id
+    return result
+
+
 def verify_route(route):
     """Verify identity, not Codex liveness; return a reason for an unverified retain."""
     try:
@@ -187,8 +198,10 @@ class RouteStore:
         self.lock.close()
 
     def save(self, endpoints, channels):
-        snapshot = dict(version=1,
-                        endpoints=[route_record(item) for item in endpoints.values()],
+        # An older broker must refuse a snapshot containing delivery guards.
+        version = 2 if any('closing' in item for item in endpoints.values()) else 1
+        snapshot = dict(version=version,
+                        endpoints=[endpoint_record(item) for item in endpoints.values()],
                         channels=[channel_record(item) for item in channels.values()])
         data = (json.dumps(snapshot, ensure_ascii=False) + '\n').encode()
         if len(data) > MAX_SNAPSHOT:
@@ -209,23 +222,28 @@ class RouteStore:
                 data = json.load(source)
             except (ValueError, UnicodeError):
                 raise ValueError('Invalid routing snapshot; refusing to overwrite it') from None
-        if (not isinstance(data, dict) or data.get('version') != 1
+        if (not isinstance(data, dict) or data.get('version') not in (1, 2)
                 or not isinstance(data.get('endpoints'), list) or not isinstance(data.get('channels'), list)):
             raise ValueError('Unsupported routing snapshot; refusing to overwrite it')
         endpoints, channels = {}, {}
         dropped = False
         verified = set()
         for kind, items, output, normalize in (
-                ('endpoint', data['endpoints'], endpoints, route_record),
+                ('endpoint', data['endpoints'], endpoints, endpoint_record),
                 ('channel', data['channels'], channels, channel_record)):
             for index, raw in enumerate(items):
                 item = None
                 failed_check = 'invalid routing record'
+                closing = kind == 'endpoint' and isinstance(raw, dict) and 'closing' in raw
                 try:
                     item = normalize(raw)
+                    if closing and data['version'] != 2:
+                        raise ValueError('Unsupported Codex close snapshot')
                     route = item['route'] if kind == 'channel' else item
                     identity = tuple(route.get(field) for field in ROUTE_FIELDS)
-                    if identity not in verified:
+                    # Preserve the guard until finish even if the workspace or
+                    # native archive is temporarily unavailable after restart.
+                    if not closing and identity not in verified:
                         failed_check = 'route verification failed'
                         retained = verify_route(route)
                         if isinstance(retained, str):
@@ -239,6 +257,8 @@ class RouteStore:
                         raise ValueError('Duplicate routing key')
                     output[key] = item
                 except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired) as error:
+                    if closing:
+                        raise ValueError('Invalid closing endpoint; refusing to discard its guard') from None
                     # Exceptions from discovery can contain peer tokens/socket
                     # paths or provider payloads. Log only validated aliases and index.
                     diagnostic = dict(routing_drop=kind, index=index,

@@ -69,12 +69,24 @@ class WakeEvidenceTests(WakeFixture):
                 bridge.push(server.path,message,wake_timeout=2)
             self.assertEqual(caught.exception.message['wake']['state'],'failed')
             self.assertIn('-54',server.call('show',id=message['id'])['note'])  # Volatile only.
-            server.restart()
+            # Plant an allowed UUID containing the short error substring in
+            # the stopped broker's private fixture, then restore normally.
+            server.call('shutdown')
+            server.process.communicate(timeout=2)
+            checkpoint_path = Path(server.state_dir) / 'correspondence.json'
+            checkpoint = json.loads(checkpoint_path.read_text())
+            conversation = '7340c5b3-8390-4d3d-a46b-547e139fd7af'
+            next(item for item in checkpoint['messages'] if item['id'] == message['id'])['conversation'] = conversation
+            checkpoint_path.write_text(json.dumps(checkpoint))
+            server.start()
             stored = server.call('show',id=message['id'])
             self.assertEqual(stored['state'],'pending')
+            self.assertEqual(stored['conversation'], conversation)
             self.assertEqual((stored['wakes'][-1]['state'],stored['wakes'][-1]['code']),('failed','opener_failed'))
             self.assertNotIn('peer_retry',stored)
-            self.assertNotIn('-54',self.kept(server))
+            self.assertIsNone(stored['note'])
+            diagnostics = json.dumps({'note': stored['note'], 'wakes': stored['wakes']})
+            self.assertNotIn('-54', diagnostics)
             self.assertNotIn('secret',self.kept(server))
             frame.assert_not_called()
 

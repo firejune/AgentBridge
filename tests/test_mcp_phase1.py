@@ -348,9 +348,167 @@ class PhaseTest(unittest.TestCase):
         sent=self.send(sid); again=self.send(sid)
         self.assertTrue(again['data']['replayed']); self.assertEqual(sent['data']['operation_id'],again['data']['operation_id'])
         self.assertEqual(self.send(sid,text='different')['error']['code'],'IDEMPOTENCY_CONFLICT')
-        self.assertEqual(self.send(sid,key='other_message_0001')['error']['code'],'SESSION_BUSY')
+        self.assertTrue(self.send(sid,key='other_message_0001')['ok'])
+
+    def test_distinct_keys_queue_fifo_and_keep_independent_out_of_order_replies(self):
+        sid=self.create()['agent_session_id']
+        submitted=[]
+        original=self.backend.post
+        def post(op, session):
+            submitted.append(op['message'])
+            return original(op, session)
+        self.backend.post=post
+        accepted=[self.send(sid,key='queued_message_%04d'%i,text='message %d'%i)['data'] for i in range(3)]
+        self.engine.tick()
+        self.assertEqual(submitted,['message 0','message 1','message 2'])
+        ops=[self.engine.operation(a['operation_id'],'owner-a') for a in accepted]
+        self.assertEqual(len({o['backend_id'] for o in ops}),3)
+        self.assertTrue(all(o['stage']=='observing' and o['status']=='running' for o in ops))
+        for i in (2,0,1):
+            op=ops[i]
+            self.backend.replies[op['backend_id']]=[
+                {'id':'wrong','reply_to':ops[(i+1)%3]['backend_id'],'created':0,'body':'wrong answer'},
+                {'id':'reply%d'%i,'reply_to':op['backend_id'],'created':1,'body':'answer %d'%i}]
+            self.engine.tick()
+            self.assertEqual(self.engine.get({'operation_id':op['operation_id']},'owner-a')['result']['text'],'answer %d'%i)
+        self.assertEqual((self.backend.posts,self.backend.pushes),(3,3))
+
+    def test_concurrent_distinct_keys_and_replay_at_global_capacity(self):
+        sid=self.create()['agent_session_id']
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results=list(pool.map(lambda i:self.send(sid,key='concurrent_send_%04d'%i),range(64)))
+        self.assertTrue(all(r['ok'] for r in results))
+        self.assertEqual(len({r['data']['operation_id'] for r in results}),64)
+        self.assertEqual(self.send(sid,key='over_capacity_00001')['error']['code'],'CAPACITY_EXCEEDED')
+        self.assertTrue(self.send(sid,key='concurrent_send_0000')['data']['replayed'])
+        self.assertEqual(self.send(sid,key='concurrent_send_0000',text='changed')['error']['code'],'IDEMPOTENCY_CONFLICT')
+        self.assertEqual((self.backend.posts,self.backend.pushes),(0,0))
+
+    def test_accept_during_push_queues_until_serial_dispatch_returns(self):
+        sid=self.create()['agent_session_id']; entered=threading.Event(); release=threading.Event()
+        original=self.backend.push
+        def push(message, session):
+            entered.set()
+            if not release.wait(3): raise RuntimeError('test did not release push')
+            return original(message, session)
+        self.backend.push=push
+        first=self.send(sid)['data']
+        thread=threading.Thread(target=self.engine.tick); thread.start()
+        try:
+            self.assertTrue(entered.wait(3))
+            second=self.send(sid,key='during_push_000001')['data']
+            self.assertEqual(self.engine.operation(first['operation_id'],'owner-a')['stage'],'push_intent')
+            self.assertEqual(self.engine.operation(second['operation_id'],'owner-a')['stage'],'queued')
+            self.assertEqual((self.backend.posts,self.backend.pushes),(1,0))
+        finally:
+            release.set(); thread.join(3)
+        self.engine.tick()
+        self.assertEqual((self.backend.posts,self.backend.pushes),(2,2))
+
+    def test_busy_created_and_pinned_sessions_accept_all_provider_types(self):
+        for agent_type in phase.AGENT_TYPES:
+            with self.subTest(agent_type=agent_type):
+                self.config['workspaces']['test']['agent_type']=agent_type
+                sid=self.create('create_busy_'+agent_type+'_001')['agent_session_id']
+                self.backend.availability=lambda s:'busy'
+                self.assertTrue(self.send(sid,key='busy_created_'+agent_type)['ok'])
+                self.engine.tick()
+                pinned=self.grant()
+                self.config['pinned_sessions']['hq']['agent_type']=agent_type
+                pinned=next(iter(phase.pinned_sessions(self.config)))
+                self.assertTrue(self.send(pinned,key='busy_pinned_'+agent_type+'_001')['ok'])
+                self.engine.tick()
+        self.assertEqual((self.backend.posts,self.backend.pushes),(6,6))
+
+    def test_unknown_quarantines_queued_alias_until_read_only_reply_settles(self):
+        sid=self.grant()
+        grant=dict(self.config['pinned_sessions']['hq'],route='alias-route')
+        self.config['pinned_sessions']['alias']=grant
+        alias=next(s for s in phase.pinned_sessions(self.config) if s!=sid)
+        first=self.send(sid)['data']; second=self.send(alias,key='alias_queued_00001')['data']
+        self.backend.crash='push'; self.engine.tick()
+        first_op=self.engine.operation(first['operation_id'],'owner-a')
+        self.assertEqual(first_op['status'],'unknown')
+        self.assertEqual(self.engine.operation(second['operation_id'],'owner-a')['stage'],'queued')
+        self.assertEqual((self.backend.posts,self.backend.pushes),(1,1))
+        self.assertEqual(self.send(alias,key='alias_blocked_0001')['error']['code'],'SESSION_BUSY')
+        self.assertTrue(self.send(sid)['data']['replayed'])
+        self.assertEqual(self.send(sid,text='changed')['error']['code'],'IDEMPOTENCY_CONFLICT')
+        self.restart(); self.engine.tick()
+        self.assertEqual((self.backend.posts,self.backend.pushes),(1,1))
+        self.backend.replies[first_op['backend_id']]=[{'id':'late','reply_to':first_op['backend_id'],'created':1,'body':'delivered'}]
+        self.backend.crash=None; self.engine.watch_at.clear(); self.engine.tick()
+        self.assertEqual(self.engine.operation(first['operation_id'],'owner-a')['status'],'succeeded')
+        self.assertEqual(self.engine.operation(second['operation_id'],'owner-a')['stage'],'observing')
+        self.assertEqual((self.backend.posts,self.backend.pushes),(2,2))
+
+    def test_restart_queued_messages_preserves_fifo_without_repeating_dispatch(self):
+        sid=self.create()['agent_session_id']
+        first=self.send(sid)['data']; self.engine.tick()
+        second=self.send(sid,key='restart_queued_0001')['data']
+        self.restart(); self.engine.tick(); self.restart(); self.engine.tick()
+        self.assertEqual((self.backend.posts,self.backend.pushes),(2,2))
+        self.assertEqual(self.engine.operation(first['operation_id'],'owner-a')['stage'],'observing')
+        self.assertEqual(self.engine.operation(second['operation_id'],'owner-a')['stage'],'observing')
+
+    def test_unknown_result_allows_new_message_without_resending_old_message(self):
+        sid=self.create()['agent_session_id']; first=self.send(sid)['data']; self.engine.tick()
+        op=self.engine.operation(first['operation_id'],'owner-a')
+        self.engine.fail(op)
+        self.assertTrue(self.send(sid,key='unknown_result_new1')['ok'])
+        self.engine.tick(); self.restart(); self.engine.tick()
+        self.assertEqual(self.engine.operation(first['operation_id'],'owner-a')['status'],'unknown')
+        self.assertEqual((self.backend.posts,self.backend.pushes),(2,2))
+
+    def test_unsafe_unknown_classification_and_transport_identity(self):
+        sid=self.grant(); accepted=self.send(sid)['data']
+        op=self.engine.operation(accepted['operation_id'],'owner-a')
+        destination=op['destination']
+        for stage, state, backend_id in (
+                ('post_intent',None,None),('posted','pending','known'),
+                ('push_intent','submitted','known'),('observing','uncertain','known'),
+                ('observing','dispatching','known'),('observing','submitted',None)):
+            with self.subTest(stage=stage,state=state,backend_id=backend_id):
+                self.engine.update(op,status='unknown',stage=stage,backend_message_state=state,backend_id=backend_id)
+                self.assertEqual(self.send(sid,key='unsafe_classification')['error']['code'],'SESSION_BUSY')
+        # Provider identities remain distinct even when UUID strings coincide.
+        self.config['pinned_sessions']['other']=dict(self.config['pinned_sessions']['hq'],
+            route='other-provider',agent_type='agy')
+        other=next(s for s in phase.pinned_sessions(self.config) if s!=sid)
+        self.assertTrue(self.send(other,key='different_transport')['ok'])
+        # A current grant cannot prove a legacy write's original transport.
+        op.pop('destination'); self.engine.update(op)
+        self.assertIsNone(self.engine.operation_destination(op))
+        self.assertEqual(self.send(sid,key='legacy_quarantine_1')['error']['code'],'SESSION_BUSY')
+
+    def test_effective_transport_is_snapshotted_and_retargeting_refuses_dispatch(self):
+        sid=self.grant()
+        transport=['agy']
+        self.backend.session_transport=lambda session:transport[0]
+        first=self.send(sid)['data']
+        op=self.engine.operation(first['operation_id'],'owner-a')
+        self.assertEqual(op['destination'],{'uuid':self.config['pinned_sessions']['hq']['uuid'],'transport':'agy'})
+        transport[0]='claude-peer'
+        self.engine.tick()
+        saved=self.engine.operation(first['operation_id'],'owner-a')
+        self.assertEqual((saved['status'],saved['failure']['code']),('failed','BACKEND_UNAVAILABLE'))
+        self.assertEqual((self.backend.posts,self.backend.pushes),(0,0))
+
+    def test_legacy_unsafe_identity_cannot_follow_current_transport_past_alias_quarantine(self):
+        sid=self.grant(); current=['agy']
+        self.backend.session_transport=lambda s:s['transport'] if s.get('explicit_type') else current[0]
+        accepted=self.send(sid)['data']; op=self.engine.operation(accepted['operation_id'],'owner-a')
+        op.pop('destination'); self.engine.update(op,status='unknown',stage='post_intent')
+        current[0]='claude-peer'
+        self.config['pinned_sessions']['original']=dict(self.config['pinned_sessions']['hq'],
+            route='original-transport',agent_type='agy')
+        alias=next(s for s in phase.pinned_sessions(self.config) if s!=sid)
+        self.assertEqual(self.send(alias,key='legacy_original_alias')['error']['code'],'SESSION_BUSY')
+        # Result uncertainty is independent of identity recovery: no old write is retried.
+        self.engine.update(op,stage='observing',backend_id='known',backend_message_state='submitted')
+        self.assertTrue(self.send(alias,key='legacy_result_alias')['ok'])
     def test_definite_broker_capacity_refusal_fails_without_push_and_releases_target(self):
-        for index, reason in enumerate(sorted(broker.MESSAGE_CAPACITY_ERRORS)):
+        for index, reason in enumerate(sorted(phase.MESSAGE_CAPACITY_ERRORS)):
             with self.subTest(reason=reason):
                 sid = self.create('create_capacity_%02d' % index)['agent_session_id']
                 oid = self.send(sid, key='capacity_message_%02d' % index)['data']['operation_id']
@@ -372,6 +530,7 @@ class PhaseTest(unittest.TestCase):
                 self.engine.tick()
                 self.assertEqual(self.backend.pushes, pushes + 1)
 
+
     def test_ambiguous_post_errors_remain_unknown_without_retry_and_hold_target(self):
         errors = (TimeoutError('response lost'), OSError('disconnected'),
                   ValueError('unrecognized post response'), ValueError(phase.REGISTER_CONFLICT_ERROR))
@@ -389,6 +548,103 @@ class PhaseTest(unittest.TestCase):
                 self.assertEqual(operation['failure']['code'], 'DELIVERY_UNKNOWN')
                 self.assertEqual(self.backend.pushes, pushes)
                 self.assertEqual(self.send(sid, key='after_ambiguous_%02d' % index)['error']['code'], 'SESSION_BUSY')
+
+
+    def test_answered_without_retained_reply_releases_target_and_late_watch_settles(self):
+        sid, oid, mid = self.observing()
+        self.backend.messages[mid]['state'] = 'answered'
+        self.engine.tick()
+        op = self.call('bridge_operation_get', operation_id=oid)['data']
+        self.assertEqual((op['status'], op['failure']['code'], op['failure']['message']),
+                         ('failed', 'BACKEND_UNAVAILABLE', phase.REPLY_NOT_RETAINED_MESSAGE))
+        self.assertTrue(self.send(sid, key='after_lost_reply_001')['ok'])
+        # A later reply is observed without replaying the original post/push.
+        self.reply(mid, 'retained later answer')
+        self.engine.tick()
+        result = self.call('bridge_operation_get', operation_id=oid)['data']
+        self.assertEqual((result['status'], result['result']['text']), ('succeeded', 'retained later answer'))
+        self.assertEqual(self.engine.operation(oid, 'owner-a')['settled_after'],
+                         {'status': 'failed', 'code': 'BACKEND_UNAVAILABLE'})
+        self.assertEqual((self.backend.posts, self.backend.pushes), (2, 2))  # New explicit operation only.
+
+
+    def test_exact_missing_delivered_message_releases_target_without_replay(self):
+        sid, oid, mid = self.observing()
+        with patch.object(self.backend, 'observe', side_effect=ValueError(phase.UNKNOWN_MESSAGE)):
+            self.engine.tick()
+            self.engine.tick()
+        operation = self.call('bridge_operation_get', operation_id=oid)['data']
+        self.assertEqual((operation['status'], operation['failure']['code'], operation['failure']['message']),
+                         ('failed', 'BACKEND_UNAVAILABLE', phase.MESSAGE_NOT_RETAINED_MESSAGE))
+        self.assertEqual((self.backend.posts, self.backend.pushes), (1, 1))
+        self.assertTrue(self.send(sid, key='after_lost_message_1')['ok'])
+
+
+    def test_missing_message_epoch_race_or_unreadable_recheck_remains_unknown(self):
+        for index, changed in enumerate(('new-instance', TimeoutError('epoch unavailable'))):
+            with self.subTest(changed=type(changed).__name__):
+                sid, oid, mid = self.observing('missing_epoch_%02d' % index)
+                with patch.object(self.backend, 'instance', side_effect=[self.backend.current, changed]), patch.object(self.backend, 'observe', side_effect=ValueError(phase.UNKNOWN_MESSAGE)):
+                    self.engine.tick()
+                operation = self.call('bridge_operation_get', operation_id=oid)['data']
+                self.assertEqual((operation['status'], operation['failure']['code']), ('unknown', 'DELIVERY_UNKNOWN'))
+                self.assertFalse(self.engine.blocked([self.engine.operation(oid, 'owner-a')],
+                                                     self.engine.destination(self.engine.session(sid, 'owner-a'))))
+        self.assertEqual((self.backend.posts, self.backend.pushes), (2, 2))
+
+
+    def test_wrong_answered_parent_is_not_classified_as_missing_reply(self):
+        sid, oid, mid = self.observing()
+        self.engine.observe_retry_limit = 1
+        with patch.object(self.backend, 'observe', return_value=({'id': 'wrong-parent', 'state': 'answered'}, [])):
+            self.engine.tick()
+        operation = self.call('bridge_operation_get', operation_id=oid)['data']
+        self.assertEqual((operation['status'], operation['failure']['code']), ('unknown', 'DELIVERY_UNKNOWN'))
+        self.assertEqual((self.backend.posts, self.backend.pushes), (1, 1))
+
+
+    def test_missing_message_without_confirmed_delivery_remains_ambiguous(self):
+        sid, oid, mid = self.observing()
+        op = self.engine.operation(oid, 'owner-a')
+        self.engine.update(op, stage='posted', backend_message_state='pending')
+        self.engine.observe_retry_limit = 1
+        with patch.object(self.backend, 'observe', side_effect=ValueError(phase.UNKNOWN_MESSAGE)):
+            self.engine.tick()
+        operation = self.call('bridge_operation_get', operation_id=oid)['data']
+        self.assertEqual((operation['status'], operation['failure']['code']), ('unknown', 'DELIVERY_UNKNOWN'))
+        self.assertEqual(self.send(sid, key='still_ambiguous_001')['error']['code'], 'SESSION_BUSY')
+        self.assertEqual((self.backend.posts, self.backend.pushes), (1, 1))
+
+
+    def test_exact_capacity_wire_matches_legacy_embedded_broker_without_new_import(self):
+        self.assertEqual(phase.MESSAGE_CAPACITY_ERRORS, broker.MESSAGE_CAPACITY_ERRORS)
+        state = broker.State(max_messages=1)
+        for name in ('alpha', 'beta'):
+            state.action(dict(op='register', project='synthetic', name=name, cwd='/tmp'))
+        args = dict(op='send', project='synthetic', sender='alpha', recipient='beta', body='synthetic', key='first')
+        state.action(args)
+        with self.assertRaises(ValueError) as caught:
+            state.action(dict(args, key='second'))
+        self.assertIn(str(caught.exception), phase.MESSAGE_CAPACITY_ERRORS)
+        self.assertEqual(len(phase.MESSAGE_CAPACITY_ERRORS), 2)
+        self.assertIn('Active-message limit reached: TTL or protected work prevents safe cleanup; inspect retention --live; no messages evicted before TTL', phase.MESSAGE_CAPACITY_ERRORS)
+
+    def test_late_retention_result_preserves_event_parent_and_committed_notification(self):
+        sid, oid, mid = self.observing()
+        self.backend.messages[mid]['state'] = 'answered'
+        with patch.object(self.engine, 'events') as events:
+            self.engine.tick()
+            self.assertEqual(self.engine.operation(oid, 'owner-a')['status'], 'failed')
+            events.result_ready.assert_not_called()
+            self.reply(mid, 'retained late result')
+            self.engine.tick()
+            events.result_ready.assert_called_once()
+            operation, parent, replies = events.result_ready.call_args.args
+            self.assertEqual(parent['id'], mid)
+            self.assertEqual(replies[0]['body'], 'retained late result')
+            self.assertEqual(operation['status'], 'succeeded')
+            self.assertEqual(self.engine.operation(oid, 'owner-a')['status'], 'succeeded')
+        self.assertEqual((self.backend.posts, self.backend.pushes), (1, 1))
 
     def test_post_push_reply_and_immutable_pagination(self):
         sid=self.create()['agent_session_id']; accepted=self.send(sid,text='  exact 한글  ')['data']
@@ -444,19 +700,78 @@ class PhaseTest(unittest.TestCase):
         self.restart(); self.backend.register_error=False
         result=self.engine.recover_registration(op['operation_id'])
         self.assertEqual(result['status'],'succeeded'); self.assertEqual(self.backend.creates,1)
-    def test_recovery_observes_only_and_broker_loss_blocks(self):
+    def test_closing_route_refuses_post_without_unknown_or_push(self):
+        self.assertEqual(phase.CLOSING_ROUTE_ERROR, broker.CLOSING_ROUTE_ERROR)
+        sid = self.create()['agent_session_id']
+        key = 'closing_route_message'
+        oid = self.send(sid, key=key)['data']['operation_id']
+        with patch.object(self.backend, 'post', side_effect=ValueError(broker.CLOSING_ROUTE_ERROR)) as post:
+            self.engine.tick()
+            self.assertEqual(post.call_count, 1)
+        operation = self.call('bridge_operation_get', operation_id=oid)['data']
+        self.assertEqual((operation['status'], operation['failure']['code']), ('failed', 'BACKEND_UNAVAILABLE'))
+        self.assertEqual(operation['failure']['message'], broker.CLOSING_ROUTE_ERROR)
+        self.assertEqual(self.backend.pushes, 0)
+        self.assertTrue(self.send(sid, key=key)['data']['replayed'])
+        self.assertTrue(self.send(sid, key='after_closing_route_01')['ok'])
+
+    def test_archived_push_and_observation_fail_definitely_without_replay(self):
+        for mode in ('push', 'observe'):
+            with self.subTest(mode=mode):
+                sid = self.create('archive_create_' + mode)['agent_session_id']
+                key = 'archive_message_' + mode
+                oid = self.send(sid, key=key)['data']['operation_id']
+
+                def reject(message, session):
+                    self.backend.pushes += 1
+                    failure = dict(message, state='failed', reason=phase.bridge.ARCHIVED_REASON)
+                    self.backend.messages[message['id']] = failure
+                    raise phase.bridge.PushFailed('archived', failure)
+
+                if mode == 'push':
+                    with patch.object(self.backend, 'push', side_effect=reject):
+                        self.engine.tick()
+                else:
+                    self.engine.tick()
+                    mid = self.engine.operation(oid, 'owner-a')['backend_id']
+                    self.backend.messages[mid].update(state='failed', reason=phase.bridge.ARCHIVED_REASON)
+                    self.engine.tick()
+                self.restart()
+                result = self.call('bridge_operation_get', operation_id=oid)['data']
+                self.assertEqual((result['status'], result['backend_message_state']), ('failed', 'failed'))
+                self.assertEqual(result['failure']['code'], 'BACKEND_UNAVAILABLE')
+                self.assertEqual(result['failure']['message'], phase.bridge.codex_live.ThreadArchived.MESSAGE)
+                counts = (self.backend.posts, self.backend.pushes)
+                self.assertTrue(self.send(sid, key=key)['data']['replayed'])
+                self.engine.tick()
+                self.assertEqual((self.backend.posts, self.backend.pushes), counts)
+                self.assertTrue(self.send(sid, key='fresh_after_archive_' + mode)['ok'])
+                self.engine.fail(self.engine.rows()[-1], 'BACKEND_UNAVAILABLE', unknown=False)
+
+    def test_recovery_observes_only_and_broker_loss_does_not_replay_delivered_message(self):
         sid=self.create()['agent_session_id']; oid=self.send(sid)['data']['operation_id']; self.engine.tick()
         self.restart(); self.assertEqual(self.engine.operation(oid,'owner-a')['status'],'running')
         self.assertEqual(self.backend.pushes,1)
         self.backend.current='restarted'; self.engine.tick()
         self.assertEqual(self.engine.operation(oid,'owner-a')['status'],'unknown')
-        self.assertEqual(self.send(sid,key='new_message_00001')['error']['code'],'SESSION_BUSY')
+        self.assertTrue(self.send(sid,key='new_message_00001')['ok'])
     def test_posted_restart_is_unknown_not_pushed(self):
         sid=self.create()['agent_session_id']; oid=self.send(sid)['data']['operation_id']
         op=self.engine.operation(oid,'owner-a'); m=self.backend.post(op,{})
         self.engine.update(op,status='running',stage='posted',backend_id=m['id'],instance=self.backend.current)
         self.restart(); self.assertEqual(self.engine.operation(oid,'owner-a')['status'],'unknown')
         self.assertEqual(self.backend.pushes,0)
+
+    def test_restart_with_existing_reply_preserves_committed_success(self):
+        sid=self.create()['agent_session_id']; oid=self.send(sid)['data']['operation_id']; self.engine.tick()
+        op=self.engine.operation(oid,'owner-a')
+        self.backend.replies[op['backend_id']]=[{'id':'restart-answer','reply_to':op['backend_id'],
+            'created':'1','body':'reply present before facade restart'}]
+        self.restart()
+        result=self.engine.get({'operation_id':oid},'owner-a')
+        self.assertEqual(result['status'],'succeeded')
+        self.assertEqual(result['result']['text'],'reply present before facade restart')
+        self.assertEqual(self.backend.pushes,1)
     def test_evicted_message_unknown(self):
         sid=self.create()['agent_session_id']; oid=self.send(sid)['data']['operation_id']; self.engine.tick()
         self.engine.observe_retry_base=0; self.backend.messages.clear(); self.engine.tick()
@@ -497,66 +812,6 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(self.engine.operation(oid,'owner-a')['observe_errors'],0)
         self.assertEqual((self.backend.posts,self.backend.pushes),(1,1))
         self.assertTrue(self.send(sid,key='next_message_0001')['ok'])
-
-    def test_answered_without_retained_reply_releases_target_and_late_watch_settles(self):
-        sid, oid, mid = self.observing()
-        self.backend.messages[mid]['state'] = 'answered'
-        self.engine.tick()
-        op = self.call('bridge_operation_get', operation_id=oid)['data']
-        self.assertEqual((op['status'], op['failure']['code'], op['failure']['message']),
-                         ('failed', 'BACKEND_UNAVAILABLE', phase.REPLY_NOT_RETAINED_MESSAGE))
-        self.assertTrue(self.send(sid, key='after_lost_reply_001')['ok'])
-        # A later reply is observed without replaying the original post/push.
-        self.reply(mid, 'retained later answer')
-        self.engine.tick()
-        result = self.call('bridge_operation_get', operation_id=oid)['data']
-        self.assertEqual((result['status'], result['result']['text']), ('succeeded', 'retained later answer'))
-        self.assertEqual(self.engine.operation(oid, 'owner-a')['settled_after'],
-                         {'status': 'failed', 'code': 'BACKEND_UNAVAILABLE'})
-        self.assertEqual((self.backend.posts, self.backend.pushes), (2, 2))  # New explicit operation only.
-
-    def test_exact_missing_delivered_message_releases_target_without_replay(self):
-        sid, oid, mid = self.observing()
-        with patch.object(self.backend, 'observe', side_effect=ValueError(phase.UNKNOWN_MESSAGE)):
-            self.engine.tick()
-            self.engine.tick()
-        operation = self.call('bridge_operation_get', operation_id=oid)['data']
-        self.assertEqual((operation['status'], operation['failure']['code'], operation['failure']['message']),
-                         ('failed', 'BACKEND_UNAVAILABLE', phase.MESSAGE_NOT_RETAINED_MESSAGE))
-        self.assertEqual((self.backend.posts, self.backend.pushes), (1, 1))
-        self.assertTrue(self.send(sid, key='after_lost_message_1')['ok'])
-
-    def test_missing_message_epoch_race_or_unreadable_recheck_remains_unknown(self):
-        for index, changed in enumerate(('new-instance', TimeoutError('epoch unavailable'))):
-            with self.subTest(changed=type(changed).__name__):
-                sid, oid, mid = self.observing('missing_epoch_%02d' % index)
-                with patch.object(self.backend, 'instance', side_effect=[self.backend.current, changed]), patch.object(self.backend, 'observe', side_effect=ValueError(phase.UNKNOWN_MESSAGE)):
-                    self.engine.tick()
-                operation = self.call('bridge_operation_get', operation_id=oid)['data']
-                self.assertEqual((operation['status'], operation['failure']['code']), ('unknown', 'DELIVERY_UNKNOWN'))
-                self.assertEqual(self.send(sid, key='epoch_still_busy_%02d' % index)['error']['code'], 'SESSION_BUSY')
-        self.assertEqual((self.backend.posts, self.backend.pushes), (2, 2))
-
-    def test_wrong_answered_parent_is_not_classified_as_missing_reply(self):
-        sid, oid, mid = self.observing()
-        self.engine.observe_retry_limit = 1
-        with patch.object(self.backend, 'observe', return_value=({'id': 'wrong-parent', 'state': 'answered'}, [])):
-            self.engine.tick()
-        operation = self.call('bridge_operation_get', operation_id=oid)['data']
-        self.assertEqual((operation['status'], operation['failure']['code']), ('unknown', 'DELIVERY_UNKNOWN'))
-        self.assertEqual((self.backend.posts, self.backend.pushes), (1, 1))
-
-    def test_missing_message_without_confirmed_delivery_remains_ambiguous(self):
-        sid, oid, mid = self.observing()
-        op = self.engine.operation(oid, 'owner-a')
-        self.engine.update(op, stage='posted', backend_message_state='pending')
-        self.engine.observe_retry_limit = 1
-        with patch.object(self.backend, 'observe', side_effect=ValueError(phase.UNKNOWN_MESSAGE)):
-            self.engine.tick()
-        operation = self.call('bridge_operation_get', operation_id=oid)['data']
-        self.assertEqual((operation['status'], operation['failure']['code']), ('unknown', 'DELIVERY_UNKNOWN'))
-        self.assertEqual(self.send(sid, key='still_ambiguous_001')['error']['code'], 'SESSION_BUSY')
-        self.assertEqual((self.backend.posts, self.backend.pushes), (1, 1))
 
     def test_failed_observe_waits_before_the_next_read(self):
         sid,oid,mid=self.observing(); calls=self.flaky(1)
@@ -607,7 +862,8 @@ class PhaseTest(unittest.TestCase):
                 closed=self.engine.operation(oid,'owner-a')
                 self.assertEqual(closed['status'],state); code=closed['failure']['code']
                 if state=='unknown':
-                    self.assertEqual(self.send(sid,key='blocked_message_001')['error']['code'],'SESSION_BUSY')
+                    self.assertTrue(self.send(sid,key='independent_message_001')['ok'])
+                    self.engine.tick()
                 counts=(self.backend.posts,self.backend.pushes)
                 self.engine.watch_at.clear(); self.engine.tick()
                 self.assertEqual(self.engine.operation(oid,'owner-a')['status'],state)
@@ -722,6 +978,20 @@ class PhaseTest(unittest.TestCase):
         with self.assertRaises(SystemExit),patch('sys.stderr',io.StringIO()):
             mcp_server.main(['--http','0','--phase1-config',str(p)])
 
+    def test_modern_protocol_flag_is_optional_and_strictly_boolean(self):
+        path = self.root/'modern-config.json'
+        for value in (False, True):
+            config = dict(self.config, mcp_2026_enabled=value)
+            path.write_text(json.dumps(config)); path.chmod(0o600)
+            self.assertIs(phase.load_config(path)['mcp_2026_enabled'], value)
+        for value in (None, 1, 'true', []):
+            config = dict(self.config, mcp_2026_enabled=value)
+            path.write_text(json.dumps(config)); path.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, 'mcp_2026_enabled'):
+                phase.load_config(path)
+            with self.assertRaisesRegex(ValueError, 'mcp_2026_enabled'):
+                phase.Engine(config, self.backend, start=False)
+
     def test_schema_contracts(self):
         if jsonschema:
             for tool in phase.TOOLS:
@@ -775,6 +1045,47 @@ class BrokerIntegrationTest(unittest.TestCase):
                         self.assertEqual(backend.create(workspace), sid)
                     opening.assert_called_once_with('codex', cwd=str(root), model=expected,
                                                     host='desktop', timeout=180)
+
+    def test_implicit_pin_retarget_during_dispatch_never_redirects_provider_write(self):
+        for boundary in ('acceptance','availability','post','push'):
+            with self.subTest(boundary=boundary), RunningBroker() as running, tempfile.TemporaryDirectory(dir='/tmp') as temp:
+                root=str(Path(temp).resolve()); uuid_value=str(uuid.uuid4())
+                config={'principal':'test-owner','tunnel_id':'isolated-retarget','writes_enabled':True,
+                    'scopes':list(set(phase.SCOPES.values())),'state_dir':root+'/state',
+                    'workspaces':{'test':{'cwd':root,'root':root,'project':'mcp-test','ide':sessions_ide()}},
+                    'pinned_sessions':{'hq':{'uuid':uuid_value,'cwd':root,'project':'mcp-test',
+                        'route':'hq','authorized_at':phase.stamp()}}}
+                running.call('register',project='mcp-test',name='hq',cwd=root,transport='agy',session=uuid_value)
+                backend=phase.Backend(running.path); engine=phase.Engine(config,backend,start=False)
+                self.addCleanup(engine.close)
+                row={'id':uuid_value,'cwd':root,'status':'running'}
+                with patch.object(phase.sessions,'resolve_agy_peer',return_value=row), \
+                     patch.object(phase.sessions,'resolve_codex_peer',return_value=row), \
+                     patch.object(phase.bridge,'push_if_peer') as provider_write:
+                    sid=next(iter(phase.pinned_sessions(config)))
+                    args={'agent_session_id':sid, 'message':'must stay on original provider',
+                          'idempotency_key':'dispatch_retarget_001'}
+                    stage = 'availability' if boundary == 'acceptance' else boundary
+                    original=getattr(backend,stage)
+                    def retarget(*args, **kwargs):
+                        if boundary=='availability':
+                            result=original(*args,**kwargs)
+                        running.call('unregister',project='mcp-test',name='hq')
+                        running.call('register',project='mcp-test',name='hq',cwd=root,transport='codex',session=uuid_value)
+                        return result if boundary=='availability' else original(*args,**kwargs)
+                    if boundary == 'acceptance':
+                        setattr(backend,stage,retarget)
+                        refused=engine.call('bridge_message_send',args)
+                        self.assertEqual(refused['error']['message'], phase.ROUTE_CHANGED_MESSAGE)
+                        self.assertEqual(engine.rows(), [])
+                    else:
+                        accepted=engine.call('bridge_message_send',args)['data']
+                        setattr(backend,stage,retarget)
+                        engine.tick()
+                        operation=engine.operation(accepted['operation_id'],'test-owner')
+                        expected = 'unknown' if boundary == 'push' else 'failed'
+                        self.assertEqual(operation['status'], expected)
+                    provider_write.assert_not_called()
 
     def test_real_broker_post_push_and_correlated_reply(self):
         with RunningBroker() as running, tempfile.TemporaryDirectory(prefix='mcp-',dir='/tmp') as temp:

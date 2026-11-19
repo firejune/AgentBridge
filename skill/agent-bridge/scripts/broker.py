@@ -18,6 +18,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import route_store
+import codex_preview
 import message_store
 import retention
 import usage
@@ -34,6 +35,9 @@ INBOX_SNAPSHOT_BYTES = 4 * 1024 * 1024
 INBOX_TOTAL_BYTES = 16 * 1024 * 1024
 INBOX_PAGE_BYTES = 128 * 1024
 INBOX_MAX_RECEIPTS = 8192
+CLOSE_KEY_PREFIX = 'agent-bridge-close:'
+CLOSE_OPERATOR_FILE = 'close-operator.json'
+CLOSING_ROUTE_ERROR = 'Codex route is closing'
 
 
 def now():
@@ -55,6 +59,10 @@ def wire(value):
 
 def route_key(route):
     return tuple(route.get(k) for k in ('project','name','transport','session','cwd','channel','generation'))
+
+
+def same_codex_thread(left, right):
+    return left['transport'] == right['transport'] == 'codex' and left['session'] == right['session']
 
 
 TERMINAL_STATES = frozenset(('done', 'answered', 'failed'))
@@ -153,7 +161,7 @@ class State:
             reply_parents = {m['reply_to'] for m in self.messages.values()}
             for mid, message in (self.messages | self.compact_messages).items():
                 self.answers[mid] = asyncio.Event()
-                if mid in reply_parents:
+                if mid in reply_parents or ('close_request' in message and message['state'] == 'done'):
                     self.answers[mid].set()
                 if message['state'] == 'dispatching':
                     message.update(state='uncertain', note='Broker restarted during delivery; resolve explicitly')
@@ -298,15 +306,22 @@ class State:
                 return self.delivery_wait(blocker)
         return {}
 
+    def require_open_route(self, route):
+        if route['transport'] == 'codex' and any(
+                'closing' in item and same_codex_thread(route, item) for item in self.endpoints.values()):
+            raise ValueError(CLOSING_ROUTE_ERROR)
+
     def route(self, project, name=None, channel=None):
         if channel:
             item = self.channels.get((project,channel))
             if not item or not item['active']:
                 raise ValueError('Channel is missing or closed')
-            return deepcopy(item['route'])
-        item = self.endpoints.get((project,name))
-        if not item:
-            raise ValueError('Unregistered endpoint')
+            item = item['route']
+        else:
+            item = self.endpoints.get((project,name))
+            if not item:
+                raise ValueError('Unregistered endpoint')
+        self.require_open_route(item)
         return deepcopy(item)
 
     def matches(self, sub, event):
@@ -337,9 +352,12 @@ class State:
                     sub['queue'].put_nowait({'error':'Subscriber fell behind; reconnect and inspect inbox'})
                     sub['overflow'] = True
 
-    def status(self, m, state, note=None, event=None):
+    def status(self, m, state, note=None, event=None, reason=None):
         m.update(state=state,note=note)
         entry = {'state':state,'note':note,'at':now()}
+        m.pop('reason', None)
+        if reason is not None:
+            m['reason'] = entry['reason'] = reason
         if state in ('done', 'answered'):
             m.setdefault('completed_at', time.time())
         if state == 'received' or (state == 'submitted' and m['route']['transport'] in retention.PUSH_TRANSPORTS):
@@ -362,14 +380,18 @@ class State:
         m['events'].append(entry)
         m['events'] = m['events'][-100:]
         self.publish(m,'status')
+        if self.pending_publications is None and 'close_request' in m and state == 'done':
+            self.answers[m['id']].set()
         return m
 
-    def post(self, args, reply_to=None):
+    def post(self, args, reply_to=None, *, close_request=None):
         body, key = args['body'], args['key']
         if not isinstance(body,str) or not body.strip() or len(body.encode()) > 32768:
             raise ValueError('Message must contain 1–32768 UTF-8 bytes')
         if not isinstance(key,str) or not key.strip() or len(key)>256:
             raise ValueError('Provide an idempotency key of at most 256 characters')
+        if key.startswith(CLOSE_KEY_PREFIX) and close_request is None:
+            raise ValueError('Idempotency key prefix is reserved for close handoffs')
         intent = {k:args.get(k) for k in ('project','sender','recipient','channel','sender_channel','body','key')}
         intent['reply_to'] = reply_to
         one_way = args.get('one_way', False)
@@ -391,7 +413,13 @@ class State:
             return self.get(mid)
         if reply_to:
             parent = self.get(reply_to)
+            if 'close_request' in parent:
+                raise ValueError('Codex close handoffs use native archive verification')
             destination, origin = deepcopy(parent['return_route']), deepcopy(parent['route'])
+            self.require_open_route(destination)
+            self.require_open_route(origin)
+            self.require_open_route(destination)
+            self.require_open_route(origin)
             conversation = parent['conversation']
         else:
             destination = self.route(args['project'],args.get('recipient'),args.get('channel'))
@@ -407,6 +435,8 @@ class State:
              'return_route':origin,'channel':destination.get('channel'),
              'sender_channel':origin.get('channel'),'body':body,'reply_to':reply_to,
              'state':'pending','created':now(),'events':[],'note':None}
+        if close_request is not None:
+            m['close_request'] = close_request
         if one_way:
             m['one_way'] = True
         if deadline is not None:
@@ -480,7 +510,8 @@ class State:
                     slot = selected.get(route_key(message['route']))
                     # Correlated replies are ALWAYS operation-only, even before an
                     # operation has saved its backend ID or observed its first reply.
-                    if slot is not None and message['reply_to'] is None and message['state'] not in TERMINAL_STATES:
+                    if (slot is not None and message['reply_to'] is None
+                            and 'close_request' not in message and message['state'] not in TERMINAL_STATES):
                         items.append(self.inbox_metadata(message, slot))
                 items.sort(key=lambda m: (m['created_at'], m['id']))
                 size = len(json.dumps(items, ensure_ascii=False).encode())
@@ -517,7 +548,7 @@ class State:
         if message is None:
             raise ValueError('MESSAGE_UNAVAILABLE')
         slot = selected.get(route_key(message['route']))
-        if slot is None or message['reply_to'] is not None:
+        if slot is None or message['reply_to'] is not None or 'close_request' in message:
             raise ValueError('NOT_FOUND')
         if message.get('body_expired'):
             raise ValueError('MESSAGE_BODY_EXPIRED')
@@ -549,12 +580,93 @@ class State:
         self.status(message, 'done', 'Explicit MCP inbox acknowledgement')
         return dict(result)
 
-    def action(self, args):
+    def archive_correspondence(self, args, *, verified_close=False):
+        expected = args['expected_route']
+        key = (expected['project'], expected['name'])
+        if self.endpoints.get(key) != expected:
+            raise ValueError('Archive route is missing or changed')
+        if not verified_close:
+            self.require_open_route(expected)
+        transport, sid, cwd = (expected.get(field) for field in ('transport', 'session', 'cwd'))
+        if (transport not in ('codex', 'claude-peer', 'agy') or not isinstance(sid, str)
+                or str(uuid.UUID(sid)) != sid or not cwd):
+            raise ValueError('Archive cleanup requires a provider session UUID and workspace')
+
+        def matches(route):
+            return (route.get('transport'), route.get('session'), route.get('cwd')) == (transport, sid, cwd)
+
+        records = self.messages | self.compact_messages
+        selected, active, uncertain = set(), set(), set()
+        for mid, message in records.items():
+            if any(matches(message[field]) for field in ('route', 'return_route')):
+                selected.add(mid)
+            if message['state'] == 'dispatching' or self.waiters.get(message['reply_to']):
+                active.add(mid)
+            if self.waiters.get(mid):
+                active.update((mid, message['reply_to']))
+            control = message.get('provider_retry', {})
+            if control.get('status') in ('reserved', 'accepted'):
+                active.update((mid, control.get('source_message_id'), control.get('event_id')))
+            elif control.get('status') == 'uncertain':
+                uncertain.update((mid, control.get('source_message_id'), control.get('event_id')))
+            if message['state'] == 'uncertain':
+                uncertain.add(mid)
+        protected = selected & (active | uncertain)
+        if args.get('check_only') is True:
+            if selected & active:
+                raise ValueError('Archive cleanup blocked by an active delivery, provider continuation or wait')
+            return dict(supported=True, matched=len(selected), retained=len(protected))
+        if args.get('archived') is not True:
+            raise ValueError('Archive cleanup requires confirmed provider archival')
+
+        removed = selected - protected
+        for mid in removed:
+            self.messages.pop(mid, None)
+            self.compact_messages.pop(mid, None)
+            self.answers.pop(mid, None)
+        self.keys = {key: value for key, value in self.keys.items() if value[1] not in removed}
+        self.inbox_receipts = {key: value for key, value in self.inbox_receipts.items() if key[2] not in removed}
+        # Invalidate the full snapshot so surviving pagination offsets stay stable.
+        self.inbox_snapshots = {key: value for key, value in self.inbox_snapshots.items()
+                                if not any(item['id'] in removed for item in value['items'])}
+        return dict(removed=len(removed), retained=len(protected), complete=not protected)
+
+    def purge_archive_events(self, removed):
+        if not removed:
+            return
+
+        def mark(event):
+            if event.get('message', {}).get('id') in removed:
+                event['_archive_purged'] = True
+        for event in self.events:
+            mark(event)
+        self.events = deque((event for event in self.events if not event.get('_archive_purged')), maxlen=1024)
+        for sub in self.subscribers:
+            for event in sub.get('backlog', ()):
+                mark(event)
+            task = sub.get('next_event')
+            if task is not None and task.done() and not task.cancelled() and task.exception() is None:
+                mark(task.result())
+            queued = []
+            while not sub['queue'].empty():
+                event = sub['queue'].get_nowait()
+                mark(event)
+                if not event.get('_archive_purged'):
+                    queued.append(event)
+            for event in queued:
+                sub['queue'].put_nowait(event)
+
+    def action(self, args, *, verified_close=False):
         # Stage mutations in isolation. A failed durable write must not acknowledge
         # an ACK, publish an event, wake a waiter or leave a half-posted reply.
         mutations = ('send', 'send-with-retention', 'reply', 'ack', 'progress', 'resolve', 'claim', 'finish',
                      'claim-guarded', 'release-claim', 'note-pending',
-                     'inbox_ack', 'provider-failure', 'provider-retry', 'retention-sweep')
+                     'inbox_ack', 'provider-failure', 'provider-retry', 'retention-sweep',
+                     'archive-correspondence', 'close-dispatch', 'close-operator')
+        archive = args['op'] == 'archive-correspondence'
+        if archive and args.get('check_only') is True:
+            return self.archive_correspondence(args)
+        archive_before = (self.messages.keys() | self.compact_messages.keys()) if archive else set()
         planned = None
         planned_at = None
         if args['op'] == 'retention-sweep':
@@ -567,30 +679,38 @@ class State:
         if self.correspondence is None or args['op'] not in mutations:
             if planned is not None:
                 return {'changed': self.sweep_retention(planned_at, planned=planned)}
-            return self.apply_action(args)
+            result = self.apply_action(args, verified_close=verified_close)
+            if archive:
+                self.purge_archive_events(archive_before - (self.messages.keys() | self.compact_messages.keys()))
+            return result
         staged = copy(self)
         for field in ('messages', 'compact_messages', 'keys', 'inbox_receipts', 'inbox_snapshots'):
             setattr(staged, field, deepcopy(getattr(self, field)))
         staged.answers = self.answers.copy()
         staged.pending_publications = []
         result = ({'changed': staged.sweep_retention(planned_at, planned=planned)}
-                  if planned is not None else staged.apply_action(args))
+                  if planned is not None else staged.apply_action(args, verified_close=verified_close))
         if args['op'] == 'retention-sweep' and not result['changed']:
             return result
         if args['op'] in ('provider-failure', 'provider-retry', 'release-claim', 'note-pending') and not staged.pending_publications:
             return result  # A no-op needs no repeated checkpoint write.
+        if archive and not result['removed']:
+            return result
         self.correspondence.save(staged)
         for field in ('messages', 'compact_messages', 'keys', 'inbox_receipts', 'inbox_snapshots', 'answers'):
             setattr(self, field, getattr(staged, field))
+        if archive:
+            self.purge_archive_events(archive_before - (self.messages.keys() | self.compact_messages.keys()))
         for message, kind in staged.pending_publications:
             self.publish(message, kind)
-            if message['state'] == 'answered':
+            if message['state'] == 'answered' or ('close_request' in message and message['state'] == 'done'):
                 self.answers[message['id']].set()
         return result
 
     def provider_failure(self, origin, source_message_id, failure):
         key = (origin['project'], origin['name'])
         current = self.endpoints.get(key)
+        self.require_open_route(origin)
         source = codex_failures.last_sender_message(self, origin)
         if (current != origin or origin['transport'] not in ('codex', 'agy')
                 or (source['id'] if source else None) != source_message_id):
@@ -660,8 +780,16 @@ class State:
         self.status(notice, 'pending', event=event)
         return notice
 
-    def apply_action(self, args):
+    def apply_action(self, args, *, verified_close=False):
         op = args['op']
+        if op == 'archive-correspondence':
+            return self.archive_correspondence(args, verified_close=verified_close)
+        if op == 'close-prepare':
+            return self.prepare_close(args)
+        if op == 'close-dispatch':
+            return self.dispatch_close(args)
+        if op == 'close-operator':
+            return self.claim_close(args)
         if op == 'retention-plan':
             return dict(self.retention_plan()['counts'], dry_run=True, live_waiters_visible=True,
                         active_waits=sum(self.waiters.values()), retention_ttl_enabled=self.retention_ttl,
@@ -702,8 +830,10 @@ class State:
                 raise ValueError('Executable must be a string')
             item = dict(project=project,name=name,transport=transport,cwd=cwd,
                         session=sid,executable=executable)
+            self.require_open_route(item)
             current = self.endpoints.get((project, name))
             if current is not None:
+                self.require_open_route(current)
                 # One event-loop turn: this authoritative check precedes every
                 # routing write, regardless of any caller's read-only preflight.
                 if (any(current.get(field) != item[field] for field in ('transport', 'cwd', 'session'))
@@ -719,18 +849,37 @@ class State:
                 raise ValueError('Endpoint is missing or changed')
             if current['transport'] != 'codex':
                 raise ValueError('Remap requires a Codex endpoint')
+            self.require_open_route(current)
             sid = str(uuid.UUID(args['session']))
             if sid == current['session']:
                 raise ValueError('Replacement UUID must differ from the current UUID')
-            return self.routing_change('endpoints', key, dict(current, session=sid))
+            replacement = dict(current, session=sid)
+            self.require_open_route(replacement)
+            return self.routing_change('endpoints', key, replacement)
         if op == 'routes':
             return [x for (p,_),x in self.endpoints.items() if p==args['project']]
         if op == 'codex-routes':
-            return [route for route in self.endpoints.values() if route['transport'] == 'codex']
-        if op == 'unregister':
+            return [route for route in self.endpoints.values()
+                    if route['transport'] == 'codex' and 'closing' not in route]
+        if op == 'close-prepare':
+            return self.prepare_close(args)
+        if op == 'close-dispatch':
+            return self.dispatch_close(args)
+        if op == 'close-operator':
+            return self.claim_close(args)
+        if op in ('unregister', 'unregister-if-current', 'unregister-archived'):
             key = (args['project'], args['name'])
-            if key not in self.endpoints:
+            current = self.endpoints.get(key)
+            # A distinct wire operation prevents an older broker from ignoring
+            # the comparison and removing a replacement endpoint by name.
+            if op == 'unregister-archived' and (args.get('archived') is not True
+                    or current != args.get('expected_route')):
+                raise ValueError('Confirmed archive endpoint is missing or changed')
+            if current is None:
                 raise ValueError(f'No participant {args["name"]!r} is registered in project {args["project"]!r}')
+            self.require_open_route(current)
+            if op == 'unregister-if-current' and current != args['expected_route']:
+                raise ValueError('Endpoint changed during close; its current route was kept')
             owned = sorted(name for (project,name),item in self.channels.items()
                            if project==args['project'] and item.get('active') and item['owner']==args['name'])
             if owned:
@@ -811,6 +960,12 @@ class State:
                     raise ValueError('Request reply deadline expired; delivery is not retried')
                 if m['state']!='pending':
                     raise ValueError('Only pending messages may be delivered')
+                self.require_open_route(m['route'])
+                self.require_open_route(m['return_route'])
+                if 'close_request' in m:
+                    if args.get('close_id') != m['close_request']['close_id']:
+                        raise ValueError('A close handoff cannot be delivered manually')
+                    self.check_close_operator(m)
                 destination = delivery_destination(m['route'])
                 for other in self.messages.values():
                     if (other.get('provider_retry', {}).get('status') == 'reserved'
@@ -847,18 +1002,186 @@ class State:
                 if args['state']=='pending' and (event!='push_failed' or not args.get('note','').strip()):
                     # A failed push stays deliverable, but never silently.
                     raise ValueError('Returning to pending requires a push_failed event and reason')
+                reason = args.get('reason')
+                if reason is not None and (reason != message_store.ARCHIVED_REASON
+                        or args['state'] != 'failed' or m['route']['transport'] != 'codex'):
+                    raise ValueError('Invalid delivery reason')
                 # Keep the normalized wake outcome on the message before it is published (#121).
                 peer_wake.record_wake(m, args.get('wake'))
-                return self.status(m,args['state'],args.get('note'),event)
+                return self.status(m,args['state'],args.get('note'),event,reason)
             if m['state'] in ('done','answered'):
                 raise ValueError('Message is already complete')
+            if 'close_request' in m and (op != 'resolve' or args.get('state') != 'done'
+                    or self.close_target(m['close_request']) is not None):
+                raise ValueError('Codex close handoffs use native archive verification')
             if op in ('ack','progress') and m['state'] in ('dispatching','uncertain'):
                 raise ValueError('Resolve delivery outcome first')
             state = {'ack':'received','progress':'in_progress'}.get(op,args.get('state'))
             if op=='resolve' and (state not in ('pending','submitted','done') or not args.get('note','').strip()):
                 raise ValueError('Recovery requires a supported state and explanation')
+            if state not in TERMINAL_STATES:
+                self.require_open_route(m['route'])
+                self.require_open_route(m['return_route'])
+                if m.get('reason') == message_store.ARCHIVED_REASON:
+                    raise ValueError('Archived delivery is terminal')
             return self.status(m,state,args.get('note'))
         raise ValueError('Unknown operation')
+
+    def prepare_close(self, args):
+        key = (identifier(args['project']), identifier(args['name']))
+        current = self.endpoints.get(key)
+        if not current or route_store.route_record(current) != args['expected_route']:
+            raise ValueError('Endpoint is missing or changed')
+        if current['transport'] != 'codex':
+            raise ValueError('Close handoff requires a Codex endpoint')
+        if 'closing' in current:
+            return {'route': current, 'message': self.close_message(current['closing'])}
+        operator = self.close_operator()
+        if operator is not None and same_codex_thread(current, operator['route']):
+            raise ValueError('The Codex close operator cannot archive itself')
+        if any(other_key != key and same_codex_thread(current, item)
+               for other_key, item in self.endpoints.items()):
+            raise ValueError('This Codex thread has another registered route; detach that alias before closing')
+        if any(channel['active'] and ((channel['project'], channel['owner']) == key
+                                     or same_codex_thread(current, channel['route']))
+               for channel in self.channels.values()):
+            raise ValueError('Close or hand off active channels before closing this Codex thread')
+        if any(message['state'] not in TERMINAL_STATES
+               and (same_codex_thread(current, message['route'])
+                    or same_codex_thread(current, message['return_route']))
+               for message in self.messages.values()):
+            raise ValueError('This Codex thread has unfinished correspondence; reconcile it before closing')
+        self.archive_correspondence({'expected_route': current, 'check_only': True})
+        route = self.routing_change('endpoints', key, dict(current, closing=str(uuid.uuid4())))
+        return {'route': route, 'operator': operator}
+
+    def close_operator(self):
+        if self.store is None:
+            return None
+        path = self.store.directory / CLOSE_OPERATOR_FILE
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise ValueError('Codex close operator configuration is unavailable') from None
+        try:
+            with os.fdopen(fd, 'rb') as source:
+                info = os.fstat(source.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                    raise ValueError('operator configuration is not owner-private')
+                settings = json.loads(source.read(4097)) if info.st_size <= 4096 else None
+            if not isinstance(settings, dict) or set(settings) != {'project', 'name', 'session', 'sender'}:
+                raise ValueError('invalid operator configuration fields')
+            project = identifier(settings['project'])
+            route = self.route(project, identifier(settings['name']))
+            sender = self.route(project, identifier(settings['sender']))
+            if (route['transport'] != 'codex' or route['session'] != str(uuid.UUID(settings['session']))
+                    or sender['transport'] != 'realtime'):
+                raise ValueError('operator or sender route differs')
+            return {'route': route, 'sender': sender}
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            raise ValueError('Codex close operator configuration or enrolled route is invalid') from None
+
+    def close_message(self, close_id):
+        entry = self.keys.get(CLOSE_KEY_PREFIX + close_id)
+        if entry is None:
+            return None
+        message = self.get(entry[1])
+        if message.get('close_request', {}).get('close_id') != close_id:
+            raise ValueError('Codex close key conflicts with existing correspondence')
+        return message
+
+    def close_target(self, request):
+        target = request['target']
+        current = self.endpoints.get((target['project'], target['name']))
+        if current == {**target, 'closing': request['close_id']}:
+            return current
+        return None
+
+    def dispatch_close(self, args):
+        target = self.closing_route(args)
+        close_id = target['closing']
+        previous = self.close_message(close_id)
+        if previous is not None:
+            return {'message': previous, 'created': False}
+        operator = self.close_operator()
+        if operator is None or operator != args['operator'] or same_codex_thread(target, operator['route']):
+            raise ValueError('Enrolled Codex close operator changed; closing route kept')
+        destination, sender = operator['route'], operator['sender']
+        message = self.post({'project': destination['project'], 'recipient': destination['name'],
+                             'sender': sender['name'], 'key': CLOSE_KEY_PREFIX + close_id,
+                             'body': 'Verify this Agent Bridge native archive request using close-operator.'},
+                            close_request={'close_id': close_id, 'target': route_store.route_record(target)})
+        return {'message': message, 'created': True}
+
+    def check_close_operator(self, message):
+        request = message['close_request']
+        if self.close_message(request['close_id']) != message or self.close_target(request) is None:
+            raise ValueError('Codex close request does not match a closing route')
+        operator = self.close_operator()
+        if operator != {'route': message['route'], 'sender': message['return_route']}:
+            raise ValueError('Enrolled Codex close operator changed; closing route kept')
+        return request
+
+    def claim_close(self, args):
+        message = self.get(args['id'])
+        if 'close_request' not in message or message['route']['session'] != args['operator_session']:
+            raise ValueError('This Codex chat is not the enrolled close operator for the request')
+        request = self.check_close_operator(message)
+        if message['state'] not in ('dispatching', 'submitted', 'uncertain'):
+            raise ValueError('Codex close request cannot be claimed again')
+        self.status(message, 'in_progress', 'Enrolled Codex operator accepted the native archive handoff')
+        return request
+
+    def closing_route(self, args):
+        key = (identifier(args['project']), identifier(args['name']))
+        current = self.endpoints.get(key)
+        if (not current or 'closing' not in current or current['closing'] != args['close_id']
+                or current['session'] != args['session']):
+            raise ValueError('Codex close generation or session does not match the closing route')
+        return current
+
+
+async def finish_close(state, args):
+    route = state.closing_route(args)
+    timeout = args.get('timeout', 10)
+    if not 0 < timeout <= 600:
+        raise ValueError('Timeout must be between 0 and 600 seconds')
+    try:
+        await asyncio.wait_for(asyncio.to_thread(codex_preview.verify_archive, route), timeout)
+    except asyncio.TimeoutError:
+        raise ValueError('Codex archive verification timed out; closing route kept') from None
+    if state.closing_route(args) != route:
+        raise ValueError('Endpoint changed during archive verification')
+
+    result = {**route, 'route_removed': False}
+    try:
+        cleanup = state.action({'op': 'archive-correspondence', 'expected_route': route, 'archived': True},
+                               verified_close=True)
+    except (ValueError, OSError) as error:
+        return {**result, 'cleanup_error': str(error),
+                'correspondence_cleanup': {'confirmed': False, 'state': 'rejected'}}
+    result['correspondence_cleanup'] = cleanup
+    if not cleanup['complete']:
+        result['cleanup_error'] = 'Archive confirmed; protected correspondence remains (active or uncertain delivery/wait)'
+
+    message = state.close_message(route['closing'])
+    try:
+        state.routing_remove('endpoints', (route['project'], route['name']))
+    except (ValueError, OSError) as error:
+        result['route_error'] = str(error)
+        result.setdefault('cleanup_error', 'Archive confirmed; route removal was not confirmed')
+        return result
+    result['route_removed'] = True
+    if message is not None:
+        try:
+            state.action({'op': 'resolve', 'id': message['id'], 'state': 'done',
+                          'note': 'Native Codex archive verified and route removed'})
+            result['operator_receipt'] = 'done'
+        except (OSError, ValueError):
+            result['operator_receipt'] = 'needs_reconciliation'
+    return result
 
 
 async def write(writer, payload):
@@ -878,6 +1201,9 @@ async def wait_answer(state, args, reader):
         done,_ = await asyncio.wait(pending,timeout=timeout,return_when=asyncio.FIRST_COMPLETED)
         if pending[1] in done:
             return None
+        if 'close_request' in message:
+            current = state.get(mid)['state']
+            return {'id': mid, 'timed_out': current != 'done', 'close_status': current, 'replies': []}
         replies = [public_message(m) for m in state.messages.values() if m['reply_to']==mid]
         return ({'id':mid,'timed_out':not bool(replies),'replies':replies}
                 | ({'body_expired': True} if message.get('body_expired') else {}))
@@ -902,19 +1228,25 @@ async def watch(state, args, reader, writer):
             raise ValueError('Event cursor is outside retained history; inspect inbox')
     sub = {'route':route_key(route),'queue':asyncio.Queue(maxsize=128),'overflow':False}
     backlog = [event for event in state.events if cursor is not None and event['seq']>cursor and state.matches(sub,event)]
+    sub['backlog'] = backlog
     state.subscribers.append(sub)  # Register before yielding to avoid a subscribe/send race.
     disconnected = asyncio.create_task(reader.read(1))
     try:
         await write(writer,{'type':'subscribed','instance':state.instance,'seq':state.sequence,'route':route})
         for event in backlog:
-            await write(writer,event)
+            if not event.get('_archive_purged'):
+                await write(writer,event)
+        sub['backlog'] = []
         while True:
             next_event = asyncio.create_task(sub['queue'].get())
+            sub['next_event'] = next_event
             try:
                 done,_ = await asyncio.wait([disconnected,next_event],return_when=asyncio.FIRST_COMPLETED)
                 if disconnected in done:
                     return
                 event = next_event.result()
+                if event.get('_archive_purged'):
+                    continue
                 await write(writer,event)
                 if 'error' in event:
                     return
@@ -1006,6 +1338,9 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
                 elif op=='shutdown':
                     await write(writer,{'result':{'stopping':True},'instance':state.instance})
                     stopping.set()
+                elif op=='close-finish':
+                    result = await finish_close(state, args)
+                    await write(writer,{'result':result,'instance':state.instance})
                 else:
                     result = state.action(args)  # No await inside mutation: one atomic event-loop turn.
                     await write(writer,{'result':result,'instance':state.instance})

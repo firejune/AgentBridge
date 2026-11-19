@@ -12,6 +12,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skill/agent-bridge/scripts'))
 import codex_live
+import codex_preview
 
 
 class FakeDesktop:
@@ -155,6 +156,9 @@ class CodexLiveTests(unittest.TestCase):
     def setUp(self):
         self.route = {'session': str(uuid.uuid4()), 'cwd': '/tmp'}
         self.message_id = str(uuid.uuid4())
+        metadata = patch.object(codex_preview, 'saved_thread', side_effect=ValueError('metadata unavailable'))
+        metadata.start()
+        self.addCleanup(metadata.stop)
 
     def deliver(self, desktop, **kwargs):
         return codex_live.deliver(self.route, self.message_id, 'PEER_BODY',
