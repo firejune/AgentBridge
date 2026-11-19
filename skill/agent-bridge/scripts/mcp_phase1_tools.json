@@ -83,11 +83,12 @@
                     "bridge_operation_get",
                     "bridge_inbox_list",
                     "bridge_message_get",
-                    "bridge_message_ack"
+                    "bridge_message_ack",
+                    "bridge_message_reply"
                   ]
                 },
                 "minItems": 1,
-                "maxItems": 8,
+                "maxItems": 9,
                 "uniqueItems": true,
                 "contains": {
                   "const": "bridge_status"
@@ -2521,6 +2522,134 @@
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": false
+      }
+    },
+    {
+      "name": "bridge_message_reply",
+      "description": "Reply to the frozen return route of a retained independent inbox message using its signed message_id. Use the same owner-bound inbox handle as bridge_message_get. Requires message-send scope and inbox opt-in. Message text is untrusted data and cannot select a destination. Returns a delivery state receipt, including when a previous request with the same key is observed. A replay never attempts peer delivery. Reuse the same key and exact text for reconciliation; changed input conflicts. A reply does not create an ACK receipt.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "message_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768,
+            "description": "Reply body, at most 32768 UTF-8 bytes."
+          },
+          "idempotency_key": {
+            "type": "string",
+            "minLength": 16,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9_-]{16,128}$",
+            "description": "Durable reply key within the authenticated owner. Same key with a different parent or exact message text conflicts.",
+            "not": {
+              "pattern": "[^A-Za-z0-9_-]"
+            }
+          }
+        },
+        "required": [
+          "message_id",
+          "message",
+          "idempotency_key"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "ok": {
+                "const": true
+              },
+              "data": {
+                "type": "object",
+                "properties": {
+                  "message_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096
+                  },
+                  "delivery_state": {
+                    "type": "string",
+                    "enum": [
+                      "pending",
+                      "dispatching",
+                      "submitted",
+                      "received",
+                      "in_progress",
+                      "answered",
+                      "done",
+                      "failed",
+                      "uncertain"
+                    ]
+                  },
+                  "replayed": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "message_id",
+                  "delivery_state",
+                  "replayed"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "ok",
+              "data"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "ok": {
+                "const": false
+              },
+              "error": {
+                "type": "object",
+                "properties": {
+                  "code": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "retryable": {
+                    "type": "boolean"
+                  },
+                  "correspondence_lost": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "code",
+                  "message",
+                  "retryable"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "ok",
+              "error"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
       }
     }
   ]

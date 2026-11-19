@@ -609,6 +609,92 @@ class PersistenceTests(unittest.TestCase):
         receipt = self.state.action(args)
         self.assertEqual(self.state.action(args), receipt)
 
+    def test_inbox_reply_checkpoint_deduplication_and_frozen_return_route(self):
+        self.register(transport='codex', session=str(uuid.uuid4()))
+        self.state.action(dict(op='register', project='demo', name='beta', cwd=str(self.root)))
+        send = dict(op='send', project='demo', sender='alpha', recipient='beta', body='question')
+        parent = self.state.action(dict(send, key='first-parent'))
+        another = self.state.action(dict(send, key='second-parent'))
+        original = parent['return_route']
+        self.remap_fixture(str(uuid.uuid4()))
+        args = dict(op='inbox_reply', owner='a' * 64, context='b' * 64, instance=self.state.instance,
+                    routes=[dict(slot='slot', route=self.state.route('demo', name='beta'))],
+                    id=parent['id'], body='answer', key='reply-key', recipient='beta',
+                    sender='alpha', channel='wrong')
+        self.state.action(dict(args, op='inbox_ack'))
+        before = deepcopy((self.state.messages, self.state.keys, list(self.state.events)))
+        with patch.object(self.state.correspondence, 'save', side_effect=OSError('disk failure')):
+            with self.assertRaisesRegex(OSError, 'disk failure'):
+                self.state.action(args)
+        self.assertEqual((self.state.messages, self.state.keys, list(self.state.events)), before)
+        self.assertFalse(self.state.answers[parent['id']].is_set())
+        first = self.state.action(args)
+        reply = first['message']
+        self.assertFalse(first['replayed'])
+        self.assertEqual(reply['route'], original)
+        self.assertEqual(reply['return_route'], parent['route'])
+        self.assertEqual(reply['reply_to'], parent['id'])
+        self.assertEqual(reply['conversation'], parent['conversation'])
+        self.assertEqual(self.state.get(parent['id'])['state'], 'answered')
+        self.assertTrue(self.state.answers[parent['id']].is_set())
+        sequence = self.state.sequence
+        self.assertEqual(self.state.action(args), dict(message=reply, replayed=True))
+        self.assertEqual(self.state.sequence, sequence)
+        for changed in ({'body': 'different'}, {'id': another['id']}):
+            with self.assertRaisesRegex(ValueError, '^IDEMPOTENCY_CONFLICT$'):
+                self.state.action(args | changed)
+        reserved = next(key for key in self.state.keys if key.startswith(broker.INBOX_REPLY_KEY_PREFIX))
+        for raw in (dict(send, key=reserved), dict(args, op='reply', key=reserved)):
+            with self.assertRaisesRegex(ValueError, 'reserved for MCP inbox replies'):
+                self.state.action(raw)
+        with patch.object(route_store, 'verify_route'):
+            restored = broker.State(store=self.store)
+        with self.assertRaisesRegex(ValueError, '^BROKER_RESTARTED$'):
+            restored.action(args)
+        replay = restored.action(dict(args, instance=restored.instance))
+        self.assertTrue(replay['replayed'])
+        self.assertEqual(replay['message']['id'], reply['id'])
+        self.assertEqual(replay['message']['route'], original)
+
+    def test_inbox_reply_checks_source_scope_and_delivery_state(self):
+        self.state.action(dict(op='register', project='demo', name='beta', cwd=str(self.root)))
+        send = dict(op='send', project='demo', sender='alpha', recipient='beta', body='question')
+        parent = self.state.action(dict(send, key='first-parent'))
+        foreign = self.state.action(dict(send, sender='beta', recipient='alpha', key='foreign'))
+        correlated = self.state.action(dict(op='reply', id=foreign['id'], body='existing', key='existing'))
+        notice = self.state.provider_notice(
+            parent['return_route'], parent['route'], 'notice',
+            'provider_failure_detected:test', 'provider_failure_detected')
+        args = dict(op='inbox_reply', owner='a' * 64, context='b' * 64, instance=self.state.instance,
+                    routes=[dict(slot='slot', route=self.state.route('demo', name='beta'))],
+                    id=parent['id'], body='answer', key='reply-key')
+        wrong = deepcopy(args['routes'])
+        wrong[0]['route']['cwd'] = '/different'
+        for changed, code in (({'id': foreign['id']}, 'NOT_FOUND'),
+                              ({'id': correlated['id']}, 'NOT_FOUND'),
+                              ({'id': notice['id']}, 'NOT_FOUND'),
+                              ({'id': str(uuid.uuid4())}, 'MESSAGE_UNAVAILABLE'),
+                              ({'instance': None}, 'INVALID_ARGUMENT'),
+                              ({'routes': wrong}, 'ROUTE_CHANGED')):
+            with self.subTest(changed=changed), self.assertRaisesRegex(ValueError, f'^{code}$'):
+                self.state.action(args | changed)
+        self.state.action(dict(op='claim', id=parent['id']))
+        with self.assertRaisesRegex(ValueError, '^DELIVERY_UNKNOWN$'):
+            self.state.action(args)
+        self.assertFalse(any(key.startswith(broker.INBOX_REPLY_KEY_PREFIX) for key in self.state.keys))
+
+    def test_inbox_reply_refuses_legacy_claude_origin(self):
+        self.register(transport='claude', session=str(uuid.uuid4()))
+        self.state.action(dict(op='register', project='demo', name='beta', cwd=str(self.root)))
+        parent = self.state.action(dict(op='send', project='demo', sender='alpha', recipient='beta',
+                                        body='question', key='parent'))
+        args = dict(op='inbox_reply', owner='a' * 64, context='b' * 64, instance=self.state.instance,
+                    routes=[dict(slot='slot', route=self.state.route('demo', name='beta'))],
+                    id=parent['id'], body='answer', key='reply-key')
+        with self.assertRaisesRegex(ValueError, '^UNSUPPORTED_TRANSPORT$'):
+            self.state.action(args)
+        self.assertEqual(set(self.state.messages), {parent['id']})
+
     def test_save_failure_rolls_back_register_bind_and_close(self):
         self.bind()
         before_maps = deepcopy((self.state.endpoints, self.state.channels))

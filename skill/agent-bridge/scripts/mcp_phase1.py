@@ -32,8 +32,9 @@ SCOPES = {'bridge_status':'bridge:read', 'bridge_sessions_list':'bridge:read',
           'bridge_operation_get':'bridge:read', 'bridge_session_create':'bridge:session:create',
           'bridge_message_send':'bridge:message:send',
           'bridge_inbox_list':'bridge:read', 'bridge_message_get':'bridge:read',
-          'bridge_message_ack':'bridge:message:send'}
-INBOX_TOOLS = frozenset(('bridge_inbox_list', 'bridge_message_get', 'bridge_message_ack'))
+          'bridge_message_ack':'bridge:message:send', 'bridge_message_reply':'bridge:message:send'}
+INBOX_TOOLS = frozenset(('bridge_inbox_list', 'bridge_message_get', 'bridge_message_ack',
+                         'bridge_message_reply'))
 AGENT_TYPES = ('claude', 'agy', 'codex')
 AGENT_TRANSPORTS = {'claude': 'claude-peer', 'agy': 'agy', 'codex': 'codex'}
 TRANSPORT_AGENTS = {'claude-peer': 'claude', 'agy': 'agy', 'codex': 'codex'}
@@ -483,6 +484,10 @@ class Backend:
         if (route.get('session'), route.get('transport')) != (session['uuid'], self.session_transport(session)):
             raise ValueError('Unexpected message route')
         self.check(session)
+        return delivery.push_if_peer(self.path, message)
+
+    def push_inbox_reply(self, message):
+        # The broker has already authorized the parent and frozen the return route.
         return delivery.push_if_peer(self.path, message)
 
     def observe(self, mid):
@@ -1282,15 +1287,25 @@ class Engine:
             known = {'BROKER_RESTARTED', 'ROUTE_CHANGED', 'CURSOR_EXPIRED', 'NOT_FOUND',
                      'MESSAGE_UNAVAILABLE', 'ACK_EXPIRED', 'DELIVERY_UNKNOWN',
                      'CAPACITY_EXCEEDED', 'INVALID_ARGUMENT', 'INBOX_ITEM_TOO_LARGE'}
-            fault = Fault(code if code in known else 'BACKEND_UNAVAILABLE')
+            if op == 'inbox_reply':
+                known.update(('IDEMPOTENCY_CONFLICT', 'UNSUPPORTED_TRANSPORT', 'MESSAGE_BODY_EXPIRED'))
+                if code in ('Unknown operation', 'Broker unavailable; start bridge.py serve for this socket'):
+                    code = 'BACKEND_UNAVAILABLE'
+                    known.add(code)
+            fallback = 'DELIVERY_UNKNOWN' if op == 'inbox_reply' else 'BACKEND_UNAVAILABLE'
+            fault = Fault(code if code in known else fallback)
             if code == 'BROKER_RESTARTED':
                 try:
                     fault.payload['correspondence_lost'] = self.backend.rpc('ping').get('correspondence_lost', True)
                 except (ValueError, OSError):
                     fault.payload['correspondence_lost'] = True
             raise fault from None
-        except OSError:
-            raise Fault('BACKEND_UNAVAILABLE') from None
+        except Exception as error:
+            if op == 'inbox_reply':
+                raise Fault('DELIVERY_UNKNOWN') from None
+            if isinstance(error, OSError):
+                raise Fault('BACKEND_UNAVAILABLE') from None
+            raise
 
     def inbox_message(self, result, principal, epoch, routes):
         result = dict(result)
@@ -1299,6 +1314,26 @@ class Engine:
         own_route = [entry for entry in routes if entry['slot'] == sid]
         result['message_id'] = self.inbox_sign(principal, 'message', e=epoch, o=mid, s=sid, r=digest(own_route))
         return result
+
+    def inbox_reply(self, args, principal, routes, handle):
+        result = self.inbox_rpc('inbox_reply', principal, routes, handle['e'], id=handle['o'],
+            body=args['message'], key=args['idempotency_key'])
+        try:
+            message, replayed = result['message'], result['replayed']
+            if (type(replayed) is not bool or message['state'] not in STATES
+                    or message['reply_to'] != handle['o']):
+                raise ValueError()
+            if not replayed:
+                try:
+                    message = self.backend.push_inbox_reply(message)
+                except delivery.PushFailed as error:
+                    message = error.message
+            state = message['state']
+            if state not in STATES:
+                raise ValueError()
+        except Exception:
+            raise Fault('DELIVERY_UNKNOWN') from None
+        return {'message_id': args['message_id'], 'delivery_state': state, 'replayed': replayed}
 
     def inbox(self, name, args, principal):
         if name == 'bridge_inbox_list':
@@ -1328,6 +1363,8 @@ class Engine:
         routes = self.inbox_routes(principal, handle['s'])
         if digest(routes) != handle['r']:
             raise Fault('NOT_FOUND')
+        if name == 'bridge_message_reply':
+            return self.inbox_reply(args, principal, routes, handle)
         if name == 'bridge_message_ack':
             result = self.inbox_rpc('inbox_ack', principal, routes, handle['e'], id=handle['o'])
             result.pop('id')
