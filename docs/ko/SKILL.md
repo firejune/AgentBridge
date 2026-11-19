@@ -174,6 +174,8 @@ python3 "$bridge_cli" usage --events
 
 같은 허용 세션이 작업 중이거나 답장을 기다려도 서로 다른 키의 MCP 메시지를 접수한다. 단일 워커는 원장의 접수 순서로 훑고 같은 UUID·transport 대상 안에서 전송 순서를 지킨다. 한 대상이 격리돼 있어도 다른 차단되지 않은 대상은 진행할 수 있다. 답장과 Events ID는 각 작업에 따로 연결한다. 세션의 `busy`는 상태 정보다. `SESSION_BUSY`는 같은 UUID·transport의 불명확한 쓰기만 격리하며, 전송 확인 후 결과를 읽지 못한 작업은 새 메시지를 막지 않는다. unknown 작업은 재전송하지 않고 전체 active/unknown 64개 한도에는 계속 포함한다.
 
+브로커에 메시지를 게시하기 전에 경로·세션 충돌이 확인되면 `BACKEND_UNAVAILABLE`과 고정된 `ROUTE_CHANGED:` 메시지를 반환한다. 최초 접수에서 발견하면 작업을 만들지 않고 도구 오류를 반환하며, 접수 후 발견하면 해당 작업을 `failed`로 끝내 점유를 해제한다. 파사드는 자동 재매핑·재전송하지 않는다. 브로커 send를 시도한 뒤 발견한 경로 불일치는 `unknown`으로 남긴다.
+
 - 로컬 에이전트는 항상 `scripts/bridge.py` 파이썬 CLI를 직접 사용하며, 로컬 MCP 서버로 중복 등록하지 않는다.
 - `scripts/mcp_server.py`는 비공개 원격 터널(`stdio` 기반 `--phase1-config`) 단일 커넥터 전용이다: [mcp-phase1.md](../../skill/agent-bridge/references/mcp-phase1.md).
 - 선택 설정 `events_enabled: true`는 `inbox_enabled: true`와 `bridge:read`가 필요하다. 서명된 `bridge.inbox.message.created` 웹훅은 짧은 검증용 읽기 후 지원되는 Work Cloud 소비자에게 알린다. 메시지 소비·ACK·본문 출력·본문 저장을 하지 않으며 처리 완료도 증명하지 않는다. 독립 메시지는 기존 inbox 목록·본문·명시적 ACK를 사용한다. 작업 결과로 저장된 답장도 같은 이벤트로 알리며, 알림에 `operation_id`가 있으면 `bridge_operation_get`을 사용한다. 답장은 inbox에 노출하지 않는다. 알림 누락 후에는 새 inbox 목록과 알고 있는 작업 결과를 조회한다. 기존 작업 지시와 플러그인 카탈로그도 이 분기를 반영하도록 갱신한다. 이벤트 재생·웹훅 자동 재전송은 없다. 서명 키는 macOS Keychain에만, 한도가 있는 구독 메타데이터는 별도 소유자 전용 상태에 둔다. [Events 계약](../../skill/agent-bridge/references/mcp-phase1.md#optional-mcp-events)을 참고한다.
