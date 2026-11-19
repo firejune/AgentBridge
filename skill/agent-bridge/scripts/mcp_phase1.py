@@ -42,6 +42,8 @@ MESSAGE_CAPACITY_ERRORS = frozenset((
     'In-memory message limit reached: no evictable terminal messages; pending or protected work is retained',
     'Active-message limit reached: TTL or protected work prevents safe cleanup; inspect retention --live; no messages evicted before TTL',
 ))
+# Kept local for compatibility with embedded broker versions lacking this guard.
+REGISTER_CONFLICT_ERROR = 'Route name is already in use; use a different name'
 CAPACITY_FAILURE_MESSAGE = 'Broker message capacity is full; the message was not posted or delivered.'
 REPLY_NOT_RETAINED_MESSAGE = 'The reply is no longer retained.'
 MESSAGE_NOT_RETAINED_MESSAGE = 'The message is no longer retained.'
@@ -437,7 +439,12 @@ class Backend:
                     raise RouteBindingRefusal('Pinned target route missing')
         for fields in (expected, sender):
             if not any(r['name'] == fields['name'] for r in rows):
-                self.rpc('register', **fields)
+                try:
+                    self.rpc('register', **fields)
+                except ValueError as error:
+                    if str(error) != REGISTER_CONFLICT_ERROR:
+                        raise
+                    raise RouteBindingRefusal(REGISTER_CONFLICT_ERROR) from None
         self.verify_routes(session)
 
     def verify_routes(self, session, allow_missing=False):
