@@ -40,7 +40,7 @@ python3 "$bridge_cli" --help
 4. **직접 Push (폴링 루프 금지)**: `watch`는 `realtime` CLI 워커 전용이다. **`claude-peer`, `codex`, `agy`는 별도의 `watch` 폴링 루프나 새 CLI 프로세스 없이 기존 라이브 세션에 직접 push한다.**
 
 ```bash
-python3 "$bridge_cli" sessions --cwd /absolute/project
+python3 "$bridge_cli" sessions --cwd /absolute/project  # 현재 모델 정보가 필요할 때 --with-model 추가
 python3 "$bridge_cli" session claude SESSION_UUID
 python3 "$bridge_cli" session codex SESSION_UUID
 python3 "$bridge_cli" session agy SESSION_UUID

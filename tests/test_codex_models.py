@@ -332,27 +332,29 @@ class CodexModelsTest(unittest.TestCase):
         self.assertEqual((code, out['uncertain'], out['session'], out['model']), (1, True, self.sid, SOL))
         self.assertEqual(sum(x['method'] == 'thread-follower-update-thread-settings' for x in desktop.calls), 1)
 
-    def test_sessions_annotates_next_turn_settings_fresh_and_skips_on_request(self):
+    def test_sessions_reads_fresh_next_turn_settings_only_on_request(self):
         def discovered(*args):
             return {'providers': {'codex': {'sessions': [{'provider': 'codex', 'id': self.sid,
                                                          'status': 'active'}]}}, 'errors': {}}
         with ModelDesktop(model=ASTRA) as desktop, self.owner(desktop), \
                 patch.object(sessions, 'discover', side_effect=discovered), \
                 patch.object(bridge.broker, 'request') as broker:
-            code, out = self.cli('sessions', '--provider', 'codex')
+            count = len(desktop.calls)
+            for flags in ((), ('--no-model',)):
+                with self.subTest(flags=flags):
+                    code, out = self.cli('sessions', '--provider', 'codex', *flags)
+                    self.assertEqual((code, out), (0, discovered()))
+                    self.assertEqual(len(desktop.calls), count)
+
+            code, out = self.cli('sessions', '--provider', 'codex', '--with-model')
             row = out['providers']['codex']['sessions'][0]
             self.assertEqual((code, row['status'], row['model']['model'], row['model']['denied']),
                              (0, 'active', ASTRA, True))
             self.assertIn('next turn', row['model']['source'])
             desktop.model = SOL
-            code, out = self.cli('sessions', '--provider', 'codex')
+            code, out = self.cli('sessions', '--provider', 'codex', '--with-model')
             row = out['providers']['codex']['sessions'][0]
             self.assertEqual((code, row['model']['model'], row['model']['denied']), (0, SOL, False))
-            count = len(desktop.calls)
-            code, out = self.cli('sessions', '--provider', 'codex', '--no-model')
-            self.assertEqual(code, 0)
-            self.assertNotIn('model', out['providers']['codex']['sessions'][0])
-            self.assertEqual(len(desktop.calls), count)
             broker.assert_not_called()
 
     def test_sessions_owner_failure_is_unknown_without_losing_discovery_rows(self):
@@ -360,7 +362,7 @@ class CodexModelsTest(unittest.TestCase):
                       'errors': {}}
         with patch.object(sessions, 'discover', return_value=discovered), \
                 patch.object(codex_live, 'Client', side_effect=codex_live.DeliveryError('owner unavailable')):
-            code, out = self.cli('sessions', '--provider', 'codex')
+            code, out = self.cli('sessions', '--provider', 'codex', '--with-model')
         row = out['providers']['codex']['sessions'][0]
         self.assertEqual((code, row['id'], row['model']['model'], row['model']['reason']),
                          (0, self.sid, 'unknown', 'owner unavailable'))

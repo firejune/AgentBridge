@@ -115,6 +115,8 @@ If saved metadata confirms that the exact Codex recipient is archived, the CLI r
 
 ### 1. Session Lifecycle (`sessions`, `open`, `register --new`, `close`)
 
+The Python CLI lists sessions without per-session model reads by default. Add `sessions --with-model` to include live model details.
+
 | Provider | Open Desktop Session | Open IDE Session (`--host ide`) | Close (`bridge.py close NAME --project P --retro-file FILE [--archive]`) |
 | --- | --- | --- | --- |
 | **Antigravity (`agy`)** | Autonomous via `language_server` / `agy --hub` (`StartCascade`), auto-linked to project & worktree environment | Identical to Desktop (`StartCascade` + project/environment association on unified hub) | Keeps conversation in active stack by default (`--archive` sets `{archived: true}`) and unregisters route |

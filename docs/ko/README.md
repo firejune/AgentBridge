@@ -115,6 +115,8 @@ python3 "$bridge_cli" reply MESSAGE_ID --key reply-001 --file /path/to/answer.tx
 
 ### 1. 세션 생명주기 (`sessions`, `open`, `register --new`, `close`)
 
+Python CLI의 `sessions`는 기본적으로 세션별 모델 조회를 건너뛴다. 현재 모델 정보가 필요하면 `sessions --with-model`을 사용한다.
+
 | 공급자 | 데스크톱 세션 열기 | IDE 세션 열기 (`--host ide`) | 세션 닫기 (`bridge.py close NAME --project P --retro-file FILE [--archive]`) |
 | --- | --- | --- | --- |
 | **Antigravity (`agy`)** | `language_server` / `agy --hub`(`StartCascade`)로 무인 생성 및 프로젝트·워크트리 환경 자동 연결 | 데스크톱과 동일 (`StartCascade` + 통합 허브 프로젝트·환경 자동 연결) | 기본은 대화 스택 유지(`--archive` 시 `{archived: true}` 보관) 후 라우트 제거 |

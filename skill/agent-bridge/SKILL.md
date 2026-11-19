@@ -45,7 +45,7 @@ If installed elsewhere, use the sibling `scripts/bridge.py` next to the `SKILL.m
 4. **Push directly (no polling loops)**: Only `realtime` CLI workers use `watch`. **`claude-peer`, `codex`, and `agy` push directly into open live sessions without a `watch` polling loop or spawning duplicate CLI processes.**
 
 ```bash
-python3 "$bridge_cli" sessions --cwd /absolute/project
+python3 "$bridge_cli" sessions --cwd /absolute/project  # Add --with-model when live model details are needed
 python3 "$bridge_cli" session claude SESSION_UUID
 python3 "$bridge_cli" session codex SESSION_UUID
 python3 "$bridge_cli" session agy SESSION_UUID
