@@ -495,7 +495,7 @@ def close_participant(args):
                   'status': 'closed' if closed['route_removed'] else 'archive_verified',
                   'closed': True, 'session': closed['session'], 'close_id': closed['closing']}
         result.update({key: closed[key] for key in ('route_removed', 'correspondence_cleanup',
-                       'cleanup_error', 'route_error', 'operator_receipt') if key in closed})
+                       'cleanup_error', 'route_error', 'operator_receipt', 'operator_error') if key in closed})
         return result
     route = next((r for r in broker.request(args.socket,{'op':'routes','project':args.project})
                   if r['name'] == args.name), None)
@@ -527,7 +527,7 @@ def close_participant(args):
         try:
             cleanup = broker.request(args.socket, {'op':'archive-correspondence', 'expected_route':route, 'archived':True})
             result['correspondence_cleanup'] = cleanup
-            if not cleanup['complete']:
+            if not cleanup['complete'] and cleanup.get('active_retained') != 0:
                 result['cleanup_error'] = 'Archive confirmed; protected correspondence remains (active or uncertain delivery/wait)'
         except (ValueError, OSError, subprocess.TimeoutExpired) as error:
             # Provider archival already succeeded. Do not turn partial success into

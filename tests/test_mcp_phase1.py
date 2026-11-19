@@ -719,6 +719,30 @@ class PhaseTest(unittest.TestCase):
         self.assertTrue(self.send(sid, key=key)['data']['replayed'])
         self.assertTrue(self.send(sid, key='after_closing_route_01')['ok'])
 
+    def test_codex_owner_discovery_timeout_closes_mcp_operation_with_pending_message(self):
+        sid = self.create()['agent_session_id']
+        key = 'owner_discovery_timeout'
+        oid = self.send(sid, key=key)['data']['operation_id']
+        detail = phase.codex_live.OwnerUnavailable.TIMEOUT + phase.codex_live.OwnerUnavailable.WORKSPACE_MISSING
+
+        def reject(message, session):
+            self.backend.pushes += 1
+            pending = dict(message, state='pending', note=detail)
+            self.backend.messages[message['id']] = pending
+            raise phase.delivery.PushFailed(detail, pending)
+
+        with patch.object(self.backend, 'push', side_effect=reject):
+            self.engine.tick()
+        self.restart()
+        operation = self.call('bridge_operation_get', operation_id=oid)['data']
+        self.assertEqual((operation['status'], operation['backend_message_state']), ('failed', 'pending'))
+        self.assertEqual(operation['failure']['code'], 'BACKEND_UNAVAILABLE')
+        self.assertEqual(operation['failure']['message'], detail)
+        self.assertTrue(self.send(sid, key=key)['data']['replayed'])
+        self.engine.tick()
+        self.assertEqual((self.backend.posts, self.backend.pushes), (1, 1))
+        self.assertTrue(self.send(sid, key='fresh_after_owner_timeout')['ok'])
+
     def test_archived_push_and_observation_fail_definitely_without_replay(self):
         for mode in ('push', 'observe'):
             with self.subTest(mode=mode):

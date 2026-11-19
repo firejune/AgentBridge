@@ -151,6 +151,7 @@ python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.
 - For a native Codex Desktop archive, explicitly request `close --archive --handoff`. Archive the exact thread in Desktop or use an enrolled operator, then verify completion with `close --finish CLOSE_ID --expect-session UUID`. [Closing a session](references/usage.md#closing-a-session).
 
 - If saved metadata confirms that the exact Codex recipient is archived, the CLI reports `state: "failed"` and `reason: "archived"` and exits 1 before contacting Desktop.
+- If the exact Desktop owner cannot be located for delivery, the message stays `pending`. The CLI and MCP report the reason and any verified missing saved workspace. The bridge never reopens the thread or resends on its own.
 
 ## Models: Read, Switch, Policy
 
