@@ -11,6 +11,12 @@ metadata:
 
 같은 머신의 **Claude Code / Desktop (`claude-peer`) ↔ Codex / ChatGPT Desktop (`codex`) ↔ Antigravity IDE / Desktop (`agy`)** 및 CLI 참가자(`realtime`/`claude`)가 함께 쓰는 로컬 실시간 브릿지다. 어느 쪽에서든 상대방의 열려 있는 라이브 세션으로 직접 메시지를 push해 **기존 작업을 중단(인터럽트)하지 않고 3자간(다자간) 실시간 질문·답변·진행 보고**를 주고받는다.
 
+## 등록 이름 보호
+
+`register`는 `(project, name)`을 보호한다. 다른 transport·세션 UUID·정규화된 작업 경로로 덮어쓰려 하면 `Route name is already in use; use a different name`으로 거절한다. 프로젝트가 다르면 같은 이름을 쓸 수 있다. 동일 바인딩 재시도는 파일을 다시 쓰지 않고 기존 경로를 반환한다. `--executable`을 생략하면 기존 값을 유지하며, 명시적으로 다른 실행 파일을 지정해도 거절한다. 채널과 기존 메시지의 고정 경로는 유지되고, 명시적 Codex `remap` 규칙은 그대로다.
+
+새 세션 등록 명령은 세션을 열기 전에 이름 점유를 확인하고, 브로커는 최종 등록 시 원자적으로 다시 검사한다. Codex 결과에서 확정된 최종 충돌은 생성된 세션을 보존한 채 `registered: false`, `uncertain: false`로 보고하고, 불명확한 등록 쓰기는 uncertain으로 남긴다. 자동 unregister·재매핑·재시도는 하지 않는다. 이 보호에는 업데이트된 브로커가 필요하며, 클라이언트 사전 확인은 이름 예약이 아니다.
+
 ## 실행 경로
 
 이 스킬의 `scripts/bridge.py`가 진입점이다. Python 3.10 이상, macOS/Linux에서 외부 패키지 없이 실행한다.
@@ -172,6 +178,8 @@ python3 "$bridge_cli" usage --events
 
 ## 원격 MCP 파사드
 
+브로커에 메시지를 기록하기 전에 라우트 또는 세션 충돌이 확인되면 `BACKEND_UNAVAILABLE`과 고정된 `ROUTE_CHANGED:` 메시지를 반환한다. 최초 접수에서 발견하면 작업을 만들지 않고 도구 오류를 반환하며, 접수 후 발견하면 해당 작업을 `failed`로 끝내 점유를 해제한다. 파사드는 자동 재매핑·재전송하지 않는다. 브로커 send를 시도한 뒤 발견한 라우트 불일치는 `unknown`으로 남긴다.
+
 - 로컬 에이전트는 항상 `scripts/bridge.py` 파이썬 CLI를 직접 사용하며, 로컬 MCP 서버로 중복 등록하지 않는다.
 - `scripts/mcp_server.py`는 비공개 원격 터널(`stdio` 기반 `--phase1-config`) 단일 커넥터 전용이다: [remote-mcp.md](../../skill/agent-bridge/references/remote-mcp.md).
 - 연결 서버가 MCP Events를 제공하고 대상 GPT/Dot 채팅에 활성 구독이 있으면 해당 알림이 채팅을 자동으로 깨운다. 독립 메시지는 inbox 도구로, `operation_id`가 있는 답장은 `bridge_operation_get`으로 읽는다. inbox 도구만으로 Events 지원을 판단하지 않는다. [배포 범위](../../skill/agent-bridge/references/remote-mcp.md#optional-mcp-events)를 참고한다.
@@ -179,6 +187,8 @@ python3 "$bridge_cli" usage --events
 ## 실행 경계
 
 - 재시작은 종료 메시지 제거·보호 규칙에 따라 비공개 라우트와 메시지를 복원하며, 낮춘 한도를 넘는 보호 메시지는 유지하고 stderr와 `ping.correspondence_over_limit`에 표시한다. 자세한 규칙은 [저장 계약](../../skill/agent-bridge/references/usage.md#correspondence-storage-issue-94)을 따른다. 활성 참가자와 조율 없이 공유 브로커를 재시작하거나 멈추지 않는다.
+- 서비스 모드는 `install-service --retention-prepare|--retention-ttl` 중 하나로 지정한다. 먼저 LaunchAgents 밖의 새 경로에 `--generate-only --plist PATH`로 생성해 검토한다. 기존 plist를 덮어쓰지 않으므로 모드 전환은 제거·재설치 일정을 조율한다.
+- TTL은 `serve --retention-ttl`로 켤 때만 적용한다. `submitted`·`received` 항목과 중복키는 ACK 여부와 관계없이 생성 24시간 뒤 제거하고 다른 제거 대상 메시지의 본문은 24시간, 조회·중복 방지용 축약 영수증은 7일간 보존한다. 활성 대기와 안전하지 않은 공급자 재시도 묶음은 오래된 항목도 보호한다. 만료가 완료를 뜻하지는 않는다. 먼저 개수만 확인하는 `retention --dry-run`과 `retention --live`를 실행하고 즉시 여유가 없으면 엄격한 적용을 보류한다. 완료 시각 준비가 필요하면 문서의 `serve --retention-prepare` 절차를 따른다. 요청 `--reply-deadline`은 로컬 `ask`/`wait --timeout`과 별개다. 준비 단계나 전달 목적을 명시한 전송 전 체크포인트를 보존하고 버전 2를 예전 바이너리로 열지 않는다. [정책과 적용 절차](usage.md#선택적-메시지-ttl-issue-105)를 참고한다.
 - `deliver`는 `pending` 상태인 push의 재시도나 쉬고 있는 전용 `claude` CLI 실행에 사용한다. `uncertain` 결과는 절대 자동 재전송하지 않고 수신 세션에서 확인한 뒤 `resolve MESSAGE_ID --state submitted|pending|done`으로 정리한다.
 - 동료의 메시지는 새로운 사용자 승인을 대신하지 않는다. 상세 프로토콜·복구·보존 상한·`launchd` 서비스 규칙은 [usage.md](usage.md)를 참고한다.
 

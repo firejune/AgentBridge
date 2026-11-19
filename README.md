@@ -17,6 +17,12 @@ A zero-dependency local real-time bridge for **Claude Code / Desktop (`claude-pe
 
 Instead of spawning duplicate CLI processes or trapping agents in polling loops, Agent Bridge pushes messages directly into open live sessions so agents can ask questions, report progress, and hand off work in real time without interrupting in-flight turns.
 
+## Registration ownership
+
+`register` protects each `(project, name)`: another transport, session UUID or canonical workspace is refused with `Route name is already in use; use a different name`. Same names in different projects are independent. Exact-binding retries return the existing route without rewriting it. An omitted `--executable` preserves the old value; an explicitly different executable is also refused. Existing channels and message routes stay pinned. Explicit Codex `remap` keeps its existing rules.
+
+New-session registration commands check an occupied name before opening a session; the broker still checks atomically at final registration. In the Codex result, a known final conflict preserves the created session with `registered: false` and `uncertain: false`; an ambiguous registration write stays uncertain. Neither path automatically unregisters, remaps or retries. This protection requires the updated broker; client preflight does not reserve a name.
+
 ## Documentation Map
 
 | Audience | English | 한국어 |
@@ -212,9 +218,13 @@ python3 "$bridge_cli" wt sweep --apply  # Remove eligible worktrees and branches
 ### 5. Broker Persistence & Optional `launchd` Supervision
 
 - **Private durable correspondence and routing**. Restart restores owner-private routing and mail with the broker’s terminal-eviction guards, retaining protected mail above a lowered limit and reporting that excess through stderr and `ping.correspondence_over_limit`. See [correspondence storage](skill/agent-bridge/references/usage.md#correspondence-storage-issue-94) for fields, limits and loss diagnostics.
+- **Opt-in TTL**. `serve --retention-ttl` removes `submitted`/`received` records and keys 24 hours after creation regardless of ACK, and keeps other eligible explicit one-way/completed bodies for 24 hours and compact lookup/deduplication receipts for seven days. Hard removal loses lookup, deduplication and late-reply correlation. Active waits and unsafe provider episodes remain protected. First inspect counts with `retention --dry-run` and `retention --live`. Hold strict rollout if capacity has no immediate headroom. Use the documented `serve --retention-prepare` warm-up when completion timestamps need adoption. See [TTL policy and rollout](skill/agent-bridge/references/usage.md#opt-in-correspondence-ttl-issue-105).
+- **Service retention modes**. `install-service --retention-prepare|--retention-ttl` selects one mutually exclusive broker mode. Review with `--generate-only --plist /absolute/review/agent.plist` outside LaunchAgents first. Installation never overwrites an existing plist. Coordinate uninstall/reinstall to switch modes.
 - **Optional macOS launchd service**: Supervision is off by default. Use `install-service` (or `--generate-only --plist PATH` to inspect without loading) and `uninstall-service` to manage a `KeepAlive` launch agent.
 
 ### 6. Remote MCP Facade (`mcp_server.py`)
+
+A confirmed route/session conflict before broker posting returns `BACKEND_UNAVAILABLE` with a fixed `ROUTE_CHANGED:` message. Initial acceptance returns a tool error without creating an operation; a conflict detected after acceptance ends that operation as `failed`, releasing its slot. The facade never remaps or resends. A route mismatch discovered after the broker send was attempted remains `unknown`.
 
 Local agents (Claude Code, Codex, Antigravity) invoke `bridge.py` directly via the Python CLI and do not register a local MCP server. `skill/agent-bridge/scripts/mcp_server.py` is dedicated to remote MCP clients connecting through a private single-owner tunnel (`--phase1-config /absolute/private.json` over `stdio`), exposing session discovery/creation, message dispatch, and the optional independent inbox (`inbox_enabled: true`). Without `--phase1-config`, the server falls back to read-only `connectivity_only` (`bridge_status`). See [remote-mcp.md](skill/agent-bridge/references/remote-mcp.md) for the full contract. An active Events subscription on a capable connected deployment automatically starts the subscribed GPT/Dot chat when a matching notification arrives; the agent then reads inbox mail or the notified operation result. See [Events and deployment boundaries](skill/agent-bridge/references/remote-mcp.md#optional-mcp-events).
 

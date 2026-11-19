@@ -6,6 +6,12 @@ A local CLI for real-time peer-to-peer correspondence across AI coding agents. R
 
 The broker keeps owner-private routing in `routes.json` and bounded correspondence in `correspondence.json`. Restart restores captured messages and delivery state without replaying delivery. Credentials, signed tokens, provider diagnostics and event streams remain in memory. See [correspondence storage](#correspondence-storage-issue-94).
 
+## Registration ownership
+
+`register` protects each `(project, name)`: another transport, session UUID or canonical workspace is refused with `Route name is already in use; use a different name`. Same names in different projects are independent. Exact-binding retries return the existing route without rewriting it. An omitted `--executable` preserves the old value; an explicitly different executable is also refused. Existing channels and message routes stay pinned. Explicit Codex `remap` keeps its existing rules.
+
+New-session registration commands check an occupied name before opening a session; the broker still checks atomically at final registration. In the Codex result, a known final conflict preserves the created session with `registered: false` and `uncertain: false`; an ambiguous registration write stays uncertain. Neither path automatically unregisters, remaps or retries. This protection requires the updated broker; client preflight does not reserve a name.
+
 ## Architecture
 
 ```mermaid
@@ -91,7 +97,7 @@ MESSAGE
 - `reply` uses the return route captured on the original request. Replying to a reply ID continues the same `conversation`.
 - `send` takes the same arguments as `ask` without waiting. You can wait later with `wait REQUEST_ID --timeout 60`.
 - When `ask` or `wait` times out, it exits with code 2 (`timed_out: true`). It does not cancel the request; run `wait` again on the same ID to collect a late reply.
-- Reuse the same `--key` when retrying a send. Reusing a key with different payload parameters is rejected. Idempotency keys last only while their messages are retained in the current broker run.
+- Reuse the same `--key` when retrying a send. Reusing a key with different payload parameters is rejected. Idempotency keys survive restart while their message or opt-in compact receipt remains retained.
 - Inspect queued or retained messages with `inbox`, `show`, and `conversation`:
 
 ```bash
@@ -110,11 +116,44 @@ python3 "$bridge_cli" watch --project my-app --channel modal-view \
 ```
 
 - **Event window**: The broker keeps the most recent 1,024 events in memory. Out-of-range cursors or stale broker instances are rejected; re-check `channels` and `inbox` when that happens.
-- **Message size & retention**: Individual message bodies are limited to 32 KiB UTF-8. `serve --max-messages 2048` sets the message retention capacity. At capacity, the oldest eligible terminal message is evicted before accepting a new send or reply:
+- **Message size & retention**: Individual message bodies are limited to 32 KiB UTF-8. `serve --max-messages 2048` sets the message retention capacity. With TTL disabled, at capacity the oldest eligible terminal message is evicted before accepting a new send or reply:
   - `done`: explicitly completed with `resolve --state done --note ...`.
   - `answered`: a bridge reply has been recorded.
   - `failed`: a definite dispatch failure, not an uncertain outcome.
-- **Protected messages**: `pending`, `dispatching`, `submitted`, `received`, `in_progress`, and `uncertain` are unfinished and never evicted. The current reply parent, active waits, and terminal replies needed by an unfinished or actively waited parent are also protected. If no eligible message remains, sends/replies fail with `In-memory message limit reached: no evictable terminal messages`.
+- **Protected messages with TTL disabled**: `pending`, `dispatching`, `submitted`, `received`, `in_progress`, and `uncertain` are unfinished and never evicted. The current reply parent, active waits, and terminal replies needed by an unfinished or actively waited parent are also protected. If no eligible message remains, sends/replies fail with `In-memory message limit reached: no evictable terminal messages`.
+
+## Opt-in correspondence TTL (issue #105)
+
+TTL retention is opt-in with `serve --retention-ttl`. Leaving the flag off keeps the existing retention policy. It separates delivery state from the lifetime of an explicitly one-way message or request. `submitted` and `received` records are removed 24 hours after `created`, whether legacy or new and whether ACKed or not. This is a retention deadline, not evidence that the work completed.
+
+- `send --one-way` explicitly declares that no reply is expected. `send` and `ask` also accept `--reply-deadline SECONDS` (positive seconds, at most 604800), mutually exclusive with `--one-way`. This deadline is independent of `ask`/`wait --timeout`. A local wait timeout still does not cancel a request.
+- Deadline intent works with TTL enabled or disabled. An explicit request exposes `request_status` (`open`, `answered`, `completed`, or `expired`), `reply_deadline_at` (epoch seconds), and `late_reply`. Expiry preserves the delivery state. An expired pending request cannot be claimed for delivery. The refusal is visible. While the request remains retained, a late reply uses the captured return route and leaves the request expired. After hard removal, its ID has no retained correlation for a late reply.
+- Eligible explicitly one-way or completed bodies have a 24-hour TTL. One-way age starts at proven delivery. Completed age starts at completion. The separate creation-age rule removes `submitted` and `received` records outright. It takes precedence over one-way and reply-deadline body compaction. Compact lookup/deduplication receipts retain the original identity and frozen routing for seven days from `compacted_at`, with a separate limit of 8192 receipts. An active child or wait can protect a compact receipt beyond seven days. A compact lookup returns `body_expired: true`, an empty `body`, `body_sha256`, `body_chars`, `body_bytes`, `body_ttl_anchor_at`, `compacted_at` and `lookup_expires_at`. It does not recover the original text.
+
+Hard removal deletes the active record and its matching idempotency keys. It leaves no compact receipt and consumes no compact-receipt capacity. Subsequent lookup and reply correlation by that ID are unavailable. Reusing its key can create a new message, so do not treat a missing record as permission to retry an ambiguous delivery. The exact parent of a post currently being committed, a live waiter on the row or its reply parent, and unrecovered provider control/source references needed for retry safety remain protected. ACK, deadlines and parent-child relations alone do not delay this removal.
+
+`body_ttl_anchor_at` is the immutable qualifying timestamp in epoch seconds. Late reply completion does not move this body-retention anchor.
+
+- `pending`, `dispatching`, `uncertain`, `in_progress`, active waits and dependent replies/work retain their existing protection outside the `submitted`/`received` hard-removal rule. The message capacity stays bounded by `--max-messages` (default and TTL maximum 2048). An oversized compact record remains a full message with protection reason `compact_record_too_large`. TTL never deletes protected or unexpired work to make room. If these occupy all capacity, a new send/reply is visibly refused.
+
+Legacy terminal records without a transition timestamp use conservative bounds. An `answered` record uses a correlated reply creation time. A `done` record uses an existing ACK timestamp. Otherwise it uses a persisted `retention_adopted_at` baseline. The separate `submitted`/`received` rule uses creation age without marking work complete. An active provider-retry episode remains protected.
+
+Plan before enabling or restarting a shared broker.
+
+```bash
+# Read offline counts without changing the live broker or checkpoint.
+python3 "$bridge_cli" retention --dry-run --state-dir /absolute/private-state --max-messages 2048
+# Read counts including live wait protection on the updated running broker.
+python3 "$bridge_cli" retention --live
+# Enable only after reviewing capacity and coordinating the restart.
+python3 "$bridge_cli" serve --retention-ttl
+```
+
+Both planners return counts only, including `legacy_adoptions`, `would_remove`, `would_compact`, `would_forget`, `free_slots_after`, `admission_blocked` and protection-reason counts. `would_remove` counts creation-aged `submitted`/`received` records separately from body compaction. A prepare-mode plan predicts these removals but does not execute them. The offline plan reports `live_waiters_visible: false`. Its estimates are upper bounds because it cannot see live waiters. Review the live counts before rollout. If there is no immediate headroom, hold strict TTL rollout. Do not delete protected rows or relabel legacy deliveries. If missing legacy completion timestamps are the blocker, coordinate a restart with `serve --retention-prepare` instead.
+
+Preparation is mutually exclusive with `--retention-ttl`. Startup, each 60-second maintenance tick and admission may persist conservative adoption timestamps without TTL deletion, while existing capacity admission/terminal eviction remains in force. Keep preparation active while the 24-hour body age elapses. Then check `retention --live` again and activate strict TTL only when it reports immediate headroom. Otherwise resolve or drain work through its normal lifecycle. The live summary reports `retention_mode` (`legacy`, `prepare`, `ttl`) and `retention_prepare_enabled`.
+
+Preserve a private copy of the checkpoint before preparation or the first explicit-intent send. The first save with explicit one-way/deadline intent or compact receipts writes a version-2 checkpoint. Timestamp-only preparation stays version 1. Once that happens, do not start an older binary against it. The updated reader with the flag off preserves compact receipts. Turning the flag off does not restore expired bodies.
 
 ## Routing Storage and Opt-In launchd
 
@@ -130,11 +169,16 @@ python3 "$bridge_cli" watch --project my-app --channel modal-view \
 
 ```bash
 python3 "$bridge_cli" --socket /absolute/private/bridge.sock install-service \
-  --state-dir /absolute/private/state --plist /absolute/review/agent.plist --generate-only
+  --state-dir /absolute/private/state --plist /absolute/review/agent.plist --generate-only \
+  --retention-prepare
 plutil -lint /absolute/review/agent.plist
 ```
 
 For owner-approved installation, run `install-service` without `--generate-only` (writes `~/Library/LaunchAgents/com.agent-bridge.broker.SOCKET_HASH.plist` and calls `launchctl bootstrap gui/UID PLIST`). Because `KeepAlive` restarts the broker after `stop` or `SIGTERM`, use `uninstall-service` to keep a supervised broker down.
+
+`install-service` accepts mutually exclusive `--retention-prepare` and `--retention-ttl` flags and places the selected mode in the generated broker arguments. Omit both for legacy mode. The review path above is outside `~/Library/LaunchAgents`. `--generate-only` never calls `launchctl`. Installation refuses to overwrite an existing plist. To change a supervised broker mode, coordinate its maintenance window, review a new plist at a separate path, then use `uninstall-service` and install the reviewed configuration with the selected mode. Uninstall recognizes either known mode flag. It rejects arbitrary appended arguments.
+
+Strict TTL rollout through the private MCP facade requires an updated facade runtime as well as the broker. The updated facade maps a definite capacity refusal to `failed`/`BACKEND_UNAVAILABLE` with a capacity explanation and releases the session. Ambiguous disconnect handling is unchanged. This requires no MCP tool schema change. Update any pinned facade deployment before enabling strict TTL. An observing operation also ends as `failed`/`BACKEND_UNAVAILABLE` and releases the session when its reply is definitively absent, or when a previously delivered message is confirmed absent in the same broker epoch. Network failures and epoch ambiguity remain `unknown`. The facade never resends automatically.
 
 ## Session Discovery, Opening & Handoff
 
@@ -312,6 +356,8 @@ While a wake runs, the message is held in `dispatching`. A second `claude-peer` 
 
 ## Private MCP Independent Inbox
 
+A confirmed route/session conflict before broker posting returns `BACKEND_UNAVAILABLE` with a fixed `ROUTE_CHANGED:` message. Initial acceptance returns a tool error without creating an operation; a conflict detected after acceptance ends that operation as `failed`, releasing its slot. The facade never remaps or resends. A route mismatch discovered after the broker send was attempted remains `unknown`.
+
 The CLI `inbox`/`ack` contract above is unchanged. The private MCP facade (`scripts/mcp_server.py`) supports an explicit `"inbox_enabled": true` opt-in in `--phase1-config` for independent (`reply_to: null`) inbound messages via three tools: `bridge_inbox_list`, `bridge_message_get`, and `bridge_message_ack`. Read messages without consuming them, then explicitly ACK the stable signed ID after consumption. Correlated replies remain operation-only (`bridge_operation_get`). See [remote-mcp.md](remote-mcp.md#independent-inbox-issue-48-explicit-opt-in) for pagination, limits, restart semantics, and owner deployment gates. For a connected Events deployment, an active GPT/Dot subscription wakes the chat automatically; use inbox tools for independent mail and `bridge_operation_get` for reply notifications carrying `operation_id`. See [automatic notifications](remote-mcp.md#optional-mcp-events).
 
 ## Security & Verification
@@ -339,7 +385,7 @@ the in-memory mutation. A failure after replacement leaves the disk commit
 outcome uncertain and does not return acceptance. There
 is no automatic retry or delivery on load.
 
-The checkpoint's version is 1. Its field allowlist is as follows.
+The checkpoint uses version 1 until explicit one-way/deadline intent or compact receipts are stored, then version 2. Both versions can carry optional `one_way`, `delivered_at`, `completed_at`, `retention_adopted_at`, `reply_deadline_at` and `last_reply_at` message metadata. Version 2 adds `compact` records with the body-expiry fields described in the [TTL policy](#opt-in-correspondence-ttl-issue-105), and compact idempotency intents use a fingerprint instead of a retained body. The original version-1 field allowlist is as follows.
 
 - `messages` preserves `id`, `conversation`, `project`, `sender`, `recipient`,
   `channel`, `sender_channel`, `body`, `reply_to`, `state`, `created`, and optional
@@ -363,8 +409,8 @@ CLI derives current blocker notes from retained dispatch start times. Live waits
 subscribers and event cursors must reconnect. New events use a new broker
 instance. Persisted message IDs and conversations remain unchanged.
 
-All retained terminal messages keep their terminal state and remain eligible for
-normal oldest-terminal eviction. `pending`, `submitted`, `received`, `in_progress`
+All retained terminal messages keep their terminal state. With TTL disabled they remain eligible for
+normal oldest-terminal eviction; enabled TTL adds expiry and protection checks, including 24-hour creation-age removal for `submitted` and `received`. `pending`, `in_progress`
 and `uncertain` retain their state. `dispatching` becomes `uncertain` because the
 broker cannot know whether the external recipient accepted the interrupted push.
 Resolve that outcome explicitly. No recovery path invokes a provider.
@@ -380,7 +426,7 @@ metadata index and loss ledger use a restore ceiling based on at least 2048
 messages, independent of a reduced retention setting. For larger prior stores,
 a validated metadata index can raise the payload read ceiling to its recorded
 message count times 1 MiB plus the inbox budgets. An oversized file without a
-usable index refuses startup. Lowering `--max-messages` reuses the broker's
+usable index refuses startup. With TTL disabled, lowering `--max-messages` reuses the broker's
 oldest-terminal eviction policy and its parent/ancestor guards. Retained messages
 keep checkpoint order, and keys are filtered only for messages actually evicted.
 Protected and non-terminal mail survives even when the retained count exceeds the
@@ -396,8 +442,8 @@ Snapshots and ACK receipts remain valid only within the broker epoch. Startup
 validates their checkpoint records and releases them, while message ACK state
 and `acknowledged_at` remain durable. A fresh list issues new handles. Read-only
 `inbox_list` updates pagination state in memory and skips the durable write.
-Other mutations still rewrite the version-1 checkpoint, including both copies
-of the body in the message and original intent. The facade instance ping shares
+Other mutations still rewrite the checkpoint. Version-1 message records include both copies
+of the body in the message and original intent; compact TTL records omit the body. The facade instance ping shares
 the bounded 3-second socket-operation timeout used by other RPCs so it can wait
 behind a busy broker.
 

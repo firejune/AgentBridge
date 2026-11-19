@@ -17,6 +17,12 @@
 
 별도의 CLI 사본을 중복 실행하거나 라이브 세션을 `watch` 폴링 루프에 가두지 않고, 열려 있는 상대 세션으로 메시지를 직접 push해 진행 중인 작업을 중단하지 않으면서 다자간 협업을 수행한다.
 
+## 등록 이름 보호
+
+`register`는 `(project, name)`을 보호한다. 다른 transport·세션 UUID·정규화된 작업 경로로 덮어쓰려 하면 `Route name is already in use; use a different name`으로 거절한다. 프로젝트가 다르면 같은 이름을 쓸 수 있다. 동일 바인딩 재시도는 파일을 다시 쓰지 않고 기존 경로를 반환한다. `--executable`을 생략하면 기존 값을 유지하며, 명시적으로 다른 실행 파일을 지정해도 거절한다. 채널과 기존 메시지의 고정 경로는 유지되고, 명시적 Codex `remap` 규칙은 그대로다.
+
+새 세션 등록 명령은 세션을 열기 전에 이름 점유를 확인하고, 브로커는 최종 등록 시 원자적으로 다시 검사한다. Codex 결과에서 확정된 최종 충돌은 생성된 세션을 보존한 채 `registered: false`, `uncertain: false`로 보고하고, 불명확한 등록 쓰기는 uncertain으로 남긴다. 자동 unregister·재매핑·재시도는 하지 않는다. 이 보호에는 업데이트된 브로커가 필요하며, 클라이언트 사전 확인은 이름 예약이 아니다.
+
 ## 문서 구성
 
 | 대상 | English | 한국어 |
@@ -208,9 +214,13 @@ python3 "$bridge_cli" wt sweep --apply  # 대상 워크트리 및 브랜치 실�
 ### 5. 라우팅 영속화 및 선택적 `launchd` 서비스
 
 - **소유자 전용 메시지·라우팅 저장**. 재시작은 브로커의 종료 메시지 제거·보호 규칙에 따라 라우트와 메시지를 복원하며, 낮춘 한도를 넘는 보호 메시지는 유지하고 stderr와 `ping.correspondence_over_limit`에 표시한다. 필드·한도·손실 진단은 [저장 계약](../../skill/agent-bridge/references/usage.md#correspondence-storage-issue-94)을 따른다.
+- **선택적 TTL**. `serve --retention-ttl`은 `submitted`·`received` 항목과 중복키를 ACK 여부와 관계없이 생성 24시간 뒤 제거하고 다른 제거 대상 메시지의 본문을 24시간, 조회·중복 방지용 축약 영수증을 7일간 보존한다. 완전 제거 뒤에는 조회·중복 방지·늦은 답장 연결을 할 수 없다. 활성 대기와 안전하지 않은 공급자 재시도 묶음은 보호한다. 먼저 `retention --dry-run`과 `retention --live`로 개수를 확인하고 즉시 여유가 없으면 엄격한 적용을 보류한다. 완료 시각 준비가 필요하면 문서의 `serve --retention-prepare` 절차를 따른다. [TTL 정책과 적용 절차](usage.md#선택적-메시지-ttl-issue-105)를 참고한다.
+- 서비스 모드는 `install-service --retention-prepare|--retention-ttl` 중 하나로 지정한다. 먼저 LaunchAgents 밖의 새 경로에 `--generate-only --plist PATH`로 생성해 검토한다. 기존 plist를 덮어쓰지 않으므로 모드 전환은 제거·재설치 일정을 조율한다.
 - **선택적 macOS `launchd` 관리**: 자동 기동 서비스는 기본 꺼짐 상태다. `install-service`(검토용 파일 생성은 `--generate-only --plist PATH`)와 `uninstall-service`로 `KeepAlive` 에이전트를 관리한다.
 
 ### 6. 원격 MCP 파사드 (`mcp_server.py`)
+
+브로커에 메시지를 기록하기 전에 라우트 또는 세션 충돌이 확인되면 `BACKEND_UNAVAILABLE`과 고정된 `ROUTE_CHANGED:` 메시지를 반환한다. 최초 접수에서 발견하면 작업을 만들지 않고 도구 오류를 반환하며, 접수 후 발견하면 해당 작업을 `failed`로 끝내 점유를 해제한다. 파사드는 자동 재매핑·재전송하지 않는다. 브로커 send를 시도한 뒤 발견한 라우트 불일치는 `unknown`으로 남긴다.
 
 로컬 에이전트(Claude Code, Codex, Antigravity)는 로컬 MCP를 등록하지 않고 `bridge.py` 파이썬 CLI를 직접 사용한다. `skill/agent-bridge/scripts/mcp_server.py`는 비공개 단일 소유자 원격 터널(`stdio` 기반 `--phase1-config /absolute/private.json`) 전용 인터페이스로, 세션 조회·생성, 메시지 전송, 독립 수신함(`inbox_enabled: true`)을 단일 커넥터로 노출한다(`--phase1-config` 생략 시 읽기 전용 `bridge_status`만 응답). 자세한 계약은 [remote-mcp.md](../../skill/agent-bridge/references/remote-mcp.md)를 참고한다. Events를 제공하는 연결 서버에 활성 구독이 있으면 알림 도착 시 구독한 GPT/Dot 채팅이 자동으로 깨어나고, 에이전트가 inbox 메시지나 알림의 작업 결과를 읽는다. [Events와 배포 범위](../../skill/agent-bridge/references/remote-mcp.md#optional-mcp-events)를 참고한다.
 

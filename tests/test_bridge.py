@@ -42,8 +42,8 @@ class StateTests(unittest.TestCase):
     def test_reply_freezes_both_addresses_and_conversation(self):
         first=self.send()
         for name in ('alpha','beta'):
-            self.call('register',project='demo',name=name,transport='codex',session=str(uuid.uuid4()),cwd='/tmp')
-            self.call('channel-bind',project='demo',name=name,owner=name,description='new',expect_generation=1)
+            self.call('register',project='demo',name=name+'-next',transport='codex',session=str(uuid.uuid4()),cwd='/tmp')
+            self.call('channel-bind',project='demo',name=name,owner=name+'-next',description='new',expect_generation=1)
         second=self.send('new')
         self.assertEqual(second['route']['generation'],2)
         answer=self.call('reply',id=first['id'],body='Answer',key='answer')
@@ -106,13 +106,13 @@ class SocketTests(unittest.TestCase):
 
     def test_remap_cli_preserves_pins_and_existing_messages(self):
         previous, replacement = str(uuid.uuid4()), str(uuid.uuid4())
-        route = self.server.call('register', project='demo', name='alpha', cwd=self.server.temp.name,
+        route = self.server.call('register', project='demo', name='remappable', cwd=self.server.temp.name,
                                  transport='codex', session=previous)
-        channel = self.server.call('channel-bind', project='demo', name='alpha', owner='alpha',
+        channel = self.server.call('channel-bind', project='demo', name='alpha', owner='remappable',
                                    description='pinned', expect_generation=1)
-        send = dict(project='demo', sender='alpha', recipient='beta', body='Question')
+        send = dict(project='demo', sender='remappable', recipient='beta', body='Question')
         old_message = self.server.call('send', key='old', **send)
-        command = ['--socket', self.server.path, 'remap', 'alpha', '--project', 'demo',
+        command = ['--socket', self.server.path, 'remap', 'remappable', '--project', 'demo',
                    '--expect-session', previous, '--session', replacement]
         thread = {'id': replacement, 'cwd': route['cwd']}
         wrong_workspace = {'session': dict(thread, cwd=self.server.state_dir)}
@@ -136,15 +136,15 @@ class SocketTests(unittest.TestCase):
         self.assertEqual(reply['route']['session'], previous)
         snapshot = Path(self.server.state_dir, 'routes.json').read_bytes()
         with self.assertRaisesRegex(ValueError, 'missing or changed'):
-            self.server.call('remap', project='demo', name='alpha', session=str(uuid.uuid4()), expected_route=route)
+            self.server.call('remap', project='demo', name='remappable', session=str(uuid.uuid4()), expected_route=route)
         with self.assertRaisesRegex(ValueError, 'missing or changed'):
             expected = dict(route, session=replacement, executable='previous-executable')
-            self.server.call('remap', project='demo', name='alpha', session=str(uuid.uuid4()), expected_route=expected)
+            self.server.call('remap', project='demo', name='remappable', session=str(uuid.uuid4()), expected_route=expected)
         self.assertEqual(Path(self.server.state_dir, 'routes.json').read_bytes(), snapshot)
 
     def test_remap_cli_restores_registered_non_archived_codex_routes(self):
         sid, archived, missing, wrong = (str(uuid.uuid4()) for _ in range(4))
-        registrations = [('demo', 'alpha', sid), ('other', 'mirror', sid),
+        registrations = [('demo', 'restorable', sid), ('other', 'mirror', sid),
                          ('other', 'archive', archived), ('other', 'missing', missing),
                          ('other', 'wrong', wrong)]
         for project, name, session in registrations:
@@ -171,7 +171,7 @@ class SocketTests(unittest.TestCase):
                 self.assertEqual(bridge.main(command), 1)  # Missing and mismatched routes remain unresolved.
                 rows = json.loads(stdout.getvalue())['routes']
                 self.assertEqual({(row['project'], row['name']): row['status'] for row in rows},
-                                 {('demo', 'alpha'): status, ('other', 'mirror'): status,
+                                 {('demo', 'restorable'): status, ('other', 'mirror'): status,
                                   ('other', 'archive'): 'archived', ('other', 'missing'): 'unresolved',
                                   ('other', 'wrong'): 'unresolved'})
                 owner_requests = [r for r in desktop.calls if r['method'] != 'initialize']
@@ -234,8 +234,8 @@ class SocketTests(unittest.TestCase):
         old,_=self.watch('alpha')
         first=self.send()
         self.assertEqual(next(old)['message']['route']['generation'],1)
-        self.server.call('register',project='demo',name='alpha',transport='realtime',session=str(uuid.uuid4()),cwd=self.server.temp.name)
-        self.server.call('channel-bind',project='demo',name='alpha',owner='alpha',description='new',expect_generation=1)
+        self.server.call('register',project='demo',name='alpha-next',transport='realtime',session=str(uuid.uuid4()),cwd=self.server.temp.name)
+        self.server.call('channel-bind',project='demo',name='alpha',owner='alpha-next',description='new',expect_generation=1)
         new,_=self.watch('alpha')
         second=self.send('second')
         self.assertEqual(next(new)['message']['id'],second['id'])
@@ -284,14 +284,14 @@ class SocketTests(unittest.TestCase):
             f'Path({str(exe.with_suffix(".args"))!r}).write_text(json.dumps(sys.argv))\n'
             f'print({result!r})\nraise SystemExit({exit_code})\n')
         exe.chmod(0o700)
-        self.server.call('register',project='demo',name='alpha',transport=transport,session=str(uuid.uuid4()),cwd=self.server.temp.name,executable=str(exe))
-        self.server.call('channel-bind',project='demo',name='alpha',owner='alpha',description='cli',expect_generation=1)
+        self.server.call('register',project='demo',name='cli-alpha',transport=transport,session=str(uuid.uuid4()),cwd=self.server.temp.name,executable=str(exe))
+        self.server.call('channel-bind',project='demo',name='alpha',owner='cli-alpha',description='cli',expect_generation=1)
         return exe
 
     def codex_route(self):
-        self.server.call('register',project='demo',name='alpha',transport='codex',
+        self.server.call('register',project='demo',name='desktop-alpha',transport='codex',
             session=str(uuid.uuid4()),cwd=self.server.temp.name)
-        self.server.call('channel-bind',project='demo',name='alpha',owner='alpha',
+        self.server.call('channel-bind',project='demo',name='alpha',owner='desktop-alpha',
             description='desktop',expect_generation=1)
 
     def test_codex_live_delivery_is_exclusive_and_duplicate_safe(self):

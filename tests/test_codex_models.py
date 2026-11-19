@@ -267,7 +267,7 @@ class CodexModelsTest(unittest.TestCase):
                     created['session'].update(id=self.sid, cwd=str(self.state))
                     with patch.dict(os.environ, env), \
                             patch.object(codex_new, 'open_codex', return_value=created) as create, \
-                            patch.object(bridge.broker, 'request', return_value=dict(self.route)) as broker:
+                            patch.object(bridge.broker, 'request', side_effect=lambda path, fields: [] if fields['op'] == 'routes' else dict(self.route)) as broker:
                         code, out = self.cli(*command, '--cwd', str(self.state), *extra)
                     self.assertEqual(code, 0, out)
                     create.assert_called_once()

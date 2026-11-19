@@ -347,9 +347,11 @@ class InboxIntegrationTests(unittest.TestCase):
         handle = self.handle(message)
         self.assertEqual(self.data('bridge_message_get', message_id=handle)['body'], message['body'])
         # A present but changed route must fail even with an unused pin alongside.
+        self.running.call('unregister', project='test-project', name=self.owned[0]['sender'])
         self.running.call('register', project='test-project', name=self.owned[0]['sender'],
             cwd=self.running.temp.name, transport='realtime')
         self.assertEqual(self.call('bridge_inbox_list')['error']['code'], 'ROUTE_CHANGED')
+        self.running.call('unregister', project='test-project', name=self.owned[0]['sender'])
         self.register(self.owned[0]['sender'])
         self.register(unused['sender'])
         initialized = self.listing()
@@ -372,11 +374,13 @@ class InboxIntegrationTests(unittest.TestCase):
                            ('bridge_inbox_list', {})]:
             original = self.engine.backend.rpc
             def replace(op, **fields):
+                self.running.call('unregister', project='test-project', name=self.owned[0]['sender'])
                 self.running.call('register', project='test-project', name=self.owned[0]['sender'],
                     cwd=self.running.temp.name, transport='realtime')
                 return original(op, **fields)
             with patch.object(self.engine.backend, 'rpc', side_effect=replace):
                 self.assertEqual(self.call(name, **args)['error']['code'], 'ROUTE_CHANGED')
+            self.running.call('unregister', project='test-project', name=self.owned[0]['sender'])
             self.register(self.owned[0]['sender'])
         self.assertEqual(self.running.call('show', id=message['id'])['state'], 'pending')
 

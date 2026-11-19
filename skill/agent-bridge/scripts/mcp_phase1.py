@@ -36,6 +36,12 @@ AGENT_TYPES = ('claude', 'agy', 'codex')
 AGENT_TRANSPORTS = {'claude': 'claude-peer', 'agy': 'agy', 'codex': 'codex'}
 TRANSPORT_AGENTS = {'claude-peer': 'claude', 'agy': 'agy', 'codex': 'codex'}
 ACTIVE = ('accepted', 'running', 'unknown')
+# Exact broker wire refusal. Older embedded broker versions lack the guard.
+REGISTER_CONFLICT_ERROR = 'Route name is already in use; use a different name'
+CAPACITY_FAILURE_MESSAGE = 'Broker message capacity is full; the message was not posted or delivered.'
+REPLY_NOT_RETAINED_MESSAGE = 'The reply is no longer retained.'
+MESSAGE_NOT_RETAINED_MESSAGE = 'The message is no longer retained.'
+ROUTE_CHANGED_MESSAGE = 'ROUTE_CHANGED: The registered route does not match this session; no message was sent.'
 STATES = {'pending','dispatching','submitted','received','in_progress','answered','done','failed','uncertain'}
 RETENTION = 720 * 3600  # Detailed records >=168h, full keys >=720h; tombstones never deleted.
 MAX_RESULT = 1024 * 1024
@@ -89,6 +95,10 @@ class Fault(Exception):
     def __init__(self, code, message=None):
         self.payload = {'code':code, 'message':message or code.replace('_', ' ').capitalize(), 'retryable':False}
         super().__init__(self.payload['message'])
+
+
+class RouteBindingRefusal(ValueError):
+    """Observed identity conflict before the broker send call."""
 
 
 def private_file(path):
@@ -269,20 +279,25 @@ class Backend:
         else:
             raise ValueError('Unsupported agent type')
         if row['id'] != session['uuid'] or Path(row['cwd']).resolve() != expected_cwd:
-            raise ValueError('Session identity changed')
+            raise RouteBindingRefusal('Session identity changed')
         if session.get('pinned'):
             rows = self.rpc('routes', project=session['workspace']['project'])
             route = next((r for r in rows if r['name'] == session['route']), {})
             route_cwd = Path(route['cwd']).resolve() if route.get('cwd') else None
             if (route.get('transport'),route.get('session'),route_cwd) != (
                     transport,session['uuid'],expected_cwd):
-                raise ValueError('Pinned route changed')
+                raise RouteBindingRefusal('Pinned route changed')
         return row
 
     def availability(self, session):
         try:
-            status = self.check(session).get('status')
+            # Discovery may need to create absent bindings, never replace a
+            # conflicting one. Existing owned bindings must still match exactly.
+            status = self.verify_routes(session, allow_missing=bool(
+                session.get('pinned') or session.get('discovered'))).get('status')
             return 'ready' if status in ('idle','ready') else 'busy' if status in ('running','busy') else 'unavailable'
+        except RouteBindingRefusal:
+            raise
         except (ValueError, OSError):
             return 'unavailable'
 
@@ -408,23 +423,34 @@ class Backend:
             existing = next((r for r in rows if r['name'] == fields['name']), None)
             if existing is not None:
                 if any(existing.get(k) != v for k,v in fields.items()):
-                    raise ValueError('Route collision')
+                    raise RouteBindingRefusal('Route collision')
             else:
                 if session.get('pinned') and fields is expected:
-                    raise ValueError('Pinned target route missing')
-                self.rpc('register', **fields)
+                    raise RouteBindingRefusal('Pinned target route missing')
+        for fields in (expected, sender):
+            if not any(r['name'] == fields['name'] for r in rows):
+                try:
+                    self.rpc('register', **fields)
+                except ValueError as error:
+                    if str(error) != REGISTER_CONFLICT_ERROR:
+                        raise
+                    raise RouteBindingRefusal(REGISTER_CONFLICT_ERROR) from None
         self.verify_routes(session)
 
-    def verify_routes(self, session):
-        self.check(session)
+    def verify_routes(self, session, allow_missing=False):
+        live = self.check(session)
         cwd = str(Path(session.get('cwd') or session['workspace']['cwd']).resolve())
         transport = self.session_transport(session)
         rows = self.rpc('routes', project=session['workspace']['project'])
         for name, expected_transport, sid in ((session['route'],transport,session['uuid']),
                                               (session['sender'],'realtime',None)):
-            row = next((r for r in rows if r['name'] == name), {})
+            row = next((r for r in rows if r['name'] == name), None)
+            if row is None and allow_missing and (not session.get('pinned') or name != session['route']):
+                continue
+            row = row or {}
             if (row.get('transport'),row.get('session'),row.get('cwd')) != (expected_transport,sid,cwd):
-                raise ValueError('Route changed')
+                raise RouteBindingRefusal('Route changed')
+        return live
 
     def post(self, op, session):
         if session.get('pinned') or session.get('discovered'):
@@ -678,6 +704,8 @@ class Engine:
                 if not creating and (not (session.get('registered') or session.get('discovered'))
                                      or self.backend.availability(session) not in (('ready','busy') if (session.get('pinned') or session.get('discovered')) else ('ready',))):
                     raise ValueError('Unavailable dedicated session')
+            except RouteBindingRefusal:
+                raise Fault('BACKEND_UNAVAILABLE', ROUTE_CHANGED_MESSAGE) from None
             except Exception:
                 raise Fault('BACKEND_UNAVAILABLE') from None
             if not creating and session.get('discovered'):
@@ -714,8 +742,8 @@ class Engine:
             if alias != session['alias']:
                 raise Fault('WORKSPACE_NOT_ALLOWED')
 
-    def fail(self, op, code='DELIVERY_UNKNOWN', unknown=True, error=None, **fields):
-        failure = Fault(code).payload
+    def fail(self, op, code='DELIVERY_UNKNOWN', unknown=True, error=None, message=None, **fields):
+        failure = Fault(code, message).payload
         failure['operation_id'] = op['operation_id']
         if error is not None:
             fields['error'] = error
@@ -771,6 +799,9 @@ class Engine:
                 session = self.session(op['agent_session_id'],op['principal']); self.allowed(session)
                 if self.backend.availability(session) not in (('ready','busy') if (session.get('pinned') or session.get('discovered')) else ('ready',)):
                     raise Fault('BACKEND_UNAVAILABLE')
+        except RouteBindingRefusal:
+            self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=ROUTE_CHANGED_MESSAGE)
+            return
         except Exception:
             self.fail(op,'BACKEND_UNAVAILABLE',unknown=False); return
         if op['kind']=='session_create':
@@ -799,7 +830,18 @@ class Engine:
                 os.close(fd)
         else:
             self.update(op,status='running',stage='post_intent',instance=instance)
-            message = self.backend.post(op,session)
+            try:
+                message = self.backend.post(op,session)
+            except RouteBindingRefusal:
+                self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=ROUTE_CHANGED_MESSAGE)
+                return
+            except ValueError as error:
+                # Only these exact broker admission refusals prove no post took
+                # place. Disconnects, timeouts and other errors remain ambiguous.
+                if str(error) not in broker.MESSAGE_CAPACITY_ERRORS:
+                    raise
+                self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=CAPACITY_FAILURE_MESSAGE)
+                return
             self.update(op,stage='posted',backend_id=message['id'],backend_message_state=message['state'])
             if self.backend.instance() != instance:
                 self.fail(op); return
@@ -852,15 +894,32 @@ class Engine:
 
     def observe(self, op):
         try:
+            same = False
             try:
                 # Read-only broker calls. A failure here says nothing about the message.
                 same = self.backend.instance()==op['instance']
                 if same:
                     message,replies = self.backend.observe(op['backend_id'])
+                    if not isinstance(message, dict) or message.get('id') != op['backend_id']:
+                        raise ValueError('Unexpected message identifier')
                     state = message['state']
                     if state not in STATES:
                         raise ValueError('Unknown message state')
             except Exception as error:
+                if (same and isinstance(error, ValueError) and str(error) == UNKNOWN_MESSAGE
+                        and op.get('stage') == 'observing'
+                        and op.get('backend_message_state') in ('submitted', 'received', 'in_progress', 'answered', 'done')):
+                    # A restart between the initial epoch check and missing
+                    # read is still ambiguous, including an unreadable recheck.
+                    try:
+                        still_same = self.backend.instance() == op['instance']
+                    except Exception:
+                        still_same = False
+                    if still_same:
+                        self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=MESSAGE_NOT_RETAINED_MESSAGE)
+                    else:
+                        self.fail(op)
+                    return
                 self.observe_error(op,error); return
             if not same:
                 self.fail(op); return
@@ -868,7 +927,12 @@ class Engine:
             self.update(op,backend_message_state=state,observe_errors=0)
             if self.settle(op,replies):
                 return
-            if state=='failed':
+            if state == 'answered':
+                # Answered proves that a correlated reply once existed. Losing
+                # that result must release the target; the late watch may still
+                # settle another retained reply without any resend.
+                self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=REPLY_NOT_RETAINED_MESSAGE)
+            elif state=='failed':
                 self.fail(op,'BACKEND_UNAVAILABLE',False)
             elif state=='uncertain' or (op.get('recovered') and state in ('pending','dispatching')):
                 self.fail(op)

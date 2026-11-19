@@ -12,6 +12,7 @@ import uuid
 import route_store
 import provider_failures
 import peer_wake
+import retention
 
 MESSAGE_FIELDS = ('id', 'conversation', 'project', 'sender', 'recipient', 'channel',
                   'sender_channel', 'body', 'reply_to', 'state', 'created')
@@ -76,7 +77,10 @@ def message_record(raw):
         uuid.UUID(result['reply_to'])
     if result['state'] not in STATES:
         raise ValueError('Invalid message state')
-    if not isinstance(result['body'], str) or not 1 <= len(result['body'].encode()) <= 32768:
+    compact = raw.get('body_expired') is True
+    if not compact and 'body_ttl_anchor_at' in raw:
+        raise ValueError('Compaction anchor belongs only to compact correspondence')
+    if not isinstance(result['body'], str) or (result['body'] != '' if compact else not 1 <= len(result['body'].encode()) <= 32768):
         raise ValueError('Invalid message body')
     for field in ('project', 'sender', 'recipient'):
         route_store.identifier(result[field])
@@ -98,6 +102,45 @@ def message_record(raw):
         if not isinstance(raw['acknowledged_at'], str):
             raise ValueError('Invalid acknowledgement time')
         result['acknowledged_at'] = raw['acknowledged_at']
+    for field in ('delivered_at', 'completed_at', 'retention_adopted_at', 'reply_deadline_at', 'last_reply_at'):
+        if field in raw:
+            if not retention.valid_time(raw[field]):
+                raise ValueError('Invalid retention time')
+            result[field] = raw[field]
+    if 'one_way' in raw:
+        if type(raw['one_way']) is not bool:
+            raise ValueError('Invalid message intent')
+        result['one_way'] = raw['one_way']
+    if result.get('one_way') and ('reply_deadline_at' in result or result['reply_to'] is not None):
+        raise ValueError('Conflicting message intent')
+    if compact:
+        if (not retention.valid_time(raw.get('compacted_at'))
+                or not retention.valid_time(raw.get('lookup_expires_at'))
+                or raw['lookup_expires_at'] != raw['compacted_at'] + retention.LOOKUP_TTL
+                or not isinstance(raw.get('body_sha256'), str)
+                or len(raw['body_sha256']) != 64
+                or any(c not in '0123456789abcdef' for c in raw['body_sha256'])
+                or type(raw.get('body_chars')) is not int or not 1 <= raw['body_chars'] <= 32768
+                or type(raw.get('body_bytes')) is not int or not 1 <= raw['body_bytes'] <= 32768):
+            raise ValueError('Invalid compact correspondence')
+        state = result['state']
+        one_way = (result.get('one_way') is True and
+                   (state == 'received' or state == 'submitted'
+                    and result['route']['transport'] in retention.PUSH_TRANSPORTS))
+        expired_request = (state in ('submitted', 'received')
+                           and retention.valid_time(result.get('delivered_at'))
+                           and retention.valid_time(result.get('reply_deadline_at'))
+                           and raw['compacted_at'] >= max(result['delivered_at'], result['reply_deadline_at']) + retention.BODY_TTL)
+        if state not in ('done', 'answered') and not one_way and not expired_request:
+            raise ValueError('Unsafe compact message state')
+        # The body was removed against this immutable planner anchor. A later
+        # correlated answer may change completed_at/state without changing when
+        # the original body satisfied its TTL.
+        anchor = raw.get('body_ttl_anchor_at')
+        if not retention.valid_time(anchor) or raw['compacted_at'] < anchor + retention.BODY_TTL:
+            raise ValueError('Compact message precedes safe body TTL')
+        for field in ('body_expired', 'compacted_at', 'lookup_expires_at', 'body_ttl_anchor_at', 'body_sha256', 'body_chars', 'body_bytes'):
+            result[field] = raw[field]
     if raw.get('provider_retry') is not None:
         result['provider_retry'] = retry_record(raw['provider_retry'])
     # claude-peer wake evidence (#121): normalized fields and fixed codes only, no diagnostics.
@@ -111,6 +154,29 @@ def message_record(raw):
     if len(encoded(result)) > FRAME_BYTES:
         raise ValueError('Correspondence message exceeds frame byte limit')
     return result
+
+
+def intent_record(key, intent):
+    if not isinstance(key, str) or not 1 <= len(key) <= 256 or not isinstance(intent, dict):
+        raise ValueError('Invalid idempotency record')
+    if set(intent) == {'fingerprint'}:
+        digest = intent['fingerprint']
+        if (not isinstance(digest, str) or len(digest) != 64
+                or any(c not in '0123456789abcdef' for c in digest)):
+            raise ValueError('Invalid idempotency fingerprint')
+        return dict(intent)
+    if (not set(INTENT_FIELDS).issubset(intent)
+            or set(intent) - set(INTENT_FIELDS) - {'one_way', 'reply_deadline_seconds'}
+            or intent['key'] != key
+            or any(value is not None and not isinstance(value, str)
+                   for field, value in intent.items() if field in INTENT_FIELDS)):
+        raise ValueError('Invalid idempotency record')
+    if 'one_way' in intent and type(intent['one_way']) is not bool:
+        raise ValueError('Invalid one-way intent')
+    seconds = intent.get('reply_deadline_seconds')
+    if seconds is not None and (not retention.valid_time(seconds) or seconds > retention.LOOKUP_TTL):
+        raise ValueError('Invalid reply deadline')
+    return dict(intent)
 
 
 def receipt_record(key, value):
@@ -186,8 +252,8 @@ class MessageStore:
         self.last_save_seconds = None
         self.max_save_seconds = 0.0
         self.checkpoint_bytes = 0
-        self.max_bytes = max_messages * FRAME_BYTES + SNAPSHOT_BYTES + MAX_RECEIPTS * 1024
-        self.restore_bytes = max(max_messages, RESTORE_MESSAGES) * FRAME_BYTES + SNAPSHOT_BYTES + MAX_RECEIPTS * 1024
+        self.max_bytes = max_messages * FRAME_BYTES + SNAPSHOT_BYTES + MAX_RECEIPTS * 1024 + retention.MAX_COMPACT * retention.MAX_COMPACT_BYTES
+        self.restore_bytes = max(max_messages, RESTORE_MESSAGES) * FRAME_BYTES + SNAPSHOT_BYTES + MAX_RECEIPTS * 1024 + retention.MAX_COMPACT * retention.MAX_COMPACT_BYTES
 
     def read(self, path):
         try:
@@ -243,6 +309,9 @@ class MessageStore:
                     pass  # A diagnostic cannot change durable acceptance.
 
     def _save(self, state):
+        compact = [message_record(m) for m in state.compact_messages.values()]
+        if len(compact) > retention.MAX_COMPACT or any(len(encoded(m)) > retention.MAX_COMPACT_BYTES for m in compact):
+            raise ValueError('Compact correspondence limit reached')
         messages = [message_record(m) for m in state.messages.values()]
         if len(messages) > self.retained_limit:
             raise ValueError('Correspondence message count limit reached')
@@ -255,9 +324,14 @@ class MessageStore:
             raise ValueError('Correspondence inbox count limit reached')
         if sum(value['bytes'] for value in snapshots.values()) > SNAPSHOT_BYTES:
             raise ValueError('Correspondence inbox byte limit reached')
-        keys = [[key, {field: intent.get(field) for field in INTENT_FIELDS}, mid]
-                for key, (intent, mid) in state.keys.items() if mid in state.messages]
-        data = encoded(dict(version=1, messages=messages, keys=keys, receipts=receipts, snapshots=snapshots))
+        keys = [[key, intent_record(key, intent), mid]
+                for key, (intent, mid) in state.keys.items()
+                if mid in state.messages or mid in state.compact_messages]
+        # Version 2 is required once compact receipts exist: a v1 writer cannot
+        # preserve their dedup and return routes. Rollback needs this reader.
+        version = 2 if (compact or any('one_way' in m or 'reply_deadline_at' in m for m in messages)
+                               or any(set(intent) != set(INTENT_FIELDS) for _, intent, _ in keys)) else 1
+        data = encoded(dict(version=version, messages=messages, compact=compact, keys=keys, receipts=receipts, snapshots=snapshots))
         if len(data) > self.max_bytes:
             raise ValueError('Correspondence checkpoint byte limit reached')
         # After initialization, commit the bounded metadata index first. It is
@@ -276,7 +350,7 @@ class MessageStore:
 
     def load(self):
         self.read_loss_reports()
-        empty = dict(messages=[], keys=[], receipts=[], snapshots={})
+        empty = dict(messages=[], compact=[], keys=[], receipts=[], snapshots={})
         try:
             raw = self.read(self.path)
         except FileNotFoundError:
@@ -288,38 +362,65 @@ class MessageStore:
         except (ValueError, UnicodeError):
             return self.lost('checkpoint corrupt', empty)
         try:
-            if (not isinstance(raw, dict) or raw['version'] != 1
-                    or not isinstance(raw['messages'], list)):
-                raise ValueError('Invalid checkpoint version or count')
-            messages = [message_record(m) for m in raw['messages']]
-            ids = {m['id'] for m in messages}
-            if len(ids) != len(messages):
-                raise ValueError('Duplicate message')
-            keys = raw['keys']
-            if (not isinstance(keys, list) or len(keys) > len(messages)
-                    or any(not isinstance(row, list) or len(row) != 3 for row in keys)):
-                raise ValueError('Invalid idempotency rows')
-            if len({row[0] for row in keys}) != len(keys):
-                raise ValueError('Invalid idempotency count')
-            for key, intent, mid in keys:
-                if (not isinstance(key, str) or not 1 <= len(key) <= 256 or mid not in ids
-                        or set(intent) != set(INTENT_FIELDS) or intent['key'] != key
-                        or any(value is not None and not isinstance(value, str) for value in intent.values())):
-                    raise ValueError('Invalid idempotency record')
-            receipts, snapshots = raw['receipts'], raw['snapshots']
-            if len(receipts) > MAX_RECEIPTS or len(snapshots) > 16:
-                raise ValueError('Invalid inbox count')
-            receipts = [receipt_record(key, value) for key, value in receipts]
-            snapshots = {key: snapshot_record(value) for key, value in snapshots.items()}
-            total = sum(value['bytes'] for value in snapshots.values())
-            if total > SNAPSHOT_BYTES:
-                raise ValueError('Invalid inbox byte count')
+            decoded = self.decode(raw)
         except MALFORMED_CONTENT:
             return self.lost('invalid checkpoint records; entire checkpoint dropped', empty)
-        # Facade handles and cursors bind the old broker instance. Validate
-        # their stored records above, then release unreachable capacity.
-        self.retained_limit = max(self.max_messages, len(messages))
-        return dict(messages=messages, keys=keys, receipts=[], snapshots={})
+        self.retained_limit = max(self.max_messages, len(decoded['messages']))
+        # Signed facade handles bind the old broker instance and are unreachable.
+        return dict(decoded, receipts=[], snapshots={})
+
+    def decode(self, raw):
+        """Strict read-only validation shared by startup and offline dry run."""
+        if (not isinstance(raw, dict) or raw['version'] not in (1, 2)
+                or not isinstance(raw['messages'], list)):
+            raise ValueError('Invalid checkpoint version or count')
+        messages = [message_record(m) for m in raw['messages']]
+        compact = [message_record(m) for m in raw.get('compact', [])]
+        if raw['version'] == 1 and (compact or any('one_way' in m or 'reply_deadline_at' in m for m in messages)):
+            raise ValueError('Retention intents require checkpoint version 2')
+        if (len(compact) > retention.MAX_COMPACT
+                or any(not m.get('body_expired') or len(encoded(m)) > retention.MAX_COMPACT_BYTES for m in compact)
+                or any(m.get('body_expired') for m in messages)):
+            raise ValueError('Invalid compact correspondence count')
+        ids = {m['id'] for m in messages + compact}
+        if len(ids) != len(messages) + len(compact):
+            raise ValueError('Duplicate message')
+        keys = raw['keys']
+        if (not isinstance(keys, list) or len(keys) > len(ids)
+                or any(not isinstance(row, list) or len(row) != 3 for row in keys)):
+            raise ValueError('Invalid idempotency rows')
+        if len({row[0] for row in keys}) != len(keys):
+            raise ValueError('Invalid idempotency count')
+        compact_ids = {m['id'] for m in compact}
+        for key, intent, mid in keys:
+            if mid not in ids or (mid in compact_ids) != ('fingerprint' in intent):
+                raise ValueError('Invalid idempotency binding')
+            intent_record(key, intent)
+            if raw['version'] == 1 and set(intent) != set(INTENT_FIELDS):
+                raise ValueError('Retention intents require checkpoint version 2')
+        receipts, snapshots = raw['receipts'], raw['snapshots']
+        if len(receipts) > MAX_RECEIPTS or len(snapshots) > 16:
+            raise ValueError('Invalid inbox count')
+        receipts = [receipt_record(key, value) for key, value in receipts]
+        snapshots = {key: snapshot_record(value) for key, value in snapshots.items()}
+        if sum(value['bytes'] for value in snapshots.values()) > SNAPSHOT_BYTES:
+            raise ValueError('Invalid inbox byte count')
+        return dict(messages=messages, compact=compact, keys=keys, receipts=receipts, snapshots=snapshots, version=raw['version'])
+
+    def retention_dry_run(self, current=None):
+        # Deliberately does not call load(), RouteStore(), loss handling or save().
+        # A broker may be live: the atomic payload is coherent but waiters are not
+        # present in a checkpoint; its counts are an offline upper bound only.
+        directory = self.path.parent.lstat()
+        if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.getuid()
+                or stat.S_IMODE(directory.st_mode) != 0o700):
+            raise UnsafeCheckpointError('Retention dry run requires an owner-private state directory')
+        raw = self.decode(self.read(self.path))
+        current = time.time() if current is None else current
+        planned = retention.plan({m['id']: m for m in raw['messages']},
+                                 {m['id']: m for m in raw['compact']}, {}, current, self.max_messages)
+        return dict(planned['counts'], dry_run=True, live_waiters_visible=False,
+                    counts_are_upper_bound=True, checkpoint_version=raw['version'])
 
     def read_loss_reports(self):
         path = self.path.with_name('correspondence-lost.json')

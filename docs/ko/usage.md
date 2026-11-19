@@ -6,6 +6,12 @@
 
 브로커는 소유자 전용 라우팅 파일(`routes.json`)과 상한이 있는 우편 체크포인트(`correspondence.json`)를 쓴다. 재시작하면 받아 둔 메시지와 전달 상태를 복원하되 전달을 재생하지 않는다. 자격 증명·서명 토큰·공급자 진단·이벤트 스트림은 메모리에만 둔다. 저장 필드와 손상 복구는 [영문 usage.md의 Correspondence storage (issue #94)](../../skill/agent-bridge/references/usage.md#correspondence-storage-issue-94)를 따른다.
 
+## 등록 이름 보호
+
+`register`는 `(project, name)`을 보호한다. 다른 transport·세션 UUID·정규화된 작업 경로로 덮어쓰려 하면 `Route name is already in use; use a different name`으로 거절한다. 프로젝트가 다르면 같은 이름을 쓸 수 있다. 동일 바인딩 재시도는 파일을 다시 쓰지 않고 기존 경로를 반환한다. `--executable`을 생략하면 기존 값을 유지하며, 명시적으로 다른 실행 파일을 지정해도 거절한다. 채널과 기존 메시지의 고정 경로는 유지되고, 명시적 Codex `remap` 규칙은 그대로다.
+
+새 세션 등록 명령은 세션을 열기 전에 이름 점유를 확인하고, 브로커는 최종 등록 시 원자적으로 다시 검사한다. Codex 결과에서 확정된 최종 충돌은 생성된 세션을 보존한 채 `registered: false`, `uncertain: false`로 보고하고, 불명확한 등록 쓰기는 uncertain으로 남긴다. 자동 unregister·재매핑·재시도는 하지 않는다. 이 보호에는 업데이트된 브로커가 필요하며, 클라이언트 사전 확인은 이름 예약이 아니다.
+
 ## 연결 구조
 
 ```mermaid
@@ -91,7 +97,7 @@ MESSAGE
 - `reply`는 질문에 고정된 답장 주소를 사용한다. 답장 ID에 다시 reply하면 같은 `conversation` 안에서 협의를 이어간다.
 - `send`는 `ask`와 같은 인수를 받되 기다리지 않는다. 전송 후 `wait REQUEST_ID --timeout 60`으로 답변을 기다릴 수 있다.
 - `ask`/`wait`의 시간 초과는 종료 코드 2(`timed_out: true`)다. 질문 취소가 아니므로 같은 ID로 다시 `wait`하면 늦은 답변을 받을 수 있다.
-- 같은 메시지를 다시 보내야 할 때는 같은 `--key`를 사용한다. 중복 방지는 현재 브로커 실행에서 해당 메시지가 보존되는 동안만 유효하다.
+- 같은 메시지를 다시 보내야 할 때는 같은 `--key`를 사용한다. 중복키는 메시지 또는 선택적 축약 영수증이 보존되는 동안 재시작 뒤에도 유지된다.
 - 브로커가 보존 중인 메시지 목록과 대화 이력은 `inbox`, `show`, `conversation`으로 확인한다:
 
 ```bash
@@ -110,8 +116,41 @@ python3 "$bridge_cli" watch --project my-app --channel modal-view \
 ```
 
 - **이벤트 창**: 최근 1,024개 이벤트를 메모리에 유지한다. 범위를 벗어난 커서나 재시작 전 `instance`는 거부되며, 이때는 `channels`와 `inbox`를 다시 확인한다.
-- **메시지 크기 및 보존 상한**: 한 메시지는 UTF-8 32 KiB까지다. `serve --max-messages 2048`은 메시지 보존 상한이며, 상한 도달 시 보호되지 않은 종료 항목(`done`, `answered`, `failed`) 중 가장 오래된 것을 제거한다.
-- **보호 대상**: `pending`·`dispatching`·`submitted`·`received`·`in_progress`·`uncertain`은 미완료 상태라 제거하지 않는다. 현재 답변의 부모, 실행 중인 `wait`, 미완료 또는 대기 중인 부모에게 필요한 종료 답변도 보호된다. 제거 후보가 없으면 `In-memory message limit reached: no evictable terminal messages`로 새 전송을 거부한다.
+- **메시지 크기 및 보존 상한**: 한 메시지는 UTF-8 32 KiB까지다. `serve --max-messages 2048`은 메시지 보존 상한이다. TTL을 끈 경우 상한 도달 시 보호되지 않은 종료 항목(`done`, `answered`, `failed`) 중 가장 오래된 것을 제거한다.
+- **TTL을 끈 경우의 보호 대상**: `pending`·`dispatching`·`submitted`·`received`·`in_progress`·`uncertain`은 미완료 상태라 제거하지 않는다. 현재 답변의 부모, 실행 중인 `wait`, 미완료 또는 대기 중인 부모에게 필요한 종료 답변도 보호된다. 제거 후보가 없으면 `In-memory message limit reached: no evictable terminal messages`로 새 전송을 거부한다.
+
+## 선택적 메시지 TTL (issue #105)
+
+`serve --retention-ttl`로 명시적으로 켤 때만 TTL 보존 정책을 적용한다. 플래그를 생략하면 기존 보존 정책을 유지한다. 전달 상태와 명시적 단방향 메시지·요청의 수명을 따로 관리하며, `submitted`·`received` 항목은 기존·신규 여부나 ACK 여부와 관계없이 `created`부터 24시간 뒤 제거한다. 보존 기한이며 작업 완료 판정은 아니다.
+
+- `send --one-way`는 답장을 기대하지 않는 단방향 메시지라고 명시한다. `send`와 `ask`는 `--reply-deadline SECONDS`(0보다 크고 최대 604800초)도 받으며 `--one-way`와 함께 쓸 수 없다. 이 기한은 `ask`/`wait --timeout`과 별개다. 로컬 대기 시간이 끝나도 요청을 취소하지 않는다.
+- 기한 지정은 TTL을 켜거나 꺼도 동작한다. 명시적 요청은 `request_status`(`open`·`answered`·`completed`·`expired`), `reply_deadline_at`(epoch 초), `late_reply`를 표시한다. 만료돼도 전달 상태는 유지한다. 만료된 pending 요청은 전달 claim을 거부하고 그 사유를 표시한다. 요청이 남아 있는 동안 늦은 답장은 원래 고정된 답장 주소로 보내며 요청은 만료 상태로 남는다. 완전히 제거된 뒤에는 그 ID로 늦은 답장을 연결할 수 없다.
+- 제거 조건을 충족한 명시적 단방향 메시지·완료 메시지의 본문 TTL은 24시간이다. 단방향 메시지는 전달이 확인된 시점부터, 완료 메시지는 완료 시점부터 계산한다. `submitted`·`received` 항목은 별도의 생성 시각 규칙으로 완전히 제거하며, 이 규칙은 단방향·답장 기한에 따른 본문 축약보다 우선한다. 조회·중복 방지용 축약 영수증은 원래 식별자와 고정 주소를 `compacted_at`부터 7일간 보존하며 별도 상한은 8192개다. 연결된 하위 메시지나 대기가 활성 상태면 축약 영수증을 7일보다 오래 보호할 수 있다. 축약 항목 조회는 `body_expired: true`, 빈 `body`, `body_sha256`·`body_chars`·`body_bytes`·`body_ttl_anchor_at`·`compacted_at`·`lookup_expires_at`을 반환한다. 원문을 복구하는 기능은 아니다.
+
+완전 제거는 활성 항목과 연결된 중복키를 지운다. 축약 영수증을 남기지 않아 축약 영수증 상한을 차지하지 않는다. 이후 그 ID로 조회하거나 답장을 연결할 수 없다. 같은 키를 쓰면 새 메시지가 생길 수 있으므로 기록이 없다는 이유로 불명확한 전달을 다시 보내지 않는다. 현재 저장 중인 답장의 정확한 부모, 해당 항목이나 답장 부모의 실제 활성 대기, 재시도 안전성에 필요한 미복구 공급자 제어·원본 참조는 보호한다. ACK·기한·부모 자식 관계만으로는 제거를 늦추지 않는다.
+
+`body_ttl_anchor_at`은 본문 제거 조건을 충족한 기준 시각(epoch 초)이며 이후 바뀌지 않는다. 늦은 답장이 완료돼도 이 본문 보존 기준은 유지한다.
+
+- `pending`·`dispatching`·`uncertain`·`in_progress`, 활성 대기와 그에 필요한 답장·작업은 `submitted`·`received` 완전 제거 규칙 외에는 기존 보호 정책을 따른다. 메시지 상한은 `--max-messages`(기본값이자 TTL 최대값 2048개)다. 축약 레코드가 너무 크면 `compact_record_too_large` 사유를 표시하고 본문 전체를 유지한다. 자리 확보를 위해 보호 항목이나 보존 기한이 남은 항목을 지우지 않는다. 이 항목들이 상한을 모두 차지하면 새 전송·답장을 명시적으로 거부한다. TTL 활성화로 상한을 우회할 수 없다.
+
+상태 전환 시각이 없는 기존 종료 항목은 보수적인 기준을 쓴다. `answered`는 연결된 답장의 생성 시각, `done`은 기존 ACK 시각을 사용하고, 그 근거도 없으면 `retention_adopted_at`을 저장해 기준으로 삼는다. 별도의 `submitted`·`received` 규칙은 작업을 완료로 바꾸지 않고 생성 시각부터 계산해 제거한다. 진행 중인 공급자 재시도 묶음도 보호한다.
+
+공유 브로커를 활성화하거나 재시작하기 전에 계획을 확인한다.
+
+```bash
+# 오프라인 개수 집계만 수행하며 라이브 브로커·체크포인트를 바꾸지 않는다.
+python3 "$bridge_cli" retention --dry-run --state-dir /absolute/private-state --max-messages 2048
+# 업데이트된 실행 중 브로커에서 활성 wait 보호까지 포함해 개수만 확인한다.
+python3 "$bridge_cli" retention --live
+# 여유와 재시작 일정을 확인한 뒤에만 활성화한다.
+python3 "$bridge_cli" serve --retention-ttl
+```
+
+두 계획은 `legacy_adoptions`·`would_remove`·`would_compact`·`would_forget`·`free_slots_after`·`admission_blocked`와 보호 사유별 개수만 반환한다. `would_remove`는 생성 기한이 지난 `submitted`·`received` 항목을 본문 축약과 별도로 센다. 준비 모드의 계획도 이 제거 수를 예측하지만 실제로 지우지는 않는다. 오프라인 계획은 `live_waiters_visible: false`를 표시한다. 실행 중인 대기자를 볼 수 없어 예상 정리 수는 상한값이다. 적용 전에 라이브 집계도 확인한다. 즉시 사용할 여유가 없으면 엄격한 TTL 적용을 보류한다. 보호 항목을 지우거나 기존 전달을 완료로 바꾸지 않는다. 기존 완료 시각 누락이 원인이면 조율 후 `serve --retention-prepare`로 재시작해 준비할 수 있다. 이 플래그는 `--retention-ttl`과 함께 쓸 수 없다. 시작 시·60초마다·새 메시지 수용 시 보수적 시각을 저장하되 TTL 제거는 하지 않으며, 기존 상한·종료 항목 제거 정책은 유지한다. 준비 모드는 저장 동결이나 무제한 큐가 아니다. 준비 모드를 유지하며 본문 나이 24시간을 기다린 뒤 `retention --live`를 다시 확인해 즉시 여유가 있을 때만 엄격한 TTL을 켠다. 여전히 여유가 없으면 정상 작업 흐름에서 완료·처리한다.
+
+라이브 집계는 `retention_mode`(`legacy`·`prepare`·`ttl`)와 `retention_prepare_enabled`도 표시한다.
+
+준비 단계나 처음으로 전달 목적을 명시해 전송하기 전에 체크포인트를 비공개 사본으로 보존한다. 명시적 단방향·기한 지정 또는 축약 영수증을 처음 저장하면 버전 2 체크포인트를 쓴다. 시각만 준비하는 단계는 버전 1을 유지한다. 그 뒤에는 예전 바이너리로 그 파일을 열지 않는다. 업데이트된 브로커는 플래그를 꺼도 축약 영수증을 보존하며, 플래그를 끈다고 제거된 본문이 돌아오지는 않는다.
 
 ## 라우팅 저장과 선택적 launchd
 
@@ -127,11 +166,16 @@ python3 "$bridge_cli" watch --project my-app --channel modal-view \
 
 ```bash
 python3 "$bridge_cli" --socket /absolute/private/bridge.sock install-service \
-  --state-dir /absolute/private/state --plist /absolute/review/agent.plist --generate-only
+  --state-dir /absolute/private/state --plist /absolute/review/agent.plist --generate-only \
+  --retention-prepare
 plutil -lint /absolute/review/agent.plist
 ```
 
 실제 설치는 `--generate-only` 없이 `install-service`를 실행한다(`~/Library/LaunchAgents/com.agent-bridge.broker.SOCKET_HASH.plist` 생성 및 `launchctl bootstrap`). `KeepAlive`는 `stop`이나 `SIGTERM` 후에도 브로커를 재기동하므로 계속 중지하려면 `uninstall-service`를 사용한다.
+
+`install-service`는 서로 함께 쓸 수 없는 `--retention-prepare`·`--retention-ttl` 플래그를 받아 생성할 브로커 인수에 해당 모드를 넣는다. 둘 다 생략하면 기존 모드다. 위 검토 경로는 `~/Library/LaunchAgents` 밖이며 `--generate-only`는 `launchctl`을 호출하지 않는다. 기존 plist는 덮어쓰지 않는다. 감독 중인 브로커의 모드를 바꿀 때는 점검 시간을 조율하고 별도 경로에 새 plist를 생성해 검토한 뒤 `uninstall-service`와 선택한 모드의 설치를 진행한다. 제거 명령은 두 모드 중 하나가 붙은 알려진 구성을 인식하며 임의의 추가 인수는 거부한다.
+
+비공개 MCP facade에서 엄격한 TTL을 적용하려면 브로커와 facade 런타임을 함께 업데이트해야 한다. 새 facade는 확정된 용량 거부를 용량 설명이 있는 `failed`/`BACKEND_UNAVAILABLE`로 반환하고 세션 점유를 해제한다. 연결 끊김으로 결과가 불명확한 경우의 처리는 그대로다. MCP 도구 스키마 변경은 없다. 기존 고정 facade 배포도 엄격한 TTL 활성화 전에 업데이트한다. 관찰 중인 작업의 답장이 확실히 없거나 같은 브로커 epoch에서 전달됐던 메시지의 부재가 확인되면 `failed`/`BACKEND_UNAVAILABLE`로 끝내고 세션 점유를 해제한다. 네트워크 실패나 epoch가 불명확하면 `unknown`을 유지한다. 자동으로 다시 보내지 않는다.
 
 ## 세션 조회, 생성과 인계
 
@@ -308,6 +352,8 @@ Claude 데스크톱은 세션을 스스로 닫는다(앱 `main.log`에서 관찰
 깨우는 동안 메시지는 `dispatching`에 묶여 있다. 같은 세션으로 두 번째 `claude-peer` push가 오면 링크를 또 열지 않고 그 뒤에서 한 번 기다린다. 기다림은 깨우기 제한 시간 + 10초와 두 번째 push 자신의 전송 한도 안이고, 쓰기용 5초를 남긴다. 앞 메시지가 전달로 끝나면 두 번째도 같은 호출자 토큰 `claim-guarded` 경로(응답을 잃었을 때의 1회 해제 포함)로 다시 claim해서 한 번 push한다(결과에 `behind: {id, state}`). 아니면 아무것도 보내지 않고 `pending`으로 남으며, 위의 차단된 전송 노트에 앞 전달이 끝난 상태를 붙여 기록한다: `pending behind <id> since <time> (<상태>); not sent`. 앞 전달이 `uncertain`이면 기다리지 않고 바로 그 노트를 단다. 브로커의 `note-pending` 작업은 메시지가 아직 `pending`일 때만 노트를 기록하고, 아니면 `noted: false`를 돌려준다. 그래서 그사이 다른 호출자가 잡은 claim을 덮어쓰지 않는다. 이 작업이 없는 브로커는 `Unknown operation`으로 답하고, 그때 노트는 CLI 결과에만 나오며(`note_scope: local`) 브로커에는 아무것도 기록하지 않는다. `unsupported`나 `uncertain` 뒤에는 앱에서 세션을 확인하고 `deliver MESSAGE_ID`로 한 번 다시 시도한다. 링크를 열면 앱이 보여 주는 세션이 바뀌고, `open -g`여도 앱이 앞으로 올 수 있다.
 
 ## 비공개 MCP 독립 inbox
+
+브로커에 메시지를 기록하기 전에 라우트 또는 세션 충돌이 확인되면 `BACKEND_UNAVAILABLE`과 고정된 `ROUTE_CHANGED:` 메시지를 반환한다. 최초 접수에서 발견하면 작업을 만들지 않고 도구 오류를 반환하며, 접수 후 발견하면 해당 작업을 `failed`로 끝내 점유를 해제한다. 파사드는 자동 재매핑·재전송하지 않는다. 브로커 send를 시도한 뒤 발견한 라우트 불일치는 `unknown`으로 남긴다.
 
 기존 CLI `inbox`·`ack` 의미는 그대로 유지된다. 비공개 MCP 파사드(`scripts/mcp_server.py`)에서 `--phase1-config`에 `"inbox_enabled": true`를 명시하면 `bridge_inbox_list`·`bridge_message_get`으로 독립(`reply_to: null`) 수신 메시지를 소비 없이 읽고, 처리 후 `bridge_message_ack`로 명시적으로 `done` 처리할 수 있다. 질문에 대한 답장(correlated reply)은 기존 `bridge_operation_get` 전용이다. 페이지네이션·용량·토큰 검증·배포 게이트는 [remote-mcp.md](../../skill/agent-bridge/references/remote-mcp.md#independent-inbox-issue-48-explicit-opt-in)를 따른다. Events를 제공하는 연결 서버에 활성 GPT/Dot 구독이 있으면 채팅이 자동으로 깨어난다. 독립 메시지는 inbox로, `operation_id`가 있는 답장 알림은 `bridge_operation_get`으로 읽는다. [자동 알림](../../skill/agent-bridge/references/remote-mcp.md#optional-mcp-events)을 참고한다.
 
