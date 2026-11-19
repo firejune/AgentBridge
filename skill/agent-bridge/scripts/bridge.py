@@ -765,7 +765,11 @@ def main(argv=None):
     p.add_argument('--cwd');p.add_argument('--search');p.add_argument('--limit',type=int,default=100)
     p.add_argument('--codex-executable',default='codex');p.add_argument('--claude-executable',default='claude')
     p.add_argument('--codex-mode',choices=['auto','shared','saved'],default='auto')
-    p.add_argument('--no-model',action='store_true',help='Skip the live model reading');p.add_argument('--state-dir')
+    model_options = p.add_mutually_exclusive_group()
+    model_options.add_argument('--with-model',action='store_true',help='Read the live model for each discovered session')
+    model_options.add_argument('--no-model',action='store_false',dest='with_model',help='Skip live model reads (default)')
+    p.set_defaults(with_model=False)
+    p.add_argument('--state-dir')
     p = sub.add_parser('session')
     p.add_argument('provider',choices=['codex','claude','agy']);p.add_argument('id');p.add_argument('--executable')
     p.add_argument('--codex-mode',choices=['auto','shared','saved'],default='auto')
@@ -994,7 +998,7 @@ def main(argv=None):
             return 0
         if args.cmd=='sessions':
             result = sessions.discover(args.provider,args.cwd,args.search,args.limit,args.codex_executable,args.claude_executable,args.codex_mode)
-            if not args.no_model:
+            if args.with_model:
                 policy = models.load_policy(broker_state_dir(args))
                 for name in ('codex','agy','claude'):
                     if name in result['providers']:

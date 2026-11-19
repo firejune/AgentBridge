@@ -185,11 +185,14 @@ plutil -lint /absolute/review/agent.plist
 python3 "$bridge_cli" sessions --cwd /path/to/workspace
 python3 "$bridge_cli" sessions --provider claude --search 'feature'
 python3 "$bridge_cli" sessions --provider codex --limit 100
+python3 "$bridge_cli" sessions --provider codex --with-model
 python3 "$bridge_cli" sessions --provider agy --cwd /path/to/workspace
 python3 "$bridge_cli" session codex SESSION_UUID
 python3 "$bridge_cli" session claude SESSION_UUID
 python3 "$bridge_cli" session agy SESSION_UUID
 ```
+
+기본 목록은 `model` 필드를 생략한다. 조회된 세션별 현재 모델 정보가 필요하면 `--with-model`을 추가한다. `--no-model`은 기본 동작을 명시하며 `--with-model`과 함께 쓸 수 없다.
 
 | 제공자 | 조회 방식 | 범위 |
 | --- | --- | --- |

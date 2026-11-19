@@ -188,11 +188,14 @@ Discovery commands work even when no broker is running and never trigger model t
 python3 "$bridge_cli" sessions --cwd /path/to/workspace
 python3 "$bridge_cli" sessions --provider claude --search 'feature'
 python3 "$bridge_cli" sessions --provider codex --limit 100
+python3 "$bridge_cli" sessions --provider codex --with-model
 python3 "$bridge_cli" sessions --provider agy --cwd /path/to/workspace
 python3 "$bridge_cli" session codex SESSION_UUID
 python3 "$bridge_cli" session claude SESSION_UUID
 python3 "$bridge_cli" session agy SESSION_UUID
 ```
+
+The default list omits the `model` field. Use `--with-model` to read live model details for each discovered session. `--no-model` explicitly selects the default and is mutually exclusive with `--with-model`.
 
 | Provider | Discovery Mechanism | Scope |
 | --- | --- | --- |
