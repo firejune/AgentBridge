@@ -161,6 +161,176 @@ class PhaseTest(unittest.TestCase):
             with self.assertRaises(ValueError):backend.register(session)
         self.assertFalse(any(op=='register' for op,args in calls))
 
+    def route_checked_owned_session(self, key='route_checked_create_01'):
+        self.engine.backend = self.backend  # Creation stays on the synthetic backend.
+        self.config['workspaces']['test']['agent_type'] = 'agy'
+        sid = self.create(key)['agent_session_id']
+        session = self.engine.session(sid, 'owner-a')
+        backend = phase.Backend('/unused-synthetic-broker')
+        routes = [dict(project=session['workspace']['project'], name=session['route'],
+                       cwd=str(self.root), transport='agy', session=session['uuid']),
+                  dict(project=session['workspace']['project'], name=session['sender'],
+                       cwd=str(self.root), transport='realtime', session=None)]
+        calls = []
+        def rpc(op, **fields):
+            calls.append((op, fields))
+            if op == 'ping':
+                return {'instance': self.backend.current}
+            if op == 'routes':
+                return [dict(row) for row in routes]
+            if op == 'send':
+                return dict(id=str(uuid.uuid4()), state='pending', route=dict(routes[0]), return_route=dict(routes[1]))
+            raise AssertionError('Unexpected synthetic broker mutation: ' + op)
+        backend.rpc = rpc
+        self.engine.backend = backend
+        return sid, session, backend, routes, calls
+
+    def test_owned_live_agy_route_collision_is_visible_before_accept_without_operation(self):
+        sid, session, backend, routes, calls = self.route_checked_owned_session()
+        other = str(uuid.uuid4())
+        routes[0]['session'] = other
+        live = {value: {'id': value, 'cwd': str(self.root), 'status': 'idle'} for value in (session['uuid'], other)}
+        before = len(self.engine.rows())
+        with patch.object(phase.sessions, 'resolve_agy_peer', side_effect=lambda value: live[value]), patch.object(backend, 'push') as push:
+            result = self.send(sid)
+        self.assertEqual((result['error']['code'], result['error']['message']),
+                         ('BACKEND_UNAVAILABLE', phase.ROUTE_CHANGED_MESSAGE))
+        self.assertEqual(len(self.engine.rows()), before)
+        self.assertEqual(routes[0]['session'], other)  # Never remap either live session.
+        self.assertFalse(any(op in ('send', 'register') for op, _ in calls))
+        push.assert_not_called()
+
+    def test_route_change_after_accept_fails_before_post_and_does_not_leave_busy(self):
+        for boundary in ('preflight', 'post'):
+            with self.subTest(boundary=boundary):
+                sid, session, backend, routes, calls = self.route_checked_owned_session('route_create_' + boundary)
+                original = session['uuid']
+                with patch.object(phase.sessions, 'resolve_agy_peer', return_value={'id': original, 'cwd': str(self.root), 'status': 'idle'}), patch.object(backend, 'push') as push:
+                    accepted = self.send(sid, key='route_message_' + boundary)['data']
+                    if boundary == 'preflight':
+                        routes[0]['session'] = str(uuid.uuid4())
+                    else:
+                        availability = backend.availability
+                        def changed_after_availability(value):
+                            status = availability(value)
+                            routes[0]['session'] = str(uuid.uuid4())
+                            return status
+                        backend.availability = changed_after_availability
+                    self.engine.tick()
+                    operation = self.call('bridge_operation_get', operation_id=accepted['operation_id'])['data']
+                    self.assertEqual((operation['status'], operation['failure']['code'], operation['failure']['message']),
+                                     ('failed', 'BACKEND_UNAVAILABLE', phase.ROUTE_CHANGED_MESSAGE))
+                    self.assertIsNone(self.engine.operation(accepted['operation_id'], 'owner-a')['backend_id'])
+                    self.assertFalse(any(op in ('send', 'register') for op, _ in calls))
+                    push.assert_not_called()
+                    # An explicit operator repair permits a separately keyed send;
+                    # replay of the failed operation never creates another intent.
+                    routes[0]['session'] = original
+                    backend.availability = phase.Backend.availability.__get__(backend)
+                    self.assertTrue(self.send(sid, key='route_message_' + boundary)['data']['replayed'])
+                    self.assertTrue(self.send(sid, key='after_route_fix_' + boundary)['ok'])
+                    self.engine.fail(self.engine.rows()[-1], 'BACKEND_UNAVAILABLE', False)
+
+    def test_route_preflight_allows_absent_discovery_bindings_and_pinned_sender_only(self):
+        sid, session, backend, routes, calls = self.route_checked_owned_session()
+        live = {'id': session['uuid'], 'cwd': str(self.root), 'status': 'idle'}
+        target = dict(routes[0])
+        with patch.object(phase.sessions, 'resolve_agy_peer', return_value=live):
+            routes.clear()
+            self.assertEqual(backend.availability(dict(session, discovered=True, registered=False)), 'ready')
+            with self.assertRaises(phase.RouteBindingRefusal):
+                backend.availability(session)  # Existing owned binding cannot disappear silently.
+            routes.append(target)
+            self.assertEqual(backend.availability(dict(session, pinned=True, explicit_type=True)), 'ready')
+            routes[0]['session'] = str(uuid.uuid4())
+            with self.assertRaises(phase.RouteBindingRefusal):
+                backend.availability(dict(session, discovered=True, registered=False))
+        self.assertFalse(any(op in ('send', 'register') for op, _ in calls))
+
+    def test_known_sender_collision_is_checked_before_creating_discovered_target(self):
+        sid, session, backend, routes, calls = self.route_checked_owned_session()
+        routes[:] = [dict(routes[1], transport='agy', session=str(uuid.uuid4()))]
+        with patch.object(phase.sessions, 'resolve_agy_peer', return_value={'id': session['uuid'], 'cwd': str(self.root), 'status': 'idle'}):
+            with self.assertRaises(phase.RouteBindingRefusal):
+                backend.register(dict(session, discovered=True, registered=False))
+        self.assertFalse(any(op in ('send', 'register') for op, _ in calls))
+
+    def test_authoritative_register_race_refuses_without_post_or_push(self):
+        cases = (('target', ValueError(phase.REGISTER_CONFLICT_ERROR), False),
+                 ('sender', ValueError(phase.REGISTER_CONFLICT_ERROR), False),
+                 ('target', TimeoutError(phase.REGISTER_CONFLICT_ERROR), True),
+                 ('target', ValueError(phase.REGISTER_CONFLICT_ERROR + ' detail'), True))
+        for index, (binding, error, ambiguous) in enumerate(cases):
+            with self.subTest(binding=binding, error=type(error).__name__, ambiguous=ambiguous):
+                sid, session, backend, routes, calls = self.route_checked_owned_session('register_race_create_%d' % index)
+                session['discovered'] = True
+                self.engine.db.execute('UPDATE owned_sessions SET doc=? WHERE id=?', (json.dumps(session), sid))
+                original_routes = [dict(row) for row in routes]
+                rpc, post = backend.rpc, backend.post
+                missing = session['route'] if binding == 'target' else session['sender']
+                def post_after_binding_disappears(operation, value):
+                    routes[:] = [row for row in routes if row['name'] != missing]
+                    return post(operation, value)
+                def competing_register(op, **fields):
+                    if op == 'register':
+                        calls.append((op, fields))
+                        routes.append(dict(fields, transport='agy', session=str(uuid.uuid4())))
+                        raise error
+                    return rpc(op, **fields)
+                backend.rpc = competing_register
+                with patch.object(phase.sessions, 'resolve_agy_peer', return_value={'id': session['uuid'], 'cwd': str(self.root), 'status': 'idle'}), patch.object(backend, 'post', side_effect=post_after_binding_disappears), patch.object(backend, 'push') as push:
+                    accepted = self.send(sid, key='register_race_message_%d' % index)['data']
+                    self.engine.tick()
+                    self.engine.tick()
+                    operation = self.call('bridge_operation_get', operation_id=accepted['operation_id'])['data']
+                    self.assertEqual((operation['status'], operation['failure']['code']),
+                                     ('unknown', 'DELIVERY_UNKNOWN') if ambiguous else ('failed', 'BACKEND_UNAVAILABLE'))
+                    if not ambiguous:
+                        self.assertEqual(operation['failure']['message'], phase.ROUTE_CHANGED_MESSAGE)
+                    self.assertIsNone(self.engine.operation(accepted['operation_id'], 'owner-a')['backend_id'])
+                    self.assertEqual(sum(op == 'register' for op, _ in calls), 1)
+                    self.assertFalse(any(op == 'send' for op, _ in calls))
+                    push.assert_not_called()
+                    self.assertTrue(self.send(sid, key='register_race_message_%d' % index)['data']['replayed'])
+                    routes[:] = original_routes  # Independent repair; the operation is never replayed.
+                    next_send = self.send(sid, key='after_register_race_%d' % index)
+                    if ambiguous:
+                        self.assertEqual(next_send['error']['code'], 'SESSION_BUSY')
+                    else:
+                        self.assertTrue(next_send['ok'])
+                        self.engine.fail(self.engine.operation(next_send['data']['operation_id'], 'owner-a'), 'BACKEND_UNAVAILABLE', False)
+
+    def test_post_response_route_race_remains_unknown_with_no_push_or_remap(self):
+        sid, session, backend, routes, calls = self.route_checked_owned_session()
+        with patch.object(phase.sessions, 'resolve_agy_peer', return_value={'id': session['uuid'], 'cwd': str(self.root), 'status': 'idle'}), patch.object(backend, 'push') as push:
+            accepted = self.send(sid)['data']
+            rpc = backend.rpc
+            def change_at_send(op, **fields):
+                if op == 'send':
+                    routes[0]['session'] = str(uuid.uuid4())
+                return rpc(op, **fields)
+            backend.rpc = change_at_send
+            self.engine.tick()
+            operation = self.call('bridge_operation_get', operation_id=accepted['operation_id'])['data']
+            self.assertEqual((operation['status'], operation['failure']['code']), ('unknown', 'DELIVERY_UNKNOWN'))
+            self.assertEqual(sum(op == 'send' for op, _ in calls), 1)
+            self.assertFalse(any(op == 'register' for op, _ in calls))
+            push.assert_not_called()
+            self.assertEqual(self.send(sid, key='race_still_busy_001')['error']['code'], 'SESSION_BUSY')
+
+    def test_typed_route_check_after_post_stays_ambiguous_and_is_not_retried(self):
+        sid = self.create()['agent_session_id']
+        accepted = self.send(sid)['data']
+        with patch.object(self.backend, 'push', side_effect=phase.RouteBindingRefusal('Session identity changed')) as push:
+            self.engine.tick()
+            self.engine.tick()
+            self.assertEqual(push.call_count, 1)
+        operation = self.call('bridge_operation_get', operation_id=accepted['operation_id'])['data']
+        self.assertEqual((operation['status'], operation['failure']['code']), ('unknown', 'DELIVERY_UNKNOWN'))
+        self.assertEqual(self.backend.posts, 1)
+        self.assertIsNotNone(self.engine.operation(accepted['operation_id'], 'owner-a')['backend_id'])
+        self.assertEqual(self.send(sid, key='after_post_still_busy')['error']['code'], 'SESSION_BUSY')
+
     def test_pinned_config_rejects_alias_collision_and_invalid_cwd(self):
         self.grant()
         self.config['pinned_sessions']['test']=self.config['pinned_sessions'].pop('hq')
@@ -204,7 +374,7 @@ class PhaseTest(unittest.TestCase):
 
     def test_ambiguous_post_errors_remain_unknown_without_retry_and_hold_target(self):
         errors = (TimeoutError('response lost'), OSError('disconnected'),
-                  ValueError('unrecognized post response'))
+                  ValueError('unrecognized post response'), ValueError(phase.REGISTER_CONFLICT_ERROR))
         for index, error in enumerate(errors):
             with self.subTest(error=type(error).__name__):
                 sid = self.create('create_ambiguous_%02d' % index)['agent_session_id']

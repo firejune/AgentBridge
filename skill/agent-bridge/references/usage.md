@@ -356,6 +356,8 @@ While a wake runs, the message is held in `dispatching`. A second `claude-peer` 
 
 ## Private MCP Independent Inbox
 
+A confirmed route/session conflict before broker posting returns `BACKEND_UNAVAILABLE` with a fixed `ROUTE_CHANGED:` message. Initial acceptance returns a tool error without creating an operation; a conflict detected after acceptance ends that operation as `failed`, releasing its slot. The facade never remaps or resends. A route mismatch discovered after the broker send was attempted remains `unknown`.
+
 The CLI `inbox`/`ack` contract above is unchanged. The private MCP facade (`scripts/mcp_server.py`) supports an explicit `"inbox_enabled": true` opt-in in `--phase1-config` for independent (`reply_to: null`) inbound messages via three tools: `bridge_inbox_list`, `bridge_message_get`, and `bridge_message_ack`. Read messages without consuming them, then explicitly ACK the stable signed ID after consumption. Correlated replies remain operation-only (`bridge_operation_get`). See [remote-mcp.md](remote-mcp.md#independent-inbox-issue-48-explicit-opt-in) for pagination, limits, restart semantics, and owner deployment gates. For a connected Events deployment, an active GPT/Dot subscription wakes the chat automatically; use inbox tools for independent mail and `bridge_operation_get` for reply notifications carrying `operation_id`. See [automatic notifications](remote-mcp.md#optional-mcp-events).
 
 ## Security & Verification

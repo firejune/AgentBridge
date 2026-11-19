@@ -220,6 +220,8 @@ python3 "$bridge_cli" wt sweep --apply  # 대상 워크트리 및 브랜치 실�
 
 ### 6. 원격 MCP 파사드 (`mcp_server.py`)
 
+브로커에 메시지를 기록하기 전에 라우트 또는 세션 충돌이 확인되면 `BACKEND_UNAVAILABLE`과 고정된 `ROUTE_CHANGED:` 메시지를 반환한다. 최초 접수에서 발견하면 작업을 만들지 않고 도구 오류를 반환하며, 접수 후 발견하면 해당 작업을 `failed`로 끝내 점유를 해제한다. 파사드는 자동 재매핑·재전송하지 않는다. 브로커 send를 시도한 뒤 발견한 라우트 불일치는 `unknown`으로 남긴다.
+
 로컬 에이전트(Claude Code, Codex, Antigravity)는 로컬 MCP를 등록하지 않고 `bridge.py` 파이썬 CLI를 직접 사용한다. `skill/agent-bridge/scripts/mcp_server.py`는 비공개 단일 소유자 원격 터널(`stdio` 기반 `--phase1-config /absolute/private.json`) 전용 인터페이스로, 세션 조회·생성, 메시지 전송, 독립 수신함(`inbox_enabled: true`)을 단일 커넥터로 노출한다(`--phase1-config` 생략 시 읽기 전용 `bridge_status`만 응답). 자세한 계약은 [remote-mcp.md](../../skill/agent-bridge/references/remote-mcp.md)를 참고한다. Events를 제공하는 연결 서버에 활성 구독이 있으면 알림 도착 시 구독한 GPT/Dot 채팅이 자동으로 깨어나고, 에이전트가 inbox 메시지나 알림의 작업 결과를 읽는다. [Events와 배포 범위](../../skill/agent-bridge/references/remote-mcp.md#optional-mcp-events)를 참고한다.
 
 ## 개발 및 검증

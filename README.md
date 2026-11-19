@@ -224,6 +224,8 @@ python3 "$bridge_cli" wt sweep --apply  # Remove eligible worktrees and branches
 
 ### 6. Remote MCP Facade (`mcp_server.py`)
 
+A confirmed route/session conflict before broker posting returns `BACKEND_UNAVAILABLE` with a fixed `ROUTE_CHANGED:` message. Initial acceptance returns a tool error without creating an operation; a conflict detected after acceptance ends that operation as `failed`, releasing its slot. The facade never remaps or resends. A route mismatch discovered after the broker send was attempted remains `unknown`.
+
 Local agents (Claude Code, Codex, Antigravity) invoke `bridge.py` directly via the Python CLI and do not register a local MCP server. `skill/agent-bridge/scripts/mcp_server.py` is dedicated to remote MCP clients connecting through a private single-owner tunnel (`--phase1-config /absolute/private.json` over `stdio`), exposing session discovery/creation, message dispatch, and the optional independent inbox (`inbox_enabled: true`). Without `--phase1-config`, the server falls back to read-only `connectivity_only` (`bridge_status`). See [remote-mcp.md](skill/agent-bridge/references/remote-mcp.md) for the full contract. An active Events subscription on a capable connected deployment automatically starts the subscribed GPT/Dot chat when a matching notification arrives; the agent then reads inbox mail or the notified operation result. See [Events and deployment boundaries](skill/agent-bridge/references/remote-mcp.md#optional-mcp-events).
 
 ## Development & Verification

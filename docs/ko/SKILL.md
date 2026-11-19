@@ -178,6 +178,8 @@ python3 "$bridge_cli" usage --events
 
 ## 원격 MCP 파사드
 
+브로커에 메시지를 기록하기 전에 라우트 또는 세션 충돌이 확인되면 `BACKEND_UNAVAILABLE`과 고정된 `ROUTE_CHANGED:` 메시지를 반환한다. 최초 접수에서 발견하면 작업을 만들지 않고 도구 오류를 반환하며, 접수 후 발견하면 해당 작업을 `failed`로 끝내 점유를 해제한다. 파사드는 자동 재매핑·재전송하지 않는다. 브로커 send를 시도한 뒤 발견한 라우트 불일치는 `unknown`으로 남긴다.
+
 - 로컬 에이전트는 항상 `scripts/bridge.py` 파이썬 CLI를 직접 사용하며, 로컬 MCP 서버로 중복 등록하지 않는다.
 - `scripts/mcp_server.py`는 비공개 원격 터널(`stdio` 기반 `--phase1-config`) 단일 커넥터 전용이다: [remote-mcp.md](../../skill/agent-bridge/references/remote-mcp.md).
 - 연결 서버가 MCP Events를 제공하고 대상 GPT/Dot 채팅에 활성 구독이 있으면 해당 알림이 채팅을 자동으로 깨운다. 독립 메시지는 inbox 도구로, `operation_id`가 있는 답장은 `bridge_operation_get`으로 읽는다. inbox 도구만으로 Events 지원을 판단하지 않는다. [배포 범위](../../skill/agent-bridge/references/remote-mcp.md#optional-mcp-events)를 참고한다.

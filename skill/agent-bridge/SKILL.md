@@ -184,6 +184,8 @@ python3 "$bridge_cli" usage --events
 
 ## Remote MCP Facade
 
+A confirmed route/session conflict before broker posting returns `BACKEND_UNAVAILABLE` with a fixed `ROUTE_CHANGED:` message. Initial acceptance returns a tool error without creating an operation; a conflict detected after acceptance ends that operation as `failed`, releasing its slot. The facade never remaps or resends. A route mismatch discovered after the broker send was attempted remains `unknown`.
+
 - Local agents always use `scripts/bridge.py` directly via the Python CLI; do not register `mcp_server.py` as a local MCP server.
 - `scripts/mcp_server.py` is for a single private remote tunnel (`--phase1-config` over `stdio`): see [remote-mcp.md](references/remote-mcp.md).
 - If the connected server supports MCP Events and the intended GPT/Dot chat has an active subscription, matching notifications wake it automatically. Read independent mail through inbox tools and captured replies through `bridge_operation_get` when `operation_id` is present. Inbox tools alone do not establish Events support; see [deployment boundaries](references/remote-mcp.md#optional-mcp-events).

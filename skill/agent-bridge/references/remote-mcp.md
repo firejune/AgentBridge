@@ -114,6 +114,12 @@ records are never aged out. Detail expiry cannot recycle a key.
 
 ## Restart and manual recovery
 
+A confirmed route/session conflict before broker posting returns `BACKEND_UNAVAILABLE` with a fixed `ROUTE_CHANGED:` message. Initial acceptance returns a tool error without creating an operation; a conflict detected after acceptance ends that operation as `failed`, releasing its slot. The facade never remaps or resends. A route mismatch discovered after the broker send was attempted remains `unknown`.
+
+Preflight reads the bindings without changing them. A discovered session can be missing both generated bindings. A pinned session can be missing its generated sender binding but requires its target to exist. The facade checks both bindings before creating any missing one and translates the broker’s exact duplicate-name refusal into the same route error.
+
+Route validation and broker send are separate calls. A route change between them can still create a pending broker packet. An unexpected returned destination leaves the operation `unknown` without pushing the packet. An operator must correct the grant or route explicitly.
+
 Queued operations have no external intent and may resume. Anything with a
 persisted intent is never blindly replayed. For a known message on the same broker
 instance, recovery observes only; missing IDs, eviction, broker restart, pending
