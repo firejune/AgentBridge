@@ -65,6 +65,11 @@ def route_key(route):
     return tuple(route.get(k) for k in ('project','name','transport','session','cwd','channel','generation'))
 
 
+def same_archive_endpoint(left, right):
+    fields = ('transport', 'session', 'cwd')
+    return all(left.get(field) == right.get(field) for field in fields)
+
+
 def same_codex_thread(left, right):
     return left['transport'] == right['transport'] == 'codex' and left['session'] == right['session']
 
@@ -601,13 +606,10 @@ class State:
                 or str(uuid.UUID(sid)) != sid or not cwd):
             raise ValueError('Archive cleanup requires a provider session UUID and workspace')
 
-        def matches(route):
-            return (route.get('transport'), route.get('session'), route.get('cwd')) == (transport, sid, cwd)
-
         records = self.messages | self.compact_messages
         selected, active, uncertain = set(), set(), set()
         for mid, message in records.items():
-            if any(matches(message[field]) for field in ('route', 'return_route')):
+            if any(same_archive_endpoint(expected, message[field]) for field in ('route', 'return_route')):
                 selected.add(mid)
             if message['state'] == 'dispatching' or self.waiters.get(message['reply_to']):
                 active.add(mid)
@@ -638,7 +640,10 @@ class State:
         # Invalidate the full snapshot so surviving pagination offsets stay stable.
         self.inbox_snapshots = {key: value for key, value in self.inbox_snapshots.items()
                                 if not any(item['id'] in removed for item in value['items'])}
-        return dict(removed=len(removed), retained=len(protected), complete=not protected)
+        result = dict(removed=len(removed), retained=len(protected), complete=not protected)
+        if protected:
+            result['active_retained'] = len(selected & active)
+        return result
 
     def purge_archive_events(self, removed):
         if not removed:
@@ -1117,12 +1122,15 @@ class State:
                                      or same_codex_thread(current, channel['route']))
                for channel in self.channels.values()):
             raise ValueError('Close or hand off active channels before closing this Codex thread')
-        if any(message['state'] not in TERMINAL_STATES
-               and (same_codex_thread(current, message['route'])
-                    or same_codex_thread(current, message['return_route']))
-               for message in self.messages.values()):
-            raise ValueError('This Codex thread has unfinished correspondence; reconcile it before closing')
         self.archive_correspondence({'expected_route': current, 'check_only': True})
+        for message in self.messages.values():
+            if message['state'] in TERMINAL_STATES:
+                continue
+            endpoints = (message['route'], message['return_route'])
+            if message['state'] == 'uncertain' and any(same_archive_endpoint(current, item) for item in endpoints):
+                continue  # Archive cleanup retains it and its idempotency key.
+            if any(same_codex_thread(current, item) for item in endpoints):
+                raise ValueError('This Codex thread has unfinished correspondence; reconcile it before closing')
         route = self.routing_change('endpoints', key, dict(current, closing=str(uuid.uuid4())))
         return {'route': route, 'operator': operator}
 
@@ -1238,8 +1246,8 @@ async def commit_close(state, args, route):
         return {**result, 'cleanup_error': str(error),
                 'correspondence_cleanup': {'confirmed': False, 'state': 'rejected'}}
     result['correspondence_cleanup'] = cleanup
-    if not cleanup['complete']:
-        result['cleanup_error'] = 'Archive confirmed; protected correspondence remains (active or uncertain delivery/wait)'
+    if cleanup.get('active_retained'):
+        result['cleanup_error'] = 'Archive confirmed; active correspondence remains'
 
     message = state.close_message(route['closing'])
     try:
@@ -1256,6 +1264,7 @@ async def commit_close(state, args, route):
             result['operator_receipt'] = 'done'
         except (OSError, ValueError):
             result['operator_receipt'] = 'needs_reconciliation'
+            result['operator_error'] = 'Archive confirmed; close operator receipt needs reconciliation'
     return result
 
 

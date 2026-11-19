@@ -943,10 +943,9 @@ class Engine:
                 # A recorded pre-send failure is definite; uncertain stays blocked.
                 m = e.message
                 self.update(op,backend_message_state=m['state'])
-                if m['state'] == 'failed' and m.get('reason') == delivery.ARCHIVED_REASON:
-                    self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=codex_live.ThreadArchived.MESSAGE)
-                elif m['state'] == 'pending':
-                    self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False)
+                detail = delivery.codex_prewrite_detail(m)
+                if detail is not None or m['state'] == 'pending':
+                    self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=detail)
                 else:
                     self.fail(op)
                 return
@@ -1029,9 +1028,8 @@ class Engine:
                 # settle another retained reply without any resend.
                 self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=REPLY_NOT_RETAINED_MESSAGE)
             elif state == 'failed':
-                detail = (codex_live.ThreadArchived.MESSAGE
-                          if message.get('reason') == delivery.ARCHIVED_REASON else None)
-                self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=detail)
+                self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False,
+                          message=delivery.codex_prewrite_detail(message))
             elif state=='uncertain' or (op.get('recovered') and state in ('pending','dispatching')):
                 self.fail(op)
         except Exception as error:

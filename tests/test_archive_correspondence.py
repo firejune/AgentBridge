@@ -105,7 +105,11 @@ class ArchiveCorrespondenceTests(unittest.TestCase):
         uncertain['state'] = 'uncertain'
         pending = self.send('pending')
         self.assertEqual(self.purge(check_only=True)['retained'], 1)
-        self.assertEqual(self.purge(archived=True), dict(removed=1, retained=1, complete=False))
+        self.state.waiters[uncertain['id']] = 1
+        with self.assertRaisesRegex(ValueError, 'active'):
+            self.purge(check_only=True)
+        self.state.waiters.clear()
+        self.assertEqual(self.purge(archived=True), dict(removed=1, retained=1, complete=False, active_retained=0))
         self.assertIn(uncertain['id'], self.state.messages)
         self.assertNotIn(pending['id'], self.state.messages)
         for mode in ('claim', 'wait', 'reply-wait', 'reserved'):
@@ -127,7 +131,7 @@ class ArchiveCorrespondenceTests(unittest.TestCase):
                 # The same guard is re-evaluated after provider archival. No
                 # destructive write to active work occurs even if it raced preflight.
                 if mode != 'reserved':
-                    self.assertFalse(self.purge(archived=True)['complete'])
+                    self.assertEqual(self.purge(archived=True)['active_retained'], 1)
                     self.assertIn(msg['id'], self.state.messages)
                 msg = self.state.messages[msg['id']]
                 msg.pop('provider_retry', None)
@@ -158,7 +162,7 @@ class ArchiveCorrespondenceTests(unittest.TestCase):
             self.state.waiters[archived['id']] = 1
             with self.assertRaisesRegex(ValueError, 'active'):
                 self.purge(check_only=True)
-            self.assertEqual(self.purge(archived=True), dict(removed=0, retained=1, complete=False))
+            self.assertEqual(self.purge(archived=True), dict(removed=0, retained=1, complete=False, active_retained=1))
             self.state.waiters.clear()
             self.assertEqual(self.purge(archived=True), dict(removed=1, retained=0, complete=True))
             self.assertEqual(json.loads(self.state.correspondence.path.read_bytes())['version'], 2)
@@ -308,10 +312,23 @@ class ArchiveCloseCommandTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 2)
         close.assert_called_once()
 
-    def test_partial_cleanup_removes_route_and_reports_retained(self):
-        self.cleanup_result = dict(removed=1, retained=1, complete=False)
-        code, result, _ = self.run_close('--archive')
-        self.assertEqual((code, result['route_removed'], result['correspondence_cleanup']['retained']), (1, True, 1))
+    def test_uncertain_only_cleanup_reports_retained_and_succeeds(self):
+        self.cleanup_result = dict(removed=1, retained=1, complete=False, active_retained=0)
+        for flags in ((), ('--keep-route',)):
+            with self.subTest(flags=flags):
+                code, result, _ = self.run_close('--archive', *flags)
+                self.assertEqual((code, result['archived'], result['route_removed']), (0, True, not flags))
+                self.assertEqual(result['correspondence_cleanup'], self.cleanup_result)
+                self.assertNotIn('cleanup_error', result)
+
+    def test_active_or_unclassified_retention_is_reported_as_incomplete(self):
+        for extra in ({'active_retained': 1}, {}):
+            with self.subTest(extra=extra):
+                self.cleanup_result = dict(removed=1, retained=1, complete=False, **extra)
+                code, result, _ = self.run_close('--archive')
+                self.assertEqual((code, result['archived'], result['route_removed']), (1, True, True))
+                self.assertEqual(result['correspondence_cleanup'], self.cleanup_result)
+                self.assertIn('protected correspondence remains', result['cleanup_error'])
 
     def test_old_broker_between_cleanup_and_removal_refuses_new_operation(self):
         original = self.request
@@ -340,7 +357,7 @@ class ArchiveCloseCommandTests(unittest.TestCase):
         self.assertEqual((code, result), (1, {'error':'socket disconnected'}))
 
     def test_partial_cleanup_and_route_failure_are_both_reported(self):
-        self.cleanup_result = dict(removed=1, retained=1, complete=False)
+        self.cleanup_result = dict(removed=1, retained=1, complete=False, active_retained=0)
         original = self.request
         def request(socket, args, **kwargs):
             if args['op'] == 'unregister-archived':
@@ -350,7 +367,7 @@ class ArchiveCloseCommandTests(unittest.TestCase):
             code, result, _ = self.run_close('--archive')
         self.assertEqual((code, result['route_removed']), (1, False))
         self.assertEqual(result['correspondence_cleanup']['retained'], 1)
-        self.assertIn('protected correspondence remains', result['cleanup_error'])
+        self.assertIn('route removal was not confirmed', result['cleanup_error'])
         self.assertIn('changed', result['route_error'])
 
     def test_route_removal_failure_keeps_successful_cleanup_receipt(self):

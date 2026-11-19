@@ -32,6 +32,22 @@ class ThreadArchived(DeliveryError):
         super().__init__(self.MESSAGE)
 
 
+class ResponseTimeout(DeliveryError):
+    """The bounded IPC response deadline expired."""
+
+
+class OwnerUnavailable(DeliveryError):
+    TIMEOUT = 'Codex Desktop owner discovery timed out for the exact thread. Message was not delivered.'
+    UNAVAILABLE = 'Codex Desktop owner discovery was unavailable for the exact thread. Message was not delivered.'
+    NO_OWNER = 'Exact Codex thread has no owner supporting untrusted input. Message was not delivered.'
+    WORKSPACE_MISSING = ' The exact saved workspace is missing.'
+
+    @classmethod
+    def details(cls):
+        return tuple(detail + suffix for detail in (cls.TIMEOUT, cls.UNAVAILABLE, cls.NO_OWNER)
+                     for suffix in ('', cls.WORKSPACE_MISSING))
+
+
 def endpoint():
     override = os.environ.get('AGENT_BRIDGE_CODEX_IPC')
     base = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex').expanduser()
@@ -97,7 +113,7 @@ class Client:
         while len(parts) < count:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise DeliveryError('Codex desktop IPC response timed out')
+                raise ResponseTimeout('Codex desktop IPC response timed out')
             self.sock.settimeout(remaining)
             chunk = self.sock.recv(count - len(parts))
             if not chunk:
@@ -118,8 +134,9 @@ class Client:
             size = struct.unpack('<I', self.exact(4, deadline))[0]
             if not 0 < size <= MAX_FRAME:
                 raise DeliveryError('Codex desktop IPC returned an invalid frame size')
+            raw = self.exact(size, deadline)
             try:
-                response = json.loads(self.exact(size, deadline))
+                response = json.loads(raw)
             except (ValueError, UnicodeError):
                 raise DeliveryError('Codex desktop IPC returned invalid JSON') from None
             if not isinstance(response, dict):
@@ -191,13 +208,25 @@ class Client:
                     raise DeliveryError('Codex desktop snapshot unsubscribe failed') from None
 
     def owner(self, thread):
-        response = self.call('thread-owner-discovery',
-                             {'hostId': 'local', 'conversationId': thread}, 1)
+        try:
+            response = self.call('thread-owner-discovery',
+                                 {'hostId': 'local', 'conversationId': thread}, 1)
+        except (ResponseTimeout, TimeoutError):
+            raise OwnerUnavailable(OwnerUnavailable.TIMEOUT) from None
+        except (DeliveryError, OSError):
+            raise OwnerUnavailable(OwnerUnavailable.UNAVAILABLE) from None
+        if response['resultType'] == 'error':
+            if response.get('method', 'thread-owner-discovery') != 'thread-owner-discovery':
+                raise OwnerUnavailable(OwnerUnavailable.UNAVAILABLE)
+            if response.get('error') == 'no-client-found' and response.get('handledByClientId') is None:
+                raise OwnerUnavailable(OwnerUnavailable.NO_OWNER)
+            raise OwnerUnavailable(OwnerUnavailable.UNAVAILABLE)
         result = response.get('result')
         owner = response.get('handledByClientId')
-        if (response['resultType'] != 'success' or not isinstance(owner, str) or not owner
-                or not isinstance(result, dict) or result.get('supportsUntrustedAppInput') is not True):
-            raise DeliveryError('Exact Codex thread has no owner supporting untrusted input')
+        if not isinstance(owner, str) or not owner or not isinstance(result, dict):
+            raise OwnerUnavailable(OwnerUnavailable.UNAVAILABLE)
+        if result.get('supportsUntrustedAppInput') is not True:
+            raise OwnerUnavailable(OwnerUnavailable.NO_OWNER)
         return owner
 
 
@@ -229,24 +258,40 @@ def accepted_turn(response):
     return turn_id
 
 
-def deliver(route, message_id, text, timeout=10, dry_run=False, path=None):
+def exact_saved_workspace(route):
     import codex_preview
 
     try:
         cwd, archived = codex_preview.saved_thread(route)
-        exact_workspace = Path(cwd).is_absolute() and Path(cwd).resolve() == Path(route['cwd']).resolve()
+        saved, registered = Path(cwd), Path(route['cwd'])
+        if saved.is_absolute() and registered.is_absolute() and saved.resolve() == registered.resolve():
+            return saved, archived
     except (OSError, ValueError, TypeError, KeyError, RuntimeError, TimeoutExpired):
         # Metadata lookup can be unavailable. Keep the existing IPC outcome
         # semantics unless the exact saved thread was confirmed archived.
         pass
-    else:
-        if archived is True and exact_workspace:
-            raise ThreadArchived()
+    return None, None
+
+
+def deliver(route, message_id, text, timeout=10, dry_run=False, path=None):
+    workspace, archived = exact_saved_workspace(route)
+    if archived is True:
+        raise ThreadArchived()
     client = Client(path, timeout)
     try:
         thread, steer, start = payloads(route, message_id, text)
         with client:
-            owner = client.owner(thread)
+            try:
+                owner = client.owner(thread)
+            except OwnerUnavailable as error:
+                if workspace is not None and archived is False:
+                    try:
+                        workspace.stat()
+                    except FileNotFoundError:
+                        raise OwnerUnavailable(str(error) + OwnerUnavailable.WORKSPACE_MISSING) from None
+                    except OSError:
+                        pass
+                raise
             if dry_run:
                 return dict(sent=False, transport='codex', session=thread, owner=owner,
                             input_role='toolOutput', methods=['thread-follower-steer-turn',

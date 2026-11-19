@@ -69,8 +69,15 @@ class FakeDesktop:
         if method == 'initialize':
             result['result'] = {'clientId': str(uuid.uuid4())}
         elif method == 'thread-owner-discovery':
-            if self.behavior == 'no-owner':
+            if self.behavior in ('no-owner', 'no-owner-conflicting-owner'):
                 result.update(resultType='error', error='no-client-found')
+                if self.behavior == 'no-owner':
+                    result.pop('handledByClientId')
+            elif self.behavior == 'owner-timeout':
+                self.stop.wait(.3)
+                return False
+            elif self.behavior == 'owner-disconnect':
+                return False
             else:
                 result['result'] = {'supportsUntrustedAppInput': self.behavior != 'no-capability'}
         elif method == 'thread-follower-steer-turn':
@@ -203,6 +210,47 @@ class CodexLiveTests(unittest.TestCase):
                     self.deliver(desktop)
                 self.assertFalse(raised.exception.uncertain)
                 self.assertEqual(len(desktop.calls), 2)
+
+    def test_owner_lookup_timeout_and_disconnect_are_prewrite_and_never_retried(self):
+        expected = {'owner-timeout': codex_live.OwnerUnavailable.TIMEOUT,
+                    'owner-disconnect': codex_live.OwnerUnavailable.UNAVAILABLE}
+        for behavior, message in expected.items():
+            with self.subTest(behavior=behavior), FakeDesktop(behavior) as desktop:
+                with self.assertRaises(codex_live.OwnerUnavailable) as raised:
+                    self.deliver(desktop)
+                self.assertEqual(str(raised.exception), message)
+                self.assertFalse(raised.exception.uncertain)
+                self.assertEqual([call['method'] for call in desktop.calls],
+                                 ['initialize', 'thread-owner-discovery'])
+                self.assertEqual(desktop.calls[-1]['params']['conversationId'], self.route['session'])
+
+    def test_exact_missing_saved_workspace_adds_context_to_owner_lookup_failure(self):
+        expected = {'no-owner': codex_live.OwnerUnavailable.NO_OWNER,
+                    'no-capability': codex_live.OwnerUnavailable.NO_OWNER,
+                    'owner-timeout': codex_live.OwnerUnavailable.TIMEOUT,
+                    'no-owner-conflicting-owner': codex_live.OwnerUnavailable.UNAVAILABLE}
+        with tempfile.TemporaryDirectory() as temp:
+            self.route['cwd'] = str(Path(temp) / 'missing')
+            with patch.object(codex_preview, 'saved_thread', return_value=(self.route['cwd'], False)):
+                for behavior, message in expected.items():
+                    with self.subTest(behavior=behavior), FakeDesktop(behavior) as desktop:
+                        with self.assertRaises(codex_live.OwnerUnavailable) as raised:
+                            self.deliver(desktop)
+                        self.assertEqual(str(raised.exception),
+                                         message + codex_live.OwnerUnavailable.WORKSPACE_MISSING)
+                        self.assertFalse(raised.exception.uncertain)
+                        self.assertEqual(len(desktop.calls), 2)
+                with FakeDesktop() as desktop:
+                    self.assertEqual(self.deliver(desktop)['turn_id'], 'active-turn')
+
+    def test_missing_workspace_for_different_saved_route_does_not_fail_definitively(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self.route['cwd'] = str(Path(temp) / 'missing')
+            with patch.object(codex_preview, 'saved_thread', return_value=(str(Path(temp) / 'other'), False)):
+                with FakeDesktop('no-owner') as desktop:
+                    with self.assertRaises(codex_live.OwnerUnavailable):
+                        self.deliver(desktop)
+                    self.assertEqual(len(desktop.calls), 2)
 
     def test_unknown_postwrite_results_are_uncertain_without_fallback(self):
         for behavior in ('unknown-error', 'different-inactive', 'disconnect', 'timeout',

@@ -299,7 +299,7 @@ class CloseCodexTests(unittest.TestCase):
         self.assertEqual(self.server.call('routes', project='p'), [])
         self.assertEqual(self.archive.read_text(encoding='utf-8'), 'test transcript')
 
-    def test_close_refuses_alias_channel_and_ambiguous_delivery(self):
+    def test_close_refuses_alias_channel_and_unfinished_delivery(self):
         self.register('alias')
         self.assertIn('another registered route', self.close('--archive', '--handoff')[1]['error'])
         self.server.call('unregister', project='p', name='alias')
@@ -308,12 +308,55 @@ class CloseCodexTests(unittest.TestCase):
         self.server.call('channel-close', project='p', name='view', expect_generation=1)
         self.server.call('register', project='p', name='sender', cwd=str(self.cwd))
         pending = self.server.call('send', project='p', sender='sender', recipient='target', key='one', body='work')
+        self.assertIn('unfinished correspondence', self.close('--archive', '--handoff')[1]['error'])
         self.server.call('claim', id=pending['id'])
         self.assertIn('active delivery', self.close('--archive', '--handoff')[1]['error'])
-        self.server.call('finish', id=pending['id'], state='uncertain')
+        self.server.call('finish', id=pending['id'], state='submitted')
+        self.server.call('progress', id=pending['id'], note='working')
         self.assertIn('unfinished correspondence', self.close('--archive', '--handoff')[1]['error'])
         self.server.call('resolve', id=pending['id'], state='done', note='reviewed')
         self.assertEqual(self.close('--archive', '--handoff')[0], 0)
+
+    def test_close_handoff_retains_uncertain_delivery_after_restart_and_missing_workspace(self):
+        self.server.call('register', project='p', name='sender', cwd=str(self.home))
+        fields = dict(project='p', sender='sender', recipient='target', key='old', body='work')
+        pending = self.server.call('send', **fields)
+        mid = pending['id']
+        self.server.call('claim', id=mid)
+        self.server.restart()
+        before = self.server.call('show', id=mid)
+        self.assertEqual(before['state'], 'uncertain')
+        self.cwd.rmdir()
+        code, prepared = self.close('--archive', '--handoff')
+        self.assertEqual((code, prepared['status']), (0, 'awaiting_native_archive'))
+        with self.assertRaisesRegex(ValueError, 'Only pending messages'):
+            self.server.call('claim', id=mid)
+        self.rollout.rename(self.archive)
+        self.record_archive(self.archive)
+        code, result = self.close('--finish', prepared['close_id'], '--expect-session', self.sid)
+        self.assertEqual((code, result['closed'], result['archived'], result['route_removed']), (0, True, True, True))
+        self.assertEqual(result['correspondence_cleanup'],
+                         dict(removed=0, retained=1, complete=False, active_retained=0))
+        self.assertNotIn('cleanup_error', result)
+        self.assertEqual(self.server.call('show', id=mid), before)
+        self.assertEqual(self.server.call('send', **fields)['id'], mid)
+        self.server.restart()
+        # Runtime annotations are outside the correspondence checkpoint.
+        saved = self.server.call('show', id=mid)
+        self.assertEqual({k: v for k, v in saved.items() if k != 'note'},
+                         {k: v for k, v in before.items() if k != 'note'})
+        self.assertEqual(self.server.call('send', **fields)['id'], mid)
+
+    def test_finish_reports_operator_receipt_failure_after_archive(self):
+        close_id = str(uuid.uuid4())
+        args = ['close', 'target', '--project', 'p', '--finish', close_id, '--expect-session', self.sid]
+        receipt = {'route_removed': True, 'session': self.sid, 'closing': close_id,
+                   'operator_receipt': 'needs_reconciliation', 'operator_error': 'fixture receipt failure'}
+        with mock.patch.object(bridge.broker, 'request', return_value=receipt):
+            code, result = run(args)
+        self.assertEqual((code, result['archived'], result['route_removed']), (1, True, True))
+        self.assertEqual(result['operator_receipt'], 'needs_reconciliation')
+        self.assertEqual(result['operator_error'], 'fixture receipt failure')
 
     def test_closing_blocks_delivery_and_route_changes_but_preserves_history(self):
         self.server.call('register', project='p', name='sender', cwd=str(self.cwd))

@@ -145,6 +145,7 @@ python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.
 - Codex Desktop의 네이티브 보관은 `close --archive --handoff`로 요청한다. Desktop에서 정확한 대화를 직접 보관하거나 등록된 담당자를 이용하고, `close --finish CLOSE_ID --expect-session UUID`로 완료를 확인한다. [세션 닫기](usage.md#세션-닫기) 참고.
 
 - 저장된 메타데이터에서 정확한 수신 Codex 대화의 보관이 확인되면 CLI는 Desktop에 연결하기 전에 `state: "failed"`와 `reason: "archived"`를 반환한다. 종료 코드는 1이다.
+- 전달에 필요한 정확한 Desktop 소유자를 찾지 못하면 메시지는 `pending`에 머문다. CLI와 MCP는 조회 이유와 확인된 작업 경로 누락을 보고한다. 브리지는 대화를 자동으로 다시 열거나 메시지를 재전송하지 않는다.
 
 ## 모델: 읽기 · 전환 · 정책
 

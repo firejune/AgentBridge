@@ -401,6 +401,16 @@ def label_claude(route, force=False, wait=0.0, poll=0.25):
         time.sleep(min(poll, max(0, deadline - time.monotonic())))
 
 
+def codex_prewrite_detail(message):
+    """Expose only fixed Codex refusal text through the remote API."""
+    if message.get('state') == 'failed':
+        if message.get('reason') == ARCHIVED_REASON:
+            return codex_live.ThreadArchived.MESSAGE
+    if message.get('state') == 'pending' and message.get('note') in codex_live.OwnerUnavailable.details():
+        return message['note']
+    return None
+
+
 def push_if_peer(path, m):
     if m['state'] == 'pending':
         if m['route']['transport'] == 'claude-peer':
