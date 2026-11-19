@@ -17,6 +17,7 @@ import uuid
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import bridge
+import delivery
 import sessions
 from support import RunningBroker
 
@@ -284,7 +285,7 @@ class PushTests(unittest.TestCase):
                 for commit, state, count in ((True, 'submitted', 1), (False, 'dispatching', 2)):
                     with self.subTest(commit=commit):
                         message = self.post(server, f'finish-{commit}')
-                        with mock.patch.object(bridge, 'PEER_BROKER_TIMEOUT', 0.45), \
+                        with mock.patch.object(delivery, 'PEER_BROKER_TIMEOUT', 0.45), \
                                 DelayedBrokerReply(self.temp.name, server, 'finish', commit) as proxy:
                             code, output, elapsed = self.deliver(proxy.path, message['id'], 0.35)
                         Path(proxy.path).unlink()
@@ -540,7 +541,7 @@ class PushTests(unittest.TestCase):
         target = {'socket':'/fake/peer.sock'}
         for method, error, expected in (('sendall', TimeoutError(), 'write timed out'),
                                         ('shutdown', OSError('lost'), 'error during the write')):
-            with self.subTest(method=method), mock.patch.object(bridge, 'peer_token', return_value=TOKEN), \
+            with self.subTest(method=method), mock.patch.object(delivery, 'peer_token', return_value=TOKEN), \
                     mock.patch.object(socket, 'socket') as connection:
                 sock = connection.return_value.__enter__.return_value
                 getattr(sock, method).side_effect = error
@@ -550,7 +551,7 @@ class PushTests(unittest.TestCase):
 
     def test_socket_teardown_error_after_eof_is_a_potential_write(self):
         target = {'socket':'/fake/peer.sock'}
-        with mock.patch.object(bridge, 'peer_token', return_value=TOKEN), \
+        with mock.patch.object(delivery, 'peer_token', return_value=TOKEN), \
                 mock.patch.object(socket, 'socket') as connection:
             sock = connection.return_value.__enter__.return_value
             sock.recv.return_value = b''

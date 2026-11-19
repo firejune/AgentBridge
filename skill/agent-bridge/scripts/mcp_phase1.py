@@ -22,7 +22,9 @@ import time
 import uuid
 
 import broker
-import bridge
+import codex_live
+import delivery
+import models
 import sessions
 
 TOOLS = json.loads(Path(__file__).with_name('mcp_phase1_tools.json').read_text())['tools']
@@ -262,8 +264,9 @@ class Backend:
         if agent_type not in AGENT_TYPES:
             raise ValueError('Unsupported agent type')
         host = workspace.get('host', 'ide' if agent_type == 'claude' else 'desktop')
-        args = SimpleNamespace(socket=self.path, model=None, host=host, cwd=workspace['cwd'])
-        bridge.new_session_policy(args, agent_type)
+        args = SimpleNamespace(model=None, host=host, cwd=workspace['cwd'])
+        state_dir = Path(self.path).expanduser().absolute().with_suffix('.state')
+        models.new_session_policy(args, agent_type, state_dir)
         if agent_type == 'claude':
             row = sessions.open_session('claude', cwd=workspace['cwd'], host=host,
                                         ide=workspace.get('ide') or sessions.DEFAULT_IDE, timeout=180)['session']
@@ -480,7 +483,7 @@ class Backend:
         if (route.get('session'), route.get('transport')) != (session['uuid'], self.session_transport(session)):
             raise ValueError('Unexpected message route')
         self.check(session)
-        return bridge.push_if_peer(self.path, message)
+        return delivery.push_if_peer(self.path, message)
 
     def observe(self, mid):
         m = self.rpc('show', id=mid)
@@ -936,12 +939,12 @@ class Engine:
             self.update(op,stage='push_intent')
             try:
                 message = self.backend.push(message,session)
-            except bridge.PushFailed as e:
+            except delivery.PushFailed as e:
                 # A recorded pre-send failure is definite; uncertain stays blocked.
                 m = e.message
                 self.update(op,backend_message_state=m['state'])
-                if m['state'] == 'failed' and m.get('reason') == bridge.ARCHIVED_REASON:
-                    self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=bridge.codex_live.ThreadArchived.MESSAGE)
+                if m['state'] == 'failed' and m.get('reason') == delivery.ARCHIVED_REASON:
+                    self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=codex_live.ThreadArchived.MESSAGE)
                 elif m['state'] == 'pending':
                     self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False)
                 else:
@@ -1026,8 +1029,8 @@ class Engine:
                 # settle another retained reply without any resend.
                 self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=REPLY_NOT_RETAINED_MESSAGE)
             elif state == 'failed':
-                detail = (bridge.codex_live.ThreadArchived.MESSAGE
-                          if message.get('reason') == bridge.ARCHIVED_REASON else None)
+                detail = (codex_live.ThreadArchived.MESSAGE
+                          if message.get('reason') == delivery.ARCHIVED_REASON else None)
                 self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=detail)
             elif state=='uncertain' or (op.get('recovered') and state in ('pending','dispatching')):
                 self.fail(op)

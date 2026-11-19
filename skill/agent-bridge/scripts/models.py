@@ -37,6 +37,32 @@ class SwitchError(ValueError):
 # "command_post" names, per provider, the registered route that performs a
 # switch the bridge cannot make itself (Claude desktop: see claude_desktop_switch).
 
+
+def new_session_policy(args, provider, state_dir):
+    """Apply the owner's defaults and denylist before any session is created."""
+    policy = load_policy(state_dir)
+    if provider == 'codex':
+        args.model, source = codex_new.resolve_model(args.model, policy=policy)
+        return source
+    model, source = default_model(provider, args.model, policy)
+    if provider == 'claude':
+        if model is not None:
+            raise Unsupported(f'claude: a new session cannot be given a model ({source} asked for {model!r}). '
+                              'Neither the desktop new-session link nor the IDE extension link carries a model; '
+                              'the session starts on the model its host picks.')
+        return
+    host = getattr(args, 'host', 'desktop')
+    cwd = getattr(args, 'cwd', None)
+    server = agy_live.discover_host_server(host, cwd=cwd) if cwd else agy_live.discover_host_server(host)
+    if model is not None:
+        found = agy_live.resolve_model(server, model)
+        require_allowed(policy, provider, model, found['model_id'], found['model_enum'], found.get('label'))
+        args.model = found['model_id']
+    else:
+        found = agy_live.resolve_model(server, None)
+        require_allowed(policy, provider, found['model_id'], found['model_enum'], found.get('label'))
+
+
 # --- Adapters ----------------------------------------------------------------
 # An adapter is read(route, timeout) -> dict and switch(route, model, timeout)
 # -> dict, registered per transport. A missing piece raises Unsupported.
