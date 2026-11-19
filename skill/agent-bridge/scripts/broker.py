@@ -1,6 +1,7 @@
 """Single-process broker: durable routing and bounded correspondence."""
 import asyncio
-from collections import deque
+from collections import deque, namedtuple
+from concurrent.futures import ThreadPoolExecutor
 from copy import copy, deepcopy
 from datetime import datetime, timezone
 import fcntl
@@ -38,6 +39,9 @@ INBOX_MAX_RECEIPTS = 8192
 CLOSE_KEY_PREFIX = 'agent-bridge-close:'
 CLOSE_OPERATOR_FILE = 'close-operator.json'
 CLOSING_ROUTE_ERROR = 'Codex route is closing'
+READ_ONLY_OPS = ('ping', 'routes', 'codex-routes', 'channels', 'show', 'conversation', 'inbox', 'retention-plan')
+CHECKPOINT_FIELDS = ('messages', 'compact_messages', 'keys', 'inbox_receipts', 'inbox_snapshots')
+Checkpoint = namedtuple('Checkpoint', CHECKPOINT_FIELDS)
 
 
 def now():
@@ -115,7 +119,8 @@ class BrokerResponseError(ValueError):
 
 
 class State:
-    def __init__(self, max_messages=2048, store=None, retention_ttl=False, retention_prepare=False):
+    def __init__(self, max_messages=2048, store=None, retention_ttl=False, retention_prepare=False,
+                 *, checkpoint_executor=None):
         if max_messages < 1:
             raise ValueError('Message retention size must be positive')
         self.instance = str(uuid.uuid4())
@@ -135,6 +140,10 @@ class State:
         self.waiters = {}
         self.inbox_snapshots = {}
         self.inbox_receipts = {}
+        self.mutation_lock = asyncio.Lock()
+        self.active_mutation = None
+        self.mutations_closed = False
+        self.checkpoint_executor = checkpoint_executor
         self.store = store
         if store is not None:
             self.endpoints, self.channels = store.load()
@@ -657,6 +666,65 @@ class State:
                 sub['queue'].put_nowait(event)
 
     def action(self, args, *, verified_close=False):
+        # Synchronous entry point for standalone State use. The serving broker
+        # admits mutations through action_async or an explicitly serialized batch.
+        result, staged = self.stage_action(args, verified_close=verified_close)
+        if staged is not None:
+            self.correspondence.save(staged)
+            self.publish_action(staged, args['op'])
+        return result
+
+    async def action_async(self, args, *, admit=None):
+        if args['op'] in READ_ONLY_OPS:
+            return self.apply_action(args)
+        return await self.serialized(self.commit_action, args, admit=admit)
+
+    async def serialized(self, operation, *args, admit=None):
+        async def run_admitted():
+            if admit is not None:
+                admit()
+            return await operation(*args)
+
+        await self.mutation_lock.acquire()
+        try:
+            if self.mutations_closed:
+                raise ValueError('Broker is stopping')
+            task = asyncio.create_task(run_admitted())
+        except BaseException:
+            self.mutation_lock.release()
+            raise
+        self.active_mutation = task
+        task.add_done_callback(self.finish_mutation)
+        # The admitted task owns the lock. A disconnected or cancelled caller
+        # cannot release it while a worker can still replace the checkpoint.
+        return await asyncio.shield(task)
+
+    def finish_mutation(self, task):
+        self.active_mutation = None
+        self.mutation_lock.release()
+        if not task.cancelled():
+            task.exception()  # The caller may have disconnected.
+
+    async def drain_mutations(self):
+        self.mutations_closed = True
+        if self.active_mutation is not None:
+            await asyncio.gather(asyncio.shield(self.active_mutation), return_exceptions=True)
+
+    async def commit_action(self, args, *, verified_close=False):
+        result, staged = self.stage_action(args, verified_close=verified_close)
+        if staged is not None:
+            # These maps are private to the stage. Give the worker the
+            # checkpoint data and a store copy, with no live asyncio objects.
+            checkpoint = Checkpoint(*(getattr(staged, field) for field in CHECKPOINT_FIELDS))
+            store = copy(self.correspondence)
+            try:
+                await asyncio.get_running_loop().run_in_executor(self.checkpoint_executor, store.save, checkpoint)
+            finally:
+                self.correspondence.update_save_status(store)
+            self.publish_action(staged, args['op'])
+        return result
+
+    def stage_action(self, args, *, verified_close=False):
         # Stage mutations in isolation. A failed durable write must not acknowledge
         # an ACK, publish an event, wake a waiter or leave a half-posted reply.
         mutations = ('send', 'send-with-retention', 'reply', 'ack', 'progress', 'resolve', 'claim', 'finish',
@@ -665,39 +733,43 @@ class State:
                      'archive-correspondence', 'close-dispatch', 'close-operator')
         archive = args['op'] == 'archive-correspondence'
         if archive and args.get('check_only') is True:
-            return self.archive_correspondence(args)
-        archive_before = (self.messages.keys() | self.compact_messages.keys()) if archive else set()
+            return self.archive_correspondence(args), None
         planned = None
         planned_at = None
         if args['op'] == 'retention-sweep':
             if not self.retention_ttl and not self.retention_prepare:
-                return {'changed': False}
+                return {'changed': False}, None
             planned_at = time.time()
             planned = self.retention_plan(planned_at)
             if not self.retention_changes(planned):
-                return {'changed': False}  # No deep copy or checkpoint write on an idle tick.
+                return {'changed': False}, None  # No deep copy or checkpoint write on an idle tick.
         if self.correspondence is None or args['op'] not in mutations:
             if planned is not None:
-                return {'changed': self.sweep_retention(planned_at, planned=planned)}
+                return {'changed': self.sweep_retention(planned_at, planned=planned)}, None
+            archive_before = (self.messages.keys() | self.compact_messages.keys()) if archive else set()
             result = self.apply_action(args, verified_close=verified_close)
             if archive:
                 self.purge_archive_events(archive_before - (self.messages.keys() | self.compact_messages.keys()))
-            return result
+            return result, None
         staged = copy(self)
-        for field in ('messages', 'compact_messages', 'keys', 'inbox_receipts', 'inbox_snapshots'):
+        for field in CHECKPOINT_FIELDS:
             setattr(staged, field, deepcopy(getattr(self, field)))
         staged.answers = self.answers.copy()
         staged.pending_publications = []
         result = ({'changed': staged.sweep_retention(planned_at, planned=planned)}
                   if planned is not None else staged.apply_action(args, verified_close=verified_close))
         if args['op'] == 'retention-sweep' and not result['changed']:
-            return result
+            return result, None
         if args['op'] in ('provider-failure', 'provider-retry', 'release-claim', 'note-pending') and not staged.pending_publications:
-            return result  # A no-op needs no repeated checkpoint write.
+            return result, None  # A no-op needs no repeated checkpoint write.
         if archive and not result['removed']:
-            return result
-        self.correspondence.save(staged)
-        for field in ('messages', 'compact_messages', 'keys', 'inbox_receipts', 'inbox_snapshots', 'answers'):
+            return result, None
+        return result, staged
+
+    def publish_action(self, staged, op):
+        archive = op == 'archive-correspondence'
+        archive_before = (self.messages.keys() | self.compact_messages.keys()) if archive else set()
+        for field in (*CHECKPOINT_FIELDS, 'answers'):
             setattr(self, field, getattr(staged, field))
         if archive:
             self.purge_archive_events(archive_before - (self.messages.keys() | self.compact_messages.keys()))
@@ -705,7 +777,6 @@ class State:
             self.publish(message, kind)
             if message['state'] == 'answered' or ('close_request' in message and message['state'] == 'done'):
                 self.answers[message['id']].set()
-        return result
 
     def provider_failure(self, origin, source_message_id, failure):
         key = (origin['project'], origin['name'])
@@ -1152,13 +1223,17 @@ async def finish_close(state, args):
         await asyncio.wait_for(asyncio.to_thread(codex_preview.verify_archive, route), timeout)
     except asyncio.TimeoutError:
         raise ValueError('Codex archive verification timed out; closing route kept') from None
+    return await state.serialized(commit_close, state, args, route)
+
+
+async def commit_close(state, args, route):
     if state.closing_route(args) != route:
         raise ValueError('Endpoint changed during archive verification')
 
     result = {**route, 'route_removed': False}
     try:
-        cleanup = state.action({'op': 'archive-correspondence', 'expected_route': route, 'archived': True},
-                               verified_close=True)
+        cleanup = await state.commit_action(
+            {'op': 'archive-correspondence', 'expected_route': route, 'archived': True}, verified_close=True)
     except (ValueError, OSError) as error:
         return {**result, 'cleanup_error': str(error),
                 'correspondence_cleanup': {'confirmed': False, 'state': 'rejected'}}
@@ -1176,8 +1251,8 @@ async def finish_close(state, args):
     result['route_removed'] = True
     if message is not None:
         try:
-            state.action({'op': 'resolve', 'id': message['id'], 'state': 'done',
-                          'note': 'Native Codex archive verified and route removed'})
+            await state.commit_action({'op': 'resolve', 'id': message['id'], 'state': 'done',
+                                       'note': 'Native Codex archive verified and route removed'})
             result['operator_receipt'] = 'done'
         except (OSError, ValueError):
             result['operator_receipt'] = 'needs_reconciliation'
@@ -1191,12 +1266,13 @@ async def write(writer, payload):
 
 async def wait_answer(state, args, reader):
     mid = args['id']
-    message = state.get(mid)
-    timeout = args.get('timeout',60)
-    if not 0 < timeout <= 3600:
-        raise ValueError('Timeout must be between 0 and 3600 seconds')
-    state.waiters[mid] = state.waiters.get(mid, 0) + 1
-    pending = [asyncio.create_task(state.answers[mid].wait()),asyncio.create_task(reader.read(1))]
+    async with state.mutation_lock:
+        message = state.get(mid)
+        timeout = args.get('timeout',60)
+        if not 0 < timeout <= 3600:
+            raise ValueError('Timeout must be between 0 and 3600 seconds')
+        state.waiters[mid] = state.waiters.get(mid, 0) + 1
+        pending = [asyncio.create_task(state.answers[mid].wait()),asyncio.create_task(reader.read(1))]
     try:
         done,_ = await asyncio.wait(pending,timeout=timeout,return_when=asyncio.FIRST_COMPLETED)
         if pending[1] in done:
@@ -1263,7 +1339,7 @@ async def retention_loop(state):
     while True:
         await asyncio.sleep(60)
         try:
-            state.action({'op': 'retention-sweep'})
+            await state.action_async({'op': 'retention-sweep'})
         except (ValueError, OSError):
             # Fixed count-only diagnostic; never reveal routes, bodies or IDs.
             print(json.dumps({'event': 'retention_sweep_failed'}), file=sys.stderr, flush=True)
@@ -1289,17 +1365,26 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
         raise ValueError('Broker is already running for this socket') from error
     server = None
     store = None
+    checkpoint_executor = None
+    state = None
     collectors = []
     failure_observer = None
     agy_failure_observer = None
     retention_task = None
+    stopping = asyncio.Event()
+    handlers = set()
+    writers = set()
     try:
         if path.exists():
             if not stat.S_ISSOCK(path.stat().st_mode):
                 raise ValueError('Refusing to replace a non-socket file')
             path.unlink()
         store = route_store.RouteStore(state_dir or path.with_suffix('.state'))
-        state = State(max_messages, store, retention_ttl=retention_ttl, retention_prepare=retention_prepare)
+        # A provider worker can wait for a durable reservation while using the
+        # default executor. Keep checkpoint IO independent of those workers.
+        checkpoint_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='ab-checkpoint')
+        state = State(max_messages, store, retention_ttl=retention_ttl, retention_prepare=retention_prepare,
+                      checkpoint_executor=checkpoint_executor)
         if retention_ttl or retention_prepare:
             retention_task = asyncio.create_task(retention_loop(state))
         if codex_failure_interval:
@@ -1314,9 +1399,6 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
                                           usage_interval, codex_executable,
                                           claude_live=claude_live).start()
                           for provider in usage.PROVIDERS]
-        stopping = asyncio.Event()
-        handlers = set()
-        writers = set()
         async def handle(reader,writer):
             if stopping.is_set():
                 writer.transport.abort()
@@ -1342,7 +1424,7 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
                     result = await finish_close(state, args)
                     await write(writer,{'result':result,'instance':state.instance})
                 else:
-                    result = state.action(args)  # No await inside mutation: one atomic event-loop turn.
+                    result = await state.action_async(args)
                     await write(writer,{'result':result,'instance':state.instance})
             except (ValueError,KeyError,TypeError,OSError,asyncio.TimeoutError) as error:
                 try:
@@ -1364,29 +1446,45 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
             loop.add_signal_handler(sig,stopping.set)
         print(json.dumps({'ready':True,'socket':str(path),'instance':state.instance}),flush=True)
         await stopping.wait()
-        server.close()
+    finally:
+        stopping.set()
+        if server is not None:
+            server.close()
         # Python 3.12.1+ waits for active clients in wait_closed(). Cancel
-        # handlers and abort transports first, including stalled readers/writers.
-        active = list(handlers)
+        # handlers and abort transports first, including stalled readers/writers,
+        # then drain any admitted operation before releasing either store lock.
+        active = list(handlers) + [task for task in (failure_observer, agy_failure_observer, retention_task)
+                                   if task is not None]
         for writer in list(writers):
             writer.transport.abort()
         for task in active:
             task.cancel()
-        await asyncio.gather(*active,return_exceptions=True)
-        await server.wait_closed()
-    finally:
-        for observer in (failure_observer, agy_failure_observer, retention_task):
-            if observer is not None:
-                observer.cancel()
-                await asyncio.gather(observer, return_exceptions=True)
-        for collector in collectors:
-            collector.stop()
-        if server is not None:
-            server.close()
-            path.unlink(missing_ok=True)
-        if store is not None:
-            store.close()
-        lock.close()
+
+        async def close_resources():
+            await asyncio.gather(*active, return_exceptions=True)
+            if state is not None:
+                await state.drain_mutations()
+            if checkpoint_executor is not None:
+                checkpoint_executor.shutdown()
+            for collector in collectors:
+                collector.stop()
+            if server is not None:
+                await server.wait_closed()
+                path.unlink(missing_ok=True)
+            if store is not None:
+                store.close()
+            lock.close()
+
+        closing = asyncio.create_task(close_resources())
+        interrupted = False
+        while not closing.done():
+            try:
+                await asyncio.shield(closing)
+            except asyncio.CancelledError:
+                interrupted = True
+        closing.result()
+        if interrupted:
+            raise asyncio.CancelledError
 
 
 def broker_response(line):
