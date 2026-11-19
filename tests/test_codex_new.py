@@ -22,6 +22,17 @@ from support import RunningBroker
 from test_codex_live import FakeDesktop
 
 
+def empty_registration_rpc(path, fields, **kwargs):
+    """A creation preflight reads an empty project; final registration succeeds."""
+    return [] if fields['op'] == 'routes' else {}
+
+
+def failed_registration_rpc(path, fields, **kwargs):
+    if fields['op'] == 'routes':
+        return []
+    raise OSError('secret /private/socket')
+
+
 def full_permissions():
     return {'activePermissionProfile':{'id':codex_new.FULL_ACCESS_PROFILE,'extends':None},
             'approvalPolicy':'never','sandboxPolicy':{'type':'dangerFullAccess'}}
@@ -419,7 +430,7 @@ class NewCodexTests(unittest.TestCase):
             self.assertEqual(set(success), set(failure))
             self.assertNotIn('secret', json.dumps(failure))
             self.assertNotIn('/private/config', json.dumps(failure))
-            with patch.object(bridge.broker, 'request', side_effect=OSError('secret /private/socket')):
+            with patch.object(bridge.broker, 'request', side_effect=failed_registration_rpc):
                 code, failure = self.cli_open(desktop, '--register', 'worker', '--project', 'demo')
             self.assertEqual(code, 1)
             self.assertEqual(set(success), set(failure))
@@ -560,7 +571,7 @@ class NewCodexTests(unittest.TestCase):
 
     def test_issue44_registration_both_failures_preserve_refusal_and_one_attempt(self):
         with ModelDesktop(refuse_permissions=True) as desktop, \
-                patch.object(bridge.broker, 'request', side_effect=OSError('secret socket')) as register:
+                patch.object(bridge.broker, 'request', side_effect=failed_registration_rpc) as register:
             code, result = self.cli_open(desktop, '--register', 'worker', '--project', 'demo')
         self.assertEqual(code, 1)
         self.assertEqual(result['stage'], 'permissions')
@@ -568,15 +579,15 @@ class NewCodexTests(unittest.TestCase):
         self.assertIsNone(result['registration_error'])
         self.assertFalse(result['registered'])
         self.assertNotIn('secret', json.dumps(result))
-        self.assertEqual(register.call_count, 0)
+        self.assertFalse(any(call.args[1]['op'] == 'register' for call in register.call_args_list))
 
     def test_issue44_registration_success_and_refusal_share_keys(self):
-        with ModelDesktop() as desktop, patch.object(bridge.broker, 'request', return_value={}) as register:
+        with ModelDesktop() as desktop, patch.object(bridge.broker, 'request', side_effect=empty_registration_rpc) as register:
             code, success = self.cli_open(desktop, '--register', 'worker', '--project', 'demo')
         self.assertEqual(code, 0)
         self.assertTrue(success['registered'])
-        self.assertEqual(register.call_count, 1)
-        with ModelDesktop(refuse_permissions=True) as desktop, patch.object(bridge.broker, 'request', return_value={}):
+        self.assertEqual([call.args[1]['op'] for call in register.call_args_list], ['routes', 'register'])
+        with ModelDesktop(refuse_permissions=True) as desktop, patch.object(bridge.broker, 'request', side_effect=empty_registration_rpc):
             code, refusal = self.cli_open(desktop, '--register', 'worker', '--project', 'demo')
         self.assertEqual(code, 1)
         self.assertEqual(set(success), set(refusal))
@@ -599,7 +610,7 @@ class NewCodexTests(unittest.TestCase):
                 return real_open(**kwargs, client_factory=self.factory, opener=self.urls.append,
                                  owner_factory=lambda **kw: codex_live.Client(desktop.path, **kw))
             with patch.object(codex_new, 'open_codex', side_effect=create), \
-                    patch.object(bridge.broker, 'request', return_value={}) as register:
+                    patch.object(bridge.broker, 'request', side_effect=empty_registration_rpc) as register:
                 out = io.StringIO()
                 with patch('sys.stdout', out):
                     code = bridge.main(['register', 'worker', '--project', 'demo', '--transport', 'codex',
@@ -608,7 +619,7 @@ class NewCodexTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertFalse(value['registered'])
         self.assertEqual(value['stage'], 'permissions')
-        self.assertEqual(register.call_count, 0)
+        self.assertFalse(any(call.args[1]['op'] == 'register' for call in register.call_args_list))
 
     def test_issue137_v13_permission_update_and_stderr_confirmation(self):
         with ModelDesktop(snapshot_version=13) as desktop, patch('sys.stderr', new_callable=io.StringIO) as err:
@@ -619,12 +630,12 @@ class NewCodexTests(unittest.TestCase):
 
     def test_issue137_unknown_snapshot_version_fails_without_registration(self):
         with ModelDesktop(snapshot_version=99) as desktop, patch('sys.stderr', new_callable=io.StringIO) as err, \
-                patch.object(bridge.broker, 'request') as register:
+                patch.object(bridge.broker, 'request', side_effect=empty_registration_rpc) as register:
             code, result = self.cli_open(desktop, '--register', 'worker', '--project', 'demo')
         self.assertEqual(code, 1)
         self.assertEqual(result['stage'], 'permissions')
         self.assertFalse(result['registered'])
-        register.assert_not_called()
+        self.assertEqual([call.args[1]['op'] for call in register.call_args_list], ['routes'])
         self.assertEqual(err.getvalue(), 'Codex open failed: stage=permissions approvalPolicy=None sandbox=None\n')
 
     def test_issue44_diagnostics_unknown_values_are_redacted(self):
@@ -775,12 +786,14 @@ class NewCodexTests(unittest.TestCase):
         real_open = codex_new.open_codex
         create = functools.partial(real_open, client_factory=self.factory, opener=self.urls.append)
         with patch.object(codex_new, 'open_codex', side_effect=create), \
+                patch.object(bridge.broker, 'request', side_effect=empty_registration_rpc) as preflight, \
                 patch('sys.stdout', io.StringIO()) as out:
             code = bridge.main(['open', '--provider', 'codex', '--register', 'worker',
                                 '--project', 'demo', '--cwd', self.root])
         self.assertEqual(code, 1)
         self.assertIn("default title 'demo/worker'", json.loads(out.getvalue())['error'])
         self.assertFalse(any(method == 'thread/start' for method, _, _ in self.calls))
+        self.assertEqual([call.args[1] for call in preflight.call_args_list], [{'op': 'routes', 'project': 'demo'}])
 
     def test_issue101_multiple_mismatches_have_distinct_separator(self):
         with ModelDesktop(refuse_permissions=True) as desktop, \
@@ -895,11 +908,11 @@ class NewCodexTests(unittest.TestCase):
                                   '--transport','codex','--new','--cwd',self.root])
             value=json.loads(out.getvalue())
             self.assertEqual(code,1)
-            self.assertTrue(value['created'])
-            self.assertTrue(value['adopted'])
+            self.assertFalse(value['created'])
+            self.assertFalse(value['adopted'])
             self.assertFalse(value['registered'])
-            self.assertEqual(value['session']['id'],self.sid)
-            self.assertEqual(create.call_count,1)
+            self.assertIsNone(value['session']['id'])
+            self.assertEqual(create.call_count,0)
 
     def test_partial_failure_cli_reports_stage_and_never_registers(self):
         failure=codex_new.CreationError('failed',True,self.sid,True,'model')

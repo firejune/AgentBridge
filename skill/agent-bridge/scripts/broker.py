@@ -58,6 +58,7 @@ def route_key(route):
 
 
 TERMINAL_STATES = frozenset(('done', 'answered', 'failed'))
+REGISTER_CONFLICT_ERROR = 'Route name is already in use; use a different name'
 LEGACY_CAPACITY_ERROR = ('In-memory message limit reached: no evictable terminal messages; '
                          'pending or protected work is retained')
 TTL_CAPACITY_ERROR = ('Active-message limit reached: TTL or protected work prevents safe cleanup; '
@@ -696,8 +697,20 @@ class State:
             sid = args.get('session')
             if transport != 'realtime' or sid:
                 sid = str(uuid.UUID(sid or ''))
+            executable = args.get('executable')
+            if executable is not None and not isinstance(executable, str):
+                raise ValueError('Executable must be a string')
             item = dict(project=project,name=name,transport=transport,cwd=cwd,
-                        session=sid,executable=args.get('executable'))
+                        session=sid,executable=executable)
+            current = self.endpoints.get((project, name))
+            if current is not None:
+                # One event-loop turn: this authoritative check precedes every
+                # routing write, regardless of any caller's read-only preflight.
+                if (any(current.get(field) != item[field] for field in ('transport', 'cwd', 'session'))
+                        or executable is not None and current.get('executable') != executable):
+                    raise ValueError(REGISTER_CONFLICT_ERROR)
+                # An omitted executable never clears an execution-bearing value.
+                return current
             return self.routing_change('endpoints', (project,name), item)
         if op == 'remap':
             key = (identifier(args['project']), identifier(args['name']))

@@ -596,15 +596,33 @@ def output(value):
     print(json.dumps(value,ensure_ascii=False),flush=True)
 
 
+class RegistrationConflict(ValueError):
+    """A known occupied name, before any external creation."""
+
+
+def require_free_registration_name(path, project, name):
+    broker.identifier(project)
+    broker.identifier(name)
+    rows = broker.request(path, {'op': 'routes', 'project': project})
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise ValueError('Registration preflight returned invalid routes')
+    if any(row.get('name') == name for row in rows):
+        raise RegistrationConflict(broker.REGISTER_CONFLICT_ERROR)
+
+
+def validate_new_registration(args):
+    if args.discover or args.session:
+        raise ValueError('--new cannot be combined with --session or --discover')
+    if args.transport not in ('agy','claude-peer','codex'):
+        raise ValueError('--new is supported only with --transport agy (Antigravity desktop or IDE), claude-peer (Claude Code desktop or IDE), or codex (Codex desktop)')
+    if not args.cwd:
+        raise ValueError('--new requires --cwd')
+
+
 def registration(args):
     observation = None
     if getattr(args, 'new', False):
-        if args.discover or args.session:
-            raise ValueError('--new cannot be combined with --session or --discover')
-        if args.transport not in ('agy','claude-peer','codex'):
-            raise ValueError('--new is supported only with --transport agy (Antigravity desktop or IDE), claude-peer (Claude Code desktop or IDE), or codex (Codex desktop)')
-        if not args.cwd:
-            raise ValueError('--new requires --cwd')
+        validate_new_registration(args)
         provider = 'claude' if args.transport == 'claude-peer' else args.transport
         title = args.title
         if args.transport == 'agy' and (not isinstance(title, str) or not title.strip()):
@@ -767,11 +785,15 @@ def open_codex_result(args):
                 except ValueError:
                     raise codex_new.CreationError(f'Codex route {label} must be a lowercase identifier') from None
         source = new_session_policy(args, 'codex')
+        if name is not None:
+            require_free_registration_name(args.socket, args.project, name)
         title = args.title
         if title is None and name:
             title = default_title = f'{args.project}/{name}'
         result = sessions.open_session('codex', cwd=args.cwd, title=title, model=args.model,
             timeout=args.timeout, host=args.host, ide=args.ide, force_new=args.new)
+    except RegistrationConflict as error:
+        result['error'] = str(error)
     except codex_new.CreationError as error:
         result = error.result
         if default_title is not None and result['stage'] == 'duplicate':
@@ -794,10 +816,13 @@ def open_codex_result(args):
             broker.request(args.socket, {'op': 'register', 'name': name, 'project': args.project,
                 'transport': 'codex', 'session': result['session']['id'], 'cwd': result['session']['cwd']})
             result['registered'] = True
-        except (ValueError, OSError, subprocess.TimeoutExpired, KeyError, TypeError):
-            # Registration was sent once; do not replay an ambiguous broker write.
-            result['registration_error'] = 'Codex route registration could not be confirmed; inspect routes before retrying'
-            result['uncertain'] = True
+        except (ValueError, OSError, subprocess.TimeoutExpired, KeyError, TypeError) as error:
+            # Exact authoritative refusal is definite; other broker write errors
+            # remain uncertain and are never retried automatically.
+            conflict = isinstance(error, ValueError) and str(error) == broker.REGISTER_CONFLICT_ERROR
+            result['registration_error'] = (broker.REGISTER_CONFLICT_ERROR if conflict else
+                'Codex route registration could not be confirmed; inspect routes before retrying')
+            result['uncertain'] = not conflict
             if result['error'] is None:
                 result.update(error=result['registration_error'], stage='registration')
         except KeyboardInterrupt:
@@ -1011,7 +1036,7 @@ def main(argv=None):
             mode = p.add_mutually_exclusive_group()
             mode.add_argument('--retention-prepare',action='store_true',help='Generate service arguments for non-deleting timestamp warm-up')
             mode.add_argument('--retention-ttl',action='store_true',help='Generate service arguments for opt-in TTL cleanup')
-    p = sub.add_parser('register')
+    p = sub.add_parser('register',help='Bind an unused project/name or retry its exact existing identity')
     p.add_argument('name');p.add_argument('--project',required=True)
     p.add_argument('--transport',choices=['realtime','codex','claude','claude-peer','agy'],default='realtime')
     p.add_argument('--session');p.add_argument('--cwd');p.add_argument('--executable')
@@ -1034,7 +1059,7 @@ def main(argv=None):
     p.add_argument('--host',choices=['desktop','ide'],default='desktop',help='Host (claude, agy): desktop app or IDE. Claude desktop needs Enter; Claude IDE, agy desktop and agy IDE do not')
     p.add_argument('--ide',choices=sorted(sessions.CLAUDE_IDES),help=f'IDE for --host ide (default {sessions.DEFAULT_IDE})')
     p.add_argument('--state-dir')
-    p.add_argument('--register', metavar='NAME', help='Codex: bind only a successfully verified new thread')
+    p.add_argument('--register', metavar='NAME', help='Codex: bind a verified new thread to an unused project/name')
     p.add_argument('--project', help='Project for --register')
     p.add_argument('--new', action='store_true', help='Codex: explicitly create despite a saved title/cwd match')
     p = sub.add_parser('model',help="Read a participant's model, or switch it with --set (provider-neutral)")
@@ -1319,6 +1344,8 @@ def main(argv=None):
             output(sessions.inspect_session(args.provider,args.id,args.executable,args.codex_mode))
             return 0
         if args.cmd=='register' and args.new and args.transport in ('agy','codex','claude-peer'):
+            validate_new_registration(args)
+            require_free_registration_name(args.socket, args.project, args.name)
             creation_model_source = new_session_policy(args, 'claude' if args.transport == 'claude-peer' else args.transport)
         observation = registration(args) if args.cmd=='register' else None
         if observation and creation_model_source is not None:

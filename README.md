@@ -17,6 +17,12 @@ A zero-dependency local real-time bridge for **Claude Code / Desktop (`claude-pe
 
 Instead of spawning duplicate CLI processes or trapping agents in polling loops, Agent Bridge pushes messages directly into open live sessions so agents can ask questions, report progress, and hand off work in real time without interrupting in-flight turns.
 
+## Registration ownership
+
+`register` protects each `(project, name)`: another transport, session UUID or canonical workspace is refused with `Route name is already in use; use a different name`. Same names in different projects are independent. Exact-binding retries return the existing route without rewriting it. An omitted `--executable` preserves the old value; an explicitly different executable is also refused. Existing channels and message routes stay pinned. Explicit Codex `remap` keeps its existing rules.
+
+New-session registration commands check an occupied name before opening a session; the broker still checks atomically at final registration. In the Codex result, a known final conflict preserves the created session with `registered: false` and `uncertain: false`; an ambiguous registration write stays uncertain. Neither path automatically unregisters, remaps or retries. This protection requires the updated broker; client preflight does not reserve a name.
+
 ## Documentation Map
 
 | Audience | English | 한국어 |

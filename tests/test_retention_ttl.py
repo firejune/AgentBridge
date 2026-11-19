@@ -388,6 +388,7 @@ class RetentionCheckpointTests(unittest.TestCase):
         compact = self.call('show', id=message['id'])
         anchor = compact['body_ttl_anchor_at']
         self.assertEqual(anchor, CLOCK + 1)
+        self.call('unregister', project='demo', name='alpha')
         self.call('register', project='demo', name='alpha', cwd='/tmp', session=str(uuid.uuid4()))
         self.clock.return_value += 10
         reply = self.call('reply', id=message['id'], body='late persisted answer', key='late-durable')

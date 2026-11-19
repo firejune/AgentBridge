@@ -473,7 +473,19 @@ class PersistenceTests(unittest.TestCase):
         self.register()
 
     def register(self, **extra):
+        if ('demo', 'alpha') in self.state.endpoints:
+            self.state.action(dict(op='unregister', project='demo', name='alpha'))
         return self.state.action(dict(op='register', project='demo', name='alpha', cwd=str(self.root), **extra))
+
+    def remap_fixture(self, session):
+        return self.state.action(dict(op='remap', project='demo', name='alpha',
+            expected_route=self.state.route('demo', 'alpha'), session=session))
+
+    def plant_registration_fixture(self, **extra):
+        # Restore tests model a legacy/external replacement while retaining an
+        # exact old pinned generation. Do not use public register to overwrite it.
+        current = self.state.route('demo', 'alpha')
+        return self.state.routing_change('endpoints', ('demo', 'alpha'), dict(current, **extra))
 
     def bind(self):
         return self.state.action(dict(op='channel-bind', project='demo', name='work', owner='alpha', description='Work'))
@@ -601,7 +613,7 @@ class PersistenceTests(unittest.TestCase):
         self.bind()
         before_maps = deepcopy((self.state.endpoints, self.state.channels))
         before_file = self.store.path.read_bytes()
-        mutations = [dict(op='register', project='demo', name='alpha', cwd=str(self.root), session=str(uuid.uuid4())),
+        mutations = [dict(op='register', project='demo', name='new-endpoint', cwd=str(self.root), session=str(uuid.uuid4())),
                      dict(op='channel-bind', project='demo', name='work', owner='alpha', description='Next', expect_generation=1),
                      dict(op='channel-close', project='demo', name='work', expect_generation=1)]
         for failure in ('replace', 'fsync'):
@@ -617,7 +629,7 @@ class PersistenceTests(unittest.TestCase):
         old = str(uuid.uuid4()); new = str(uuid.uuid4())
         self.register(transport='codex', session=old)
         channel = deepcopy(self.bind())
-        self.register(transport='codex', session=new)
+        self.remap_fixture(new)
         seen = []
         with patch.object(route_store, 'verify_route', side_effect=lambda route: seen.append(route['session'])):
             loaded = broker.State(store=self.store)
@@ -628,7 +640,7 @@ class PersistenceTests(unittest.TestCase):
     def test_dead_pinned_channel_dropped_even_when_new_endpoint_is_live(self):
         old = str(uuid.uuid4()); new = str(uuid.uuid4())
         self.register(transport='agy', session=old); self.bind()
-        self.register(transport='agy', session=new)
+        self.plant_registration_fixture(transport='agy', session=new)
         def verify(route):
             if route['session'] == old:
                 raise ValueError('SECRET_TOKEN /private/peer.sock')
@@ -646,7 +658,7 @@ class PersistenceTests(unittest.TestCase):
         old = str(uuid.uuid4()); new = str(uuid.uuid4())
         self.register(transport='agy', session=old)
         channel = deepcopy(self.bind())
-        self.register(transport='agy', session=new)
+        self.plant_registration_fixture(transport='agy', session=new)
         def verify(route):
             if route['session'] == new:
                 raise ValueError('Unavailable')
@@ -837,7 +849,7 @@ class PersistenceTests(unittest.TestCase):
         old, new = str(uuid.uuid4()), str(uuid.uuid4())
         self.register(transport='codex', session=old)
         channel = deepcopy(self.bind())
-        self.register(transport='codex', session=new)
+        self.remap_fixture(new)
         def inspect(provider, sid, executable, codex_mode):
             if sid == new:
                 raise route_store.sessions.DiscoveryError('temporarily unavailable')

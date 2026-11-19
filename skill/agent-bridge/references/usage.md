@@ -6,6 +6,12 @@ A local CLI for real-time peer-to-peer correspondence across AI coding agents. R
 
 The broker keeps owner-private routing in `routes.json` and bounded correspondence in `correspondence.json`. Restart restores captured messages and delivery state without replaying delivery. Credentials, signed tokens, provider diagnostics and event streams remain in memory. See [correspondence storage](#correspondence-storage-issue-94).
 
+## Registration ownership
+
+`register` protects each `(project, name)`: another transport, session UUID or canonical workspace is refused with `Route name is already in use; use a different name`. Same names in different projects are independent. Exact-binding retries return the existing route without rewriting it. An omitted `--executable` preserves the old value; an explicitly different executable is also refused. Existing channels and message routes stay pinned. Explicit Codex `remap` keeps its existing rules.
+
+New-session registration commands check an occupied name before opening a session; the broker still checks atomically at final registration. In the Codex result, a known final conflict preserves the created session with `registered: false` and `uncertain: false`; an ambiguous registration write stays uncertain. Neither path automatically unregisters, remaps or retries. This protection requires the updated broker; client preflight does not reserve a name.
+
 ## Architecture
 
 ```mermaid
