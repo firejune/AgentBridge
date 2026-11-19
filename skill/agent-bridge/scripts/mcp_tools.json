@@ -83,11 +83,12 @@
                     "bridge_operation_get",
                     "bridge_inbox_list",
                     "bridge_message_get",
-                    "bridge_message_ack"
+                    "bridge_message_ack",
+                    "bridge_message_reply"
                   ]
                 },
                 "minItems": 1,
-                "maxItems": 8,
+                "maxItems": 9,
                 "uniqueItems": true,
                 "contains": {
                   "const": "bridge_status"

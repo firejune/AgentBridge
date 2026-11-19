@@ -37,6 +37,10 @@ INBOX_TOTAL_BYTES = 16 * 1024 * 1024
 INBOX_PAGE_BYTES = 128 * 1024
 INBOX_MAX_RECEIPTS = 8192
 CLOSE_KEY_PREFIX = 'agent-bridge-close:'
+INBOX_REPLY_KEY_PREFIX = 'agent-bridge-inbox-reply:'
+PROVIDER_NOTICE_KEY_PREFIXES = tuple(event + ':' for event in (
+    provider_failures.DETECTED_EVENT, provider_failures.RETRY_EVENT, provider_failures.EXHAUSTED,
+    provider_failures.UNSAFE, provider_failures.UNCERTAIN))
 CLOSE_OPERATOR_FILE = 'close-operator.json'
 CLOSING_ROUTE_ERROR = 'Codex route is closing'
 READ_ONLY_OPS = ('ping', 'routes', 'codex-routes', 'channels', 'show', 'conversation', 'inbox', 'retention-plan')
@@ -121,6 +125,10 @@ def public_message(message):
 
 class BrokerResponseError(ValueError):
     """The broker did not return a usable response to a request."""
+
+
+class IdempotencyConflict(ValueError):
+    """The same key was used for a different message intent."""
 
 
 class State:
@@ -398,7 +406,7 @@ class State:
             self.answers[m['id']].set()
         return m
 
-    def post(self, args, reply_to=None, *, close_request=None):
+    def post(self, args, reply_to=None, *, close_request=None, inbox_reply=False):
         body, key = args['body'], args['key']
         if not isinstance(body,str) or not body.strip() or len(body.encode()) > 32768:
             raise ValueError('Message must contain 1–32768 UTF-8 bytes')
@@ -406,6 +414,8 @@ class State:
             raise ValueError('Provide an idempotency key of at most 256 characters')
         if key.startswith(CLOSE_KEY_PREFIX) and close_request is None:
             raise ValueError('Idempotency key prefix is reserved for close handoffs')
+        if key.startswith(INBOX_REPLY_KEY_PREFIX) and not inbox_reply:
+            raise ValueError('Idempotency key prefix is reserved for MCP inbox replies')
         intent = {k:args.get(k) for k in ('project','sender','recipient','channel','sender_channel','body','key')}
         intent['reply_to'] = reply_to
         one_way = args.get('one_way', False)
@@ -423,7 +433,7 @@ class State:
         if key in self.keys:
             original_intent, mid = self.keys[key]
             if not retention.matches(original_intent, intent):
-                raise ValueError('Idempotency key already used with different content')
+                raise IdempotencyConflict('Idempotency key already used with different content')
             return self.get(mid)
         if reply_to:
             parent = self.get(reply_to)
@@ -481,9 +491,11 @@ class State:
                 'body_sha256': hashlib.sha256(body.encode('utf-8')).hexdigest()}
 
     def inbox_action(self, args):
-        # Runs in the same event-loop turn as route/epoch checks and ACK mutation.
+        # Runs in the same event-loop turn as route/epoch checks and inbox mutations.
         if args.get('instance') is not None and args['instance'] != self.instance:
             raise ValueError('BROKER_RESTARTED')
+        if args['op'] == 'inbox_reply' and args.get('instance') is None:
+            raise ValueError('INVALID_ARGUMENT')
         owner, context, routes = args['owner'], args['context'], args['routes']
         if (not isinstance(owner, str) or len(owner) != 64 or not isinstance(context, str)
                 or len(context) != 64 or not isinstance(routes, list) or len(routes) > 64):
@@ -579,6 +591,8 @@ class State:
             if len(wire({'result': result, 'instance': self.instance})) > INBOX_PAGE_BYTES:
                 raise ValueError('INBOX_ITEM_TOO_LARGE')
             return result
+        if op == 'inbox_reply':
+            return self.reply_to_inbox(owner, message, args)
         if op != 'inbox_ack':
             raise ValueError('INVALID_ARGUMENT')
         if message['state'] in TERMINAL_STATES:
@@ -593,6 +607,44 @@ class State:
         message['acknowledged_at'] = result['acknowledged_at']
         self.status(message, 'done', 'Explicit MCP inbox acknowledgement')
         return dict(result)
+
+    def reply_to_inbox(self, owner, parent, args):
+        mid = parent['id']
+        if ('provider_retry' in parent or any(record[1] == mid and key.startswith(PROVIDER_NOTICE_KEY_PREFIXES)
+                                             for key, record in self.keys.items())):
+            raise ValueError('NOT_FOUND')
+        if parent['state'] in ('dispatching', 'uncertain'):
+            raise ValueError('DELIVERY_UNKNOWN')
+        destination = parent['return_route']
+        transport = destination['transport']
+        if transport not in ('realtime', 'codex', 'claude-peer', 'agy'):
+            raise ValueError('UNSUPPORTED_TRANSPORT')
+        if transport != 'realtime' and not destination.get('session'):
+            raise ValueError('NOT_FOUND')
+        body, key = args.get('body'), args.get('key')
+        if (not isinstance(body, str) or not body.strip()
+                or not isinstance(key, str) or not key.strip() or len(key) > 256):
+            raise ValueError('INVALID_ARGUMENT')
+        try:
+            body_size = len(body.encode())
+        except UnicodeEncodeError:
+            raise ValueError('INVALID_ARGUMENT') from None
+        if body_size > 32768:
+            raise ValueError('INVALID_ARGUMENT')
+        digest = hashlib.sha256(json.dumps([owner, key]).encode()).hexdigest()
+        downstream_key = INBOX_REPLY_KEY_PREFIX + digest
+        replayed = downstream_key in self.keys
+        try:
+            message = self.post({'body': body, 'key': downstream_key}, mid, inbox_reply=True)
+        except IdempotencyConflict:
+            raise ValueError('IDEMPOTENCY_CONFLICT') from None
+        except ValueError as error:
+            if str(error) in MESSAGE_CAPACITY_ERRORS:
+                raise ValueError('CAPACITY_EXCEEDED') from None
+            if str(error) == CLOSING_ROUTE_ERROR:
+                raise ValueError('ROUTE_CHANGED') from None
+            raise
+        return {'message': public_message(message), 'replayed': replayed}
 
     def archive_correspondence(self, args, *, verified_close=False):
         expected = args['expected_route']
@@ -734,7 +786,7 @@ class State:
         # an ACK, publish an event, wake a waiter or leave a half-posted reply.
         mutations = ('send', 'send-with-retention', 'reply', 'ack', 'progress', 'resolve', 'claim', 'finish',
                      'claim-guarded', 'release-claim', 'note-pending',
-                     'inbox_ack', 'provider-failure', 'provider-retry', 'retention-sweep',
+                     'inbox_ack', 'inbox_reply', 'provider-failure', 'provider-retry', 'retention-sweep',
                      'archive-correspondence', 'close-dispatch', 'close-operator')
         archive = args['op'] == 'archive-correspondence'
         if archive and args.get('check_only') is True:
@@ -765,7 +817,8 @@ class State:
                   if planned is not None else staged.apply_action(args, verified_close=verified_close))
         if args['op'] == 'retention-sweep' and not result['changed']:
             return result, None
-        if args['op'] in ('provider-failure', 'provider-retry', 'release-claim', 'note-pending') and not staged.pending_publications:
+        if (args['op'] in ('inbox_reply', 'provider-failure', 'provider-retry', 'release-claim', 'note-pending')
+                and not staged.pending_publications):
             return result, None  # A no-op needs no repeated checkpoint write.
         if archive and not result['removed']:
             return result, None
@@ -877,7 +930,7 @@ class State:
             return public_message(self.provider_failure(args['expected_route'], args['source_message_id'], args['failure']))
         if op == 'provider-retry':
             return public_message(codex_failures.retry_action(self, args))
-        if op in ('inbox_list', 'inbox_get', 'inbox_ack'):
+        if op in ('inbox_list', 'inbox_get', 'inbox_ack', 'inbox_reply'):
             return self.inbox_action(args)
         if op == 'ping':
             return {'instance':self.instance,'messages':len(self.messages),'subscribers':len(self.subscribers),

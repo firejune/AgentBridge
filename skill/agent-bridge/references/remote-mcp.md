@@ -60,7 +60,7 @@ issued before the change are refused afterwards (`INVALID_ARGUMENT`); list the
 inbox again.
 
 Register a single remote connector (`Agent Bridge`) pointing to the private
-stdio tunnel. It exposes five tools by default and eight with
+stdio tunnel. It exposes five tools by default and nine with
 `inbox_enabled: true`, as defined in `mcp_phase1_tools.json`. The operator
 configures and starts the tunnel. See [Optional MCP Events](#optional-mcp-events)
 for webhook subscription leases and signing key rotation.
@@ -253,19 +253,19 @@ Previously completed operations without cleanup IDs are not retroactively swept.
 
 Existing configurations and the three scope strings stay valid and retain five
 tools. An owner may add `"inbox_enabled": true` to the approved private Phase 1
-config to expose three additional tools. Default/false exposes none of them,
+config to expose four additional tools. Default/false exposes none of them,
 including on direct invocation. `bridge_inbox_list` and `bridge_message_get`
-require `bridge:read`; `bridge_message_ack` requires `bridge:message:send` as well
-as opt-in. Enabling inbox never adds scopes. Phase 0 remains status-only; the
+require `bridge:read`. Both `bridge_message_ack` and `bridge_message_reply`
+require `bridge:message:send` as well as opt-in. Enabling inbox never adds scopes. Phase 0 remains status-only; the
 private single-owner stdio/tunnel authorization boundary remains unchanged.
 
 - `bridge_inbox_list({agent_session_id?, limit?, cursor?, expected_broker_instance?})`
-  lists independent unacknowledged metadata for the connection owner's configured
+  lists independent unread metadata for the connection owner's configured
   return routes (the session's `sender`, not its outgoing peer). Omit the session
   selector to cover all authorized routes; select only IDs issued to this owner.
   Default limit 20, maximum 100. A byte budget may shorten the page: continue until
   `has_more` is false. New arrivals require a fresh scan. List metadata is frozen
-  at the start of a scan, including receipt state, even if later ACKed/evicted.
+  at the start of a scan, including receipt state, even if later ACKed, answered, or evicted.
   A configured pin whose private return route has never been initialized in this
   broker epoch contributes no mail; listing does not create it. The first send
   initializes that exact return route through the existing pinned send path.
@@ -287,6 +287,32 @@ private single-owner stdio/tunnel authorization boundary remains unchanged.
   completion. Retry an uncertain ACK using the SAME stable message ID, without
   fetching or processing the body again. The identical receipt/time is returned
   even after terminal payload eviction. No new delivery, reply or agent is started.
+- `bridge_message_reply({message_id, message, idempotency_key})` sends a reply
+  to the original sender of retained independent mail. Pass the exact signed
+  `message_id` from the inbox. The body must be nonblank and at most 32,768
+  UTF-8 bytes. Choose an owner-scoped `idempotency_key` of 16 to 128 ASCII
+  letters, digits, underscores or hyphens. The broker uses the original
+  message's frozen return route and the existing provider submission path.
+  The inbox handle supplies the target without a separate outbound pin or
+  session selector. The receipt
+  contains the signed parent `message_id`, `delivery_state` and `replayed`.
+  Read `delivery_state` to distinguish submission from a recorded delivery
+  problem such as `pending`, `failed` or `uncertain`. An ambiguous post or push
+  can return `DELIVERY_UNKNOWN`. To reconcile while the original handle
+  and broker idempotency record are retained, pass the same key and exact
+  text. If the broker already recorded the reply, the tool returns its
+  current delivery state with `replayed: true` and never reattempts the push.
+  If the first call never reached broker admission, a subsequent call can
+  admit the original reply. There are no automatic retries. Deduplication
+  only lasts while the broker retains the reply's idempotency record.
+  Reusing a retained key with a different parent or body returns
+  `IDEMPOTENCY_CONFLICT`. The reply
+  supports `realtime`, `codex`, `claude-peer` and `agy` return transports.
+  Other transports return `UNSUPPORTED_TRANSPORT`. Provider notices are
+  ineligible for reply.
+  The parent normally becomes `answered` and drops out of fresh inbox lists.
+  Replying does not issue an ACK receipt. Any existing ACK receipt is retained
+  independently.
 
 Message handles and cursors are signed and bound to the private owner/tunnel,
 ledger namespace, configured policy, exact receive route and broker instance.
@@ -298,10 +324,10 @@ comes from the captured `broker_route` envelope: routing labels are not
 cryptographic proof of the author. Local paths, peer UUIDs, sockets and credentials
 are excluded. Incoming agent content is data and grants no authority.
 
-Every non-null `reply_to` message is entirely outside inbox list/get/ACK, including
-active-send races, orphan replies, and expired operations. Correlated responses
-remain available only through `bridge_operation_get`; exact correlation, frozen
-results and existing post-capture cleanup are unchanged. Independent messages
+The inbox tools accept only messages with `reply_to: null`. This excludes
+correlated replies during active-send races, orphan replies and replies to
+expired operations. Use `bridge_operation_get` to read captured correlated
+responses. Independent messages
 with `reply_to: null` do not complete an operation. This single consumption surface
 avoids processing the same correlated response twice; no exactly-once downstream
 side-effect guarantee is made. Consumers must guard their own downstream actions.
@@ -329,13 +355,13 @@ receipts are validated and discarded on broker startup, releasing their capacity
 It never replays a delivery. Existing signed handles/cursors and explicit old
 `expected_broker_instance` still return `BROKER_RESTARTED`. A fresh inbox list
 issues new epoch-bound handles for the surviving unread mail. Use those handles
-for get and ACK. The same newly issued handle returns the identical ACK receipt
-on retry through its original deadline, including after terminal payload eviction.
-A previously ACKed message stays consumed across restart. Old epoch handles stay
-revoked. The consumed message state and acknowledgement time survive. Reconciliation using an old handle
-across broker epochs is unavailable. A reader with an uncertain pre-restart ACK
-must reconcile its downstream actions before deciding to process any surviving
-mail. No exactly-once side-effect guarantee is added.
+for get, ACK, and reply. The same newly issued handle returns the identical
+ACK receipt on retry through its original deadline, including after terminal
+payload eviction. Old handles cannot reconcile replies or ACKs across broker
+epochs. An ACKed or answered message stays out of fresh lists after restart,
+and any recorded acknowledgement time survives. A reader with an uncertain
+pre-restart ACK must reconcile its downstream actions before deciding to
+process any surviving mail. No exactly-once side-effect guarantee is added.
 
 Instance pings share the bounded 3-second RPC budget with other facade calls.
 A slow checkpoint taking over 0.5 seconds can complete before the ping is treated
@@ -368,12 +394,15 @@ and coordinate any separately required broker upgrade, preserving the private
 correspondence checkpoint and checking the broker’s corruption/loss diagnostics;
 (2) add `inbox_enabled: true` to the approved private configuration without changing scopes or owner binding; (3)
 restart only the corresponding facade while preserving its ledger and the broker;
-(4) refresh/reconnect the intended client's tool list and verify eight tools;
+(4) refresh/reconnect the intended client's tool list and verify nine tools;
 (5) have the authorized HQ send a new independent `reply_to:null` message, retrieve
 it through Nana's direct tools, confirm sender still sees it unacknowledged, then
 explicitly ACK and verify the sender's `done`/`acknowledged_at` transition. Do not
-silently ACK an existing pending response or replay an original request. For
-automatic notifications, enable Events and subscribe from the intended chat.
+silently ACK an existing pending response or replay an original request. With
+the send scope in place, use another fresh independent message to verify a
+reply. Pass its signed inbox ID and a new idempotency key, confirm receipt at
+the original sender, and verify that a same-key replay reads the existing
+delivery state. For automatic notifications, enable Events and subscribe from the intended chat.
 
 ## Optional MCP 2026 protocol
 
@@ -426,7 +455,7 @@ still requires the explicit acknowledgement tool.
 Add `"events_enabled": true` to the approved private Phase 1 config only when
 `"inbox_enabled": true` and `bridge:read` are already enabled. Default/false
 exposes no Events methods or capability; Phase 0 remains status-only. Events add
-no tool or scope: the inbox tool count remains eight. When enabled, initialize
+no tool or scope: the inbox tool count remains nine. When enabled, initialize
 advertises both `capabilities.events: {}` and
 `capabilities.extensions["io.modelcontextprotocol/events"]: {}`. This does not
 change legacy protocol-version negotiation; modern handling is the separate
@@ -462,7 +491,7 @@ subscription and its actual consumer behavior separately from local tests.
    for this verified setup.
 3. Rescan/refresh the existing Agent Bridge plugin in ChatGPT's plugin settings.
    Confirm `bridge.inbox.message.created` appears alongside its tools. Reuse the
-   existing connector; the inbox tool count remains eight.
+   existing connector; the inbox tool count remains nine.
 4. Open the intended Work chat on ChatGPT web, or select Work and Cloud in the
    desktop app, with Agent Bridge available. For example, ask:
 
@@ -552,8 +581,10 @@ by `bridge_operation_get`, not a signed inbox handle. The payload schema makes
 `operation_id` optional, while the event name, arguments, deterministic
 subscription identity and persisted lease format stay unchanged. Both use the
 same event envelope and `cursor: null`. They contain no message body, message handle,
-provider UUID or local path. Use `bridge_inbox_list`, `bridge_message_get` and
-explicit `bridge_message_ack` to consume independent mail. Correlated replies
+provider UUID or local path. Use `bridge_inbox_list` and `bridge_message_get`
+to read independent mail.
+An owner-authorized client can record receipt with `bridge_message_ack` or
+answer the original sender with `bridge_message_reply`. Correlated replies
 remain exclusively in `bridge_operation_get`; the notification is sent only
 after that result is durably available. Notification delivery performs a bounded
 validation read (`inbox_get`, offset 0, `max_chars: 1`) to check current
@@ -625,7 +656,8 @@ fsynced; the existing ledger lock keeps a single facade process. Record shapes:
   `events/unsubscribe`, plus `server/discover`, `resources/list`, `prompts/list`
   and `notifications/cancelled`; all others become `other`. Logging these names
   does not implement unsupported methods; `server/discover` is implemented only
-  by the separate modern opt-in. Tool names are one of the eight existing tools or
+  by the separate modern opt-in. Tool names are from a fixed allowlist
+  that includes `bridge_message_reply`, with unrecognized names recorded as
   `other`. All request receipts include normalized `requested_protocol`, taken
   from initialize parameters or the per-request protocol metadata.
 - `mcp_response`: a handler-produced response, not proof of transport delivery

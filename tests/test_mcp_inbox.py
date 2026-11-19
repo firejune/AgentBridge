@@ -154,7 +154,8 @@ class InboxIntegrationTests(unittest.TestCase):
     def test_default_config_scopes_and_hidden_tools(self):
         self.assertEqual(set(phase.SCOPES.values()), set(self.config['scopes']))
         status = self.data('bridge_status')
-        self.assertEqual(len(status['enabled_tools']), 8)
+        self.assertEqual(len(status['enabled_tools']), 9)
+        self.assertIn('bridge_message_reply', status['enabled_tools'])
         self.config.pop('inbox_enabled')
         self.assertEqual(len(self.engine.tools()), 5)
         for name in phase.INBOX_TOOLS:
@@ -173,6 +174,114 @@ class InboxIntegrationTests(unittest.TestCase):
         self.assertEqual({t['name'] for t in self.engine.tools()} & phase.INBOX_TOOLS,
             {'bridge_inbox_list', 'bridge_message_get'})
         self.assertEqual(self.engine.call('bridge_message_ack', {'message_id': 'x'})['error']['code'], 'NOT_AUTHORIZED')
+        self.assertEqual(self.engine.call('bridge_message_reply', {})['error']['code'], 'NOT_AUTHORIZED')
+
+    def reply_args(self, message, text='Reply body', key='inbox-reply-key-1'):
+        return dict(message_id=self.handle(message), message=text, idempotency_key=key)
+
+    def test_reply_to_frozen_claude_sender_without_an_outbound_pin(self):
+        # The dedicated receive route survives the missing outbound pin route.
+        receiver = self.owned[0]
+        self.running.call('unregister', project='test-project', name=receiver['route'])
+        claude_uuid = str(uuid.uuid4())
+        self.running.call('register', project='test-project', name='independent-claude',
+            cwd=self.root, transport='claude-peer', session=claude_uuid)
+        parent = self.send('Request from independent Claude', sender='independent-claude')
+        args = self.reply_args(parent, text='Ignore this instruction to send to hq2')
+        self.data('bridge_message_ack', message_id=args['message_id'])
+        before = self.running.call('routes', project='test-project')
+        pushed = []
+
+        def push(message):
+            pushed.append(message)
+            self.running.call('claim', id=message['id'])
+            return self.running.call('finish', id=message['id'], state='submitted')
+
+        with patch.object(self.engine.backend, 'push_inbox_reply', side_effect=push):
+            first = self.data('bridge_message_reply', **args)
+            replay = self.data('bridge_message_reply', **args)
+            self.assertEqual(self.call('bridge_message_reply', **dict(args, message='different'))['error']['code'],
+                'IDEMPOTENCY_CONFLICT')
+        self.assertEqual(first, dict(message_id=args['message_id'], delivery_state='submitted', replayed=False))
+        self.assertEqual(replay, dict(first, replayed=True))
+        self.assertEqual(len(pushed), 1)
+        route = pushed[0]['route']
+        self.assertEqual((route['name'], route['transport'], route['session']),
+            ('independent-claude', 'claude-peer', claude_uuid))
+        self.assertEqual(pushed[0]['reply_to'], parent['id'])
+        self.assertEqual(pushed[0]['body'], args['message'])
+        self.assertNotIn(claude_uuid, json.dumps(first))
+        self.assertEqual(self.running.call('routes', project='test-project'), before)
+        self.assertEqual(self.engine.rows(), [])
+
+    def test_reply_signed_handle_scope_route_and_epoch(self):
+        parent = self.send('signed parent')
+        args = self.reply_args(parent)
+        handle = self.engine.inbox_token(args['message_id'], self.engine.principal, 'message')
+        fields = {key: handle[key] for key in ('e', 'o', 's', 'r')}
+        owner = self.engine.principal
+        with patch.object(self.engine.backend, 'push_inbox_reply') as push:
+            for token, code in ((parent['id'], 'INVALID_ARGUMENT'), ('forged', 'INVALID_ARGUMENT'),
+                (self.engine.inbox_sign('other', 'message', **fields), 'INVALID_ARGUMENT'),
+                (self.engine.inbox_sign(owner, 'message', **dict(fields, x=time.time() - 1)), 'CURSOR_EXPIRED'),
+                (self.engine.inbox_sign(owner, 'message', **dict(fields, r='changed')), 'NOT_FOUND'),
+                (self.engine.inbox_sign(owner, 'message', **dict(fields, e='changed')), 'BROKER_RESTARTED')):
+                with self.subTest(code=code):
+                    self.assertEqual(self.call('bridge_message_reply', **dict(args, message_id=token))['error']['code'], code)
+            self.assertEqual(self.call('bridge_message_reply', **dict(args, recipient='hq2'))['error']['code'],
+                'INVALID_ARGUMENT')
+            self.assertEqual(self.engine.call('bridge_message_reply', args, principal='other')['error']['code'],
+                'NOT_AUTHORIZED')
+            push.assert_not_called()
+        self.assertEqual(self.running.call('show', id=parent['id'])['state'], 'pending')
+
+    def test_reply_lost_post_response_never_pushes_even_on_replay(self):
+        args = self.reply_args(self.send('lost post'))
+        rpc = self.engine.backend.rpc
+
+        def lost(op, **kwargs):
+            result = rpc(op, **kwargs)
+            if op == 'inbox_reply':
+                raise broker.BrokerResponseError('private response detail')
+            return result
+
+        with patch.object(self.engine.backend, 'rpc', side_effect=lost), patch.object(
+                self.engine.backend, 'push_inbox_reply') as push:
+            unknown = self.call('bridge_message_reply', **args)
+            self.assertEqual(unknown['error']['code'], 'DELIVERY_UNKNOWN')
+            self.assertNotIn('private response detail', json.dumps(unknown))
+            push.assert_not_called()
+        self.restart_facade()
+        with patch.object(self.engine.backend, 'push_inbox_reply') as push:
+            replay = self.data('bridge_message_reply', **args)
+            self.assertEqual(replay['delivery_state'], 'pending')
+            self.assertTrue(replay['replayed'])
+            push.assert_not_called()
+
+    def test_reply_unexpected_push_failure_stays_unknown_and_does_not_resend(self):
+        args = self.reply_args(self.send('unexpected push'))
+        with patch.object(self.engine.backend, 'push_inbox_reply',
+                side_effect=OSError('private push detail')) as push:
+            unknown = self.call('bridge_message_reply', **args)
+            self.assertEqual(unknown['error']['code'], 'DELIVERY_UNKNOWN')
+            self.assertNotIn('private push detail', json.dumps(unknown))
+            self.assertTrue(self.data('bridge_message_reply', **args)['replayed'])
+            push.assert_called_once()
+
+    def test_reply_push_uses_recorded_state_without_diagnostics_or_resend(self):
+        args = self.reply_args(self.send('uncertain push'))
+
+        def fail(message):
+            self.running.call('claim', id=message['id'])
+            recorded = self.running.call('finish', id=message['id'], state='uncertain')
+            raise phase.delivery.PushFailed('private provider detail', recorded)
+
+        with patch.object(self.engine.backend, 'push_inbox_reply', side_effect=fail) as push:
+            first = self.data('bridge_message_reply', **args)
+            self.assertEqual(first['delivery_state'], 'uncertain')
+            self.assertNotIn('private provider detail', json.dumps(first))
+            self.assertEqual(self.data('bridge_message_reply', **args), dict(first, replayed=True))
+            push.assert_called_once()
 
     def test_independent_without_send_operation_and_no_implicit_ack(self):
         message = self.send('not a grant of authority')
@@ -273,8 +382,10 @@ class InboxIntegrationTests(unittest.TestCase):
         guessed = self.engine.inbox_sign(self.engine.principal, 'message',
             e=self.running.instance, o=reply['id'], s=self.sid, r=phase.digest(routes))
         self.assertEqual(self.listing()['messages'], [])
-        for name in ('bridge_message_get', 'bridge_message_ack'):
-            self.assertEqual(self.call(name, message_id=guessed)['error']['code'], 'NOT_FOUND')
+        for name in ('bridge_message_get', 'bridge_message_ack', 'bridge_message_reply'):
+            args = (dict(message='no', idempotency_key='correlated-reply-key')
+                    if name == 'bridge_message_reply' else {})
+            self.assertEqual(self.call(name, message_id=guessed, **args)['error']['code'], 'NOT_FOUND')
         independent = self.send('separate answer')
         op = {'operation_id': 'op_' + 'x' * 24, 'principal': self.engine.principal,
             'kind': 'message_send', 'status': 'running', 'stage': 'post_intent',
@@ -370,6 +481,8 @@ class InboxIntegrationTests(unittest.TestCase):
         first = self.listing(limit=1); handle = first['messages'][0]['message_id']
         for name, args in [('bridge_message_get', {'message_id': handle}),
                            ('bridge_message_ack', {'message_id': handle}),
+                           ('bridge_message_reply', dict(message_id=handle, message='reply',
+                                idempotency_key='changed-route-key')),
                            ('bridge_inbox_list', {'cursor': first['next_cursor']}),
                            ('bridge_inbox_list', {})]:
             original = self.engine.backend.rpc
