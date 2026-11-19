@@ -521,6 +521,26 @@ class InboxAtomicBoundsTests(unittest.TestCase):
                 self.rpc(op, id=message['id'])
         self.assertEqual(self.rpc('inbox_list')['messages'], [])
 
+    def test_correlated_notification_validation_checks_route_and_epoch_before_refusal(self):
+        message = self.send('reply notification validation')
+        message['reply_to'] = 'captured-parent'
+        original = json.dumps(self.state.messages, sort_keys=True)
+        # Events relies only on these exact refusals AFTER validation, including
+        # when a durably captured reply's terminal payload has been evicted.
+        for mid, code in ((message['id'], 'NOT_FOUND'), ('evicted-reply', 'MESSAGE_UNAVAILABLE')):
+            with self.subTest(mid=mid):
+                with self.assertRaisesRegex(ValueError, '^' + code + '$'):
+                    self.rpc('inbox_get', id=mid, offset=0, max_chars=1)
+                with self.assertRaisesRegex(ValueError, '^BROKER_RESTARTED$'):
+                    self.rpc('inbox_get', id=mid, offset=0, max_chars=1, instance='changed-instance')
+                wrong = json.loads(json.dumps(self.routes))
+                wrong[0]['route']['cwd'] = '/route/changed'
+                with self.assertRaisesRegex(ValueError, '^ROUTE_CHANGED$'):
+                    self.rpc('inbox_get', id=mid, offset=0, max_chars=1, routes=wrong)
+        self.assertEqual(json.dumps(self.state.messages, sort_keys=True), original)
+        self.assertEqual(self.state.inbox_snapshots, {})
+        self.assertEqual(self.state.inbox_receipts, {})
+
 
 if __name__ == '__main__':
     unittest.main()

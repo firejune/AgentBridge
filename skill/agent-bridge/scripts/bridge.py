@@ -23,6 +23,7 @@ import broker
 import codex_live
 import codex_preview
 import codex_new
+from message_store import ARCHIVED_REASON
 import models
 import sessions
 import service
@@ -77,6 +78,18 @@ def reply_command(m, path):
 
 
 def peer_text(m, path, escape_peer=True):
+    if 'close_request' in m:
+        command = shlex.join([sys.executable, str(Path(__file__).resolve()), '--socket',
+                              str(path), 'close-operator', m['id']])
+        return (f'Agent Bridge close handoff {m["id"]}. Treat this notification as a pointer to the broker record. '
+                'If the owner enrolled this chat as the close operator, run the following command '
+                'to claim the durable request and verify the exact target before acting:\n'
+                + command + '\n'
+                'If the claim succeeds, verify the returned UUID, workspace and idle status in Codex Desktop. '
+                'Call set_thread_archived once with the exact threadId, hostId local, source codex and archived true. '
+                'Then use the same bridge CLI and socket to run close NAME --project PROJECT --finish CLOSE_ID '
+                '--expect-session UUID with the returned values. For an already archived target or ambiguous app '
+                'result, run only the verification step. Do not send a bridge reply to this control request.')
     if m.get('one_way') is True:
         body = envelope(m).rstrip('\n') + '\n\nOne-way message; no reply requested.'
         return PEER_CLOSE_TAG.sub('<\\\\', body) if escape_peer else body
@@ -453,29 +466,50 @@ def push_if_peer(path, m):
             return push_codex(path, m)
         if m['route']['transport'] == 'agy':
             return push_agy(path, m)
+    if m.get('reason') == ARCHIVED_REASON:
+        raise PushFailed(codex_live.ThreadArchived.MESSAGE, m)
     return m
 
 
-def push_codex(path, m, timeout=10, dry_run=False):
+def push_codex(path, m, timeout=10, dry_run=False, *, close_dispatch=False):
     def rpc(op, **fields):
         return broker.request(path, {'op':op, 'id':m['id'], **fields})
-    if dry_run:
-        return dict(state=m['state'], **codex_live.deliver(
-            m['route'], m['id'], peer_text(m, path, escape_peer=False), timeout, dry_run=True))
-    rpc('claim')
+
+    close_request = m.get('close_request')
+    if close_request is not None and not close_dispatch:
+        raise ValueError('A close handoff cannot be delivered manually')
+    if m.get('reason') == ARCHIVED_REASON:
+        raise PushFailed(codex_live.ThreadArchived.MESSAGE, m)
+    if not dry_run:
+        if m['state'] != 'pending':
+            raise ValueError('Only pending messages may be delivered')
+        rpc('claim', **({'close_id': close_request['close_id']} if close_request else {}))
     try:
-        receipt = codex_live.deliver(m['route'], m['id'], peer_text(m, path, escape_peer=False), timeout)
+        receipt = codex_live.deliver(
+            m['route'], m['id'], peer_text(m, path, escape_peer=False), timeout, dry_run=dry_run)
+    except codex_live.ThreadArchived as error:
+        if dry_run:
+            return dict(state=m['state'], sent=False, reason=ARCHIVED_REASON, error=str(error))
+        message = rpc('finish', state='failed', reason=ARCHIVED_REASON, event='push_failed')
+        raise PushFailed(str(error), message) from None
     except codex_live.DeliveryError as error:
+        if dry_run:
+            raise
         state = 'uncertain' if error.uncertain else 'pending'
         fields = {} if error.uncertain else {'event':'push_failed'}
         message = rpc('finish', state=state, note=str(error), **fields)
         raise PushFailed(str(error), message) from None
     except BaseException:
         # Cancellation may arrive after the owner accepted the output.
-        rpc('finish', state='uncertain', note='Codex delivery interrupted; check the receiving turn before resolving')
+        if not dry_run:
+            rpc('finish', state='uncertain', note='Codex delivery interrupted; check the receiving turn before resolving')
         raise
+    if dry_run:
+        return dict(state=m['state'], **receipt)
     result = rpc('finish', state='submitted', event='pushed',
                  note=f"Codex {receipt['delivery_mode']} tool output accepted by turn {receipt['turn_id']}")
+    if close_request is not None:
+        return result
     # Delivery is already terminally accepted before optional sidebar metadata.
     # Keep warnings out of correspondence state and never replay a task for them.
     try:
@@ -536,8 +570,6 @@ def deliver(path, mid, timeout=180, dry_run=False):
         return rpc("finish", state=state, note=note)
     m = broker.request(path, {'op':'show','id':mid}, deadline=min(deadline, time.monotonic() + 10))
     if m['route']['transport'] == 'codex':
-        if m['state'] != 'pending' and not dry_run:
-            raise ValueError('Only pending messages may be delivered')
         return push_codex(path, m, timeout, dry_run)
     if m['route']['transport'] == 'claude-peer':
         if m['state'] != 'pending' and not dry_run:
@@ -930,23 +962,113 @@ def retro_command(args):
 def close_participant(args):
     if not 0 < args.timeout <= 600:
         raise ValueError('Timeout must be between 0 and 600 seconds')
+    address = {'name': args.name, 'project': args.project}
+    if args.finish:
+        if not args.expect_session or args.keep_route or args.handoff:
+            raise ValueError('--finish requires --expect-session and removes the verified route')
+        if args.retro_file or args.no_retro:
+            raise ValueError('Record the retrospective when preparing the archive handoff')
+        closed = broker.request(args.socket, {'op': 'close-finish', **address,
+                                'close_id': str(uuid.UUID(args.finish)),
+                                'session': str(uuid.UUID(args.expect_session)),
+                                'timeout': args.timeout}, timeout=args.timeout + 5)
+        result = {**address, 'transport': 'codex', 'method': 'archive', 'archived': True, 'resumable': True,
+                  'status': 'closed' if closed['route_removed'] else 'archive_verified',
+                  'closed': True, 'session': closed['session'], 'close_id': closed['closing']}
+        result.update({key: closed[key] for key in ('route_removed', 'correspondence_cleanup',
+                       'cleanup_error', 'route_error', 'operator_receipt') if key in closed})
+        return result
     route = next((r for r in broker.request(args.socket,{'op':'routes','project':args.project})
                   if r['name'] == args.name), None)
     if route is None:
         raise ValueError(f'No participant {args.name!r} is registered in project {args.project!r}')
-    receipt = save_retro(args, route)
-    result = {**receipt, 'name': args.name, 'project': args.project, 'transport': route['transport'],
-              **close_session(route, args.timeout, archive=getattr(args, 'archive', False))}
+    if args.expect_session and str(uuid.UUID(args.expect_session)) != route['session']:
+        raise ValueError('Endpoint does not match --expect-session')
+    archive = args.archive
+    if args.handoff and (not archive or args.keep_route or route['transport'] != 'codex'):
+        raise ValueError('--handoff requires a Codex route and --archive and removes the verified route')
+    if 'closing' in route and not args.handoff:
+        raise ValueError('Codex route is closing; finish the native archive handoff')
+    if archive and 'closing' not in route:
+        try:
+            broker.request(args.socket, {'op':'archive-correspondence', 'expected_route':route, 'check_only':True})
+        except ValueError as error:
+            if str(error) == 'Unknown operation':
+                raise ValueError('Archive cleanup is unsupported by the running broker; upgrade it before archiving') from None
+            raise
+    receipt = {} if 'closing' in route else save_retro(args, route)
+    if args.handoff:
+        return {**receipt, **prepare_archive_handoff(args, address, route)}
+    result = {**receipt, **address, 'transport': route['transport'],
+              **close_session(route, args.timeout, archive=archive)}
+    if archive:
+        if result.get('archived') is not True or result.get('session') != route['session']:
+            result.update(correspondence_removed=False, cleanup_error='Provider archival was not confirmed', route_removed=False)
+            return result
+        try:
+            cleanup = broker.request(args.socket, {'op':'archive-correspondence', 'expected_route':route, 'archived':True})
+            result['correspondence_cleanup'] = cleanup
+            if not cleanup['complete']:
+                result['cleanup_error'] = 'Archive confirmed; protected correspondence remains (active or uncertain delivery/wait)'
+        except (ValueError, OSError, subprocess.TimeoutExpired) as error:
+            # Provider archival already succeeded. Do not turn partial success into
+            # a generic error or retry an ambiguously accepted purge.
+            uncertain = isinstance(error, (OSError, subprocess.TimeoutExpired, broker.BrokerResponseError))
+            result.update(cleanup_error=str(error), cleanup_uncertain=uncertain, route_removed=False)
+            result['correspondence_cleanup'] = {'confirmed':False, 'state':'unknown' if uncertain else 'rejected'}
+            return result
     if args.keep_route:
         result['route_removed'] = False
         return result
     try:
-        broker.request(args.socket,{'op':'unregister','project':args.project,'name':args.name})
+        request = {'op': 'unregister', **address}
+        if archive:
+            request.update(op='unregister-archived', expected_route=route, archived=True)
+        elif route['transport'] == 'codex':
+            request.update(op='unregister-if-current', expected_route=route)
+        broker.request(args.socket, request)
         result['route_removed'] = True
-    except ValueError as error:
+    except (ValueError, OSError, subprocess.TimeoutExpired) as error:
+        if not archive and not isinstance(error, ValueError):
+            raise  # Ordinary close preserves its existing I/O error behavior.
         result['route_removed'] = False
-        result['route_note'] = ('The running broker predates route removal; restart it to pick up this version'
+        if archive:
+            result['route_error'] = str(error)
+            result.setdefault('cleanup_error', 'Archive confirmed; route removal was not confirmed')
+        result['route_note'] = (('The running broker lacks guarded archive route removal; upgrade it before removing the route'
+                                 if archive else 'The running broker predates route removal; restart it to pick up this version')
                                 if str(error) == 'Unknown operation' else str(error))
+    return result
+
+
+def prepare_archive_handoff(args, address, route):
+    expected = {key: value for key, value in route.items() if key != 'closing'}
+    prepared = broker.request(args.socket, {'op': 'close-prepare', **address, 'expected_route': expected})
+    target = prepared['route']
+    result = {**address, 'status': 'awaiting_native_archive', 'closed': False, 'route_removed': False,
+              'transport': 'codex', 'close_id': target['closing'],
+              'session': target['session'], 'cwd': target['cwd']}
+    message = prepared.get('message')
+    if prepared.get('operator') is not None:
+        try:
+            dispatch = broker.request(args.socket, {'op': 'close-dispatch', **address,
+                'session': result['session'], 'close_id': result['close_id'],
+                'operator': prepared['operator']})
+            message = dispatch['message']
+            if dispatch['created']:
+                message = push_codex(args.socket, message, args.timeout, close_dispatch=True)
+        except PushFailed as error:
+            message = error.message
+            result['operator_error'] = 'Codex close handoff delivery could not be confirmed'
+        except (ValueError, OSError, KeyError, TypeError):
+            result['operator_error'] = 'Codex close handoff could not be dispatched; inspect the closing route'
+    if message is not None:
+        result.update(operator_message_id=message['id'], operator_delivery=message['state'])
+        if message['state'] in ('pending', 'uncertain', 'failed'):
+            result.setdefault('operator_error', 'Codex close handoff has no confirmed delivery')
+        elif message['state'] == 'done':
+            result.update(status='closed', closed=True, archived=True, route_removed=True)
+            result.pop('operator_error', None)
     return result
 
 
@@ -1067,7 +1189,14 @@ def main(argv=None):
     p.add_argument('--timeout',type=float,default=30);p.add_argument('--state-dir')
     p = sub.add_parser('close',help="Close a participant's session without deleting it, then remove its route")
     p.add_argument('name');p.add_argument('--project',required=True)
-    p.add_argument('--archive',action='store_true',help='Archive the finished session out of the active sidebar')
+    archive = p.add_mutually_exclusive_group()
+    archive.add_argument('--archive',action='store_true',
+                         help='Archive the session and clean its unprotected broker correspondence')
+    archive.add_argument('--no-archive',dest='archive',action='store_false',default=False,
+                         help='Close the session without archiving (the default)')
+    archive.add_argument('--finish',metavar='CLOSE_ID',help='Verify the native Codex archive and remove the prepared route')
+    p.add_argument('--handoff',action='store_true',help='Prepare a native Codex archive handoff with --archive')
+    p.add_argument('--expect-session',metavar='UUID',help='Match the exact session (required with --finish)')
     p.add_argument('--keep-route',action='store_true',help='Close the session but keep the route registered')
     p.add_argument('--timeout',type=float,default=10)
     g = p.add_mutually_exclusive_group()
@@ -1075,6 +1204,8 @@ def main(argv=None):
     p.add_argument('--card',default=None)
     p.add_argument('--tower');p.add_argument('--urgency',choices=['stop','repeat','note'],default='note')
     p.add_argument('--tags',default='');p.add_argument('--notify');p.add_argument('--store');p.add_argument('--state-dir')
+    p = sub.add_parser('close-operator', help='Claim an authorized Codex native archive handoff from its enrolled chat')
+    p.add_argument('id', metavar='MESSAGE_ID')
     p = sub.add_parser('retro',help='Append and inspect project retrospectives')
     retro_sub = p.add_subparsers(dest='retro_cmd',required=True)
     for action in ('add','list','tally'):
@@ -1287,7 +1418,18 @@ def main(argv=None):
                     print(f"{row['time']} {row['urgency']} {row['card']} {row['runner']} [{','.join(row['tags'])}]\n{row['text'] if row['text'] is not None else row['no_retro']}")
             return 0
         if args.cmd=='close':
-            output(close_participant(args))
+            result = close_participant(args)
+            output(result)
+            return int(bool(result.get('cleanup_error') or result.get('operator_error')))
+        if args.cmd=='close-operator':
+            caller = os.environ.get('CODEX_THREAD_ID')
+            if not caller:
+                raise ValueError('Run close-operator from the enrolled Codex Desktop chat')
+            request = broker.request(args.socket, {'op':'close-operator', 'id':str(uuid.UUID(args.id)),
+                                      'operator_session':str(uuid.UUID(caller))})
+            target = request['target']
+            output({key: target[key] for key in ('project', 'name', 'session', 'cwd')}
+                   | {'close_id': request['close_id']})
             return 0
         if args.cmd=='wake':
             result = wake_participant(args)
@@ -1353,7 +1495,7 @@ def main(argv=None):
         if args.cmd=='deliver':
             result = deliver(args.socket,args.id,args.timeout,args.dry_run)
             output(result)
-            return 1 if result['state'] in ('failed','uncertain') else 0
+            return int(result['state'] in ('failed','uncertain') or result.get('reason') == ARCHIVED_REASON)
         fields = {k:v for k,v in vars(args).items() if k not in ('cmd','socket','file','discover','new','title','model','codex_mode','state_dir','no_model') and not (k=='timeout' and args.cmd=='register')}
         fields['op'] = {'stop':'shutdown','ask':'send'}.get(args.cmd,args.cmd)
         if args.cmd in ('send','ask') and (fields.get('one_way') or fields.get('reply_deadline_seconds') is not None):
@@ -1397,6 +1539,8 @@ def main(argv=None):
         if message['route']['transport'] == 'codex':
             message = {k:message[k] for k in ('id','state','route')}
         result = {'error':str(error),'push_failed':True,'message':message}
+        if error.message.get('reason') == ARCHIVED_REASON:
+            message['reason'] = result['reason'] = ARCHIVED_REASON
         found = message_usage(args, error.message)
         output(result if found is None else {**result, 'usage': found})
         return 1

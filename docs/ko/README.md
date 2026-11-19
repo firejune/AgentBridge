@@ -111,6 +111,8 @@ python3 "$bridge_cli" reply MESSAGE_ID --key reply-001 --file /path/to/answer.tx
 
 ## 핵심 기능
 
+저장된 메타데이터에서 정확한 수신 Codex 대화의 보관이 확인되면 CLI는 Desktop에 연결하기 전에 `state: "failed"`와 `reason: "archived"`를 반환한다. 종료 코드는 1이다.
+
 ### 1. 세션 생명주기 (`sessions`, `open`, `register --new`, `close`)
 
 | 공급자 | 데스크톱 세션 열기 | IDE 세션 열기 (`--host ide`) | 세션 닫기 (`bridge.py close NAME --project P --retro-file FILE [--archive]`) |
@@ -131,6 +133,10 @@ python3 "$bridge_cli" close agy-worker --project my-app --retro-file /absolute/r
 # 유휴로 닫힌 Claude 데스크톱 세션 깨우기 (woken, already-live, unsupported, uncertain 중 하나를 출력):
 python3 "$bridge_cli" wake claude-tower --project my-app [--timeout 30]
 ```
+
+보관이 확인되면 브로커는 별칭을 포함해 정확한 세션의 정리 가능한 서신을 삭제하고, 영향을 받은 수신함 스냅샷을 만료시킨다. 공급자 대화 원문은 유지한다. 일반 종료는 서신을 유지한다. 직접 보관에 `--keep-route`를 사용해도 서신 정리는 수행한다.
+
+Codex Desktop의 네이티브 보관은 `close --archive --handoff`로 요청한다. Desktop에서 정확한 대화를 직접 보관하거나 등록된 담당자를 이용하고, `close --finish CLOSE_ID --expect-session UUID`로 완료를 확인한다. [세션 닫기](usage.md#세션-닫기) 참고.
 
 Claude 데스크톱은 세션을 스스로 닫는다. 화면에 안 보이는 세션은 마지막 턴 뒤 900초가 지나면 멈추고, 메모리가 부족하면 가장 오래 쉰 세션을 내린다. 그러면 CLI가 끝나고 레지스트리 기록과 inbox 소켓이 사라진다. 이런 라우트로 `claude-peer` push가 오면 브릿지가 먼저 세션을 깨운다. 데스크톱 메타데이터에서 `cliSessionId`로 찾은 `claude://claude.ai/epitaxy/<local_id>`를 열면, 앱이 같은 세션 ID와 대화 기록을 새 PID로 이어 받는다. 새 inbox 소켓이 뜨면 메시지를 한 번만 push한다. 그때까지 메시지는 `dispatching`이고, 다른 결과면 아무것도 보내지 않은 채 `pending`으로 돌아간다. 브릿지는 스스로 다시 열거나 다시 보내지 않는다. `bridge.py wake NAME --project P`는 같은 단계를 명시적으로 한다. 링크를 열면 앱이 그 세션으로 포커스를 옮기고 앞으로 올 수 있다. 예약 작업 세션(앱이 세션 간 메시징을 끈 채 띄운다)과 IDE 세션은 `unsupported`다.
 
@@ -222,7 +228,11 @@ python3 "$bridge_cli" wt sweep --apply  # 대상 워크트리 및 브랜치 실�
 
 브로커에 메시지를 기록하기 전에 라우트 또는 세션 충돌이 확인되면 `BACKEND_UNAVAILABLE`과 고정된 `ROUTE_CHANGED:` 메시지를 반환한다. 최초 접수에서 발견하면 작업을 만들지 않고 도구 오류를 반환하며, 접수 후 발견하면 해당 작업을 `failed`로 끝내 점유를 해제한다. 파사드는 자동 재매핑·재전송하지 않는다. 브로커 send를 시도한 뒤 발견한 라우트 불일치는 `unknown`으로 남긴다.
 
-로컬 에이전트(Claude Code, Codex, Antigravity)는 로컬 MCP를 등록하지 않고 `bridge.py` 파이썬 CLI를 직접 사용한다. `skill/agent-bridge/scripts/mcp_server.py`는 비공개 단일 소유자 원격 터널(`stdio` 기반 `--phase1-config /absolute/private.json`) 전용 인터페이스로, 세션 조회·생성, 메시지 전송, 독립 수신함(`inbox_enabled: true`)을 단일 커넥터로 노출한다(`--phase1-config` 생략 시 읽기 전용 `bridge_status`만 응답). 자세한 계약은 [remote-mcp.md](../../skill/agent-bridge/references/remote-mcp.md)를 참고한다. Events를 제공하는 연결 서버에 활성 구독이 있으면 알림 도착 시 구독한 GPT/Dot 채팅이 자동으로 깨어나고, 에이전트가 inbox 메시지나 알림의 작업 결과를 읽는다. [Events와 배포 범위](../../skill/agent-bridge/references/remote-mcp.md#optional-mcp-events)를 참고한다.
+로컬 에이전트(Claude Code, Codex, Antigravity)는 로컬 MCP를 등록하지 않고 `bridge.py` 파이썬 CLI를 직접 사용한다. `skill/agent-bridge/scripts/mcp_server.py`는 비공개 단일 소유자 원격 터널(`stdio` 기반 `--phase1-config /absolute/private.json`) 전용 인터페이스로, 세션 조회·생성, 메시지 전송, 독립 수신함(`inbox_enabled: true`)을 단일 커넥터로 노출한다(`--phase1-config` 생략 시 읽기 전용 `bridge_status`만 응답). 자세한 계약은 [remote-mcp.md](../../skill/agent-bridge/references/remote-mcp.md)를 참고한다.
+
+허용된 세션이 작업 중이거나 답장을 기다리는 동안에도 서로 다른 키의 MCP 요청을 접수한다. 전송 순서는 같은 UUID와 transport 안에서 유지되고 결과는 각 작업에 따로 연결된다. 쓰기 결과가 불명확하면 해당 대상만 격리되고 `SESSION_BUSY`가 반환될 수 있다. 결과를 알 수 없는 작업은 재전송하지 않으며 전체 active/unknown 작업 64개 한도에 포함된다.
+
+원격 MCP Events에는 `events_enabled: true`, `inbox_enabled: true`, `bridge:read`가 필요하다. 활성 구독과 일치하는 서명된 `bridge.inbox.message.created` 웹훅이 도착하면 웹의 ChatGPT Work 채팅이나 Cloud를 선택한 Desktop Work 채팅이 깨어날 수 있다. 알림에 `operation_id`가 있으면 `bridge_operation_get`으로 기록된 답장을 읽는다. 독립 메시지는 수신함 도구로 읽고 명시적으로 ACK한다. 알림이 누락되면 수신함과 알고 있는 작업 ID를 다시 조회한다. 알림의 재생과 자동 재시도는 지원하지 않는다. [Events 계약과 설정](../../skill/agent-bridge/references/remote-mcp.md#optional-mcp-events)을 참고한다.
 
 ## 개발 및 검증
 
@@ -246,7 +256,7 @@ Codex `open` / `register --new`는 권한 확인에 실패하면 라우트를 �
 `close NAME --project P`에는 `--retro-file FILE` 또는 `--no-retro "사유"`가
 필수다. 누락은 `RETRO_REQUIRED`, 빈 파일은 `RETRO_EMPTY`, 빈 사유는
 `RETRO_REASON_EMPTY`로 공급자 동작과 경로 삭제 전에 거절한다. 타워와 HQ는
-`--no-retro` 사유를 남긴다. 기존 detach/archive/timeout/`--keep-route`는 유지한다.
+`--no-retro` 사유를 남긴다.
 회고를 먼저 저장하므로 이후 공급자 종료가 실패해도 기록은 남는다. 기록 영수증이
 종료 성공을 뜻하지 않으며 실패한 close를 무작정 반복하지 않는다.
 

@@ -288,11 +288,13 @@ class SocketTests(unittest.TestCase):
         self.server.call('channel-bind',project='demo',name='alpha',owner='cli-alpha',description='cli',expect_generation=1)
         return exe
 
-    def codex_route(self):
-        self.server.call('register',project='demo',name='desktop-alpha',transport='codex',
-            session=str(uuid.uuid4()),cwd=self.server.temp.name)
+    def codex_route(self, executable=None):
+        executable = executable or str(Path(self.server.temp.name, 'missing-codex'))
+        route = self.server.call('register',project='demo',name='desktop-alpha',transport='codex',
+            session=str(uuid.uuid4()),cwd=self.server.temp.name,executable=executable)
         self.server.call('channel-bind',project='demo',name='alpha',owner='desktop-alpha',
             description='desktop',expect_generation=1)
+        return route
 
     def test_codex_live_delivery_is_exclusive_and_duplicate_safe(self):
         self.codex_route()
@@ -367,7 +369,7 @@ class SocketTests(unittest.TestCase):
             self.assertEqual(raised.exception.message['state'],'uncertain')
 
     def test_codex_missing_owner_returns_pending_and_cli_nonzero(self):
-        self.codex_route()
+        self.codex_route(executable=str(Path(self.server.temp.name, 'missing-codex')))
         with FakeDesktop('no-owner') as desktop:
             result=subprocess.run([sys.executable,bridge.__file__,'--socket',self.server.path,
                 'send','--project','demo','--from-channel','beta','--channel','alpha',
@@ -378,6 +380,61 @@ class SocketTests(unittest.TestCase):
             self.assertEqual(failure['message']['state'],'pending')
             self.assertNotIn('SECRET_PEER_BODY',result.stdout)
             self.assertNotIn('SECRET_PEER_BODY',result.stderr)
+
+    def test_codex_archived_delivery_is_terminal_and_retained(self):
+        route = self.codex_route()
+        database = Path(self.server.temp.name, 'state_5.sqlite')
+        connection = sqlite3.connect(database)
+        with connection:
+            connection.execute('CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, archived INTEGER)')
+            connection.execute('INSERT INTO threads VALUES (?, ?, 0)', (str(uuid.uuid4()), route['cwd']))
+            connection.execute('INSERT INTO threads VALUES (?, ?, 1)', (route['session'], route['cwd']))
+        connection.close()
+        native_before = database.read_bytes()
+
+        def run_cli(*command):
+            with patch('sys.stdin', StringIO('SECRET_PEER_BODY')), redirect_stdout(StringIO()) as stdout:
+                self.assertEqual(bridge.main(['--socket', self.server.path, *command]), 1)
+            result = json.loads(stdout.getvalue())
+            self.assertEqual(result['reason'], 'archived')
+            self.assertNotIn('SECRET_PEER_BODY', stdout.getvalue())
+            return result
+
+        send = ['--project', 'demo', '--from-channel', 'beta', '--channel', 'alpha', '--file', '-']
+        pending = self.send('explicit')
+        original = self.server.call('send', project='demo', sender_channel='alpha',
+                                    channel='beta', body='Question', key='original')
+        with patch.object(bridge.codex_preview, 'state_path', return_value=database), \
+                patch.object(bridge.codex_live, 'Client') as client:
+            dry_run = run_cli('deliver', pending['id'], '--dry-run')
+            self.assertFalse(dry_run['sent'])
+            self.assertEqual(self.server.call('show', id=pending['id'])['state'], 'pending')
+            results = [
+                run_cli('deliver', pending['id']),
+                run_cli('send', *send, '--key', 'archived-send'),
+                run_cli('ask', *send, '--key', 'archived-ask', '--timeout', '0.05'),
+                run_cli('reply', original['id'], '--key', 'archived-reply', '--file', '-'),
+            ]
+            for result in results:
+                self.assertEqual(result['message']['state'], 'failed')
+            client.assert_not_called()
+
+        self.assertEqual(database.read_bytes(), native_before)
+        self.server.restart()
+        with patch.object(bridge.codex_preview, 'saved_thread') as lookup, \
+                patch.object(bridge.codex_live, 'Client') as client:
+            again = run_cli('send', *send, '--key', 'archived-send')
+            self.assertEqual(again['message'], results[1]['message'])
+            lookup.assert_not_called()
+            client.assert_not_called()
+        expected_bodies = ['Question'] + ['SECRET_PEER_BODY'] * 3
+        for result, expected_body in zip(results, expected_bodies):
+            stored = self.server.call('show', id=result['message']['id'])
+            self.assertEqual(stored['state'], 'failed')
+            self.assertEqual(stored['reason'], 'archived')
+            self.assertEqual(stored['body'], expected_body)
+            self.assertEqual(stored['events'], [])
+            self.assertIsNone(stored['note'])
 
     def test_codex_send_and_reply_automatically_push_and_preserve_reply_route(self):
         self.codex_route()

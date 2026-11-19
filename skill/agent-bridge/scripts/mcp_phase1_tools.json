@@ -116,6 +116,9 @@
                   },
                   "durable_idempotency": {
                     "type": "boolean"
+                  },
+                  "events": {
+                    "type": "boolean"
                   }
                 },
                 "required": [
@@ -156,6 +159,233 @@
                   "operation_retention_hours",
                   "idempotency_retention_hours"
                 ],
+                "additionalProperties": false
+              },
+              "events": {
+                "type": "object",
+                "properties": {
+                  "active_subscriptions": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "watching_routes": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "queued_notifications": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "watch_gaps": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "callback_failures": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "last_error": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "replay_supported": {
+                    "type": "boolean",
+                    "const": false
+                  },
+                  "pending_key_deletions": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "uninitialized_agent_session_ids": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "request_diagnostics": {
+                    "type": "object",
+                    "properties": {
+                      "started_at": {
+                        "type": "string",
+                        "format": "date-time"
+                      },
+                      "methods": {
+                        "type": "object",
+                        "propertyNames": {
+                          "enum": [
+                            "events/list",
+                            "events/subscribe",
+                            "events/unsubscribe"
+                          ]
+                        },
+                        "required": [
+                          "events/list",
+                          "events/subscribe",
+                          "events/unsubscribe"
+                        ],
+                        "additionalProperties": {
+                          "type": "object",
+                          "properties": {
+                            "received_count": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "accepted_count": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "failed_count": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "last_received_at": {
+                              "type": [
+                                "string",
+                                "null"
+                              ],
+                              "format": "date-time"
+                            },
+                            "last_stage": {
+                              "type": [
+                                "string",
+                                "null"
+                              ],
+                              "enum": [
+                                "received",
+                                "authorize",
+                                "validate",
+                                "resolve_routes",
+                                "verify_callback",
+                                "start_watchers",
+                                "reserve_key_reference",
+                                "store_signing_key",
+                                "persist_subscription",
+                                "persist_unsubscribe",
+                                "cleanup_keys",
+                                "complete",
+                                null
+                              ]
+                            },
+                            "last_outcome": {
+                              "type": [
+                                "string",
+                                "null"
+                              ],
+                              "enum": [
+                                "processing",
+                                "accepted",
+                                "failed",
+                                null
+                              ]
+                            },
+                            "last_failure": {
+                              "type": [
+                                "object",
+                                "null"
+                              ],
+                              "properties": {
+                                "at": {
+                                  "type": "string",
+                                  "format": "date-time"
+                                },
+                                "code": {
+                                  "type": "integer",
+                                  "enum": [
+                                    -32600,
+                                    -32601,
+                                    -32602,
+                                    -32603,
+                                    -32015
+                                  ]
+                                },
+                                "reason": {
+                                  "type": "string",
+                                  "enum": [
+                                    "events_disabled",
+                                    "invalid_request",
+                                    "invalid_event",
+                                    "invalid_arguments",
+                                    "invalid_delivery",
+                                    "invalid_callback_url",
+                                    "invalid_signing_secret",
+                                    "replay_unavailable",
+                                    "invalid_lifetime",
+                                    "subscription_capacity",
+                                    "non_public_callback",
+                                    "response_too_large",
+                                    "callback_failed",
+                                    "challenge_failed",
+                                    "keychain_unavailable",
+                                    "inbox_watch_unavailable",
+                                    "inbox_route_changed",
+                                    "owner_or_route_unavailable",
+                                    "storage_failed",
+                                    "event_operation_failed"
+                                  ]
+                                },
+                                "stage": {
+                                  "type": "string",
+                                  "enum": [
+                                    "received",
+                                    "authorize",
+                                    "validate",
+                                    "resolve_routes",
+                                    "verify_callback",
+                                    "start_watchers",
+                                    "reserve_key_reference",
+                                    "store_signing_key",
+                                    "persist_subscription",
+                                    "persist_unsubscribe",
+                                    "cleanup_keys",
+                                    "complete"
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "at",
+                                "code",
+                                "reason",
+                                "stage"
+                              ],
+                              "additionalProperties": false
+                            }
+                          },
+                          "required": [
+                            "received_count",
+                            "accepted_count",
+                            "failed_count",
+                            "last_received_at",
+                            "last_stage",
+                            "last_outcome",
+                            "last_failure"
+                          ],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
+                    "required": [
+                      "started_at",
+                      "methods"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "audit_write_failures": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "audit_last_error": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "enum": [
+                      "audit_write_failed",
+                      null
+                    ]
+                  }
+                },
                 "additionalProperties": false
               }
             },
@@ -803,7 +1033,7 @@
     },
     {
       "name": "bridge_message_send",
-      "description": "Asynchronously accept an exact message for a caller-authorized adapter session (owned, pinned, or approved workspace live Claude, Antigravity, or Codex session). Preserve message code points and UTF-8 bytes exactly: no trimming or normalization. maxLength is a character precheck; runtime MUST reject UTF-8 encoded length above 32768 bytes before durable acceptance. At most one message operation may be in flight per session; reject SESSION_BUSY before durable acceptance. Durable key and dispatch intent must precede side effects; uncertainty becomes unknown, never automatic replay. Downstream agent may change files or contact external services. No cwd/model/shell arguments. Absent in Phase 0; explicit post-verification write enablement is required.",
+      "description": "Asynchronously accept an exact message for a caller-authorized adapter session (owned, pinned, or approved workspace live Claude, Antigravity, or Codex session). Preserve message code points and UTF-8 bytes exactly: no trimming or normalization. maxLength is a character precheck; runtime MUST reject UTF-8 encoded length above 32768 bytes before durable acceptance. Independently keyed messages may queue for the same exact authorized session while it works or awaits replies. A single worker scans durable acceptance order and preserves submission order within each exact UUID and transport without waiting for earlier replies; other unblocked destinations may proceed while one destination is quarantined. Session state busy is informational. SESSION_BUSY quarantines only unresolved ambiguous writes to the same UUID and transport, not unknown results after confirmed submission. Preserve the global 64 active/unknown operation limit. Durable key and dispatch intent must precede side effects; uncertainty becomes unknown, never automatic replay. Downstream agent may change files or contact external services. No cwd/model/shell arguments. Absent in Phase 0; explicit post-verification write enablement is required.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",

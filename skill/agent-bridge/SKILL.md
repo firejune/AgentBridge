@@ -146,7 +146,11 @@ python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.
 
 - 📬 **Always report results back on the channel the task came in on** via `bridge.py reply`, including when blocked. Issue or PR comments do not replace the bridge reply.
 - `ack` and `progress` report receipt and status, not final answers. Exit code 2 from `ask` or `wait` means the wait timed out — run `wait REQUEST_ID` again rather than resending.
-- `close` stops or detaches the session while keeping it in the active conversation history (`archived: false`, `resumable: true`) by default across all three providers (Claude sends `SIGTERM` to the background CLI process, Antigravity verifies the turn is idle and detaches, and Codex detaches the thread). Pass `--archive` to also archive the conversation out of the active sidebar (`archived: true`). Do not close sessions you did not open unless instructed by the owner or HQ.
+- Close sessions you own or have the owner or HQ’s authorization to close. Plain `close` stops the exact Claude CLI process, detaches an idle Antigravity conversation or detaches the Codex route. Pass `--archive` to archive the session.
+- After archive is confirmed, the broker removes eligible retained correspondence for the exact session, including aliases, and expires inbox snapshots affected by removal. Provider transcripts remain available. Ordinary close preserves correspondence. Direct archive with `--keep-route` still cleans correspondence.
+- For a native Codex Desktop archive, explicitly request `close --archive --handoff`. Archive the exact thread in Desktop or use an enrolled operator, then verify completion with `close --finish CLOSE_ID --expect-session UUID`. [Closing a session](references/usage.md#closing-a-session).
+
+- If saved metadata confirms that the exact Codex recipient is archived, the CLI reports `state: "failed"` and `reason: "archived"` and exits 1 before contacting Desktop.
 
 ## Models: Read, Switch, Policy
 
@@ -188,7 +192,8 @@ A confirmed route/session conflict before broker posting returns `BACKEND_UNAVAI
 
 - Local agents always use `scripts/bridge.py` directly via the Python CLI; do not register `mcp_server.py` as a local MCP server.
 - `scripts/mcp_server.py` is for a single private remote tunnel (`--phase1-config` over `stdio`): see [remote-mcp.md](references/remote-mcp.md).
-- If the connected server supports MCP Events and the intended GPT/Dot chat has an active subscription, matching notifications wake it automatically. Read independent mail through inbox tools and captured replies through `bridge_operation_get` when `operation_id` is present. Inbox tools alone do not establish Events support; see [deployment boundaries](references/remote-mcp.md#optional-mcp-events).
+- Independently keyed MCP requests can queue for the same authorized session while it is busy or awaiting replies. Submission order is preserved per exact UUID and transport. Each operation retains its own result. An ambiguous write quarantines only that destination and can return `SESSION_BUSY`. Unknown operations are never resent and count toward the 64 active/unknown operation limit.
+- Remote MCP Events require `events_enabled: true`, `inbox_enabled: true` and `bridge:read`. A matching signed `bridge.inbox.message.created` webhook can wake a supported ChatGPT Work chat on web or Desktop Work with Cloud selected. Read a captured reply with `bridge_operation_get` when the event carries `operation_id`. Read independent mail with the inbox tools and ACK it explicitly. After a gap, list the inbox and query known operations. Notifications have no replay or automatic retry. [Events contract and setup](references/remote-mcp.md#optional-mcp-events).
 
 ## Operational Boundaries
 
@@ -258,8 +263,7 @@ Codex `open` / `register --new` does not register a route when permission verifi
 `close NAME --project P` requires `--retro-file FILE` or `--no-retro "reason"`.
 Missing retros (`RETRO_REQUIRED`), blank files (`RETRO_EMPTY`) and blank opt-out
 reasons (`RETRO_REASON_EMPTY`) are refused before any provider action or route
-removal. Towers and HQ use an explicit `--no-retro` reason. Existing detach,
-archive, timeout and `--keep-route` behavior remains unchanged. A retro is saved
+removal. Towers and HQ use an explicit `--no-retro` reason. A retro is saved
 before close, so a later provider refusal can leave a recorded retro; the receipt
 is not evidence that the session closed. Do not blindly repeat failed closes.
 

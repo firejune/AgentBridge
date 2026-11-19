@@ -140,7 +140,11 @@ python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.
 
 - 📬 **작업이 끝나면 반드시 그 작업이 들어온 채널로 결과를 보고한다** — 브릿지로 받은 일은 그 메시지에 `bridge.py reply`로 답하며, 막혀서 멈춘 경우에도 동일하게 보고한다. 이슈·PR 코멘트가 브릿지 답장을 대신하지 않는다.
 - `ack`와 `progress`는 수신 확인·진행 보고이며 최종 답변이 아니다. `ask`/`wait`의 종료 코드 2는 대기 시간 초과이므로 요청을 다시 보내지 말고 같은 ID로 `wait`한다.
-- `close`는 기본적으로 세 공급자 모두 세션을 삭제하거나 아카이빙하지 않고 대화 스택에 그대로 남긴 채(`archived: false`, `resumable: true`) 세션/라우트를 종료하며(Claude: 백그라운드 CLI 프로세스에 `SIGTERM` 전송, Antigravity: 대기 상태 확인 후 분리, Codex: 스레드 분리 및 라우트 제거), `--archive` 옵션을 주면 사이드바에서 보관 처리(`archived: true`)까지 함께 수행한다. 소유자나 HQ의 지시 없이 내가 열지 않은 세션을 닫지 않는다.
+- 내가 소유하거나 소유자 또는 HQ가 종료를 지시한 세션만 닫는다. 일반 `close`는 정확한 Claude CLI 프로세스를 중지하거나, 대기 중인 Antigravity 대화 또는 Codex 라우트를 분리한다. 세션을 보관하려면 `--archive`를 사용한다.
+- 보관이 확인되면 브로커는 별칭을 포함해 정확한 세션의 정리 가능한 서신을 삭제하고, 영향을 받은 수신함 스냅샷을 만료시킨다. 공급자 대화 원문은 유지한다. 일반 종료는 서신을 유지한다. 직접 보관에 `--keep-route`를 사용해도 서신 정리는 수행한다.
+- Codex Desktop의 네이티브 보관은 `close --archive --handoff`로 요청한다. Desktop에서 정확한 대화를 직접 보관하거나 등록된 담당자를 이용하고, `close --finish CLOSE_ID --expect-session UUID`로 완료를 확인한다. [세션 닫기](usage.md#세션-닫기) 참고.
+
+- 저장된 메타데이터에서 정확한 수신 Codex 대화의 보관이 확인되면 CLI는 Desktop에 연결하기 전에 `state: "failed"`와 `reason: "archived"`를 반환한다. 종료 코드는 1이다.
 
 ## 모델: 읽기 · 전환 · 정책
 
@@ -182,7 +186,8 @@ python3 "$bridge_cli" usage --events
 
 - 로컬 에이전트는 항상 `scripts/bridge.py` 파이썬 CLI를 직접 사용하며, 로컬 MCP 서버로 중복 등록하지 않는다.
 - `scripts/mcp_server.py`는 비공개 원격 터널(`stdio` 기반 `--phase1-config`) 단일 커넥터 전용이다: [remote-mcp.md](../../skill/agent-bridge/references/remote-mcp.md).
-- 연결 서버가 MCP Events를 제공하고 대상 GPT/Dot 채팅에 활성 구독이 있으면 해당 알림이 채팅을 자동으로 깨운다. 독립 메시지는 inbox 도구로, `operation_id`가 있는 답장은 `bridge_operation_get`으로 읽는다. inbox 도구만으로 Events 지원을 판단하지 않는다. [배포 범위](../../skill/agent-bridge/references/remote-mcp.md#optional-mcp-events)를 참고한다.
+- 허용된 세션이 작업 중이거나 답장을 기다리는 동안에도 서로 다른 키의 MCP 요청을 접수한다. 전송 순서는 같은 UUID와 transport 안에서 유지되고 결과는 각 작업에 따로 연결된다. 쓰기 결과가 불명확하면 해당 대상만 격리되고 `SESSION_BUSY`가 반환될 수 있다. 결과를 알 수 없는 작업은 재전송하지 않으며 전체 active/unknown 작업 64개 한도에 포함된다.
+- 원격 MCP Events에는 `events_enabled: true`, `inbox_enabled: true`, `bridge:read`가 필요하다. 활성 구독과 일치하는 서명된 `bridge.inbox.message.created` 웹훅이 도착하면 웹의 ChatGPT Work 채팅이나 Cloud를 선택한 Desktop Work 채팅이 깨어날 수 있다. 알림에 `operation_id`가 있으면 `bridge_operation_get`으로 기록된 답장을 읽는다. 독립 메시지는 수신함 도구로 읽고 명시적으로 ACK한다. 알림이 누락되면 수신함과 알고 있는 작업 ID를 다시 조회한다. 알림의 재생과 자동 재시도는 지원하지 않는다. [Events 계약과 설정](../../skill/agent-bridge/references/remote-mcp.md#optional-mcp-events)을 참고한다.
 
 ## 실행 경계
 
@@ -236,7 +241,7 @@ Codex `open` / `register --new`는 권한 확인에 실패하면 라우트를 �
 `close NAME --project P`에는 `--retro-file FILE` 또는 `--no-retro "사유"`가
 필수다. 누락은 `RETRO_REQUIRED`, 빈 파일은 `RETRO_EMPTY`, 빈 사유는
 `RETRO_REASON_EMPTY`로 공급자 동작과 경로 삭제 전에 거절한다. 타워와 HQ는
-`--no-retro` 사유를 남긴다. 기존 detach/archive/timeout/`--keep-route`는 유지한다.
+`--no-retro` 사유를 남긴다.
 회고를 먼저 저장하므로 이후 공급자 종료가 실패해도 기록은 남는다. 기록 영수증이
 종료 성공을 뜻하지 않으며 실패한 close를 무작정 반복하지 않는다.
 

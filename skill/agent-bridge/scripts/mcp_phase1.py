@@ -36,8 +36,15 @@ AGENT_TYPES = ('claude', 'agy', 'codex')
 AGENT_TRANSPORTS = {'claude': 'claude-peer', 'agy': 'agy', 'codex': 'codex'}
 TRANSPORT_AGENTS = {'claude-peer': 'claude', 'agy': 'agy', 'codex': 'codex'}
 ACTIVE = ('accepted', 'running', 'unknown')
-# Exact broker wire refusal. Older embedded broker versions lack the guard.
+# Exact broker wire refusals only. The production E31 embedded broker predates
+# TTL mode, so the facade must not depend on newer broker module constants.
+MESSAGE_CAPACITY_ERRORS = frozenset((
+    'In-memory message limit reached: no evictable terminal messages; pending or protected work is retained',
+    'Active-message limit reached: TTL or protected work prevents safe cleanup; inspect retention --live; no messages evicted before TTL',
+))
+# Kept local for compatibility with embedded broker versions lacking this guard.
 REGISTER_CONFLICT_ERROR = 'Route name is already in use; use a different name'
+CLOSING_ROUTE_ERROR = 'Codex route is closing'
 CAPACITY_FAILURE_MESSAGE = 'Broker message capacity is full; the message was not posted or delivered.'
 REPLY_NOT_RETAINED_MESSAGE = 'The reply is no longer retained.'
 MESSAGE_NOT_RETAINED_MESSAGE = 'The message is no longer retained.'
@@ -115,7 +122,7 @@ def load_config(path):
     if not stat.S_ISREG(s.st_mode) or s.st_uid != os.getuid() or stat.S_IMODE(s.st_mode) != 0o600:
         raise ValueError('Phase 1 configuration must be owner-only (0600)')
     config = json.loads(Path(path).read_text())
-    if set(config) - {'pinned_sessions', 'inbox_enabled'} != {'principal','scopes','workspaces','state_dir','tunnel_id','writes_enabled'}:
+    if set(config) - {'pinned_sessions', 'inbox_enabled', 'events_enabled', 'mcp_2026_enabled'} != {'principal','scopes','workspaces','state_dir','tunnel_id','writes_enabled'}:
         raise ValueError('Unexpected Phase 1 configuration fields')
     if config['writes_enabled'] is not True or not config['principal'] or not config['tunnel_id']:
         raise ValueError('An approved private tunnel owner mapping is required')
@@ -123,6 +130,10 @@ def load_config(path):
         raise ValueError('Phase 1 requires exactly the three bridge scopes')
     if type(config.get('inbox_enabled', False)) is not bool:
         raise ValueError('inbox_enabled must be a boolean')
+    if type(config.get('mcp_2026_enabled', False)) is not bool:
+        raise ValueError('mcp_2026_enabled must be a boolean')
+    if type(config.get('events_enabled', False)) is not bool or (config.get('events_enabled') and not config.get('inbox_enabled')):
+        raise ValueError('events_enabled requires inbox_enabled')
     validate_workspaces(config['workspaces'])
     pinned_sessions(config)
     return config
@@ -465,6 +476,9 @@ class Backend:
         return m
 
     def push(self, message, session):
+        route = message.get('route', {})
+        if (route.get('session'), route.get('transport')) != (session['uuid'], self.session_transport(session)):
+            raise ValueError('Unexpected message route')
         self.check(session)
         return bridge.push_if_peer(self.path, message)
 
@@ -495,8 +509,12 @@ class Engine:
     def __init__(self, config, backend, start=True):
         validate_workspaces(config['workspaces'])
         pinned_sessions(config)
+        if type(config.get('events_enabled', False)) is not bool or (config.get('events_enabled') and not config.get('inbox_enabled')):
+            raise ValueError('events_enabled requires inbox_enabled')
         if type(config.get('inbox_enabled', False)) is not bool:
             raise ValueError('inbox_enabled must be a boolean')
+        if type(config.get('mcp_2026_enabled', False)) is not bool:
+            raise ValueError('mcp_2026_enabled must be a boolean')
         self.config, self.backend = config, backend
         self.principal = config['principal']
         self.scopes = frozenset(config['scopes'])
@@ -541,12 +559,28 @@ class Engine:
         self.observe_retry_limit, self.observe_retry_base = OBSERVE_RETRY_LIMIT, OBSERVE_RETRY_BASE
         self.reply_watch_fast, self.reply_watch_slow = REPLY_WATCH_FAST, REPLY_WATCH_SLOW
         self.observe_at, self.watch_at = {}, {}  # Volatile schedules; a restart only reads sooner.
+        self.events = None
         self.recover()
+        if config.get('events_enabled', False):
+            if not config.get('inbox_enabled', False):
+                raise ValueError('events_enabled requires inbox_enabled')
+            from mcp_events import EventService
+            try:
+                self.events = EventService(self, start=start)
+            except BaseException:
+                self.db.close()
+                os.close(self.lock_fd)
+                raise
         if start:
             self.thread = threading.Thread(target=self.run, daemon=True, name='bridge-mcp-worker')
             self.thread.start()
 
     def close(self):
+        worker = getattr(self, '_mcp_stdio_worker', None)
+        if worker is not None and worker.is_alive():
+            raise RuntimeError('MCP handler is still active; ledger remains owned')
+        if self.events is not None:
+            self.events.close()
         self.stop.set(); self.wake.set()
         if self.thread:
             self.thread.join(timeout=195)
@@ -567,7 +601,39 @@ class Engine:
 
     def rows(self):
         with self.lock:
-            return [json.loads(r[0]) for r in self.db.execute('SELECT doc FROM operations')]
+            return [json.loads(r[0]) for r in self.db.execute('SELECT doc FROM operations ORDER BY rowid')]
+
+    def destination(self, session):
+        transport = (self.backend.session_transport(session) if hasattr(self.backend, 'session_transport')
+                     else session.get('transport', AGENT_TRANSPORTS.get(session.get('agent_type', 'claude'))))
+        return {'uuid': session['uuid'], 'transport': transport}
+
+    def operation_destination(self, op):
+        if op.get('destination'):
+            return op['destination']
+        if op['status'] != 'accepted':
+            # A current implicit grant cannot prove a legacy write's original
+            # transport. Its route may have changed since that write began.
+            return None
+        try:
+            # Queued legacy work has not attempted any external effect yet.
+            return self.destination(self.session(op['agent_session_id'], op['principal']))
+        except Exception:
+            return None  # An unidentifiable legacy intent cannot safely be bypassed.
+
+    def blocked(self, ops, destination, queued=False):
+        for other in ops:
+            if other['kind'] != 'message_send':
+                continue
+            delivered = (other.get('stage') == 'observing' and other.get('backend_id')
+                         and other.get('backend_message_state') in ('submitted','received','in_progress','answered','done'))
+            # Unknown *results* after confirmed submission do not reserve a write slot.
+            # Incomplete/uncertain writes and unidentifiable legacy records still do.
+            unsafe = (other['status'] == 'unknown' and not delivered) or (queued and (
+                other['status'] == 'accepted' or (other['status'] == 'running' and not delivered)))
+            if unsafe and self.operation_destination(other) in (None, destination):
+                return True
+        return False
 
     def save(self, op):
         op['updated_at'] = max(op['updated_at'], stamp())
@@ -694,16 +760,19 @@ class Engine:
             if self.stop.is_set():
                 raise Fault('BACKEND_UNAVAILABLE')
             ops = self.rows()
-            if not creating and any(o['agent_session_id']==args['agent_session_id'] and o['status'] in ACTIVE
-                                    and o['kind']=='message_send' for o in ops):
+            destination = self.destination(session) if not creating else None
+            if not creating and self.blocked(ops, destination):
                 raise Fault('SESSION_BUSY')
             if sum(o['status'] in ACTIVE for o in ops) >= 64 or (self.root/'ledger.sqlite3').stat().st_size >= 64*1024*1024:
                 raise Fault('CAPACITY_EXCEEDED')
             try:
                 self.backend.instance()
-                if not creating and (not (session.get('registered') or session.get('discovered'))
-                                     or self.backend.availability(session) not in (('ready','busy') if (session.get('pinned') or session.get('discovered')) else ('ready',))):
-                    raise ValueError('Unavailable dedicated session')
+                if not creating:
+                    target = dict(session, transport=destination['transport'],
+                                  agent_type=TRANSPORT_AGENTS[destination['transport']], explicit_type=True)
+                    if (not (session.get('registered') or session.get('discovered'))
+                            or self.backend.availability(target) not in ('ready', 'busy')):
+                        raise ValueError('Unavailable dedicated session')
             except RouteBindingRefusal:
                 raise Fault('BACKEND_UNAVAILABLE', ROUTE_CHANGED_MESSAGE) from None
             except Exception:
@@ -723,6 +792,7 @@ class Engine:
                 op.update(alias=args['workspace_alias'],workspace=dict(self.config['workspaces'][args['workspace_alias']]),agent_type=agent_type)
             else:
                 op['message'] = args['message']
+                op['destination'] = destination
             self.db.execute('INSERT INTO operations VALUES (?,?,?,?,?,?)',
                             (op['operation_id'],principal,tool,key_hash,payload_hash,json.dumps(op)))
         self.wake.set()
@@ -757,7 +827,7 @@ class Engine:
                 if op['kind'] == 'message_send' and op['backend_id']:
                     # Durable, so a read retried on a later tick keeps the recovery rule.
                     self.update(op, recovered=True)
-                    self.observe(op)
+                    self.observe(op,notify_events=False)
                 else:
                     self.fail(op)
 
@@ -797,7 +867,21 @@ class Engine:
                 self.allowed({'alias':op['alias'],'workspace':op['workspace']})
             else:
                 session = self.session(op['agent_session_id'],op['principal']); self.allowed(session)
-                if self.backend.availability(session) not in (('ready','busy') if (session.get('pinned') or session.get('discovered')) else ('ready',)):
+                destination = self.destination(session)
+                if op.get('destination', destination) != destination:
+                    raise RouteBindingRefusal('Effective destination changed')
+                # Keep the accepted effective provider fixed through availability,
+                # route checks, broker post, returned-route validation and push.
+                session = dict(session, transport=destination['transport'],
+                               agent_type=TRANSPORT_AGENTS[destination['transport']], explicit_type=True)
+                earlier = []
+                for other in self.rows():
+                    if other['operation_id'] == op['operation_id']:
+                        break
+                    earlier.append(other)
+                if self.blocked(earlier, destination, queued=True):
+                    return  # Still unattempted: never write past an ambiguous intent.
+                if self.backend.availability(session) not in ('ready','busy'):
                     raise Fault('BACKEND_UNAVAILABLE')
         except RouteBindingRefusal:
             self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=ROUTE_CHANGED_MESSAGE)
@@ -829,7 +913,7 @@ class Engine:
             finally:
                 os.close(fd)
         else:
-            self.update(op,status='running',stage='post_intent',instance=instance)
+            self.update(op,status='running',stage='post_intent',instance=instance,destination=destination)
             try:
                 message = self.backend.post(op,session)
             except RouteBindingRefusal:
@@ -838,9 +922,13 @@ class Engine:
             except ValueError as error:
                 # Only these exact broker admission refusals prove no post took
                 # place. Disconnects, timeouts and other errors remain ambiguous.
-                if str(error) not in broker.MESSAGE_CAPACITY_ERRORS:
+                if str(error) == CLOSING_ROUTE_ERROR:
+                    detail = CLOSING_ROUTE_ERROR
+                elif str(error) in MESSAGE_CAPACITY_ERRORS:
+                    detail = CAPACITY_FAILURE_MESSAGE
+                else:
                     raise
-                self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=CAPACITY_FAILURE_MESSAGE)
+                self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=detail)
                 return
             self.update(op,stage='posted',backend_id=message['id'],backend_message_state=message['state'])
             if self.backend.instance() != instance:
@@ -852,7 +940,12 @@ class Engine:
                 # A recorded pre-send failure is definite; uncertain stays blocked.
                 m = e.message
                 self.update(op,backend_message_state=m['state'])
-                self.fail(op,'BACKEND_UNAVAILABLE' if m['state']=='pending' else 'DELIVERY_UNKNOWN',m['state']!='pending')
+                if m['state'] == 'failed' and m.get('reason') == bridge.ARCHIVED_REASON:
+                    self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=bridge.codex_live.ThreadArchived.MESSAGE)
+                elif m['state'] == 'pending':
+                    self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False)
+                else:
+                    self.fail(op)
                 return
             self.update(op,stage='observing',backend_message_state=message['state'])
             with self.transaction():
@@ -892,7 +985,7 @@ class Engine:
         self.registered(op,session)
         return self.get({'operation_id':oid},self.principal)
 
-    def observe(self, op):
+    def observe(self, op, notify_events=True):
         try:
             same = False
             try:
@@ -925,15 +1018,17 @@ class Engine:
                 self.fail(op); return
             self.observe_at.pop(op['operation_id'],None)
             self.update(op,backend_message_state=state,observe_errors=0)
-            if self.settle(op,replies):
+            if self.settle(op,replies,parent=message,notify_events=notify_events):
                 return
             if state == 'answered':
                 # Answered proves that a correlated reply once existed. Losing
                 # that result must release the target; the late watch may still
                 # settle another retained reply without any resend.
                 self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=REPLY_NOT_RETAINED_MESSAGE)
-            elif state=='failed':
-                self.fail(op,'BACKEND_UNAVAILABLE',False)
+            elif state == 'failed':
+                detail = (bridge.codex_live.ThreadArchived.MESSAGE
+                          if message.get('reason') == bridge.ARCHIVED_REASON else None)
+                self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=detail)
             elif state=='uncertain' or (op.get('recovered') and state in ('pending','dispatching')):
                 self.fail(op)
         except Exception as error:
@@ -948,7 +1043,7 @@ class Engine:
         self.update(op,observe_errors=count,error=describe(error))
         self.observe_at[op['operation_id']] = time.monotonic()+self.observe_retry_base*2**(count-1)
 
-    def settle(self, op, replies, late=False):
+    def settle(self, op, replies, late=False, parent=None, notify_events=True):
         replies = [r for r in replies if r.get('reply_to') == op['backend_id'] and isinstance(r.get('body'),str) and r['body'].strip()]
         if not replies:
             return False
@@ -966,6 +1061,15 @@ class Engine:
                       'finished_epoch':time.time()}
         self.update(op,status='succeeded',stage='complete',text=text,result={'type':'message_result'},
                     pending_reply_cleanup=[r['id'] for r in replies],**fields)
+        # The result is committed before notifying Events. Only a live watch can
+        # supply the other half of this volatile rendezvous; recovery and cleanup
+        # never synthesize notifications. Notification failure cannot undo success.
+        if notify_events:
+            try:
+                if self.events is not None:
+                    self.events.result_ready(op,parent,replies)
+            except Exception:
+                pass
         self.cleanup_replies(op)
         return True
 
@@ -984,8 +1088,8 @@ class Engine:
         try:
             if self.backend.instance()!=op['instance']:
                 self.update(op,reply_watch_closed='instance_changed'); return
-            _,replies = self.backend.observe(op['backend_id'])
-            self.settle(op,replies,late=True)
+            parent,replies = self.backend.observe(op['backend_id'])
+            self.settle(op,replies,late=True,parent=parent)
         except ValueError as error:
             if str(error)==UNKNOWN_MESSAGE:
                 self.update(op,reply_watch_closed='message_unknown')

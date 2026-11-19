@@ -288,6 +288,7 @@ Handoff succeeds only when `--expect-generation` matches the current generation.
   - Older brokers explicitly refuse the guarded claim operation before the CLI falls back to their legacy claim. If that legacy reply is lost, its reservation stays protected. When a claim, release or finish remains unconfirmed, the CLI exits 1 with `id`, `stage` (`claim`, `claim-release` or `finish`) and `uncertain: true`. Use `show ID` to inspect the recorded message state.
   - When the session has no live record, it is woken once first (see "Waking an Idle-Closed Claude Session") inside the same budget, leaving 5 seconds for the push, and pushed once if its inbox appears. Any failure or interrupt before the peer write (lookup, wake, frame) returns the message to `pending` with a `push_failed` event; only a possible write records `uncertain`.
 - **Codex (`codex`)**:
+  - If saved metadata confirms that the exact Codex recipient is archived, the CLI reports `state: "failed"` and `reason: "archived"` and exits 1 before contacting Desktop. `send`, `ask`, `reply` and `deliver` keep the failed message and its reason across broker restarts. `deliver --dry-run` reports the reason without changing the message. If saved metadata is unavailable, normal IPC delivery checks apply.
   - Connects to the exact registered thread owner over `CODEX_HOME/ipc/ipc.sock` (or `AGENT_BRIDGE_CODEX_IPC`).
   - Delivers peer bodies as standalone `toolOutput` (`agent_bridge`), calling `thread-follower-steer-turn` first to join an active turn and falling back to `thread-follower-start-turn` only when inactive.
   - After the first accepted task (`submitted`), initializes an empty native sidebar `preview` in `state_5.sqlite` (100 ms SQLite lock budget; preview warnings never fail or resend an accepted delivery).
@@ -322,18 +323,39 @@ python3 "$bridge_cli" resolve MESSAGE_ID --state done --note 'Completed'
 ## Closing a Session
 
 ```bash
-python3 "$bridge_cli" close NAME --project PROJECT [--keep-route] [--timeout 10]
+python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.txt [--archive] [--keep-route] [--timeout 10]
+python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.txt --archive --handoff
+python3 "$bridge_cli" close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID
 ```
 
-`close` stops or archives the session behind a registered route and removes the route via `unregister` (unless `--keep-route`). It never deletes data and never retries:
+Plain `close` stops or detaches the session and removes its route unless you pass `--keep-route`. Use `--archive` to archive the exact session as part of closing.
 
-| Transport / Host | Action | Observed Behavior | Undo / Resume |
-| --- | --- | --- | --- |
-| `claude-peer` (`claude-vscode`) | `SIGTERM` to the exact registered PID; waits up to `--timeout` | Process exits within ~1 s (`resumable: true`), freeing ~310 MB RSS; tab shows exit code 143 | Typing in the tab resumes the same `sessionId` under a new PID |
-| `claude-peer` (`claude-desktop`) | Same (`SIGTERM`) | Process exits within ~3 s; app shows "session interrupted" | Sending a message in the session resumes the same `sessionId` |
-| `agy` (Desktop & IDE) | Refused while `running`; sends `UpdateConversationAnnotations {archived: true}` and verifies readback | Conversation leaves the IDE panel / Desktop sidebar | Restore from archive in the UI |
-| `codex` | `unsupported` (nothing sent) | Desktop IPC exposes no archive/unload request | — |
-| `realtime` / `claude` | Route removal only | — | — |
+After archive is confirmed, the broker removes eligible retained correspondence for the exact session, including aliases, and expires inbox snapshots affected by removal. Provider transcripts remain available. Ordinary close preserves correspondence. Direct archive with `--keep-route` still cleans correspondence. Before direct archive, the CLI checks broker support and active delivery, continuation and wait. Any of those active operations blocks archive. Cleanup matches the frozen transport, UUID and workspace at either endpoint. Activity that races archive and uncertain deliveries are protected. Cleanup and route removal are separate writes. Exit 1 reports any protected records or unconfirmed cleanup or route removal alongside the confirmed archive result. The CLI leaves retries to the caller.
+
+| Transport | Plain close | With direct `--archive` |
+| --- | --- | --- |
+| `claude-peer` | Sends `SIGTERM` to the exact registered CLI process | Archives supported Desktop sessions |
+| `agy` | Detaches an idle conversation | Archives the conversation and checks readback |
+| `codex` | Detaches the route | Archives the exact workspace-matched thread and notifies Desktop |
+| `realtime` / `claude` | Removes the route | — |
+
+### Native Codex archive handoff
+
+Use `--archive --handoff` to prepare the exact registered Codex thread for native archive. Prepare returns `session`, `cwd` and `close_id`, and refuses active channels, other aliases for the same thread and unfinished correspondence. The closing route survives broker restart and blocks delivery, replacement and bulk reopen. Repeating the handoff command inspects the pending close. Handoff requires route removal.
+
+An authorized operator in a separate Codex Desktop chat verifies the UUID, workspace and idle state. Call `set_thread_archived` with the exact `threadId`, verified local host, `source: codex` and `archived: true`. The user can also archive the exact thread in Desktop. Run `--finish` with the original identifiers. Finish checks the archive flag and readable native archive transcript, then cleans eligible correspondence and removes the matching route. Verification failure or timeout preserves the closing route. Use finish to verify an ambiguous app response before any further archive action.
+
+#### Enrolling a Codex close operator
+
+The owner can authorize one existing Codex Desktop chat with access to `set_thread_archived`. Register its exact Codex UUID and a `realtime` sender in the same project. Save the enrollment in the broker’s owner-private `<state-dir>/close-operator.json` with mode `0600`.
+
+```json
+{"project":"ops","name":"archive","session":"OPERATOR_UUID","sender":"trigger"}
+```
+
+A new handoff sends one control request to the enrolled operator and reports `operator_message_id` and `operator_delivery`. Use `wait MESSAGE_ID --timeout 60` to wait for verified completion. A failed or interrupted delivery leaves the route closing for manual reconciliation. Uncertain delivery is never replayed.
+
+Run the supplied `close-operator MESSAGE_ID` in the enrolled chat to claim the control request. It verifies enrollment, caller thread and the broker’s exact closing target and generation. Then verify the native target, archive it and finish with the returned identifiers. After verified route removal, `operator_receipt: needs_reconciliation` means the completion receipt needs to be recorded manually. Inspect the archive and route before resolving the control message.
 
 ## Waking an Idle-Closed Claude Session (issue #115)
 
@@ -358,7 +380,13 @@ While a wake runs, the message is held in `dispatching`. A second `claude-peer` 
 
 A confirmed route/session conflict before broker posting returns `BACKEND_UNAVAILABLE` with a fixed `ROUTE_CHANGED:` message. Initial acceptance returns a tool error without creating an operation; a conflict detected after acceptance ends that operation as `failed`, releasing its slot. The facade never remaps or resends. A route mismatch discovered after the broker send was attempted remains `unknown`.
 
-The CLI `inbox`/`ack` contract above is unchanged. The private MCP facade (`scripts/mcp_server.py`) supports an explicit `"inbox_enabled": true` opt-in in `--phase1-config` for independent (`reply_to: null`) inbound messages via three tools: `bridge_inbox_list`, `bridge_message_get`, and `bridge_message_ack`. Read messages without consuming them, then explicitly ACK the stable signed ID after consumption. Correlated replies remain operation-only (`bridge_operation_get`). See [remote-mcp.md](remote-mcp.md#independent-inbox-issue-48-explicit-opt-in) for pagination, limits, restart semantics, and owner deployment gates. For a connected Events deployment, an active GPT/Dot subscription wakes the chat automatically; use inbox tools for independent mail and `bridge_operation_get` for reply notifications carrying `operation_id`. See [automatic notifications](remote-mcp.md#optional-mcp-events).
+The CLI `inbox`/`ack` contract above is unchanged. The private MCP facade (`scripts/mcp_server.py`) supports an explicit `"inbox_enabled": true` opt-in in `--phase1-config` for independent (`reply_to: null`) inbound messages via three tools: `bridge_inbox_list`, `bridge_message_get`, and `bridge_message_ack`. Read messages without consuming them, then explicitly ACK the stable signed ID after consumption. Correlated replies remain operation-only (`bridge_operation_get`). See [remote-mcp.md](remote-mcp.md#independent-inbox-issue-48-explicit-opt-in) for pagination, limits, restart semantics, and owner deployment gates.
+
+Independently keyed MCP requests can queue for the same authorized session while it is busy or awaiting replies. Submission order is preserved per exact UUID and transport. Each operation retains its own result. An ambiguous write quarantines only that destination and can return `SESSION_BUSY`. Unknown operations are never resent and count toward the 64 active/unknown operation limit.
+
+A confirmed route conflict before broker posting reports `BACKEND_UNAVAILABLE` with `ROUTE_CHANGED:`. A conflict during initial admission creates no operation. A conflict after admission marks the operation `failed`. A route mismatch detected after the send attempt remains `unknown`.
+
+Remote MCP Events require `events_enabled: true`, `inbox_enabled: true` and `bridge:read`. A matching signed `bridge.inbox.message.created` webhook can wake a supported ChatGPT Work chat on web or Desktop Work with Cloud selected. Read a captured reply with `bridge_operation_get` when the event carries `operation_id`. Read independent mail with the inbox tools and ACK it explicitly. After a gap, list the inbox and query known operations. Notifications have no replay or automatic retry. [Events contract and setup](remote-mcp.md#optional-mcp-events).
 
 ## Security & Verification
 
@@ -385,7 +413,7 @@ the in-memory mutation. A failure after replacement leaves the disk commit
 outcome uncertain and does not return acceptance. There
 is no automatic retry or delivery on load.
 
-The checkpoint uses version 1 until explicit one-way/deadline intent or compact receipts are stored, then version 2. Both versions can carry optional `one_way`, `delivered_at`, `completed_at`, `retention_adopted_at`, `reply_deadline_at` and `last_reply_at` message metadata. Version 2 adds `compact` records with the body-expiry fields described in the [TTL policy](#opt-in-correspondence-ttl-issue-105), and compact idempotency intents use a fingerprint instead of a retained body. The original version-1 field allowlist is as follows.
+The checkpoint uses version 1 until explicit one-way/deadline intent or compact receipts are stored, then version 2. Both versions can carry optional `one_way`, `delivered_at`, `completed_at`, `retention_adopted_at`, `reply_deadline_at` and `last_reply_at` message metadata. Version 2 adds `compact` records with the body-expiry fields described in the [TTL policy](#opt-in-correspondence-ttl-issue-105), and compact idempotency intents use a fingerprint instead of a retained body. Both versions preserve the `archived` reason for failed Codex delivery. The original version-1 field allowlist is as follows.
 
 - `messages` preserves `id`, `conversation`, `project`, `sender`, `recipient`,
   `channel`, `sender_channel`, `body`, `reply_to`, `state`, `created`, and optional
@@ -536,8 +564,7 @@ Codex `open` / `register --new` does not register a route when permission verifi
 `close NAME --project P` requires `--retro-file FILE` or `--no-retro "reason"`.
 Missing retros (`RETRO_REQUIRED`), blank files (`RETRO_EMPTY`) and blank opt-out
 reasons (`RETRO_REASON_EMPTY`) are refused before any provider action or route
-removal. Towers and HQ use an explicit `--no-retro` reason. Existing detach,
-archive, timeout and `--keep-route` behavior remains unchanged. A retro is saved
+removal. Towers and HQ use an explicit `--no-retro` reason. A retro is saved
 before close, so a later provider refusal can leave a recorded retro; the receipt
 is not evidence that the session closed. Do not blindly repeat failed closes.
 

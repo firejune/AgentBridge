@@ -285,6 +285,7 @@ python3 "$bridge_cli" channel-bind modal-view --project my-app --owner codex-age
   - 구버전 브로커가 보호된 claim 작업을 명시적으로 거부한 뒤에만 기존 claim 방식을 사용한다. 기존 방식의 응답을 잃으면 예약을 보호 상태로 둔다. claim, 해제, finish가 미확정이면 종료 코드 1과 `id`, `stage`(`claim`, `claim-release` 또는 `finish`), `uncertain: true`를 출력한다. 기록된 메시지 상태는 `show ID`로 조회한다.
   - 세션의 라이브 기록이 없으면 같은 한도 안에서 push용 5초를 남기고 먼저 한 번 깨우고(「유휴로 닫힌 Claude 세션 깨우기」), inbox가 뜨면 한 번 push한다. peer 쓰기 전(조회 · 깨우기 · 프레임)에 실패하거나 중단되면 `push_failed` 이벤트와 함께 `pending`으로 돌아간다. `uncertain`은 쓰기가 일어났을 수 있을 때만 기록한다.
 - **Codex (`codex`)**:
+  - 저장된 메타데이터에서 정확한 수신 Codex 대화의 보관이 확인되면 CLI는 Desktop에 연결하기 전에 `state: "failed"`와 `reason: "archived"`를 반환한다. 종료 코드는 1이다. `send`, `ask`, `reply`, `deliver`의 실패 메시지와 이유는 브로커 재시작 뒤에도 남는다. `deliver --dry-run`은 메시지를 바꾸지 않고 이유만 반환한다. 저장된 메타데이터를 읽을 수 없으면 일반 IPC 전달 검사를 적용한다.
   - `CODEX_HOME/ipc/ipc.sock`(또는 `AGENT_BRIDGE_CODEX_IPC`)에서 정확한 대화 소유자에 연결한다.
   - 동료 본문을 standalone `toolOutput`(`agent_bridge`)로 전달하며, 활성 턴이면 `thread-follower-steer-turn`을 먼저 호출해 현재 턴에 합류하고 유휴 상태일 때만 `thread-follower-start-turn`을 호출한다.
   - 첫 과제가 `submitted`로 수락된 뒤 비어 있는 네이티브 사이드바 `preview`를 `state_5.sqlite`에 한 번 초기화한다(잠금 대기 100ms 제한; 미리보기 실패가 전달 성공을 뒤집거나 재전송을 유발하지 않음).
@@ -319,18 +320,39 @@ python3 "$bridge_cli" resolve MESSAGE_ID --state done --note '결과 확인 완�
 ## 세션 닫기
 
 ```bash
-python3 "$bridge_cli" close NAME --project PROJECT [--keep-route] [--timeout 10]
+python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.txt [--archive] [--keep-route] [--timeout 10]
+python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.txt --archive --handoff
+python3 "$bridge_cli" close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID
 ```
 
-`close`는 등록된 라우트의 세션을 멈추거나 보관한 뒤 브로커의 `unregister`로 라우트를 지운다(`--keep-route`면 라우트 유지). 데이터를 영구 삭제하거나 재시도하지 않는다:
+일반 `close`는 세션을 중지하거나 분리하고 라우트를 제거한다. `--keep-route`로 라우트를 유지할 수 있다. `--archive`를 사용하면 정확한 세션을 보관한다.
 
-| Transport / Host | 동작 | 관찰된 결과 | 되돌리기 / 재개 |
-| --- | --- | --- | --- |
-| `claude-peer` (`claude-vscode`) | 등록된 정확한 PID에 `SIGTERM`, `--timeout`까지 대기 | 약 1초 내 종료(`resumable: true`), RSS 약 310 MB 해제, 탭에 종료 코드 143 표시 | 그 탭에 입력하면 같은 `sessionId`가 새 PID로 이어짐 |
-| `claude-peer` (`claude-desktop`) | 같음 (`SIGTERM`) | 약 3초 내 종료, 앱에 「세션이 중단되었습니다」 표시 | 그 세션에 메시지를 보내면 같은 `sessionId`로 이어짐 |
-| `agy` (데스크톱 · IDE) | `running`이면 거부, 대기 중일 때 `UpdateConversationAnnotations {archived: true}` 전송 후 재조회 | 에이전트 패널·데스크톱 사이드바에서 보관 처리됨 | UI 보관함에서 복원 |
-| `codex` | `unsupported` (아무것도 보내지 않음) | 데스크톱 IPC에 외부 보관·언로드 요청 없음 | — |
-| `realtime` / `claude` | 라우트만 제거 | — | — |
+보관이 확인되면 브로커는 별칭을 포함해 정확한 세션의 정리 가능한 서신을 삭제하고, 영향을 받은 수신함 스냅샷을 만료시킨다. 공급자 대화 원문은 유지한다. 일반 종료는 서신을 유지한다. 직접 보관에 `--keep-route`를 사용해도 서신 정리는 수행한다. 직접 보관 전에 브로커 지원 여부와 전달·이어하기·대기 상태를 확인한다. 진행 중인 작업이 있으면 보관을 거부한다. 정리는 서신의 양쪽 주소에 저장된 transport, UUID, 작업 경로를 대조한다. 보관 도중 시작된 작업과 전달이 불명확한 서신은 보존한다. 서신 정리와 라우트 제거는 별도로 저장한다. 보호된 서신이 있거나 정리·라우트 제거를 확인하지 못하면 보관 결과와 함께 보고하며 종료 코드 1을 반환한다. 재시도는 호출자가 결정한다.
+
+| Transport | 일반 종료 | 직접 보관 (`--archive`) |
+| --- | --- | --- |
+| `claude-peer` | 정확히 등록된 CLI 프로세스에 `SIGTERM`을 보낸다 | 지원되는 Desktop 세션을 보관한다 |
+| `agy` | 대기 중인 대화를 분리한다 | 대화를 보관하고 상태를 재확인한다 |
+| `codex` | 라우트를 분리한다 | 정확한 작업 경로의 대화를 보관하고 Desktop에 알린다 |
+| `realtime` / `claude` | 라우트를 제거한다 | — |
+
+### Codex 네이티브 보관 인계
+
+`--archive --handoff`는 정확히 등록된 Codex 대화의 보관 인계를 준비하고 `session`, `cwd`, `close_id`를 반환한다. 활성 채널, 같은 대화의 다른 별칭 또는 미완료 서신이 있으면 준비를 거부한다. 종료 대기 라우트는 재시작 후에도 남고 전달, 교체, 일괄 다시 열기를 막는다. 인계 명령을 다시 실행하면 대기 상태를 확인한다. 인계에는 `--keep-route`를 사용할 수 없다.
+
+권한을 받은 별도의 Codex Desktop 담당자가 UUID와 작업 경로, 대기 상태를 확인한다. `set_thread_archived`에 정확한 `threadId`, 확인한 로컬 호스트, `source: codex`, `archived: true`를 전달한다. 사용자가 Desktop에서 정확한 대화를 직접 보관할 수도 있다. 원래 식별자로 `--finish`를 실행한다. 보관 플래그와 읽을 수 있는 네이티브 보관 기록을 확인한 뒤 서신을 정리하고 일치하는 라우트를 제거한다. 검증 실패나 시간 초과 시 종료 대기 라우트를 유지한다. 앱 응답이 불명확하면 보관을 다시 시도하기 전에 finish로 확인한다.
+
+#### Codex 종료 담당자 등록
+
+소유자는 `set_thread_archived`를 사용할 수 있는 기존 Codex Desktop 채팅 하나를 지정할 수 있다. 해당 Codex UUID와 `realtime` 발신자를 같은 프로젝트에 등록한다. 브로커의 소유자 전용 `<state-dir>/close-operator.json`에 권한 `0600`으로 저장한다.
+
+```json
+{"project":"ops","name":"archive","session":"OPERATOR_UUID","sender":"trigger"}
+```
+
+새 인계는 등록된 담당자에게 제어 요청을 한 번 보내고 `operator_message_id`와 `operator_delivery`를 반환한다. `wait MESSAGE_ID --timeout 60`으로 검증된 완료를 기다릴 수 있다. 전달이 실패하거나 중단되면 수동 확인을 위해 종료 대기 라우트가 남는다. 불명확한 요청은 재전송하지 않는다.
+
+등록된 채팅에서 전달받은 `close-operator MESSAGE_ID`를 실행한다. 이 명령은 등록 정보, 호출자 대화, 종료 대상과 세대를 대조한다. 대상이 대기 중인지 확인한 뒤 보관하고, 반환받은 식별자로 finish를 실행한다. 라우트 제거를 확인한 뒤 `operator_receipt: needs_reconciliation`이 나오면 완료 기록을 수동으로 남겨야 한다. 보관과 라우트 상태를 확인한 뒤 제어 요청을 완료로 처리한다.
 
 ## 유휴로 닫힌 Claude 세션 깨우기 (이슈 #115)
 
@@ -355,11 +377,17 @@ Claude 데스크톱은 세션을 스스로 닫는다(앱 `main.log`에서 관찰
 
 브로커에 메시지를 기록하기 전에 라우트 또는 세션 충돌이 확인되면 `BACKEND_UNAVAILABLE`과 고정된 `ROUTE_CHANGED:` 메시지를 반환한다. 최초 접수에서 발견하면 작업을 만들지 않고 도구 오류를 반환하며, 접수 후 발견하면 해당 작업을 `failed`로 끝내 점유를 해제한다. 파사드는 자동 재매핑·재전송하지 않는다. 브로커 send를 시도한 뒤 발견한 라우트 불일치는 `unknown`으로 남긴다.
 
-기존 CLI `inbox`·`ack` 의미는 그대로 유지된다. 비공개 MCP 파사드(`scripts/mcp_server.py`)에서 `--phase1-config`에 `"inbox_enabled": true`를 명시하면 `bridge_inbox_list`·`bridge_message_get`으로 독립(`reply_to: null`) 수신 메시지를 소비 없이 읽고, 처리 후 `bridge_message_ack`로 명시적으로 `done` 처리할 수 있다. 질문에 대한 답장(correlated reply)은 기존 `bridge_operation_get` 전용이다. 페이지네이션·용량·토큰 검증·배포 게이트는 [remote-mcp.md](../../skill/agent-bridge/references/remote-mcp.md#independent-inbox-issue-48-explicit-opt-in)를 따른다. Events를 제공하는 연결 서버에 활성 GPT/Dot 구독이 있으면 채팅이 자동으로 깨어난다. 독립 메시지는 inbox로, `operation_id`가 있는 답장 알림은 `bridge_operation_get`으로 읽는다. [자동 알림](../../skill/agent-bridge/references/remote-mcp.md#optional-mcp-events)을 참고한다.
+기존 CLI `inbox`·`ack` 의미는 그대로 유지된다. 비공개 MCP 파사드(`scripts/mcp_server.py`)에서 `--phase1-config`에 `"inbox_enabled": true`를 명시하면 `bridge_inbox_list`·`bridge_message_get`으로 독립(`reply_to: null`) 수신 메시지를 소비 없이 읽고, 처리 후 `bridge_message_ack`로 명시적으로 `done` 처리할 수 있다. 질문에 대한 답장(correlated reply)은 기존 `bridge_operation_get` 전용이다. 페이지네이션·용량·토큰 검증·배포 게이트는 [remote-mcp.md](../../skill/agent-bridge/references/remote-mcp.md#independent-inbox-issue-48-explicit-opt-in)를 따른다.
+
+허용된 세션이 작업 중이거나 답장을 기다리는 동안에도 서로 다른 키의 MCP 요청을 접수한다. 전송 순서는 같은 UUID와 transport 안에서 유지되고 결과는 각 작업에 따로 연결된다. 쓰기 결과가 불명확하면 해당 대상만 격리되고 `SESSION_BUSY`가 반환될 수 있다. 결과를 알 수 없는 작업은 재전송하지 않으며 전체 active/unknown 작업 64개 한도에 포함된다.
+
+브로커 발송 전에 라우트 충돌이 확인되면 `BACKEND_UNAVAILABLE`과 `ROUTE_CHANGED:` 메시지를 반환한다. 최초 접수에서 발견하면 작업을 만들지 않고, 접수 뒤에 발견하면 작업을 `failed`로 종료한다. 발송 시도 뒤에 확인된 라우트 불일치는 `unknown`으로 남긴다.
+
+원격 MCP Events에는 `events_enabled: true`, `inbox_enabled: true`, `bridge:read`가 필요하다. 활성 구독과 일치하는 서명된 `bridge.inbox.message.created` 웹훅이 도착하면 웹의 ChatGPT Work 채팅이나 Cloud를 선택한 Desktop Work 채팅이 깨어날 수 있다. 알림에 `operation_id`가 있으면 `bridge_operation_get`으로 기록된 답장을 읽는다. 독립 메시지는 수신함 도구로 읽고 명시적으로 ACK한다. 알림이 누락되면 수신함과 알고 있는 작업 ID를 다시 조회한다. 알림의 재생과 자동 재시도는 지원하지 않는다. [Events 계약과 설정](../../skill/agent-bridge/references/remote-mcp.md#optional-mcp-events)을 참고한다.
 
 ## 메시지 체크포인트 복원
 
-소유자 전용 `correspondence.json`의 버전은 1이며 메시지·전달 상태·중복키·ACK 시각과 차단 중인 전송의 `dispatch_started_at`을 보존한다. 재시작은 메시지를 자동 전송하지 않는다. `--max-messages`를 줄이면 브로커의 기존 `make_room`을 재사용해 보호되지 않은 종료 메시지부터 오래된 순서로 제거한다. 부모·조상 보호 조건을 적용하고 남은 메시지는 저장 순서를 유지한다. 중복키는 실제 제거한 메시지의 것만 해제한다. 비종료 메시지와 보호된 메시지는 새 한도를 넘어도 유지한다. 시작 시 stderr에 `correspondence.json`·보존 건수·한도를 기록하고, `ping.correspondence_over_limit`과 `ping.max_messages`로 상태를 알린다. 새 메시지를 넣을 자리가 생길 때까지 전송은 기존 메시지 한도 오류로 거부된다. 실제 제거한 종료 메시지 ID만 손실 원장에 기록하며, 제거한 메시지가 없으면 원장을 새로 쓰지 않는다.
+소유자 전용 `correspondence.json`의 버전은 1이며 메시지·전달 상태·중복키·ACK 시각과 차단 중인 전송의 `dispatch_started_at`을 보존한다. 전달 이유는 실패한 Codex 전송의 `archived`를 저장한다. 재시작은 메시지를 자동 전송하지 않는다. `--max-messages`를 줄이면 브로커의 기존 `make_room`을 재사용해 보호되지 않은 종료 메시지부터 오래된 순서로 제거한다. 부모·조상 보호 조건을 적용하고 남은 메시지는 저장 순서를 유지한다. 중복키는 실제 제거한 메시지의 것만 해제한다. 비종료 메시지와 보호된 메시지는 새 한도를 넘어도 유지한다. 시작 시 stderr에 `correspondence.json`·보존 건수·한도를 기록하고, `ping.correspondence_over_limit`과 `ping.max_messages`로 상태를 알린다. 새 메시지를 넣을 자리가 생길 때까지 전송은 기존 메시지 한도 오류로 거부된다. 실제 제거한 종료 메시지 ID만 손실 원장에 기록하며, 제거한 메시지가 없으면 원장을 새로 쓰지 않는다.
 
 쓰기 상한은 `max_messages * 1 MiB + 16 MiB + 8192 * 1024`바이트이며 건수 한도를 초과해 복원된 집합에도 적용한다. 읽기 상한은 최소 2048건 기준을 유지하며, 더 큰 이전 저장본은 검증된 메타데이터 인덱스의 건수로 본문 읽기 상한을 높인다. 상한을 넘고 인덱스를 사용할 수 없으면 시작을 거부한다.
 
@@ -421,7 +449,7 @@ Codex `open` / `register --new`는 권한 확인에 실패하면 라우트를 �
 `close NAME --project P`에는 `--retro-file FILE` 또는 `--no-retro "사유"`가
 필수다. 누락은 `RETRO_REQUIRED`, 빈 파일은 `RETRO_EMPTY`, 빈 사유는
 `RETRO_REASON_EMPTY`로 공급자 동작과 경로 삭제 전에 거절한다. 타워와 HQ는
-`--no-retro` 사유를 남긴다. 기존 detach/archive/timeout/`--keep-route`는 유지한다.
+`--no-retro` 사유를 남긴다.
 회고를 먼저 저장하므로 이후 공급자 종료가 실패해도 기록은 남는다. 기록 영수증이
 종료 성공을 뜻하지 않으며 실패한 close를 무작정 반복하지 않는다.
 

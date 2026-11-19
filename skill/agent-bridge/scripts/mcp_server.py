@@ -10,10 +10,13 @@ from datetime import datetime, timezone
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 from pathlib import Path
+import queue
 import re
 import socket
 import sys
+import threading
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import broker
@@ -21,6 +24,9 @@ import broker
 CONTRACT_VERSION = '0.1.0'
 # Newest first; an unsupported request is answered with the newest (MCP lifecycle).
 PROTOCOL_VERSIONS = ('2025-11-25', '2025-06-18', '2025-03-26')
+MODERN_PROTOCOL = '2026-07-28'
+STDIO_CAPACITY = 16
+STDIO_SHUTDOWN_SECONDS = 15
 PHASE = 'connectivity_only'
 ENABLED_TOOLS = ('bridge_status',)
 LIMITS = {'max_message_bytes': 32768, 'max_wait_ms': 5000, 'max_result_page_chars': 16000,
@@ -40,7 +46,7 @@ def _compute_runtime_revision():
         if idx + 1 < len(parts) and re.fullmatch(r'[A-Za-z0-9._-]{7,64}', parts[idx + 1]):
             return parts[idx + 1]
     h = hashlib.sha256()
-    for name in ('mcp_server.py', 'mcp_phase1.py'):
+    for name in ('mcp_server.py', 'mcp_phase1.py', 'mcp_events.py'):
         candidate = here.with_name(name)
         if candidate.is_file():
             h.update(candidate.read_bytes())
@@ -101,26 +107,117 @@ def error(mid, code, message):
     return {'jsonrpc': '2.0', 'id': mid, 'error': {'code': code, 'message': message}}
 
 
-def handle(message, path, engine=None):
+def modern_enabled(engine):
+    return engine is not None and engine.config.get('mcp_2026_enabled', False)
+
+
+def modern_request(message):
+    params = message.get('params') if isinstance(message, dict) else None
+    meta = params.get('_meta') if isinstance(params, dict) else None
+    return isinstance(meta, dict) and 'io.modelcontextprotocol/protocolVersion' in meta
+
+
+def protocol_error(message):
+    """Validate modern metadata before a request can reach any tool or callback."""
+    params = message.get('params')
+    meta = params.get('_meta') if isinstance(params, dict) else None
+    mid = message.get('id')
+    if not isinstance(meta, dict):
+        return error(mid, -32602, 'Modern requests require metadata')
+    version = meta.get('io.modelcontextprotocol/protocolVersion')
+    if not isinstance(version, str):
+        return error(mid, -32602, 'Modern requests require a protocol version')
+    if version != MODERN_PROTOCOL:
+        response = error(mid, -32022, 'Unsupported protocol version')
+        response['error']['data'] = {'supported': [MODERN_PROTOCOL], 'requested': version}
+        return response
+    if not isinstance(meta.get('io.modelcontextprotocol/clientCapabilities'), dict):
+        return error(mid, -32602, 'Modern requests require client capabilities')
+    info = meta.get('io.modelcontextprotocol/clientInfo')
+    if 'io.modelcontextprotocol/clientInfo' in meta and (not isinstance(info, dict) or
+            any(not isinstance(info.get(key), str) for key in ('name', 'version'))):
+        return error(mid, -32602, 'Invalid client information')
+    if 'progressToken' in meta:
+        token = meta['progressToken']
+        if type(token) not in (str, int, float) or (type(token) is float and not math.isfinite(token)):
+            return error(mid, -32602, 'Invalid progress token')
+    if type(mid) not in (str, int):
+        return error(None, -32600, 'Invalid request identifier')
+    return None
+
+
+def capabilities(engine):
+    result = {'tools': {'listChanged': False}}
+    if engine is not None and getattr(engine, 'events', None) is not None:
+        # Keep the ChatGPT Events dialect alongside the current draft namespace.
+        result.update(events={}, extensions={'io.modelcontextprotocol/events': {}})
+    return result
+
+
+def handle(message, path, engine=None, *, received=False):
     """One JSON-RPC message in, one response or None (notification/response) out."""
+    events = getattr(engine, 'events', None) if engine is not None else None
+    if events is not None and not received:
+        events.audit_request(message)
+    modern = (modern_enabled(engine) and isinstance(message, dict) and
+              'id' in message and (modern_request(message) or message.get('method') == 'server/discover'))
+    response = protocol_error(message) if modern and message.get('jsonrpc') == '2.0' else None
+    if response is None:
+        response = _handle(message, path, engine, modern=modern)
+    if modern and response is not None and 'result' in response:
+        response['result'] = dict(response['result'], resultType='complete',
+            _meta={'io.modelcontextprotocol/serverInfo': {'name': 'agent-bridge', 'version': CONTRACT_VERSION}})
+        if message.get('method') in ('server/discover', 'tools/list'):
+            response['result'].update(ttlMs=0, cacheScope='private')
+    if events is not None:
+        events.audit_response(message, response)
+    return response
+
+
+def _handle(message, path, engine=None, modern=False):
     if not isinstance(message, dict) or message.get('jsonrpc') != '2.0':
         return error(None, -32600, 'Invalid Request: one JSON-RPC 2.0 object; batches are not supported')
     if 'method' not in message:
         return None  # a client response; this server sends no requests
     method, mid = message['method'], message.get('id')
     if 'id' not in message:
+        if isinstance(method, str) and method in ('events/list', 'events/subscribe', 'events/unsubscribe'):
+            if engine is not None and getattr(engine, 'events', None) is not None:
+                engine.events.invalid_request(method)
         return None
     params = message.get('params') or {}
     if not isinstance(method, str) or not isinstance(params, dict):
+        if isinstance(method, str) and method in ('events/list', 'events/subscribe', 'events/unsubscribe'):
+            if engine is not None and getattr(engine, 'events', None) is not None:
+                engine.events.invalid_request(method)
         return error(mid, -32600, 'Invalid Request')
-    if method == 'initialize':
+    if method == 'server/discover' and modern:
+        if set(params) != {'_meta'}:
+            return error(mid, -32602, 'Invalid discovery parameters')
+        return {'jsonrpc': '2.0', 'id': mid, 'result': {
+            'supportedVersions': [MODERN_PROTOCOL, *PROTOCOL_VERSIONS], 'capabilities': capabilities(engine)}}
+    if method == 'initialize' and not modern:
         asked = params.get('protocolVersion')
         return {'jsonrpc': '2.0', 'id': mid, 'result': {
             'protocolVersion': asked if asked in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0],
-            'capabilities': {'tools': {'listChanged': False}},
+            'capabilities': capabilities(engine),
             'serverInfo': {'name': 'agent-bridge', 'version': CONTRACT_VERSION}}}
     if method == 'ping':
         return {'jsonrpc': '2.0', 'id': mid, 'result': {}}
+    if method.startswith('events/') and engine is not None and getattr(engine, 'events', None) is not None:
+        from mcp_events import EventError
+        from mcp_phase1 import Fault
+        try:
+            result = engine.events.call(method, params)
+            return {'jsonrpc': '2.0', 'id': mid, 'result': result}
+        except EventError as exc:
+            response = error(mid, exc.code, exc.reason)
+            response['error']['data'] = {'reason': exc.reason}
+            return response
+        except Fault:
+            return error(mid, -32602, 'Event arguments are unavailable to this owner')
+        except Exception:
+            return error(mid, -32603, 'Event operation failed')
     if method == 'tools/list':
         return {'jsonrpc': '2.0', 'id': mid, 'result': {'tools': engine.tools() if engine else TOOLS}}
     if method == 'tools/call':
@@ -142,6 +239,9 @@ def handle(message, path, engine=None):
                                 enabled_tools=[t['name'] for t in enabled_defs],
                                 allowed_workspace_aliases=sorted(engine.config['workspaces']),
                                 capabilities=dict.fromkeys(data['capabilities'], True))
+                    if getattr(engine, 'events', None) is not None:
+                        data['capabilities']['events'] = True
+                        data['events'] = engine.events.health()
                     payload = {'ok': True, 'data': data}
                 except Fault as exc:
                     payload = {'ok': False, 'error': exc.payload}
@@ -156,7 +256,131 @@ def handle(message, path, engine=None):
     return error(mid, -32601, f'Method not found: {method}')
 
 
+def serve_modern_stdio(path, stdin, stdout, engine):
+    """A bounded reader and one handler; cancellation never replays or undoes work."""
+    pending = queue.Queue(STDIO_CAPACITY)
+    state_lock = threading.RLock()
+    states = {}
+    failures = []
+    input_closed = threading.Event()
+    previous = getattr(engine, '_mcp_stdio_worker', None)
+    if previous is not None and previous.is_alive():
+        raise RuntimeError('MCP stdio handler already active')
+
+    def request_key(value):
+        return (type(value), value) if type(value) in (str, int) else None
+
+    def emit(response):
+        if response is not None:
+            stdout.write(json.dumps(response, ensure_ascii=False) + '\n')
+            stdout.flush()
+
+    def work():
+        while True:
+            try:
+                item = pending.get(timeout=0.1)
+            except queue.Empty:
+                if input_closed.is_set():
+                    return
+                continue
+            key, message, state = item
+            try:
+                with state_lock:
+                    cancelled = state['cancelled']
+                if cancelled:
+                    # A queued request cancelled before execution has no effect.
+                    continue
+                try:
+                    response = handle(message, path, engine, received=True)
+                except Exception:
+                    response = error(message.get('id'), -32603, 'MCP operation failed')
+                with state_lock:
+                    if not state['cancelled']:
+                        emit(response)
+                    if states.get(key) is state:
+                        states.pop(key)
+            except (OSError, ValueError):
+                with state_lock:
+                    failures[:] = [True]
+            finally:
+                with state_lock:
+                    if key is not None and states.get(key) is state:
+                        states.pop(key, None)
+
+    worker = threading.Thread(target=work, name='mcp-stdio-handler')
+    engine._mcp_stdio_worker = worker
+    worker.start()
+    try:
+        while True:
+            line = stdin.readline(MAX_BODY + 1)
+            if not line:
+                break
+            if not line.strip():
+                continue
+            if len(line) > MAX_BODY or len(line.encode('utf-8')) > MAX_BODY:
+                # Drain an oversized frame in bounded chunks, never store it.
+                while line and not line.endswith('\n'):
+                    line = stdin.readline(MAX_BODY + 1)
+                with state_lock:
+                    emit(error(None, -32600, 'MCP frame exceeds capacity'))
+                continue
+            try:
+                message = json.loads(line)
+            except ValueError:
+                with state_lock:
+                    emit(error(None, -32700, 'Parse error'))
+                continue
+            if (isinstance(message, dict) and message.get('jsonrpc') == '2.0'
+                    and message.get('method') == 'notifications/cancelled' and 'id' not in message):
+                params = message.get('params')
+                key = request_key(params.get('requestId')) if isinstance(params, dict) else None
+                with state_lock:
+                    if key in states:
+                        states[key]['cancelled'] = True
+                # Mark cancellation before a potentially slow receipt write.
+                # Receipt contains the fixed method only, never the request ID.
+                handle(message, path, engine)
+                continue
+            if not isinstance(message, dict) or 'id' not in message:
+                with state_lock:
+                    emit(handle(message, path, engine))
+                continue
+            events = getattr(engine, 'events', None)
+            if events is not None:
+                events.audit_request(message)
+            key = request_key(message['id'])
+            with state_lock:
+                if failures:
+                    raise RuntimeError('MCP output failed')
+                if key is None or key in states:
+                    response = error(None, -32600, 'Invalid or duplicate in-flight request identifier')
+                    if events is not None:
+                        events.audit_response(message, response)
+                    emit(response)
+                    continue
+                if len(states) >= STDIO_CAPACITY:
+                    response = error(message['id'], -32603, 'MCP request capacity reached')
+                    if events is not None:
+                        events.audit_response(message, response)
+                    emit(response)
+                    continue
+                state = {'cancelled': False}
+                states[key] = state
+                pending.put_nowait((key, message, state))
+    finally:
+        # Do not release Engine's DB/owner lock if accepted handler work
+        # outlives the shutdown bound. The worker exits after draining its queue.
+        input_closed.set()
+        worker.join(STDIO_SHUTDOWN_SECONDS)
+        if worker.is_alive():
+            raise RuntimeError('MCP handler shutdown is still pending')
+        if failures:
+            raise RuntimeError('MCP output failed')
+
+
 def serve_stdio(path, stdin=sys.stdin, stdout=sys.stdout, engine=None):
+    if modern_enabled(engine):
+        return serve_modern_stdio(path, stdin, stdout, engine)
     for line in stdin:
         if not line.strip():
             continue

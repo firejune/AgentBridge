@@ -19,6 +19,7 @@ MESSAGE_FIELDS = ('id', 'conversation', 'project', 'sender', 'recipient', 'chann
 INTENT_FIELDS = ('project', 'sender', 'recipient', 'channel', 'sender_channel', 'body', 'key', 'reply_to')
 STATES = frozenset(('pending', 'dispatching', 'submitted', 'received', 'in_progress',
                     'uncertain', 'done', 'answered', 'failed'))
+ARCHIVED_REASON = 'archived'
 FRAME_BYTES = 1024 * 1024
 SNAPSHOT_BYTES = 16 * 1024 * 1024
 MAX_RECEIPTS = 8192
@@ -92,6 +93,20 @@ def message_record(raw):
             or result['route']['name'] != result['recipient']
             or result['return_route']['name'] != result['sender']):
         raise ValueError('Inconsistent message routes')
+    if 'reason' in raw:
+        if (raw['reason'] != ARCHIVED_REASON or result['state'] != 'failed'
+                or result['route']['transport'] != 'codex'):
+            raise ValueError('Invalid delivery reason')
+        result['reason'] = ARCHIVED_REASON
+    if 'close_request' in raw:
+        request = raw['close_request']
+        close_id = request['close_id']
+        route = route_store.route_record(request['target'])
+        if (str(uuid.UUID(close_id)) != close_id or route['transport'] != 'codex'
+                or result['route']['transport'] != 'codex'
+                or result['return_route']['transport'] != 'realtime' or result['reply_to'] is not None):
+            raise ValueError('Invalid Codex close control record')
+        result['close_request'] = {'close_id': close_id, 'target': route}
     if raw.get('dispatch_started_at') is not None:
         started = raw['dispatch_started_at']
         if (not isinstance(started, str) or len(started) > 40

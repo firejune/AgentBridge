@@ -9,6 +9,7 @@ from pathlib import Path
 import socket
 import stat
 import struct
+from subprocess import TimeoutExpired
 import time
 import uuid
 
@@ -22,6 +23,13 @@ class DeliveryError(ValueError):
     def __init__(self, reason, uncertain=False):
         super().__init__(reason)
         self.uncertain = uncertain
+
+
+class ThreadArchived(DeliveryError):
+    MESSAGE = 'Codex thread is archived. Message was not delivered.'
+
+    def __init__(self):
+        super().__init__(self.MESSAGE)
 
 
 def endpoint():
@@ -222,6 +230,18 @@ def accepted_turn(response):
 
 
 def deliver(route, message_id, text, timeout=10, dry_run=False, path=None):
+    import codex_preview
+
+    try:
+        cwd, archived = codex_preview.saved_thread(route)
+        exact_workspace = Path(cwd).is_absolute() and Path(cwd).resolve() == Path(route['cwd']).resolve()
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError, TimeoutExpired):
+        # Metadata lookup can be unavailable. Keep the existing IPC outcome
+        # semantics unless the exact saved thread was confirmed archived.
+        pass
+    else:
+        if archived is True and exact_workspace:
+            raise ThreadArchived()
     client = Client(path, timeout)
     try:
         thread, steer, start = payloads(route, message_id, text)
