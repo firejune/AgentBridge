@@ -5,7 +5,7 @@ description: Discover live Codex (ChatGPT Desktop), Claude Code, and Antigravity
 
 # Agent Bridge
 
-**English** | [한국어](../../docs/ko/SKILL.md)
+**English** | [한국어](https://github.com/firejune/AgentBridge/blob/main/docs/ko/SKILL.md)
 
 A shared local real-time bridge for **Claude Code / Desktop (`claude-peer`) ↔ Codex / ChatGPT Desktop (`codex`) ↔ Antigravity IDE / Desktop (`agy`)** and CLI participants (`realtime`/`claude`) on the same machine. Any participant can push messages directly into a peer's open live session **without interrupting active work**, enabling 3-way (multi-agent) real-time questions, answers, and progress reporting.
 

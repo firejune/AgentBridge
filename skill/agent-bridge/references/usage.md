@@ -1,6 +1,6 @@
 # Agent Bridge Usage Reference
 
-**English** | [한국어](../../../docs/ko/usage.md)
+**English** | [한국어](https://github.com/firejune/AgentBridge/blob/main/docs/ko/usage.md)
 
 A local CLI for real-time peer-to-peer correspondence across AI coding agents. Requires Python 3.10+ and uses only the Python standard library over Unix domain sockets on macOS and Linux — no third-party packages, API keys, or network ports required.
 
@@ -413,7 +413,7 @@ the in-memory mutation. A failure after replacement leaves the disk commit
 outcome uncertain and does not return acceptance. There
 is no automatic retry or delivery on load.
 
-The checkpoint uses version 1 until explicit one-way/deadline intent or compact receipts are stored, then version 2. Both versions can carry optional `one_way`, `delivered_at`, `completed_at`, `retention_adopted_at`, `reply_deadline_at` and `last_reply_at` message metadata. Version 2 adds `compact` records with the body-expiry fields described in the [TTL policy](#opt-in-correspondence-ttl-issue-105), and compact idempotency intents use a fingerprint instead of a retained body. Both versions preserve the `archived` reason for failed Codex delivery. The original version-1 field allowlist is as follows.
+Each save selects version 2 when explicit one-way/deadline intent or compact receipts remain. Later saves use version 1 once those records and intents are gone. Both versions can carry optional `delivered_at`, `completed_at`, `retention_adopted_at` and `last_reply_at` message metadata. The `one_way` and `reply_deadline_at` message fields require version 2. Version 2 adds `compact` records with the body-expiry fields described in the [TTL policy](#opt-in-correspondence-ttl-issue-105), and compact idempotency intents use a fingerprint instead of a retained body. Both versions preserve the `archived` reason for failed Codex delivery. The original version-1 field allowlist is as follows.
 
 - `messages` preserves `id`, `conversation`, `project`, `sender`, `recipient`,
   `channel`, `sender_channel`, `body`, `reply_to`, `state`, `created`, and optional
@@ -448,10 +448,9 @@ and protected work is never evicted to admit a new message. The existing 32768-b
 body limit remains. A checkpoint message must fit the existing 1 MiB frame budget.
 Inbox limits remain 16 snapshots, 4 MiB per snapshot, 16 MiB total and 8192 ACK
 receipts, with the existing fixed one-hour expiry. The encoded write ceiling
-is `max_messages * 1 MiB + 16 MiB + 8192 * 1024` bytes. Capacity or write failures
+is `max_messages * 1 MiB + 16 MiB + 8192 * 1024 + 8192 * 16384` bytes. The last term budgets up to 8192 compact records at up to 16384 bytes each. Capacity or write failures
 reject the mutation before publication, without consuming the message. The
-metadata index and loss ledger use a restore ceiling based on at least 2048
-messages, independent of a reduced retention setting. For larger prior stores,
+payload, metadata index and loss ledger start with the same byte ceiling formula, using at least 2048 messages even if retention is set lower. For larger prior stores,
 a validated metadata index can raise the payload read ceiling to its recorded
 message count times 1 MiB plus the inbox budgets. An oversized file without a
 usable index refuses startup. With TTL disabled, lowering `--max-messages` reuses the broker's
@@ -470,8 +469,7 @@ Snapshots and ACK receipts remain valid only within the broker epoch. Startup
 validates their checkpoint records and releases them, while message ACK state
 and `acknowledged_at` remain durable. A fresh list issues new handles. Read-only
 `inbox_list` updates pagination state in memory and skips the durable write.
-Other mutations still rewrite the checkpoint. Version-1 message records include both copies
-of the body in the message and original intent; compact TTL records omit the body. The facade instance ping shares
+Other mutations still rewrite the checkpoint. Active message records in either version include the body. Any corresponding idempotency entry also stores the body as part of the original intent. Compact TTL records omit the body and any corresponding idempotency entry stores a fingerprint. Compact lookup receipts follow the TTL policy across broker epochs. The facade instance ping shares
 the bounded 3-second socket-operation timeout used by other RPCs so it can wait
 behind a busy broker.
 
