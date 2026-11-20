@@ -30,6 +30,7 @@ import sessions
 TOOLS = json.loads(Path(__file__).with_name('mcp_phase1_tools.json').read_text())['tools']
 SCOPES = {'bridge_status':'bridge:read', 'bridge_sessions_list':'bridge:read',
           'bridge_operation_get':'bridge:read', 'bridge_session_create':'bridge:session:create',
+          'bridge_models_list':'bridge:read',
           'bridge_message_send':'bridge:message:send',
           'bridge_inbox_list':'bridge:read', 'bridge_message_get':'bridge:read',
           'bridge_message_ack':'bridge:message:send', 'bridge_message_reply':'bridge:message:send'}
@@ -111,6 +112,10 @@ class RouteBindingRefusal(ValueError):
     """Observed identity conflict before the broker send call."""
 
 
+class ModelSelectionRefusal(ValueError):
+    """An explicit creation model was refused before the provider opener."""
+
+
 def private_file(path):
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     s = os.fstat(fd)
@@ -165,6 +170,12 @@ def validate_workspaces(workspaces):
                 raise ValueError('Workspace paths must be existing canonical absolute directories')
         if not Path(w['cwd']).is_relative_to(w['root']):
             raise ValueError('Workspace is outside its allowed root')
+
+
+def creation_host(workspace, agent_type):
+    if agent_type == 'codex':
+        return 'desktop'
+    return workspace.get('host', 'ide' if agent_type == 'claude' else 'desktop')
 
 
 def match_workspace(cwd, workspaces, preferred_project=None):
@@ -258,25 +269,36 @@ class Backend:
     def session_agent_type(self, session):
         return TRANSPORT_AGENTS.get(self.session_transport(session), session.get('agent_type', 'claude'))
 
+    def model_state_dir(self):
+        return Path(self.path).expanduser().absolute().with_suffix('.state')
+
+    def models_list(self, workspace, agent_type):
+        return models.session_model_options(workspace, agent_type, self.model_state_dir())
+
     def create(self, workspace):
         # Same policy and supported opening path as bridge register --new.
         from types import SimpleNamespace
         agent_type = workspace.get('agent_type', 'claude')
         if agent_type not in AGENT_TYPES:
             raise ValueError('Unsupported agent type')
-        host = workspace.get('host', 'ide' if agent_type == 'claude' else 'desktop')
-        args = SimpleNamespace(model=None, host=host, cwd=workspace['cwd'])
-        state_dir = Path(self.path).expanduser().absolute().with_suffix('.state')
-        models.new_session_policy(args, agent_type, state_dir)
-        if agent_type == 'claude':
-            row = sessions.open_session('claude', cwd=workspace['cwd'], host=host,
-                                        ide=workspace.get('ide') or sessions.DEFAULT_IDE, timeout=180)['session']
-        elif agent_type == 'agy':
-            row = sessions.open_session('agy', cwd=workspace['cwd'], model=args.model,
-                                        host=host, timeout=180)['session']
+        host = creation_host(workspace, agent_type)
+        cwd = workspace['cwd']
+        state_dir = self.model_state_dir()
+        if 'model' in workspace:
+            try:
+                model = models.explicit_session_model(
+                    dict(workspace, host=host), agent_type, state_dir, workspace['model'])
+            except models.ModelSelectionError:
+                raise ModelSelectionRefusal from None
         else:
-            row = sessions.open_session('codex', cwd=workspace['cwd'], model=args.model,
-                                        host='desktop', timeout=180)['session']
+            args = SimpleNamespace(model=None, host=workspace.get('host', host), cwd=cwd)
+            models.new_session_policy(args, agent_type, state_dir)
+            model = args.model
+        if agent_type == 'claude':
+            row = sessions.open_session('claude', cwd=cwd, host=host,
+                                        ide=workspace.get('ide') or sessions.DEFAULT_IDE, timeout=180)['session']
+        else:
+            row = sessions.open_session(agent_type, cwd=cwd, model=model, host=host, timeout=180)['session']
         sid = str(uuid.UUID(row['id']))
         # Return the acquired UUID immediately; registration rechecks exact cwd after it is durable.
         return sid
@@ -702,6 +724,11 @@ class Engine:
                     valid = re.fullmatch(p['pattern'],v) is not None
                 if valid and 'enum' in p:
                     valid = v in p['enum']
+            if valid and k == 'model':
+                try:
+                    v.encode('utf-8')
+                except UnicodeEncodeError:
+                    valid = False
             if not valid:
                 raise Fault('INVALID_ARGUMENT')
         if 'message' in args:
@@ -720,6 +747,8 @@ class Engine:
                 data = self.accept(name,args,principal)
             elif name == 'bridge_sessions_list':
                 data = self.list_sessions(args,principal)
+            elif name == 'bridge_models_list':
+                data = self.models_list(args)
             elif name == 'bridge_operation_get':
                 data = self.get(args,principal)
             elif name in INBOX_TOOLS:
@@ -741,15 +770,37 @@ class Engine:
             result['message_request_id'] = op['message_request_id']
         return result
 
+    def creation_workspace(self, args):
+        workspace = self.config['workspaces'].get(args['workspace_alias'])
+        if workspace is None:
+            raise Fault('WORKSPACE_NOT_ALLOWED')
+        agent_type = args.get('agent_type') or workspace.get('agent_type', 'claude')
+        if agent_type not in AGENT_TYPES:
+            raise Fault('INVALID_ARGUMENT')
+        return workspace, agent_type
+
+    def models_list(self, args):
+        workspace, agent_type = self.creation_workspace(args)
+        self.allowed({'alias':args['workspace_alias'], 'workspace':workspace})
+        effective_workspace = dict(workspace, agent_type=agent_type,
+                                   host=creation_host(workspace, agent_type))
+        try:
+            options = self.backend.models_list(effective_workspace, agent_type)
+        except models.ModelSelectionError:
+            raise Fault('MODEL_UNAVAILABLE') from None
+        return {'workspace_alias':args['workspace_alias'], 'agent_type':agent_type,
+                'supports_model_selection':options['supports_model_selection'],
+                'default_model':options['default_model'], 'models':options['models']}
+
     def accept(self, tool, args, principal):
         creating = tool == 'bridge_session_create'
         if creating:
-            if args['workspace_alias'] not in self.config['workspaces']:
-                raise Fault('WORKSPACE_NOT_ALLOWED')
-            agent_type = args.get('agent_type') or self.config['workspaces'][args['workspace_alias']].get('agent_type', 'claude')
-            if agent_type not in AGENT_TYPES:
-                raise Fault('INVALID_ARGUMENT')
+            workspace, agent_type = self.creation_workspace(args)
             payload = {'contract_version':'0.1.0','workspace_alias':args['workspace_alias'],'agent_type':agent_type}
+            if 'model' in args:
+                if agent_type == 'claude':
+                    raise Fault('UNSUPPORTED_MODEL_SELECTION')
+                payload['model'] = args['model']
         else:
             session = self.session(args['agent_session_id'],principal)
             self.allowed(session)
@@ -797,7 +848,9 @@ class Engine:
                   'instance':None,'backend_id':None,
                   'downstream_key':digest([self.ledger_namespace,key_hash])}
             if creating:
-                op.update(alias=args['workspace_alias'],workspace=dict(self.config['workspaces'][args['workspace_alias']]),agent_type=agent_type)
+                op.update(alias=args['workspace_alias'],workspace=dict(workspace),agent_type=agent_type)
+                if 'model' in payload:
+                    op['model'] = payload['model']
             else:
                 op['message'] = args['message']
                 op['destination'] = destination
@@ -907,7 +960,13 @@ class Engine:
                 self.update(op,status='running',stage='create_intent',instance=instance)
                 agent_type = op.get('agent_type') or op['workspace'].get('agent_type', 'claude')
                 create_ws = dict(op['workspace'], agent_type=agent_type) if agent_type != op['workspace'].get('agent_type', 'claude') else op['workspace']
-                sid = self.backend.create(create_ws)
+                if 'model' in op:
+                    create_ws = dict(create_ws, model=op['model'])
+                try:
+                    sid = self.backend.create(create_ws)
+                except ModelSelectionRefusal:
+                    self.fail(op, 'MODEL_UNAVAILABLE', unknown=False)
+                    return
                 self.update(op,stage='created',backend_session=sid)
                 session = {'id':opaque('as_'),'uuid':sid,'alias':op['alias'],'workspace':op['workspace'],
                            'agent_type':agent_type,'transport':AGENT_TRANSPORTS[agent_type],

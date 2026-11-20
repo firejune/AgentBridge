@@ -78,7 +78,7 @@ def resolve_model(model=None, environ=None, policy=None):
         raise CreationError(str(error)) from None
 
 
-def require_model(client, model, remaining=None, missing=None):
+def model_catalog(client, remaining=None):
     cursor, seen = None, set()
     while True:
         if remaining is not None:
@@ -90,14 +90,19 @@ def require_model(client, model, remaining=None, missing=None):
         rows = page.get('data')
         if not isinstance(rows, list):
             raise CreationError('Codex model/list returned no model catalog')
-        if any(isinstance(row, dict) and row.get('model') == model for row in rows):
-            return
+        yield from (row for row in rows if isinstance(row, dict))
         cursor = page.get('nextCursor')
         if not cursor:
-            raise CreationError(missing or 'Requested --model is not advertised by the installed Codex provider')
+            return
         if not isinstance(cursor, str) or cursor in seen or len(seen) >= 100:
             raise CreationError('Codex model/list returned an invalid or repeated cursor')
         seen.add(cursor)
+
+
+def require_model(client, model, remaining=None, missing=None):
+    if any(row.get('model') == model for row in model_catalog(client, remaining)):
+        return
+    raise CreationError(missing or 'Requested --model is not advertised by the installed Codex provider')
 
 
 def require_full_access_profile(client, cwd, remaining):

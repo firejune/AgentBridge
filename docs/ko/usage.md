@@ -377,6 +377,10 @@ Claude 데스크톱은 세션을 스스로 닫는다(앱 `main.log`에서 관찰
 
 깨우는 동안 메시지는 `dispatching`에 묶여 있다. 같은 세션으로 두 번째 `claude-peer` push가 오면 링크를 또 열지 않고 그 뒤에서 한 번 기다린다. 기다림은 깨우기 제한 시간 + 10초와 두 번째 push 자신의 전송 한도 안이고, 쓰기용 5초를 남긴다. 앞 메시지가 전달로 끝나면 두 번째도 같은 호출자 토큰 `claim-guarded` 경로(응답을 잃었을 때의 1회 해제 포함)로 다시 claim해서 한 번 push한다(결과에 `behind: {id, state}`). 아니면 아무것도 보내지 않고 `pending`으로 남으며, 위의 차단된 전송 노트에 앞 전달이 끝난 상태를 붙여 기록한다: `pending behind <id> since <time> (<상태>); not sent`. 앞 전달이 `uncertain`이면 기다리지 않고 바로 그 노트를 단다. 브로커의 `note-pending` 작업은 메시지가 아직 `pending`일 때만 노트를 기록하고, 아니면 `noted: false`를 돌려준다. 그래서 그사이 다른 호출자가 잡은 claim을 덮어쓰지 않는다. 이 작업이 없는 브로커는 `Unknown operation`으로 답하고, 그때 노트는 CLI 결과에만 나오며(`note_scope: local`) 브로커에는 아무것도 기록하지 않는다. `unsupported`나 `uncertain` 뒤에는 앱에서 세션을 확인하고 `deliver MESSAGE_ID`로 한 번 다시 시도한다. 링크를 열면 앱이 보여 주는 세션이 바뀌고, `open -g`여도 앱이 앞으로 올 수 있다.
 
+## 원격 MCP 세션 모델 선택
+
+비공개 MCP에서 `bridge:read` 권한으로 `bridge_models_list`를 호출하면 승인된 워크스페이스와 에이전트 종류에 맞는 모델 ID가 나온다. Codex와 Antigravity는 반환된 ID를 `bridge_session_create`의 `model`에 지정할 수 있다. 생략하면 기존 기본값을 사용한다. 같은 생성 멱등성 키로 모델을 바꾸면 충돌한다. [세션 모델 선택 계약](../../skill/agent-bridge/references/remote-mcp.md#session-model-selection).
+
 ## 비공개 MCP 독립 inbox
 
 브로커에 메시지를 기록하기 전에 라우트 또는 세션 충돌이 확인되면 `BACKEND_UNAVAILABLE`과 고정된 `ROUTE_CHANGED:` 메시지를 반환한다. 최초 접수에서 발견하면 작업을 만들지 않고 도구 오류를 반환하며, 접수 후 발견하면 해당 작업을 `failed`로 끝내 점유를 해제한다. 파사드는 자동 재매핑·재전송하지 않는다. 브로커 send를 시도한 뒤 발견한 라우트 불일치는 `unknown`으로 남긴다.

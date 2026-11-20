@@ -78,6 +78,7 @@
                   "enum": [
                     "bridge_status",
                     "bridge_sessions_list",
+                    "bridge_models_list",
                     "bridge_session_create",
                     "bridge_message_send",
                     "bridge_operation_get",
@@ -88,7 +89,7 @@
                   ]
                 },
                 "minItems": 1,
-                "maxItems": 9,
+                "maxItems": 10,
                 "uniqueItems": true,
                 "contains": {
                   "const": "bridge_status"
@@ -865,8 +866,206 @@
       }
     },
     {
+      "name": "bridge_models_list",
+      "description": "Read the selectable model catalog for an allowed workspace and agent provider, using the workspace provider when omitted. Requires bridge:read. Claude does not expose model selection. This read does not create a session.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "workspace_alias": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_-]{0,31}$",
+            "description": "An operator-configured alias returned by bridge_status; never a path or arbitrary cwd.",
+            "not": {
+              "pattern": "[^A-Za-z0-9_-]"
+            }
+          },
+          "agent_type": {
+            "type": "string",
+            "enum": [
+              "claude",
+              "agy",
+              "codex"
+            ],
+            "description": "Optional agent provider to query in the workspace alias (default: workspace configuration or claude)."
+          }
+        },
+        "required": [
+          "workspace_alias"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "workspace_alias": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_-]{0,31}$",
+                "description": "An operator-configured alias returned by bridge_status; never a path or arbitrary cwd.",
+                "not": {
+                  "pattern": "[^A-Za-z0-9_-]"
+                }
+              },
+              "agent_type": {
+                "type": "string",
+                "enum": [
+                  "claude",
+                  "agy",
+                  "codex"
+                ],
+                "description": "Resolved agent provider."
+              },
+              "supports_model_selection": {
+                "type": "boolean"
+              },
+              "default_model": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"
+              },
+              "models": {
+                "type": "array",
+                "maxItems": 200,
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[\\s\\S]*\\S[\\s\\S]*$"
+                    },
+                    "label": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "maxLength": 256
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "label"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "workspace_alias",
+              "agent_type",
+              "supports_model_selection",
+              "default_model",
+              "models"
+            ],
+            "additionalProperties": false
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": [
+                  "INVALID_ARGUMENT",
+                  "PHASE_DISABLED",
+                  "NOT_AUTHORIZED",
+                  "NOT_FOUND",
+                  "WORKSPACE_NOT_ALLOWED",
+                  "IDEMPOTENCY_CONFLICT",
+                  "IDEMPOTENCY_EXPIRED",
+                  "SESSION_BUSY",
+                  "CAPACITY_EXCEEDED",
+                  "BACKEND_UNAVAILABLE",
+                  "UNSUPPORTED_MODEL_SELECTION",
+                  "MODEL_UNAVAILABLE",
+                  "BACKEND_PROTOCOL_ERROR",
+                  "DELIVERY_UNKNOWN",
+                  "OPERATION_EXPIRED",
+                  "INTERNAL_ERROR"
+                ]
+              },
+              "message": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2048
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "operation_id": {
+                "type": "string",
+                "pattern": "^op_[A-Za-z0-9_-]{16,128}$",
+                "not": {
+                  "pattern": "[^A-Za-z0-9_-]"
+                }
+              }
+            },
+            "required": [
+              "code",
+              "message",
+              "retryable"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [],
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "properties": {
+              "ok": {
+                "const": true
+              }
+            },
+            "required": [
+              "ok",
+              "data"
+            ],
+            "not": {
+              "required": [
+                "error"
+              ]
+            }
+          },
+          {
+            "properties": {
+              "ok": {
+                "const": false
+              }
+            },
+            "required": [
+              "ok",
+              "error"
+            ],
+            "not": {
+              "required": [
+                "data"
+              ]
+            }
+          }
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
       "name": "bridge_session_create",
-      "description": "Asynchronously accept creation of a dedicated Claude, Antigravity (agy), or Codex (codex) session in an operator-allowed workspace alias. Return only durable acceptance; poll bridge_operation_get for the session ID. Requires durable adapter idempotency and dispatch-intent ledger verified before registration; backend memory-only deduplication is insufficient. No caller, cwd, model, shell, or arguments are accepted. Absent in Phase 0; operator must explicitly enable writes after read-only integration verification.",
+      "description": "Asynchronously accept creation of a dedicated Claude, Antigravity (agy), or Codex (codex) session in an operator-allowed workspace alias. Return only durable acceptance; poll bridge_operation_get for the session ID. Requires durable adapter idempotency and dispatch-intent ledger verified before registration; backend memory-only deduplication is insufficient. Use an optional model ID from bridge_models_list for Codex or Antigravity. Omit model to use the existing provider default. No caller, cwd, shell, or provider arguments are accepted. Absent in Phase 0; operator must explicitly enable writes after read-only integration verification.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -887,6 +1086,13 @@
               "codex"
             ],
             "description": "Optional agent provider to open in the workspace alias (default: workspace configuration or claude)."
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[\\s\\S]*\\S[\\s\\S]*$",
+            "description": "Optional exact model ID returned by bridge_models_list for this workspace and agent provider."
           },
           "idempotency_key": {
             "type": "string",
@@ -958,6 +1164,8 @@
                   "SESSION_BUSY",
                   "CAPACITY_EXCEEDED",
                   "BACKEND_UNAVAILABLE",
+                  "UNSUPPORTED_MODEL_SELECTION",
+                  "MODEL_UNAVAILABLE",
                   "BACKEND_PROTOCOL_ERROR",
                   "DELIVERY_UNKNOWN",
                   "OPERATION_EXPIRED",
@@ -1447,6 +1655,8 @@
                           "SESSION_BUSY",
                           "CAPACITY_EXCEEDED",
                           "BACKEND_UNAVAILABLE",
+                          "UNSUPPORTED_MODEL_SELECTION",
+                          "MODEL_UNAVAILABLE",
                           "BACKEND_PROTOCOL_ERROR",
                           "DELIVERY_UNKNOWN",
                           "OPERATION_EXPIRED",
@@ -1579,6 +1789,8 @@
                             "SESSION_BUSY",
                             "CAPACITY_EXCEEDED",
                             "BACKEND_UNAVAILABLE",
+                            "UNSUPPORTED_MODEL_SELECTION",
+                            "MODEL_UNAVAILABLE",
                             "BACKEND_PROTOCOL_ERROR",
                             "DELIVERY_UNKNOWN",
                             "OPERATION_EXPIRED",
@@ -1767,6 +1979,8 @@
                   "SESSION_BUSY",
                   "CAPACITY_EXCEEDED",
                   "BACKEND_UNAVAILABLE",
+                  "UNSUPPORTED_MODEL_SELECTION",
+                  "MODEL_UNAVAILABLE",
                   "BACKEND_PROTOCOL_ERROR",
                   "DELIVERY_UNKNOWN",
                   "OPERATION_EXPIRED",

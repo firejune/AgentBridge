@@ -238,6 +238,8 @@ A confirmed route/session conflict before broker posting returns `BACKEND_UNAVAI
 
 Local agents (Claude Code, Codex, Antigravity) invoke `bridge.py` directly via the Python CLI and do not register a local MCP server. `skill/agent-bridge/scripts/mcp_server.py` is dedicated to remote MCP clients connecting through a private single-owner tunnel (`--phase1-config /absolute/private.json` over `stdio`), exposing session discovery/creation, message dispatch, and the optional independent inbox (`inbox_enabled: true`). Without `--phase1-config`, the server falls back to read-only `connectivity_only` (`bridge_status`). See [remote-mcp.md](skill/agent-bridge/references/remote-mcp.md) for the full contract.
 
+Remote clients with `bridge:read` can use `bridge_models_list` for an allowed workspace and pass a returned model ID to `bridge_session_create` for Codex or Antigravity. Omit `model` to use the existing default behavior. Claude does not offer model selection. [Session model selection](skill/agent-bridge/references/remote-mcp.md#session-model-selection).
+
 Use `bridge_message_reply({message_id, message, idempotency_key})` to answer independent inbox mail when the connection has `bridge:message:send`. The signed inbox ID selects the original sender’s frozen return route. Reply and ACK are separate actions.
 
 Independently keyed MCP requests can queue for the same authorized session while it is busy or awaiting replies. Submission order is preserved per exact UUID and transport. Each operation retains its own result. An ambiguous write quarantines only that destination and can return `SESSION_BUSY`. Unknown operations are never resent and count toward the 64 active/unknown operation limit.

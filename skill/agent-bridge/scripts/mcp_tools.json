@@ -78,6 +78,7 @@
                   "enum": [
                     "bridge_status",
                     "bridge_sessions_list",
+                    "bridge_models_list",
                     "bridge_session_create",
                     "bridge_message_send",
                     "bridge_operation_get",
@@ -88,7 +89,7 @@
                   ]
                 },
                 "minItems": 1,
-                "maxItems": 9,
+                "maxItems": 10,
                 "uniqueItems": true,
                 "contains": {
                   "const": "bridge_status"
