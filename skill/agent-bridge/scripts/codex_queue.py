@@ -29,29 +29,35 @@ class QueueUnavailable(DeliveryError):
         super().__init__(UNAVAILABLE)
 
 
-def checked_output(args):
-    return subprocess.run(args, check=True, capture_output=True, text=True, timeout=2).stdout
+def checked_output(args, timeout=2):
+    return subprocess.run(args, check=True, capture_output=True, text=True, timeout=timeout).stdout
 
 
-def running_desktop_owns_queue(queue):
+def desktop_queue_owner(queue, read=checked_output):
     # Multiple owners could load the same persistent UUID. Refuse competing
     # processes instead of allowing an enqueue to choose the runtime.
-    pids = checked_output(['/usr/sbin/lsof', '-t', '--', str(queue)]).split()
+    pids = read(['/usr/sbin/lsof', '-t', '--', str(queue)]).split()
     if len(set(pids)) != 1 or not pids[0].isascii() or not pids[0].isdecimal():
-        return False
-    process = checked_output(['/bin/ps', '-ww', '-p', pids[0], '-o', 'uid=,ppid=,command='])
+        return None
+    process = read(['/bin/ps', '-ww', '-p', pids[0], '-o', 'uid=,ppid=,command='])
     uid, parent, command = process.strip().split(None, 2)
     args = shlex.split(command)
     if uid != str(os.getuid()) or not parent.isdecimal() or not args:
-        return False
+        return None
     if args[0] != str(CLI) or 'app-server' not in args or any(
             arg == '--listen' or arg.startswith('--listen=') for arg in args):
-        return False
-    parent_line = checked_output(['/bin/ps', '-ww', '-p', parent, '-o', 'uid=,comm='])
+        return None
+    parent_line = read(['/bin/ps', '-ww', '-p', parent, '-o', 'uid=,comm='])
     parent_uid, owner = parent_line.strip().split(None, 1)
-    return (parent_uid == str(os.getuid())
+    if (parent_uid == str(os.getuid())
             and owner.startswith(str(APP / 'Contents/Frameworks/Codex Framework.framework/Versions') + '/')
-            and owner.endswith('/Helpers/Codex (Aperitif).app/Contents/MacOS/Codex (Aperitif)'))
+            and owner.endswith('/Helpers/Codex (Aperitif).app/Contents/MacOS/Codex (Aperitif)')):
+        return pids[0], parent, owner
+    return None
+
+
+def running_desktop_owns_queue(queue):
+    return desktop_queue_owner(queue, checked_output) is not None
 
 
 def check_route(route):
@@ -95,8 +101,13 @@ def deliver(route, thread, message_id, timeout, dry_run):
                    delivery_path=DELIVERY_PATH, input_role='notification')
     if dry_run:
         return dict(sent=False, **receipt)
+    return dict(queued_id=enqueue(thread, NOTICE + mid, timeout), **receipt)
+
+
+def enqueue(thread, message, timeout):
+    """Submit one official queue entry and verify its exact local receipt."""
     args = [str(CLI), 'queue', '--disable', 'daemon_auto_start', '--thread', thread,
-            '--message', NOTICE + mid]
+            '--message', message]
     try:
         process = subprocess.Popen(args, stdin=subprocess.DEVNULL,
                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
@@ -123,4 +134,4 @@ def deliver(route, thread, message_id, timeout, dry_run):
             raise ValueError
     except ValueError:
         raise DeliveryError(UNKNOWN, uncertain=True) from None
-    return dict(queued_id=match[1], **receipt)
+    return match[1]

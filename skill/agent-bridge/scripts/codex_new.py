@@ -1,9 +1,11 @@
 """Create a persistent thread with the public app-server API, then adopt it in Desktop.
 
 The creator is an ordinary, short-lived app-server client. Only exact Desktop
-ownership and model readback admit a session to the bridge; no composer, native
-pipe authorization workaround, synthetic user prompt, or creation replay.
+ownership and model readback or verified local Desktop wake admit a session to
+the bridge. Neither path replays creation.
 """
+from contextlib import ExitStack
+from functools import partial
 import math
 from pathlib import Path
 import shutil
@@ -12,9 +14,16 @@ import time
 import uuid
 
 import codex_live
+import codex_queue
+import codex_wake_open
 import new_session_policy
 
 FULL_ACCESS_PROFILE = ':danger-full-access'
+QUEUE_ADOPTION = 'desktop-queue-wake'
+RESTRICTED_WARNING = {
+    'code': 'CODEX_DESKTOP_WAKE_RESTRICTED',
+    'message': 'Desktop started this thread with read-only sandbox and on-request approval.',
+}
 PERMISSION_SETTLE_SECONDS = 2
 PERMISSION_SETTLE_ATTEMPTS = 20
 # New threads request this model when --model is omitted, so they never
@@ -166,6 +175,7 @@ def open_result():
                         'status': 'unknown', 'reported_status': 'unknown', 'runtime_observed': False,
                         'source': None, 'updated_at': None, 'observed_at': None, 'scope': 'saved-metadata'},
             'owner': None, 'url': None, 'model': None, 'model_source': None,
+            'adoption_mode': None, 'wake_turn_id': None,
             'creator_settings': None, 'permission_settings': None, 'permission_settings_source': None,
             'settings_update': {'applied': None, 'resultType': None},
             'existing_sessions': [], 'warning': None}
@@ -256,7 +266,7 @@ def owner_settings(client, sid, owner):
 
 
 def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_factory=None,
-               owner_factory=None, poll=0.5, policy=None, force_new=False):
+               owner_factory=None, poll=0.5, policy=None, force_new=False, *, allow_queue_wake=False):
     import sessions
     result = open_result()
     sid, adopted, attempted, stage = None, False, False, 'preflight'
@@ -283,13 +293,16 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
         owners = owner_factory or codex_live.Client
         deadline = time.monotonic() + timeout
 
-        def remaining():
+        wake = None
+
+        def remaining(limit=10):
             left = deadline - time.monotonic()
             if left <= 0:
                 raise CreationError('Codex session creation/adoption timed out; use the returned UUID to recover')
-            return min(left, 10)
+            return min(left, limit)
 
-        with factory(mode='saved', timeout=remaining(), experimental=True) as creator:
+        def validate_creator(creator):
+            nonlocal stage
             if title is not None and not force_new:
                 stage = 'duplicate'
                 matches = matching_threads(creator, folder, title, remaining)
@@ -303,10 +316,29 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
             stage = 'preflight'
             require_full_access_profile(creator, folder, remaining)
             require_model(creator, model, remaining, missing)
-            # Initializing the owner transport is read-only. Do this before
-            # thread/start, which may persist a thread we could never adopt.
-            with owners(timeout=min(remaining(), 2)):
-                pass
+
+        with ExitStack() as scope:
+            creator = scope.enter_context(factory(mode='saved', timeout=remaining(), experimental=True))
+            validate_creator(creator)
+            try:
+                # Probe before thread/start, which may persist a thread.
+                with owners(timeout=min(remaining(), 2)):
+                    pass
+            except codex_live.EndpointUnavailable as error:
+                if (not allow_queue_wake or error.endpoint_name != codex_live.EndpointUnavailable.DEFAULT
+                        or error.reason not in (codex_live.EndpointUnavailable.MISSING,
+                                                codex_live.EndpointUnavailable.REFUSED)):
+                    raise
+                # The saved app-server can hold the same queue database open.
+                scope.close()
+                result['adoption_mode'] = QUEUE_ADOPTION
+                wake = codex_wake_open.prepare(remaining())
+                if wake is None:
+                    raise CreationError('Codex Desktop wake preflight returned no verified owner')
+                if client_factory is None:
+                    factory = partial(sessions.CodexClient, executable=str(codex_queue.CLI))
+                creator = scope.enter_context(factory(mode='saved', timeout=remaining(), experimental=True))
+                validate_creator(creator)
             params = {'cwd': str(folder), 'ephemeral': False, 'allowProviderModelFallback': False,
                       'permissions': FULL_ACCESS_PROFILE, 'approvalPolicy': 'never', 'model': model}
             stage, attempted = 'create', True
@@ -329,7 +361,7 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                 stage = 'title'
                 creator.timeout = remaining()
                 creator.call('thread/name/set', {'threadId': sid, 'name': title})
-            elif thread.get('historyMode') == 'paginated':
+            if thread.get('historyMode') == 'paginated' and (title is None or wake is not None):
                 stage = 'persistence'
                 creator.timeout = remaining()
                 # Reading history materializes a loaded paginated thread. Some
@@ -346,18 +378,45 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                                     sid, folder, title)
             result['session'] = sessions.codex_row(stored, 'saved')
         stage = 'adoption'
-        if opener is None:
+        if wake is not None:
+            route = {'session': sid, 'cwd': str(folder), 'transport': 'codex'}
+            confirmed = codex_wake_open.adopt(wake, route, model, remaining(timeout))
+            stage = 'model'
+            if confirmed.get('model') != model:
+                raise CreationError('Codex Desktop wake did not confirm the requested model')
+            stage = 'permissions'
+            raw_permissions = confirmed.get('permission_settings')
+            if not isinstance(raw_permissions, dict) or ('activePermissionProfile' not in raw_permissions
+                    or (raw_permissions['activePermissionProfile'] is not None
+                        and not isinstance(raw_permissions['activePermissionProfile'], dict))):
+                raise CreationError('Codex Desktop wake returned malformed permission settings')
+            permissions = permission_diagnostics(raw_permissions)
+            result.update(permission_settings=permissions,
+                          permission_settings_source='Desktop wake turn context')
+            if not has_full_access(permissions):
+                if (permissions['sandboxPolicy'] != {'type': 'readOnly'}
+                        or permissions['approvalPolicy'] != 'on-request'
+                        or (permissions['activePermissionProfile'] or {}).get('id') != ':read-only'):
+                    raise CreationError('Codex Desktop wake returned unconfirmed permission settings')
+                result['warning'] = dict(RESTRICTED_WARNING)
+            stage = 'adoption'
+            turn_id = confirmed.get('turn_id')
+            if not isinstance(turn_id, str) or str(uuid.UUID(turn_id)) != turn_id:
+                raise CreationError('Codex Desktop wake did not confirm the exact turn ID')
+            adopted = True
+            result.update(adopted=True, wake_turn_id=turn_id)
+        elif opener is None:
             open_link(result['url'], remaining())
         else:
             opener(result['url'])
-        while True:
+        while wake is None:
             remaining()
             try:
                 client = owners(timeout=min(remaining(), 2))
                 with client:
                     owner = client.owner(sid)
                     adopted = True
-                    result.update(adopted=True, owner=owner)
+                    result.update(adopted=True, owner=owner, adoption_mode='desktop-ipc')
                     stage = 'model'
                     settings = owner_settings(client, sid, owner)
                     stage = 'permissions'
@@ -426,7 +485,7 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
             raise
         if isinstance(error, codex_live.EndpointUnavailable):
             message = error.diagnosis()
-        elif isinstance(error, CreationError):
+        elif isinstance(error, (CreationError, codex_wake_open.WakeError)):
             message = str(error)
         else:
             message = 'Codex creation/adoption failed; do not create another thread automatically'

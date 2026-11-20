@@ -18,6 +18,7 @@ import bridge
 import broker
 import codex_live
 import codex_new
+import codex_wake_open
 import sessions
 from support import RunningBroker
 from test_codex_live import FakeDesktop
@@ -735,7 +736,8 @@ class NewCodexTests(unittest.TestCase):
                 self.calls.clear()
                 self.urls.clear()
                 out = io.StringIO()
-                with self.subTest(reason=reason), patch.object(codex_live, 'endpoint', return_value=endpoint), \
+                with self.subTest(reason=reason), \
+                        patch.dict(os.environ, {'AGENT_BRIDGE_CODEX_IPC': str(endpoint)}), \
                         patch.object(codex_new, 'open_codex', side_effect=create), patch('sys.stdout', out), \
                         patch.object(broker, 'request', side_effect=empty_registration_rpc) as rpc:
                     self.assertEqual(bridge.main(command), 1)
@@ -749,6 +751,128 @@ class NewCodexTests(unittest.TestCase):
                     self.assertIn(reason, result['error'])
                     self.assertNotIn(str(endpoint), result['error'])
                     self.assertEqual([call.args[1]['op'] for call in rpc.call_args_list], ['routes'])
+
+    def test_open_registers_queue_wake_with_verified_restricted_settings(self):
+        self.thread['historyMode'] = 'paginated'
+        real_open = codex_new.open_codex
+        turn_id = str(uuid.uuid4())
+        prepared = object()
+        permissions = {'activePermissionProfile': {'id': ':read-only'},
+                       'approvalPolicy': 'on-request', 'sandboxPolicy': {'type': 'readOnly'}}
+        command = ['open', '--provider', 'codex', '--cwd', self.root, '--register', 'worker',
+                   '--project', 'demo', '--state-dir', self.root, '--model', 'requested-model']
+
+        def create(**kwargs):
+            return real_open(**kwargs, opener=self.urls.append)
+
+        def prepare_context(timeout):
+            self.assertGreater(timeout, 0)
+            self.assertTrue(all(client.closed for client in self.instances))
+            return prepared
+
+        def adopt(context, route, model, timeout):
+            self.assertIs(context, prepared)
+            self.assertEqual(route, {'session': self.sid, 'cwd': self.root, 'transport': 'codex'})
+            self.assertEqual(model, 'requested-model')
+            self.assertTrue(all(client.closed for client in self.instances))
+            self.assertGreater(timeout, 0)
+            return {'model': model, 'permission_settings': permissions, 'turn_id': turn_id}
+
+        endpoint = codex_live.EndpointUnavailable
+        for reason in (endpoint.MISSING, endpoint.REFUSED):
+            self.calls.clear()
+            with self.subTest(reason=reason), patch.object(codex_new, 'open_codex', side_effect=create), \
+                    patch.object(codex_live, 'Client', side_effect=endpoint(endpoint.DEFAULT, reason)) as ipc, \
+                    patch.object(codex_wake_open, 'prepare', side_effect=prepare_context) as prepare, \
+                    patch.object(codex_wake_open, 'adopt', side_effect=adopt) as wake, \
+                    patch.object(sessions, 'CodexClient', side_effect=self.factory) as creator, \
+                    patch.object(broker, 'request', side_effect=empty_registration_rpc) as rpc, \
+                    patch('sys.stdout', new_callable=io.StringIO) as out:
+                self.assertEqual(bridge.main(command), 0)
+                result = json.loads(out.getvalue())
+            ipc.assert_called_once()
+            prepare.assert_called_once()
+            wake.assert_called_once()
+            self.assertEqual([call.kwargs.get('executable') for call in creator.call_args_list],
+                             [None] + [str(codex_wake_open.codex_queue.CLI)] * 3)
+            self.assertEqual(self.urls, [])
+            self.assertEqual([call.args[1]['op'] for call in rpc.call_args_list], ['routes', 'register'])
+            self.assertEqual(rpc.call_args.args[1]['session'], self.sid)
+            self.assertTrue(all(result[key] for key in ('created', 'adopted', 'registered')))
+            self.assertFalse(result['uncertain'])
+            self.assertEqual(result['session']['name'], 'demo/worker')
+            self.assertEqual(result['adoption_mode'], 'desktop-queue-wake')
+            self.assertEqual(result['wake_turn_id'], turn_id)
+            self.assertEqual(result['permission_settings'], permissions)
+            self.assertEqual(result['permission_settings_source'], 'Desktop wake turn context')
+            self.assertEqual(result['warning']['code'], 'CODEX_DESKTOP_WAKE_RESTRICTED')
+            self.assertEqual(result['model'], 'requested-model')
+            self.assertEqual(result['creator_settings']['sandbox']['type'], 'dangerFullAccess')
+            self.assertEqual([method for method, _, _ in self.calls].count('thread/start'), 1)
+            self.assertEqual([(method, params.get('includeTurns')) for method, params, client in self.calls
+                              if client.creator and method in ('thread/name/set', 'thread/read')],
+                             [('thread/name/set', None), ('thread/read', True)])
+
+    def test_queue_wake_preflight_refuses_without_creating_or_retrying(self):
+        endpoint = codex_live.EndpointUnavailable
+        cases = [(True, endpoint.DEFAULT, endpoint.MISSING, 1),
+                 (True, endpoint.DEFAULT, endpoint.UNSAFE, 0),
+                 (True, endpoint.DEFAULT, endpoint.TIMEOUT, 0),
+                 (True, endpoint.DEFAULT, endpoint.INITIALIZE, 0),
+                 (True, endpoint.CONFIGURED, endpoint.MISSING, 0),
+                 (False, endpoint.DEFAULT, endpoint.MISSING, 0)]
+        for allow, name, reason, prepare_calls in cases:
+            self.calls.clear()
+            with self.subTest(allow=allow, name=name, reason=reason), \
+                    patch.object(codex_live, 'Client', side_effect=endpoint(name, reason)) as ipc, \
+                    patch.object(codex_wake_open, 'prepare',
+                                 side_effect=codex_wake_open.WakeError('unsupported topology')) as prepare, \
+                    patch.object(codex_wake_open, 'adopt') as wake, \
+                    self.assertRaises(codex_new.CreationError) as rejected:
+                codex_new.open_codex(self.root, client_factory=self.factory, opener=self.urls.append,
+                                     allow_queue_wake=allow)
+            error = rejected.exception
+            self.assertEqual(error.stage, 'preflight')
+            self.assertFalse(error.created or error.uncertain or error.adopted)
+            self.assertNotIn('thread/start', [method for method, _, _ in self.calls])
+            self.assertEqual(self.urls, [])
+            self.assertEqual(prepare.call_count, prepare_calls)
+            ipc.assert_called_once()
+            wake.assert_not_called()
+
+    def test_queue_wake_without_exact_model_and_permissions_keeps_uuid_unregistered(self):
+        real_open = codex_new.open_codex
+        permissions = {'activePermissionProfile': {'id': ':read-only'},
+                       'approvalPolicy': 'on-request', 'sandboxPolicy': {'type': 'readOnly'}}
+        command = ['register', 'worker', '--project', 'demo', '--transport', 'codex',
+                   '--cwd', self.root, '--new', '--state-dir', self.root, '--model', 'requested-model']
+
+        def create(**kwargs):
+            return real_open(**kwargs, client_factory=self.factory, opener=self.urls.append)
+
+        confirmations = [('model', 'substituted', permissions),
+                         ('permissions', 'requested-model', dict(permissions, activePermissionProfile=None))]
+        endpoint = codex_live.EndpointUnavailable
+        for stage, model, observed in confirmations:
+            self.calls.clear()
+            with self.subTest(stage=stage), \
+                    patch.object(codex_new, 'open_codex', side_effect=create), \
+                    patch.object(codex_live, 'Client', side_effect=endpoint(endpoint.DEFAULT, endpoint.MISSING)), \
+                    patch.object(codex_wake_open, 'prepare'), \
+                    patch.object(codex_wake_open, 'adopt', return_value={
+                        'model': model, 'permission_settings': observed, 'turn_id': str(uuid.uuid4())}) as wake, \
+                    patch.object(broker, 'request', side_effect=empty_registration_rpc) as rpc, \
+                    patch('sys.stdout', new_callable=io.StringIO) as out:
+                self.assertEqual(bridge.main(command), 1)
+                result = json.loads(out.getvalue())
+            self.assertEqual(result['stage'], stage)
+            self.assertEqual(result['session']['id'], self.sid)
+            self.assertTrue(result['created'] and result['uncertain'])
+            self.assertFalse(result['adopted'] or result['registered'])
+            self.assertEqual([call.args[1]['op'] for call in rpc.call_args_list], ['routes'])
+            self.assertEqual([method for method, _, _ in self.calls].count('thread/start'), 1)
+            self.assertEqual(self.urls, [])
+            wake.assert_called_once()
 
     def test_no_owner_never_registers_or_creates_replacement(self):
         with ModelDesktop(behavior='no-owner') as desktop, self.assertRaises(codex_new.CreationError) as caught:

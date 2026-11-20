@@ -58,7 +58,7 @@ flowchart LR
 | **Antigravity IDE & Desktop** | `agy` | 로컬 `language_server` / `agy --hub`의 ConnectRPC에 연결해 활성 턴에는 `<SYSTEM_MESSAGE>`(`SendAgentMessage`)로 합류하고, 유휴/대기 상태에는 빈 `SendUserCascadeMessage`(`NEXT_INVOCATION`)로 즉시 깨운다. |
 | **CLI 워커** | `realtime` / `claude` | `realtime`은 `watch`로 JSONL 이벤트를 구독한다. `claude`는 **쉬고 있는 전용 CLI 세션**만 `deliver` 시 읽기 전용 `plan` 모드로 `--resume`한다(라이브 세션에는 절대 사용하지 않는다). |
 
-기본 IPC 소켓이 없거나 연결을 거부하고, 서명된 앱 번들 Codex CLI와 확인된 단일 로컬 Desktop 소유자가 기본 큐 저장소를 공유하며, 기본 로컬 브로커 소켓을 사용할 때 이 경로를 사용한다. Codex 큐 경로는 `codex queue`로 브로커 메시지 UUID만 담은 고정 알림을 보낸다. 지정된 대화가 `bridge.py receive-codex MESSAGE_ID`를 실행하면 동료 본문이 도구 결과로 들어온다. 발신 CLI와 Desktop 소유자가 같은 큐 저장소를 사용해야 하며, 정확한 대화가 로드되어 유휴 턴을 시작할 수 있어야 한다. 큐 접수만으로 대화가 깨어났거나 본문을 읽었다고 판정하지 않는다. 브리지는 대화를 자동 재개하거나 결과가 모호한 큐 쓰기를 재시도하지 않는다. Codex 대화를 새로 열 때는 별도의 IPC 검사를 거친다.
+기본 IPC 소켓이 없거나 연결을 거부하고, 서명된 앱 번들 Codex CLI와 확인된 단일 로컬 Desktop 소유자가 기본 큐 저장소를 공유하며, 기본 로컬 브로커 소켓을 사용할 때 이 경로를 사용한다. Codex 큐 경로는 `codex queue`로 브로커 메시지 UUID만 담은 고정 알림을 보낸다. 지정된 대화가 `bridge.py receive-codex MESSAGE_ID`를 실행하면 동료 본문이 도구 결과로 들어온다. 발신 CLI와 Desktop 소유자가 같은 큐 저장소를 사용해야 하며, 정확한 대화가 로드되어 유휴 턴을 시작할 수 있어야 한다. 큐 접수만으로 대화가 깨어났거나 본문을 읽었다고 판정하지 않는다. 브리지는 대화를 자동 재개하거나 결과가 모호한 큐 쓰기를 재시도하지 않는다.
 
 Claude peer 전송은 소켓 쓰기와 연결 종료 대기에 시간 제한을 둔다. `deliver ID --timeout SECONDS`는 Claude peer 전송의 조회, claim, peer I/O에 적용된다. 쓰기가 시작됐을 수 있다면 결과 기록에 최대 10초를 더 쓸 수 있다. peer에 쓰기 전 보호된 claim 응답을 잃으면, claim 접수 한도가 지난 뒤 자기 예약을 푸는 데 최대 2초를 더 쓴다. 결과가 미확정인 전송은 수신자에게 중복 전송되지 않도록 계속 보호한다. `show`와 CLI `inbox`는 대기 중인 메시지에 `pending behind <id> since <time>`을 표시한다.
 
@@ -123,7 +123,7 @@ Python CLI의 `sessions`는 기본적으로 세션별 모델 조회를 건너뛴
 | --- | --- | --- | --- |
 | **Antigravity (`agy`)** | `language_server` / `agy --hub`(`StartCascade`)로 무인 생성 및 프로젝트·워크트리 환경 자동 연결 | 데스크톱과 동일 (`StartCascade` + 통합 허브 프로젝트·환경 자동 연결) | 기본은 대화 스택 유지(`--archive` 시 `{archived: true}` 보관) 후 라우트 제거 |
 | **Claude (`claude-peer`)** | `claude://code/new`로 첫 메시지를 채운 입력창을 열고 사용자의 Enter 대기 | IDE CLI + `<scheme>://anthropic.claude-code/open`으로 무인 생성 | CLI 프로세스에 `SIGTERM` 전송 후 기본은 대화 스택 유지(`--archive` 시 데스크톱 `isArchived: true` 보관) 및 라우트 제거 |
-| **Codex (`codex`)** | `app-server --stdio` 생성 후 `codex://threads/UUID`로 데스크톱 자동 인계 (`:danger-full-access`, `approvalPolicy: never`) | 미지원 | 기본은 사이드바 대화 유지(`--archive` 시 `state_5.sqlite` `archived=1` 및 IPC 알림) 후 라우트 제거 |
+| **Codex (`codex`)** | `app-server --stdio`로 저장 스레드 생성 후 IPC 또는 검증된 큐 시작 턴으로 Desktop 인계 | 미지원 | 기본은 사이드바 대화 유지(`--archive` 시 `state_5.sqlite` `archived=1` 및 IPC 알림) 후 라우트 제거 |
 
 ```bash
 # 단독 생성 또는 생성과 동시에 브로커 등록:
@@ -146,7 +146,7 @@ Claude 데스크톱은 세션을 스스로 닫는다. 화면에 안 보이는 �
 
 IPC 경로에서 정확한 Codex Desktop 소유자 조회가 시간 초과되거나 불가능하거나 외부 입력을 지원하는 소유자가 없으면 전달은 `pending`에 머문다. CLI와 MCP는 조회 결과와 확인된 작업 경로 누락을 보고하며, 대화를 자동으로 다시 열거나 메시지를 재전송하지 않는다.
 
-Codex `open`과 `register --new`는 스레드를 만들기 전에 Desktop IPC 초기화 응답을 확인한다. 소유권을 확인할 IPC에 연결할 수 없으면 원인을 보고하고 스레드를 생성하거나 열지 않는다.
+Codex `open`과 `register --new`는 저장 스레드를 하나 만들고 정확한 ID를 확인한 뒤 Desktop에 인계한다. IPC에 연결되면 정확한 소유자에게 설정을 재조회해 Full Access와 승인 정책 `never`를 확인한다. 로컬 CLI의 `bridge.py open`과 `bridge.py register --new`에서 기본 IPC 소켓이 없거나 연결을 거부하면 서명된 로컬 Desktop `26.1117.31558` (빌드 `29513`)과 기본 큐 저장소를 사용한다. IPC 엔드포인트를 명시했거나 원격 MCP에서 생성하는 경우에는 스레드를 만들기 전에 IPC 초기화 응답을 확인해야 한다. 열기 요청으로 승인된 무해한 시작 프롬프트 하나를 큐에 넣고 정확한 UUID를 깨운다. 지정한 모델로 실행된 해당 Desktop 턴의 완료를 확인해야 성공한다. 성공하면 `adoption_mode: "desktop-queue-wake"`와 `wake_turn_id`에 인계 방식과 턴 ID가 표시된다. `permission_settings`는 해당 자동 턴의 실효 권한이다. `readOnly`와 승인 정책 `on-request`로 실행된 경우 경고 코드 `CODEX_DESKTOP_WAKE_RESTRICTED`가 표시된다. 이후 Desktop 입력창에서 Full Access를 쓸 수 있으며 이후 턴의 실제 권한은 별도로 확인한다. 결과가 모호해도 생성, 큐 제출, 깨우기를 자동으로 반복하지 않는다.
 
 기존에 등록한 Codex 라우트에는 평소대로 메시지를 보낸다. 기본 IPC 소켓이 없거나 연결을 거부할 때 큐 전송 조건이 충족되면 브리지는 공식 `codex queue`로 해당 스레드에 알림을 넣는다. Desktop에 지정된 스레드가 로드되어 있고 유휴 턴을 시작할 수 있어야 알림을 처리한다.
 
