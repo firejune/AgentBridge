@@ -272,6 +272,8 @@ python3 "$bridge_cli" channel-bind modal-view --project my-app --owner codex-age
 
 ## 라이브 세션 Push 및 전달 메커니즘
 
+[Codex Desktop 큐 수신 및 작업 실행 문제 해결](codex-desktop-troubleshooting.md)
+
 `codex`, `claude-peer`, `agy`는 `send`·`ask`·`reply` 시 자동으로 대상 라이브 세션에 push하며, `pending` 실패 후에는 `deliver`로 명시적 재시도가 가능하다. 쉬고 있는 전용 `claude` CLI 세션은 `deliver`로 실행한다.
 
 - **Claude (`claude-peer`)**:
