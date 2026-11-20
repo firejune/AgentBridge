@@ -3,6 +3,7 @@
 Desktop IPC is an internal, versioned protocol. Never create a router/server,
 resume a thread, send human input, or retry an ambiguous mutation here.
 """
+import errno
 import json
 import os
 from pathlib import Path
@@ -36,6 +37,26 @@ class ResponseTimeout(DeliveryError):
     """The bounded IPC response deadline expired."""
 
 
+class EndpointUnavailable(DeliveryError):
+    DEFAULT = '~/.codex/ipc/ipc.sock'
+    CONFIGURED = 'configured IPC endpoint'
+    MISSING = 'is missing'
+    REFUSED = 'has no listening server'
+    UNSAFE = 'is inaccessible or is not an owned private socket'
+    TIMEOUT = 'timed out during connection'
+    UNAVAILABLE = 'could not be connected'
+    INITIALIZE = 'failed the initialization handshake'
+
+    def __init__(self, endpoint_name, reason):
+        super().__init__(f'Codex Desktop IPC ({endpoint_name}) {reason}. Message was not delivered.')
+
+    @classmethod
+    def details(cls):
+        return tuple(str(cls(endpoint_name, reason)) for endpoint_name in (cls.DEFAULT, cls.CONFIGURED)
+                     for reason in (cls.MISSING, cls.REFUSED, cls.UNSAFE, cls.TIMEOUT,
+                                    cls.UNAVAILABLE, cls.INITIALIZE))
+
+
 class OwnerUnavailable(DeliveryError):
     TIMEOUT = 'Codex Desktop owner discovery timed out for the exact thread. Message was not delivered.'
     UNAVAILABLE = 'Codex Desktop owner discovery was unavailable for the exact thread. Message was not delivered.'
@@ -54,37 +75,64 @@ def endpoint():
     return Path(override).expanduser() if override else base / 'ipc' / 'ipc.sock'
 
 
-def validate_endpoint(path):
+def validate_endpoint(path, endpoint_name=EndpointUnavailable.CONFIGURED):
     """Only connect to an existing socket in the current user's private directory."""
     info, parent = path.lstat(), path.parent.lstat()
     uid = os.getuid()
     if (not stat.S_ISSOCK(info.st_mode) or info.st_uid != uid
             or not stat.S_ISDIR(parent.st_mode) or parent.st_uid != uid
             or parent.st_mode & 0o022):
-        raise DeliveryError('Codex desktop IPC is not an owned private socket')
+        raise EndpointUnavailable(endpoint_name, EndpointUnavailable.UNSAFE)
 
 
 class Client:
     def __init__(self, path=None, timeout=10):
-        self.path = Path(path) if path is not None else endpoint()
+        self.endpoint_name = (EndpointUnavailable.CONFIGURED
+                              if path is not None or os.getenv('AGENT_BRIDGE_CODEX_IPC') or os.getenv('CODEX_HOME')
+                              else EndpointUnavailable.DEFAULT)
+        try:
+            self.path = Path(path) if path is not None else endpoint()
+        except (RuntimeError, ValueError, TypeError):
+            raise EndpointUnavailable(self.endpoint_name, EndpointUnavailable.UNAVAILABLE) from None
         self.timeout = timeout
         self.sock = None
         self.client_id = 'initializing-client'
         self.mutation_sent = False
 
-    def __enter__(self):
+    def connect(self):
         try:
-            validate_endpoint(self.path)
+            validate_endpoint(self.path, self.endpoint_name)
             self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self.sock.settimeout(self.timeout)
             self.sock.connect(str(self.path))
-            response = self.call('initialize', {'clientType': 'agent-bridge'}, 0)
+        except TimeoutError:
+            raise EndpointUnavailable(self.endpoint_name, EndpointUnavailable.TIMEOUT) from None
+        except OSError as error:
+            reason = {
+                errno.ENOENT: EndpointUnavailable.MISSING,
+                errno.ECONNREFUSED: EndpointUnavailable.REFUSED,
+                errno.EACCES: EndpointUnavailable.UNSAFE,
+                errno.EPERM: EndpointUnavailable.UNSAFE,
+                errno.ENOTDIR: EndpointUnavailable.UNSAFE,
+                errno.ETIMEDOUT: EndpointUnavailable.TIMEOUT,
+            }.get(error.errno, EndpointUnavailable.UNAVAILABLE)
+            raise EndpointUnavailable(self.endpoint_name, reason) from None
+        except EndpointUnavailable:
+            raise
+        except ValueError:
+            raise EndpointUnavailable(self.endpoint_name, EndpointUnavailable.UNAVAILABLE) from None
+
+    def __enter__(self):
+        try:
+            self.connect()
+            try:
+                response = self.call('initialize', {'clientType': 'agent-bridge'}, 0)
+            except (OSError, DeliveryError):
+                raise EndpointUnavailable(self.endpoint_name, EndpointUnavailable.INITIALIZE) from None
             result = response.get('result')
-            if response.get('resultType') != 'success' or not isinstance(result, dict):
-                raise DeliveryError('Codex desktop IPC initialization rejected')
-            client_id = result.get('clientId')
-            if not isinstance(client_id, str) or not client_id:
-                raise DeliveryError('Codex desktop IPC returned no client ID')
+            client_id = result.get('clientId') if isinstance(result, dict) else None
+            if response.get('resultType') != 'success' or not isinstance(client_id, str) or not client_id:
+                raise EndpointUnavailable(self.endpoint_name, EndpointUnavailable.INITIALIZE)
             self.client_id = client_id
             return self
         except BaseException:
@@ -277,9 +325,12 @@ def deliver(route, message_id, text, timeout=10, dry_run=False, path=None):
     workspace, archived = exact_saved_workspace(route)
     if archived is True:
         raise ThreadArchived()
-    client = Client(path, timeout)
     try:
         thread, steer, start = payloads(route, message_id, text)
+    except (ValueError, TypeError, KeyError, AttributeError):
+        raise DeliveryError('Codex desktop delivery payload is invalid') from None
+    client = Client(path, timeout)
+    try:
         with client:
             try:
                 owner = client.owner(thread)
@@ -322,5 +373,5 @@ def deliver(route, message_id, text, timeout=10, dry_run=False, path=None):
         raise
     except (OSError, ValueError, TypeError, KeyError):
         # Never include arbitrary owner errors or peer content in logs.
-        raise DeliveryError('Codex desktop delivery transport or payload failed',
+        raise DeliveryError('Codex desktop delivery transport or response failed',
                             client.mutation_sent) from None

@@ -406,7 +406,8 @@ def codex_prewrite_detail(message):
     if message.get('state') == 'failed':
         if message.get('reason') == ARCHIVED_REASON:
             return codex_live.ThreadArchived.MESSAGE
-    if message.get('state') == 'pending' and message.get('note') in codex_live.OwnerUnavailable.details():
+    if message.get('state') == 'pending' and message.get('note') in (
+            codex_live.OwnerUnavailable.details() + codex_live.EndpointUnavailable.details()):
         return message['note']
     return None
 

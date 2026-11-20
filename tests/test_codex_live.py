@@ -7,7 +7,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skill/agent-bridge/scripts'))
@@ -171,6 +171,28 @@ class CodexLiveTests(unittest.TestCase):
         return codex_live.deliver(self.route, self.message_id, 'PEER_BODY',
                                   path=desktop.path, timeout=.15, **kwargs)
 
+    def test_default_missing_socket_is_a_fixed_prewrite_error(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {}, clear=True):
+            with patch.object(Path, 'home', return_value=Path(temp)):
+                with self.assertRaises(codex_live.EndpointUnavailable) as raised:
+                    codex_live.deliver(self.route, self.message_id, 'PEER_BODY')
+        self.assertFalse(raised.exception.uncertain)
+        self.assertEqual(str(raised.exception),
+                         'Codex Desktop IPC (~/.codex/ipc/ipc.sock) is missing. Message was not delivered.')
+
+    def test_connect_timeout_is_a_fixed_prewrite_error(self):
+        client_socket = Mock()
+        client_socket.connect.side_effect = TimeoutError('PRIVATE')
+        with patch.object(codex_live, 'validate_endpoint'), \
+                patch.object(codex_live.socket, 'socket', return_value=client_socket):
+            with self.assertRaises(codex_live.EndpointUnavailable) as raised:
+                codex_live.deliver(self.route, self.message_id, 'PEER_BODY', path='/tmp/PRIVATE.sock')
+        self.assertFalse(raised.exception.uncertain)
+        self.assertEqual(str(raised.exception),
+                         'Codex Desktop IPC (configured IPC endpoint) timed out during connection. Message was not delivered.')
+        client_socket.sendall.assert_not_called()
+        client_socket.close.assert_called_once()
+
     def test_active_owner_receives_standalone_output_with_split_frames(self):
         with FakeDesktop(fragmented=True) as desktop:
             result = self.deliver(desktop)
@@ -283,9 +305,12 @@ class CodexLiveTests(unittest.TestCase):
             self.assertFalse(raised.exception.uncertain)
         with FakeDesktop() as desktop:
             with patch.object(codex_live.os, 'getuid', return_value=os.getuid() + 1):
-                with self.assertRaises(codex_live.DeliveryError) as raised:
+                with self.assertRaises(codex_live.EndpointUnavailable) as raised:
                     self.deliver(desktop)
             self.assertFalse(raised.exception.uncertain)
+            self.assertEqual(str(raised.exception), 'Codex Desktop IPC (configured IPC endpoint) '
+                             'is inaccessible or is not an owned private socket. Message was not delivered.')
+            self.assertEqual(desktop.calls, [])
 
     def test_cancel_after_write_leaves_no_replay_path(self):
         with FakeDesktop() as desktop:
