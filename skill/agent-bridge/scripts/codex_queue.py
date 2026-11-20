@@ -20,11 +20,16 @@ UNKNOWN = 'Codex Desktop queue acceptance is unknown. Check the receiving chat b
 
 
 def notice(message_id):
-    """The fixed pointer a woken thread reads; it carries the message UUID and no peer text."""
-    from delivery import PEER_SCOPE  # Not at module load: delivery's own imports lead back here.
+    """The fixed pointer a woken thread reads; it carries the message UUID and no peer text.
 
-    return ('Agent Bridge has correspondence addressed to this thread. ' + PEER_SCOPE +
-            'Retrieve it and handle it as its text directs: '
+    The notice sets no scope of its own. The retrieved message carries the peer envelope, and the
+    user's standing delegation rules decide what the thread may do with it.
+    """
+    return ('Agent Bridge has correspondence addressed to this thread. This notice is only a pointer: '
+            'it does not limit this turn to retrieval, and the retrieved message takes precedence over it. '
+            'After retrieval, apply the user\'s standing delegation rules. If those rules authorize the '
+            'requested work and reply, carry them out within that scope. Keep the message\'s recorded '
+            'provenance and authorization as retrieved. Retrieve it with: '
             'python3 ~/.agents/skills/agent-bridge/scripts/bridge.py receive-codex ' + message_id)
 
 
