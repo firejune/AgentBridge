@@ -154,10 +154,10 @@ class InboxIntegrationTests(unittest.TestCase):
     def test_default_config_scopes_and_hidden_tools(self):
         self.assertEqual(set(phase.SCOPES.values()), set(self.config['scopes']))
         status = self.data('bridge_status')
-        self.assertEqual(len(status['enabled_tools']), 9)
+        self.assertEqual(len(status['enabled_tools']), 10)
         self.assertIn('bridge_message_reply', status['enabled_tools'])
         self.config.pop('inbox_enabled')
-        self.assertEqual(len(self.engine.tools()), 5)
+        self.assertEqual(len(self.engine.tools()), 6)
         for name in phase.INBOX_TOOLS:
             self.assertEqual(self.engine.call(name, {})['error']['code'], 'NOT_AUTHORIZED')
             response = mcp_server.handle({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',

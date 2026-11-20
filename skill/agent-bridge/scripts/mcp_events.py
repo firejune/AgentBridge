@@ -156,7 +156,7 @@ class ArrivalAudit:
         'server/discover', 'resources/list', 'prompts/list', 'ping', 'tools/list',
         'tools/call', *EVENT_METHODS, 'other')
     PROTOCOLS = ('2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25', '2026-07-28')
-    TOOLS = ('bridge_status', 'bridge_sessions_list', 'bridge_session_create',
+    TOOLS = ('bridge_status', 'bridge_sessions_list', 'bridge_models_list', 'bridge_session_create',
         'bridge_message_send', 'bridge_operation_get', 'bridge_inbox_list',
         'bridge_message_get', 'bridge_message_ack', 'bridge_message_reply', 'other')
 

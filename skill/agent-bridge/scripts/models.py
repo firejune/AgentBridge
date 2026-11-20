@@ -7,6 +7,8 @@ reports a provider gap by name. It never fakes a switch it cannot make.
 """
 import json
 import os
+import re
+import time
 from pathlib import Path
 import uuid
 
@@ -61,6 +63,141 @@ def new_session_policy(args, provider, state_dir):
     else:
         found = agy_live.resolve_model(server, None)
         require_allowed(policy, provider, found['model_id'], found['model_enum'], found.get('label'))
+
+
+# MCP session creation catalog. CLI resolution keeps its existing behavior.
+SESSION_MODEL_LIMIT = 200
+SESSION_MODEL_ID_LIMIT = 128
+SESSION_MODEL_LABEL_LIMIT = 256
+SESSION_MODEL_TIMEOUT = 5
+_CATALOG_LIMIT = 10000
+_MODEL_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_./:-]*')
+_CATALOG_UNAVAILABLE = 'Session model catalog unavailable'
+_MODEL_UNAVAILABLE = 'Requested model is unavailable for this agent type'
+
+
+class ModelSelectionError(ValueError):
+    """Public MCP model-selection refusal with a fixed message."""
+
+
+def _model_option(model_id, label):
+    if (not isinstance(model_id, str) or len(model_id) > SESSION_MODEL_ID_LIMIT
+            or not _MODEL_ID.fullmatch(model_id)):
+        return None
+    if (not isinstance(label, str) or not label.strip() or len(label) > SESSION_MODEL_LABEL_LIMIT
+            or not label.isprintable()):
+        label = model_id
+    return {'id': model_id, 'label': label}
+
+
+def _codex_options(policy, remaining):
+    options = {}
+    blocked = set()
+    with sessions.CodexClient(mode='saved', timeout=remaining(), experimental=True) as client:
+        for count, row in enumerate(codex_new.model_catalog(client, remaining), 1):
+            if count > _CATALOG_LIMIT:
+                raise ModelSelectionError(_CATALOG_UNAVAILABLE)
+            label = row.get('displayName')
+            option = _model_option(row.get('model'), label)
+            if option:
+                model_id = option['id']
+                if denied(policy, 'codex', model_id, row.get('id'), label):
+                    blocked.add(model_id)
+                options.setdefault(model_id, option)
+    return {model_id: option for model_id, option in options.items() if model_id not in blocked}
+
+
+def _agy_options(policy, catalog):
+    if len(catalog) > _CATALOG_LIMIT:
+        raise ModelSelectionError(_CATALOG_UNAVAILABLE)
+    matches = {}
+    rows = []
+    for row in catalog:
+        model_or_alias = row.get('modelOrAlias', {})
+        if not isinstance(model_or_alias, dict):
+            raise ModelSelectionError(_CATALOG_UNAVAILABLE)
+        model_enum = model_or_alias.get('model')
+        if not isinstance(model_enum, str) or not model_enum:
+            continue
+        model_id, label = row.get('modelId'), row.get('label')
+        # The local resolver matches these names case-insensitively in catalog order.
+        # Exclude advertised IDs that could resolve to a different catalog row.
+        names = (model_id, model_enum, label)
+        identity = (model_id if isinstance(model_id, str) else None, model_enum)
+        for name in names:
+            if isinstance(name, str):
+                matches.setdefault(name.casefold(), set()).add(identity)
+        rows.append((identity, _model_option(model_id, label),
+                     denied(policy, 'agy', *names, model_or_alias.get('alias'))))
+    denied_ids = {identity for identity, _, blocked in rows if blocked}
+    options = {}
+    for identity, option, _ in rows:
+        # A catalog change during open must not send the CLI's raw enum fallback.
+        if (option and not option['id'].startswith('MODEL_') and identity not in denied_ids
+                and matches[option['id'].casefold()] == {identity}):
+            options.setdefault(option['id'], option)
+    return options
+
+
+def _session_model_options(workspace, agent_type, state_dir, include_default):
+    result = {'supports_model_selection': agent_type != 'claude', 'default_model': None, 'models': []}
+    if agent_type == 'claude':
+        return result
+    if agent_type not in ('codex', 'agy'):
+        raise ModelSelectionError(_MODEL_UNAVAILABLE)
+
+    deadline = time.monotonic() + SESSION_MODEL_TIMEOUT
+
+    def remaining():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise ModelSelectionError(_CATALOG_UNAVAILABLE)
+        return left
+
+    try:
+        policy = load_policy(state_dir)
+        if agent_type == 'codex':
+            options = _codex_options(policy, remaining)
+        else:
+            server = agy_live.discover_host_server(workspace.get('host', 'desktop'),
+                                                   cwd=workspace['cwd'], timeout=remaining())
+            options = _agy_options(policy, agy_live.model_catalog(server, timeout=remaining()))
+    except (ValueError, OSError, KeyError, TypeError):
+        raise ModelSelectionError(_CATALOG_UNAVAILABLE) from None
+    result['models'] = list(options.values())
+    if include_default:
+        result['models'] = result['models'][:SESSION_MODEL_LIMIT]
+    if include_default and options:
+        try:
+            chosen, _ = default_model(agent_type, None, policy)
+            if agent_type == 'agy':
+                found = agy_live.resolve_model(server, chosen, timeout=remaining())
+                if denied(policy, 'agy', chosen, found['model_id'], found['model_enum'], found.get('label')):
+                    chosen = None
+                else:
+                    chosen = found['model_id']
+            if chosen in options:
+                result['default_model'] = chosen
+                if all(row['id'] != chosen for row in result['models']):
+                    result['models'][-1] = options[chosen]
+        except (ValueError, OSError, KeyError, TypeError, AttributeError):
+            pass  # Explicit choices remain available if the default cannot be resolved.
+    return result
+
+
+def session_model_options(workspace, agent_type, state_dir):
+    """Return the read-only public model catalog and effective allowed default."""
+    return _session_model_options(workspace, agent_type, state_dir, include_default=True)
+
+
+def explicit_session_model(workspace, agent_type, state_dir, requested):
+    """Validate an exact advertised canonical ID before a remote session starts."""
+    if agent_type == 'claude' or _model_option(requested, None) is None:
+        raise ModelSelectionError(_MODEL_UNAVAILABLE)
+    result = _session_model_options(workspace, agent_type, state_dir, include_default=False)
+    if any(row['id'] == requested for row in result['models']):
+        return requested
+    raise ModelSelectionError(_MODEL_UNAVAILABLE)
 
 
 # --- Adapters ----------------------------------------------------------------

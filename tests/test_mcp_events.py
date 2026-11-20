@@ -475,7 +475,7 @@ class EventTests(unittest.TestCase):
             self.assertEqual(self.rpc('initialize')['result']['capabilities'], {'tools': {'listChanged': False}})
         finally:
             self.engine.events = self.service
-        self.assertEqual(len(self.engine.tools()), 9)
+        self.assertEqual(len(self.engine.tools()), 10)
 
     def test_catalog_and_subscribe_signature(self):
         self.assertEqual(self.rpc('events/list')['result']['events'], [events.CATALOG])
@@ -944,6 +944,7 @@ class EventTests(unittest.TestCase):
         sensitive = 'private-url-whsec-keyref-message-id-cursor-DO-NOT-LOG'
         self.rpc('initialize', {'private': sensitive})
         self.rpc('tools/call', {'name': 'bridge_status', 'arguments': {'private': sensitive}})
+        self.rpc('tools/call', {'name': 'bridge_models_list', 'arguments': {'workspace_alias': sensitive}})
         self.rpc('tools/call', {'name': 'bridge_message_reply',
             'arguments': {'message_id': sensitive, 'message': sensitive, 'idempotency_key': sensitive}})
         self.rpc('tools/call', {'name': sensitive, 'arguments': {'private': sensitive}})
@@ -952,9 +953,9 @@ class EventTests(unittest.TestCase):
         records = self.audit_records()
         arrivals = [record for record in records if record['type'] == 'mcp_request']
         self.assertEqual([record['method'] for record in arrivals],
-            ['initialize', 'tools/call', 'tools/call', 'tools/call', 'other', 'events/subscribe'])
+            ['initialize', 'tools/call', 'tools/call', 'tools/call', 'tools/call', 'other', 'events/subscribe'])
         self.assertEqual([record.get('tool') for record in arrivals],
-            [None, 'bridge_status', 'bridge_message_reply', 'other', None, None])
+            [None, 'bridge_status', 'bridge_models_list', 'bridge_message_reply', 'other', None, None])
         self.assertTrue(all(record['at'].endswith('Z') for record in records))
         self.assertNotIn(sensitive, json.dumps(records))
         self.assertEqual(self.service.audit.path.stat().st_mode & 0o777, 0o600)

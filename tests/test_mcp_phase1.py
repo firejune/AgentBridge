@@ -679,7 +679,7 @@ class PhaseTest(unittest.TestCase):
         with self.assertRaises(phase.Fault): self.engine.operation(oid,'other')
         for args in ({'operation_id':oid,'wait_ms':True},{'operation_id':oid,'wait_ms':5001},{'operation_id':oid,'cursor':'forged'}):
             self.assertEqual(self.engine.call('bridge_operation_get',args)['error']['code'],'INVALID_ARGUMENT')
-        self.assertEqual(self.call('bridge_session_create',workspace_alias='test',idempotency_key='valid_key_0000001',model='x')['error']['code'],'INVALID_ARGUMENT')
+        self.assertEqual(self.call('bridge_session_create',workspace_alias='test',idempotency_key='valid_key_0000001',model='x')['error']['code'],'UNSUPPORTED_MODEL_SELECTION')
         token=self.engine.cursor('owner-a','result',oid,1)
         with self.assertRaises(phase.Fault): self.engine.offset(token,'owner-b','result',oid)
         with self.assertRaises(phase.Fault): self.engine.offset(token,'owner-a','result','another-op')
@@ -957,7 +957,7 @@ class PhaseTest(unittest.TestCase):
     def test_mcp_opt_in_and_stdio(self):
         req={'jsonrpc':'2.0','id':1,'method':'tools/list'}
         self.assertEqual(len(mcp_server.handle(req,'/missing')['result']['tools']),1)
-        self.assertEqual(len(mcp_server.handle(req,'/missing',self.engine)['result']['tools']),5)
+        self.assertEqual(len(mcp_server.handle(req,'/missing',self.engine)['result']['tools']),6)
         call={'jsonrpc':'2.0','id':2,'method':'tools/call','params':{'name':'bridge_session_create','arguments':{'workspace_alias':'test','idempotency_key':'stdio_create_001'}}}
         output=io.StringIO();mcp_server.serve_stdio('/missing',io.StringIO(json.dumps(call)+'\n'),output,self.engine)
         result=json.loads(output.getvalue())['result']
@@ -1025,6 +1025,140 @@ class PhaseTest(unittest.TestCase):
             for tool in phase.TOOLS:
                 jsonschema.Draft202012Validator.check_schema(tool['inputSchema'])
                 jsonschema.Draft202012Validator.check_schema(tool['outputSchema'])
+
+    def test_models_list_checks_scope_and_workspace_without_ledger_or_provider_writes(self):
+        backend = phase.Backend(str(self.root / 'broker.sock'))
+        self.engine.backend = backend
+        workspace = self.config['workspaces']['test']
+        before = dict(workspace)
+        options = {'supports_model_selection': True, 'default_model': 'default-model',
+                   'models': [{'id': 'default-model', 'label': 'Default model'}]}
+        with patch.object(phase.models, 'session_model_options', return_value=options) as catalog, \
+                patch.object(backend, 'rpc') as rpc, patch.object(phase.sessions, 'open_session') as open_session:
+            self.assertIn('bridge_models_list', {t['name'] for t in self.engine.tools()})
+            args = {'workspace_alias': 'test', 'agent_type': 'codex'}
+            self.assertEqual(self.engine.call('bridge_models_list', args, 'other')['error']['code'],
+                             'NOT_AUTHORIZED')
+            scopes = self.engine.scopes
+            self.engine.scopes = scopes - {'bridge:read'}
+            self.assertEqual(self.call('bridge_models_list', **args)['error']['code'], 'NOT_AUTHORIZED')
+            self.assertNotIn('bridge_models_list', {t['name'] for t in self.engine.tools()})
+            self.engine.scopes = scopes
+            self.assertEqual(self.call('bridge_models_list', workspace_alias='unknown')['error']['code'],
+                             'WORKSPACE_NOT_ALLOWED')
+            self.assertEqual(self.call('bridge_models_list', workspace_alias='test', agent_type='other')
+                             ['error']['code'], 'INVALID_ARGUMENT')
+            catalog.assert_not_called()
+            workspace['host'] = 'ide'
+            request = {'jsonrpc': '2.0', 'id': 10, 'method': 'tools/call',
+                       'params': {'name': 'bridge_models_list', 'arguments': args}}
+            response = mcp_server.handle(request, backend.path, self.engine)
+            self.assertEqual(response['result']['structuredContent'],
+                             {'ok': True, 'data': {**args, **options}})
+            catalog.assert_called_once_with(dict(workspace, agent_type='codex', host='desktop'),
+                                            'codex', self.root / 'broker.state')
+            catalog.reset_mock()
+            no_options = {'supports_model_selection': False, 'default_model': None, 'models': []}
+            catalog.return_value = no_options
+            self.assertEqual(self.call('bridge_models_list', workspace_alias='test')['data'],
+                             {'workspace_alias': 'test', 'agent_type': 'claude', **no_options})
+            catalog.assert_called_once_with(dict(workspace, agent_type='claude'), 'claude',
+                                            self.root / 'broker.state')
+            catalog.reset_mock()
+            del workspace['host']
+            self.call('bridge_models_list', workspace_alias='test', agent_type='agy')
+            catalog.assert_called_once_with(dict(workspace, agent_type='agy', host='desktop'),
+                                            'agy', self.root / 'broker.state')
+            catalog.side_effect = phase.models.ModelSelectionError('private details')
+            failure = self.call('bridge_models_list', **args)
+            self.assertEqual(failure['error']['code'], 'MODEL_UNAVAILABLE')
+            self.assertNotIn('private details', json.dumps(failure))
+            rpc.assert_not_called()
+            open_session.assert_not_called()
+        self.assertEqual(workspace, before)
+        self.assertEqual(list(self.engine.rows()), [])
+        self.assertEqual(self.engine.db.execute('SELECT COUNT(*) FROM owned_sessions').fetchone()[0], 0)
+
+    def test_create_model_idempotency_and_transient_workspace(self):
+        args = {'workspace_alias': 'test', 'agent_type': 'agy', 'idempotency_key': 'create_model_0001'}
+        explicit = dict(args, model='exact-model')
+        with patch.object(self.backend, 'create', wraps=self.backend.create) as opening:
+            for invalid in ('', ' 	 ', None, 'x' * 129, chr(0xd800)):
+                self.assertEqual(self.call('bridge_session_create', **dict(args, model=invalid))
+                                 ['error']['code'], 'INVALID_ARGUMENT')
+            accepted = self.call('bridge_session_create', **explicit)['data']
+            oid = accepted['operation_id']
+            stored = self.engine.operation(oid, 'owner-a')
+            self.assertEqual(stored['model'], 'exact-model')
+            self.assertNotIn('model', stored['workspace'])
+            self.restart()
+            replay = self.call('bridge_session_create', **explicit)['data']
+            self.assertEqual(replay['operation_id'], oid)
+            self.assertTrue(replay['replayed'])
+            for different in (args, dict(args, model='other-model')):
+                self.assertEqual(self.call('bridge_session_create', **different)['error']['code'],
+                                 'IDEMPOTENCY_CONFLICT')
+            self.engine.tick()
+            expected_workspace = self.config['workspaces']['test']
+            opening.assert_called_once_with(dict(expected_workspace, agent_type='agy', model='exact-model'))
+            session_id = self.call('bridge_operation_get', operation_id=oid)['data']['agent_session_id']
+            self.assertEqual(self.engine.session(session_id, 'owner-a')['workspace'], expected_workspace)
+            self.assertNotIn('model', expected_workspace)
+
+        legacy = dict(args, idempotency_key='create_legacy_0001')
+        oid = self.call('bridge_session_create', **legacy)['data']['operation_id']
+        payload_hash = self.engine.db.execute('SELECT payload_hash FROM operations WHERE id=?', (oid,)).fetchone()[0]
+        self.assertEqual(payload_hash, phase.digest({'contract_version': '0.1.0',
+                                                     'workspace_alias': 'test', 'agent_type': 'agy'}))
+        self.assertNotIn('model', self.engine.operation(oid, 'owner-a'))
+        self.restart()
+        self.assertTrue(self.call('bridge_session_create', **legacy)['data']['replayed'])
+        self.assertEqual(self.call('bridge_session_create', **dict(legacy, model='exact-model'))
+                         ['error']['code'], 'IDEMPOTENCY_CONFLICT')
+
+    def test_create_model_claude_refused_before_admission(self):
+        with patch.object(self.backend, 'instance') as instance:
+            result = self.call('bridge_session_create', workspace_alias='test',
+                               idempotency_key='create_claude_model', model='exact-model')
+            self.assertEqual(result['error']['code'], 'UNSUPPORTED_MODEL_SELECTION')
+            instance.assert_not_called()
+        self.assertEqual(list(self.engine.rows()), [])
+
+    def test_create_model_refusal_is_definite_and_never_opens_or_retries(self):
+        backend = phase.Backend(str(self.root / 'broker.sock'))
+        self.engine.backend = backend
+        args = {'workspace_alias': 'test', 'agent_type': 'codex',
+                'idempotency_key': 'create_refused_model', 'model': 'unavailable-model'}
+        with patch.object(backend, 'instance', return_value='instance1'), \
+                patch.object(phase.models, 'explicit_session_model',
+                             side_effect=phase.models.ModelSelectionError('private details')) as resolve, \
+                patch.object(phase.sessions, 'open_session') as opening:
+            accepted = self.call('bridge_session_create', **args)['data']
+            self.engine.tick()
+            result = self.call('bridge_operation_get', operation_id=accepted['operation_id'])['data']
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['failure']['code'], 'MODEL_UNAVAILABLE')
+            self.assertNotIn('private details', json.dumps(result))
+            self.assertTrue(self.call('bridge_session_create', **args)['data']['replayed'])
+            self.engine.tick()
+            resolve.assert_called_once()
+            opening.assert_not_called()
+
+    def test_explicit_model_does_not_reclassify_ambiguous_open(self):
+        backend = phase.Backend(str(self.root / 'broker.sock'))
+        self.engine.backend = backend
+        args = {'workspace_alias': 'test', 'agent_type': 'codex',
+                'idempotency_key': 'create_ambiguous_model', 'model': 'exact-model'}
+        with patch.object(backend, 'instance', return_value='instance1'), \
+                patch.object(phase.models, 'explicit_session_model', return_value='exact-model'), \
+                patch.object(phase.sessions, 'open_session', side_effect=RuntimeError('open reply lost')) as opening:
+            accepted = self.call('bridge_session_create', **args)['data']
+            self.engine.tick()
+            result = self.call('bridge_operation_get', operation_id=accepted['operation_id'])['data']
+            self.assertEqual((result['status'], result['failure']['code']), ('unknown', 'DELIVERY_UNKNOWN'))
+            self.assertTrue(self.call('bridge_session_create', **args)['data']['replayed'])
+            self.engine.tick()
+            opening.assert_called_once()
 
     def test_create_agy_and_codex_sessions_and_list_agent_types(self):
         self.assertEqual(self.call('bridge_session_create', workspace_alias='test',
@@ -1116,6 +1250,27 @@ assert 'bridge' not in sys.modules
                     self.assertIn(body, write['toolOutput']['output'])
             finally:
                 engine.close()
+
+    def test_explicit_model_selection_forwards_canonical_value_to_existing_openers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            backend = phase.Backend(str(root / 'broker.sock'))
+            sid = str(uuid.uuid4())
+            for agent_type, host in (('codex', 'desktop'), ('agy', 'ide')):
+                with self.subTest(agent_type=agent_type), \
+                        patch.object(phase.models, 'explicit_session_model',
+                                     return_value='canonical-model') as resolve, \
+                        patch.object(phase.models, 'new_session_policy') as legacy_policy, \
+                        patch.object(phase.sessions, 'open_session',
+                                     return_value={'session': {'id': sid}}) as opening:
+                    workspace = {'cwd': str(root), 'host': 'ide', 'agent_type': agent_type,
+                                 'model': 'requested-model'}
+                    self.assertEqual(backend.create(workspace), sid)
+                    resolve.assert_called_once_with(dict(workspace, host=host), agent_type,
+                                                    root / 'broker.state', 'requested-model')
+                    opening.assert_called_once_with(agent_type, cwd=str(root), model='canonical-model',
+                                                    host=host, timeout=180)
+                    legacy_policy.assert_not_called()
 
     def test_codex_creation_uses_shared_default_and_owner_overrides(self):
         with tempfile.TemporaryDirectory() as temp:

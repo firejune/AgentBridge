@@ -1,6 +1,6 @@
 # Remote MCP (contract 0.1.0)
 
-Local agents (Claude Code, Codex, Antigravity) invoke `bridge.py` directly via the Python CLI and do not register a local MCP server. `mcp_server.py` is dedicated to a single remote connector behind a verified private single-owner tunnel, enabled via `--phase1-config /absolute/private.json` over **stdio only**. (If invoked without `--phase1-config`, the server falls back to `connectivity_only`, exposing only `bridge_status`; `--http` plus Phase 1 is refused because loopback alone is not authentication.) No API key, principal, workspace path, model, route, or existing session UUID is a tool argument.
+Local agents (Claude Code, Codex, Antigravity) invoke `bridge.py` directly via the Python CLI and do not register a local MCP server. `mcp_server.py` is dedicated to a single remote connector behind a verified private single-owner tunnel, enabled via `--phase1-config /absolute/private.json` over **stdio only**. (If invoked without `--phase1-config`, the server falls back to `connectivity_only`, exposing only `bridge_status`; `--http` plus Phase 1 is refused because loopback alone is not authentication.) No API key, principal, workspace path, route, or existing session UUID is a tool argument.
 
 ## Naming and capability boundaries
 
@@ -60,7 +60,7 @@ issued before the change are refused afterwards (`INVALID_ARGUMENT`); list the
 inbox again.
 
 Register a single remote connector (`Agent Bridge`) pointing to the private
-stdio tunnel. It exposes five tools by default and nine with
+stdio tunnel. With all three scopes, it exposes six tools by default and ten with
 `inbox_enabled: true`, as defined in `mcp_phase1_tools.json`. The operator
 configures and starts the tunnel. See [Optional MCP Events](#optional-mcp-events)
 for webhook subscription leases and signing key rotation.
@@ -134,6 +134,30 @@ Full terminal details are retained for 720 hours **after completion**, exceeding
 both specified minima. Subsequent maintenance removes payload/result details but
 retains operation/key/hash tombstones for the ledger lifetime. Unknown/in-flight
 records are never aged out. Detail expiry cannot recycle a key.
+
+## Session model selection
+
+Call `bridge_models_list({workspace_alias, agent_type?})` with `bridge:read` to
+discover selectable model IDs for an allowed creation workspace. A pinned session
+alias does not grant model discovery. The tool uses the same
+provider default as session creation when `agent_type` is omitted. It is
+available in the Phase 1 read-only tool set and requires neither create scope nor
+inbox opt-in. The result contains `workspace_alias`, the resolved `agent_type`,
+`supports_model_selection`, nullable `default_model`, and up to 200
+`models` entries with an `id` and nullable `label`. Claude reports
+`supports_model_selection: false`, `default_model: null`, and an empty list.
+
+For Codex or Antigravity, pass the exact listed `id` as the optional `model` in
+`bridge_session_create`. Model IDs must contain a non-whitespace character and
+are limited to 128 characters. Omit `model` to preserve existing default
+behavior. Create still requires the create scope and enabled writes. An explicit
+Claude model returns `UNSUPPORTED_MODEL_SELECTION`. A requested model that is
+unavailable or refused by model policy fails with `MODEL_UNAVAILABLE` without
+falling back to another model. Catalog lookup also reports `MODEL_UNAVAILABLE`
+when it cannot determine the provider's selectable models. Poll `bridge_operation_get` after durable
+acceptance. Reusing a create idempotency key with a changed, added, or removed
+model conflicts. Model listings are discovery snapshots and availability can
+change before an accepted creation runs.
 
 ## Restart and manual recovery
 
@@ -224,8 +248,7 @@ Each grant requires canonical `uuid`, existing canonical `cwd`, `project`,
 existing route name `route`, and ISO timestamp `authorized_at`. This is an
 explicit external-session grant, not adapter ownership. It cannot be used with
 session_create and does not authorize other sessions in that directory.
-The existing five tool schemas remain unchanged: list returns an opaque as_ ID,
-send accepts that ID, and operation_get retrieves only replies to that request.
+Session listing returns an opaque as_ ID. Send accepts that ID, and operation lookup retrieves only replies to that request.
 
 Every delivery verifies UUID/cwd and the existing claude-peer route. Missing or
 retargeted routes fail closed; only a dedicated realtime reply route may be
@@ -251,8 +274,7 @@ Previously completed operations without cleanup IDs are not retroactively swept.
 
 ## Independent inbox (issue #48; explicit opt-in)
 
-Existing configurations and the three scope strings stay valid and retain five
-tools. An owner may add `"inbox_enabled": true` to the approved private Phase 1
+Existing configurations and the three scope strings stay valid. An owner may add `"inbox_enabled": true` to the approved private Phase 1
 config to expose four additional tools. Default/false exposes none of them,
 including on direct invocation. `bridge_inbox_list` and `bridge_message_get`
 require `bridge:read`. Both `bridge_message_ack` and `bridge_message_reply`
@@ -394,7 +416,7 @@ and coordinate any separately required broker upgrade, preserving the private
 correspondence checkpoint and checking the broker’s corruption/loss diagnostics;
 (2) add `inbox_enabled: true` to the approved private configuration without changing scopes or owner binding; (3)
 restart only the corresponding facade while preserving its ledger and the broker;
-(4) refresh/reconnect the intended client's tool list and verify nine tools;
+(4) refresh/reconnect the intended client's tool list and verify ten tools (with all three scopes);
 (5) have the authorized HQ send a new independent `reply_to:null` message, retrieve
 it through Nana's direct tools, confirm sender still sees it unacknowledged, then
 explicitly ACK and verify the sender's `done`/`acknowledged_at` transition. Do not
@@ -455,7 +477,7 @@ still requires the explicit acknowledgement tool.
 Add `"events_enabled": true` to the approved private Phase 1 config only when
 `"inbox_enabled": true` and `bridge:read` are already enabled. Default/false
 exposes no Events methods or capability; Phase 0 remains status-only. Events add
-no tool or scope: the inbox tool count remains nine. When enabled, initialize
+no tool or scope: the inbox-enabled tool count remains ten with all three scopes. When enabled, initialize
 advertises both `capabilities.events: {}` and
 `capabilities.extensions["io.modelcontextprotocol/events"]: {}`. This does not
 change legacy protocol-version negotiation; modern handling is the separate
@@ -491,7 +513,7 @@ subscription and its actual consumer behavior separately from local tests.
    for this verified setup.
 3. Rescan/refresh the existing Agent Bridge plugin in ChatGPT's plugin settings.
    Confirm `bridge.inbox.message.created` appears alongside its tools. Reuse the
-   existing connector; the inbox tool count remains nine.
+   existing connector; the inbox-enabled tool count remains ten with all three scopes.
 4. Open the intended Work chat on ChatGPT web, or select Work and Cloud in the
    desktop app, with Agent Bridge available. For example, ask:
 
@@ -657,7 +679,7 @@ fsynced; the existing ledger lock keeps a single facade process. Record shapes:
   and `notifications/cancelled`; all others become `other`. Logging these names
   does not implement unsupported methods; `server/discover` is implemented only
   by the separate modern opt-in. Tool names are from a fixed allowlist
-  that includes `bridge_message_reply`, with unrecognized names recorded as
+  that includes `bridge_message_reply` and `bridge_models_list`, with unrecognized names recorded as
   `other`. All request receipts include normalized `requested_protocol`, taken
   from initialize parameters or the per-request protocol metadata.
 - `mcp_response`: a handler-produced response, not proof of transport delivery

@@ -22,7 +22,7 @@ except ImportError:
     jsonschema = None
 
 CALL = {'jsonrpc':'2.0','id':1,'method':'tools/call','params':{'name':'bridge_status','arguments':{}}}
-OTHER_TOOLS = ('bridge_sessions_list','bridge_session_create','bridge_message_send','bridge_operation_get')
+OTHER_TOOLS = ('bridge_sessions_list','bridge_models_list','bridge_session_create','bridge_message_send','bridge_operation_get')
 
 
 class FakeBroker:
@@ -95,6 +95,43 @@ class StatusTest(unittest.TestCase):
         self.assertEqual(result['structuredContent']['error']['code'],'INVALID_ARGUMENT')
         if jsonschema:
             jsonschema.validate(result['structuredContent'],mcp_server.TOOLS[0]['outputSchema'])
+
+
+@unittest.skipIf(jsonschema is None, 'optional jsonschema unavailable')
+class ModelToolSchemaTest(unittest.TestCase):
+    def setUp(self):
+        scripts = Path(__file__).resolve().parents[1] / 'skill' / 'agent-bridge' / 'scripts'
+        tools = json.loads((scripts / 'mcp_phase1_tools.json').read_text())['tools']
+        self.tools = {tool['name']: tool for tool in tools}
+
+    def test_model_catalog_schema_accepts_public_fields_only(self):
+        tool = self.tools['bridge_models_list']
+        arguments = {'workspace_alias': 'sample', 'agent_type': 'codex'}
+        jsonschema.validate(arguments, tool['inputSchema'])
+        payload = {'ok': True, 'data': {
+            **arguments, 'supports_model_selection': True,
+            'default_model': None, 'models': [{'id': 'sample-model', 'label': None}],
+        }}
+        jsonschema.validate(payload, tool['outputSchema'])
+        payload['data']['models'][0]['provider_metadata'] = 'private'
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(payload, tool['outputSchema'])
+        payload['data']['models'] = [{'id': 'sample-model', 'label': None}] * 201
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(payload, tool['outputSchema'])
+
+    def test_create_model_schema_preserves_omission_and_bounds_explicit_id(self):
+        tool = self.tools['bridge_session_create']
+        arguments = {'workspace_alias': 'sample', 'idempotency_key': 'example-key-1234'}
+        for model in ({}, {'model': 'x' * 128}):
+            jsonschema.validate({**arguments, **model}, tool['inputSchema'])
+        for model in ('', ' \t\n', 'x' * 129, None, 42):
+            with self.subTest(model=model), self.assertRaises(jsonschema.ValidationError):
+                jsonschema.validate({**arguments, 'model': model}, tool['inputSchema'])
+        error = {'ok': False, 'error': {
+            'code': 'UNSUPPORTED_MODEL_SELECTION', 'message': 'Unsupported.', 'retryable': False,
+        }}
+        jsonschema.validate(error, tool['outputSchema'])
 
 
 class ProtocolTest(unittest.TestCase):
@@ -319,7 +356,7 @@ class ModernProtocolTest(unittest.TestCase):
         rows = [json.loads(line) for line in process.stdout.splitlines()]
         self.assertEqual([row['id'] for row in rows], [1, 2, 3, 4, 5])
         self.assertEqual([row['result'].get('resultType') for row in rows], ['complete']*3 + [None, None])
-        self.assertEqual(len(rows[1]['result']['tools']), 5)
+        self.assertEqual(len(rows[1]['result']['tools']), 6)
         for row in rows[:2]:
             self.assertEqual((row['result']['ttlMs'], row['result']['cacheScope']), (0, 'private'))
         for row in rows[2:]:

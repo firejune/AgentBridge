@@ -68,6 +68,131 @@ class PolicyTest(unittest.TestCase):
             models.default_model('agy', None, policy, {'AGENT_BRIDGE_AGY_MODEL': ' '})
 
 
+class SessionModelCatalogTest(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.state = Path(temp.name)
+        self.workspace = {'host': 'ide', 'cwd': str(self.state)}
+        environment = patch.dict('os.environ', {}, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def test_codex_uses_saved_model_list_with_pagination_and_owner_policy(self):
+        pages = [
+            {'data': [{'model': 'gpt-6-astra', 'displayName': 'Astra'},
+                      {'id': 'preview-alias', 'model': 'preview', 'displayName': 'Preview'}],
+             'nextCursor': 'second'},
+            {'data': [{'model': 'gpt-6.2-sol', 'displayName': 'Sol', 'hidden': True, 'diagnostic': '/private'},
+                      {'model': 'other', 'displayName': 'Other'}]},
+        ]
+        (self.state / 'policy.json').write_text(json.dumps({
+            'defaults': {'codex': 'other'}, 'deny': {'codex': ['Astra', 'preview-alias']},
+        }))
+        with patch.dict('os.environ', {'AGENT_BRIDGE_CODEX_MODEL': 'gpt-6.2-sol'}), \
+                patch.object(sessions, 'CodexClient') as factory:
+            client = factory.return_value.__enter__.return_value
+            client.call.side_effect = pages
+            result = models.session_model_options(self.workspace, 'codex', self.state)
+        self.assertEqual(result, {
+            'supports_model_selection': True,
+            'default_model': 'gpt-6.2-sol',
+            'models': [{'id': 'gpt-6.2-sol', 'label': 'Sol'}, {'id': 'other', 'label': 'Other'}],
+        })
+        self.assertEqual(factory.call_args.kwargs['mode'], 'saved')
+        self.assertTrue(factory.call_args.kwargs['experimental'])
+        self.assertLess(client.timeout, factory.call_args.kwargs['timeout'])
+        self.assertEqual([call.args for call in client.call.call_args_list], [
+            ('model/list', {'limit': 100, 'includeHidden': True}),
+            ('model/list', {'limit': 100, 'includeHidden': True, 'cursor': 'second'}),
+        ])
+
+    def test_codex_public_list_is_bounded_and_explicit_uses_advertised_ids(self):
+        rows = [{'model': f'model-{i}', 'displayName': 'x' * 257}
+                for i in range(models.SESSION_MODEL_LIMIT + 1)]
+        rows += [{'model': 'gpt-6-astra'}, {'model': '/private/model'}]
+        with patch.object(sessions, 'CodexClient') as factory:
+            client = factory.return_value.__enter__.return_value
+            client.call.return_value = {'data': rows}
+            result = models.session_model_options(self.workspace, 'codex', self.state)
+            self.assertEqual(len(result['models']), models.SESSION_MODEL_LIMIT)
+            self.assertEqual(result['models'][0], {'id': 'model-0', 'label': 'model-0'})
+            self.assertIsNone(result['default_model'])
+            requested = f'model-{models.SESSION_MODEL_LIMIT}'
+            with patch.dict('os.environ', {'AGENT_BRIDGE_CODEX_MODEL': requested}):
+                with_default = models.session_model_options(self.workspace, 'codex', self.state)
+            self.assertEqual(len(with_default['models']), models.SESSION_MODEL_LIMIT)
+            self.assertEqual(with_default['default_model'], requested)
+            self.assertEqual(with_default['models'][-1]['id'], requested)
+            self.assertEqual(models.explicit_session_model(self.workspace, 'codex', self.state, requested),
+                             requested)
+            for denied in ('gpt-6-astra', '/private/model'):
+                with self.assertRaises(models.ModelSelectionError):
+                    models.explicit_session_model(self.workspace, 'codex', self.state, denied)
+
+    def test_codex_repeated_cursor_and_deadline_fail_with_safe_message(self):
+        with patch.object(sessions, 'CodexClient') as factory:
+            client = factory.return_value.__enter__.return_value
+            client.call.return_value = {'data': [], 'nextCursor': '/private'}
+            with self.assertRaisesRegex(models.ModelSelectionError, '^Session model catalog unavailable$'):
+                models.session_model_options(self.workspace, 'codex', self.state)
+            self.assertEqual(client.call.call_count, 2)
+            client.call.reset_mock()
+            with patch.object(models.time, 'monotonic', side_effect=[0, 1, 5]):
+                with self.assertRaisesRegex(models.ModelSelectionError, '^Session model catalog unavailable$'):
+                    models.session_model_options(self.workspace, 'codex', self.state)
+            client.call.assert_not_called()
+
+    def test_agy_filters_enum_label_and_ambiguous_ids_and_resolves_allowed_default(self):
+        extra = [
+            {'modelId': 'denied-label', 'label': 'Denied Label', 'modelOrAlias': {'model': 'MODEL_LABEL'}},
+            {'modelId': 'ambiguous', 'label': 'A', 'modelOrAlias': {'model': 'MODEL_A'}},
+            {'modelId': 'collision', 'label': 'AMBIGUOUS', 'modelOrAlias': {'model': 'MODEL_B'}},
+        ]
+        (self.state / 'policy.json').write_text(json.dumps({
+            'defaults': {'agy': CATALOG[1]['label']},
+            'deny': {'agy': ['model_placeholder_m320', 'Denied Label']},
+        }))
+        data = {'clientModelConfigs': CATALOG + extra}
+        with patch.object(agy_live, 'discover_host_server', return_value={'url': 'url', 'csrf': 'secret'}) as discover, \
+                patch.object(agy_live, 'rpc_call', return_value=data):
+            result = models.session_model_options(self.workspace, 'agy', self.state)
+        self.assertEqual(discover.call_args.args, ('ide',))
+        self.assertEqual(discover.call_args.kwargs['cwd'], str(self.state))
+        self.assertEqual(result, {
+            'supports_model_selection': True,
+            'default_model': CATALOG[1]['modelId'],
+            'models': [{'id': CATALOG[1]['modelId'], 'label': CATALOG[1]['label']},
+                       {'id': 'collision', 'label': 'AMBIGUOUS'}],
+        })
+
+    def test_agy_explicit_model_requires_exact_advertised_id(self):
+        model = CATALOG[0]['modelId']
+        catalog = CATALOG + [
+            {'modelOrAlias': {'model': 'MODEL_ENUM_ONLY'}},
+            {'modelId': 'MODEL_ID', 'modelOrAlias': {'model': 'MODEL_ENUM'}},
+        ]
+        with patch.object(agy_live, 'discover_host_server'), \
+                patch.object(agy_live, 'model_catalog', return_value=catalog), \
+                patch.object(agy_live, 'resolve_model') as resolve:
+            self.assertEqual(models.explicit_session_model(self.workspace, 'agy', self.state, model), model)
+            for token in (model.upper(), CATALOG[0]['label'], 'MODEL_PLACEHOLDER_M320',
+                          'MODEL_UNKNOWN', 'MODEL_ENUM_ONLY', 'MODEL_ID'):
+                with self.subTest(token=token):
+                    with self.assertRaisesRegex(models.ModelSelectionError, '^Requested model is unavailable'):
+                        models.explicit_session_model(self.workspace, 'agy', self.state, token)
+            resolve.assert_not_called()
+
+    def test_claude_does_not_load_policy_or_contact_a_provider(self):
+        with patch.object(models, 'load_policy') as policy:
+            self.assertEqual(models.session_model_options(self.workspace, 'claude', self.state), {
+                'supports_model_selection': False, 'default_model': None, 'models': [],
+            })
+            with self.assertRaises(models.ModelSelectionError):
+                models.explicit_session_model(self.workspace, 'claude', self.state, 'sonnet')
+        policy.assert_not_called()
+
+
 class NewSessionPolicyTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
