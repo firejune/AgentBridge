@@ -624,10 +624,7 @@ def with_models(rows, policy, timeout, key='session'):
     return rows
 
 
-def main(argv=None):
-    argv = sys.argv[1:] if argv is None else argv
-    if argv[:1] == ['wt']:  # Own parser, so `wt --help` and leading options reach it.
-        return wt.main(argv[1:],prog='bridge.py wt')
+def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--socket',default=str(broker.DEFAULT_SOCKET))
     sub = parser.add_subparsers(dest='cmd',required=True)
@@ -814,6 +811,14 @@ def main(argv=None):
     p = sub.add_parser('resolve');p.add_argument('id');p.add_argument('--state',choices=['pending','submitted','done'],required=True);p.add_argument('--note',required=True)
     p = sub.add_parser('wt',add_help=False,help='Agent worktrees: new, list, sweep, adopt (bridge.py wt --help)')
     p.add_argument('wt_args',nargs=argparse.REMAINDER)
+    return parser
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ['wt']:  # Own parser, so `wt --help` and leading options reach it.
+        return wt.main(argv[1:],prog='bridge.py wt')
+    parser = build_parser()
     args = parser.parse_args(argv)
     if args.cmd=='wt':
         return wt.main(args.wt_args,prog='bridge.py wt')
