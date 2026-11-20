@@ -2,6 +2,7 @@
 """Live agent correspondence over a local Unix socket. No database."""
 import argparse
 import asyncio
+import errno
 import hashlib
 import json
 import math
@@ -58,19 +59,37 @@ def receive_codex(args):
     except ValueError:
         raise ValueError(invalid) from None
 
-    unavailable = 'No dispatched peer correspondence is available for this Codex thread and message ID'
+    unmatched = 'No correspondence matches this Codex thread and message ID.'
+    unavailable = 'The addressed correspondence is not available to receive.'
+    bad_response = 'Agent Bridge broker did not return a usable message response.'
     try:
         message = broker.request(args.socket, {'op': 'show', 'id': args.id})
-    except ValueError:
-        raise ValueError(unavailable) from None
-    route = message.get('route', {})
-    if (message.get('id') != args.id or route.get('transport') != 'codex'
-            or route.get('session') != thread_id
-            or message.get('state') not in ('dispatching', 'submitted', 'uncertain', 'received', 'in_progress')
+    except (broker.BrokerConnectError, OSError) as error:
+        if error.errno in (errno.EACCES, errno.EPERM):
+            raise ValueError('Agent Bridge broker socket access was denied. '
+                             'Check shell sandbox and socket permissions.') from None
+        if isinstance(error, broker.BrokerConnectError):
+            raise ValueError('Agent Bridge broker is unavailable for this socket.') from None
+        raise ValueError(bad_response) from None
+    except (broker.BrokerResponseError, KeyError, TypeError):
+        raise ValueError(bad_response) from None
+    except ValueError as error:
+        # The existing wire response has no machine-readable error code.
+        if str(error) == broker.UNKNOWN_MESSAGE_ERROR:
+            raise ValueError(unmatched) from None
+        raise ValueError(bad_response) from None
+    if not isinstance(message, dict) or not isinstance(message.get('route'), dict):
+        raise ValueError(bad_response)
+    route = message['route']
+    if message.get('id') != args.id or route.get('transport') != 'codex' or route.get('session') != thread_id:
+        raise ValueError(unmatched)
+    if (message.get('state') not in ('dispatching', 'submitted', 'uncertain', 'received', 'in_progress')
             or message.get('reason') == ARCHIVED_REASON
             or message.get('body_expired') or 'close_request' in message
             or not isinstance(message.get('body'), str)):
         raise ValueError(unavailable)
+    if not isinstance(message.get('sender'), str):
+        raise ValueError(bad_response)
     return {'id': args.id, 'sender': message['sender'], 'body': message['body'],
             'provenance': 'agent_bridge_peer', 'authorization': 'none'}
 

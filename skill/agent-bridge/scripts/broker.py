@@ -79,6 +79,7 @@ def same_codex_thread(left, right):
 
 
 TERMINAL_STATES = frozenset(('done', 'answered', 'failed'))
+UNKNOWN_MESSAGE_ERROR = 'Unknown message; broker may have restarted'
 REGISTER_CONFLICT_ERROR = 'Route name is already in use; use a different name'
 LEGACY_CAPACITY_ERROR = ('In-memory message limit reached: no evictable terminal messages; '
                          'pending or protected work is retained')
@@ -121,6 +122,14 @@ def public_message(message):
               if key not in ('dispatch_claim', 'dispatch_claim_deadline')}
     result.update(retention.request_status(message, time.time()))
     return result
+
+
+class BrokerConnectError(ValueError):
+    """A socket connection failed before a broker request was sent."""
+
+    def __init__(self, error):
+        super().__init__('Broker unavailable; start bridge.py serve for this socket')
+        self.errno = error.errno
 
 
 class BrokerResponseError(ValueError):
@@ -303,7 +312,7 @@ class State:
             return self.messages[mid]
         if mid in self.compact_messages:
             return self.compact_messages[mid]
-        raise ValueError('Unknown message; broker may have restarted')
+        raise ValueError(UNKNOWN_MESSAGE_ERROR)
 
     def delivery_blockers(self):
         blockers = {}
@@ -1557,7 +1566,7 @@ def stream(path, args, timeout=None):
         try:
             sock.connect(str(Path(path).expanduser()))
         except OSError as error:
-            raise ValueError('Broker unavailable; start bridge.py serve for this socket') from error
+            raise BrokerConnectError(error) from error
         sock.sendall(wire(args))
         with sock.makefile('rb') as reader:
             while True:
@@ -1588,7 +1597,7 @@ def timed_request(path, args, deadline):
         try:
             sock.connect(str(Path(path).expanduser()))
         except OSError as error:
-            raise ValueError('Broker unavailable; start bridge.py serve for this socket') from error
+            raise BrokerConnectError(error) from error
         limit(sock)
         sock.sendall(payload)
         line = bytearray()
