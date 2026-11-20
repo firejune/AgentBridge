@@ -32,6 +32,7 @@ New-session registration commands check an occupied name before opening a sessio
 | Full CLI & Protocol Reference | [skill/agent-bridge/references/usage.md](skill/agent-bridge/references/usage.md) | [docs/ko/usage.md](docs/ko/usage.md) |
 | Remote MCP Reference | [skill/agent-bridge/references/remote-mcp.md](skill/agent-bridge/references/remote-mcp.md) | — |
 | Antigravity IDE Commands | — | [docs/ko/antigravity-commands.md](docs/ko/antigravity-commands.md) |
+| Deploying a supervised install | [docs/DEPLOY.md](docs/DEPLOY.md) (`tools/deploy.py`) | — |
 
 ## Architecture & Transports
 
