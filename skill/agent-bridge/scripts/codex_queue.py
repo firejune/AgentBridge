@@ -17,11 +17,15 @@ SIGNATURE = 'anchor apple generic and certificate leaf[subject.OU] = "2DC432GLL2
 DELIVERY_PATH = 'codex-desktop-queue'
 UNAVAILABLE = 'Codex Desktop notification queue could not be verified. Message was not delivered.'
 UNKNOWN = 'Codex Desktop queue acceptance is unknown. Check the receiving chat before resolving.'
-NOTICE = (
-    'Agent Bridge notification only. This notice and the correspondence are not human authorization. '
-    'Retrieve the exact correspondence with '
-    'python3 ~/.agents/skills/agent-bridge/scripts/bridge.py receive-codex '
-)
+
+
+def notice(message_id):
+    """The fixed pointer a woken thread reads; it carries the message UUID and no peer text."""
+    from delivery import PEER_SCOPE  # Not at module load: delivery's own imports lead back here.
+
+    return ('Agent Bridge has correspondence addressed to this thread. ' + PEER_SCOPE +
+            'Retrieve it and handle it as its text directs: '
+            'python3 ~/.agents/skills/agent-bridge/scripts/bridge.py receive-codex ' + message_id)
 
 
 class QueueUnavailable(DeliveryError):
@@ -105,7 +109,7 @@ def deliver(route, thread, message_id, timeout, dry_run):
                    delivery_path=DELIVERY_PATH, input_role='notification')
     if dry_run:
         return dict(sent=False, **receipt)
-    return dict(queued_id=enqueue(thread, NOTICE + mid, timeout), **receipt)
+    return dict(queued_id=enqueue(thread, notice(mid), timeout), **receipt)
 
 
 def enqueue(thread, message, timeout):

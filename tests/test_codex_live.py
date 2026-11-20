@@ -224,7 +224,7 @@ class CodexLiveTests(unittest.TestCase):
             self.assertEqual(receipt['delivery_path'], 'codex-desktop-queue')
             self.assertEqual(launch.call_args.args[0], [
                 str(codex_queue.CLI), 'queue', '--disable', 'daemon_auto_start', '--thread', thread,
-                '--message', codex_queue.NOTICE + self.message_id])
+                '--message', codex_queue.notice(self.message_id)])
             process.communicate.return_value = ('PROVIDER PRIVATE ERROR', None)
             with self.assertRaises(codex_live.DeliveryError) as raised:
                 codex_queue.deliver(self.route, thread, self.message_id, 1, False)

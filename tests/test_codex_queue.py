@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skill/agent-bridge
 import codex_preview
 import codex_queue
 import codex_wake_open
+import delivery
 from codex_live import ThreadArchived
 
 UID = str(os.getuid())
@@ -57,6 +58,21 @@ class QueueOwnerTests(unittest.TestCase):
         for name, read in cases.items():
             with self.subTest(case=name):
                 self.assertIsNone(codex_queue.desktop_queue_owner('queue', read))
+
+
+class QueueNoticeTests(unittest.TestCase):
+    def test_the_notice_states_the_scope_every_peer_envelope_states_and_grants_nothing(self):
+        message = {'id': str(uuid.uuid4()), 'sender': 'a', 'recipient': 'b', 'project': 'p', 'body': 'PEER BODY',
+                   'reply_to': None, 'sender_channel': None, 'channel': None}
+        self.assertIn(delivery.PEER_SCOPE, delivery.envelope(message))
+        self.assertIn('not a new human instruction', delivery.PEER_SCOPE)
+        self.assertIn('existing user-authorized scope', delivery.PEER_SCOPE)
+        notice = codex_queue.notice(message['id'])
+        self.assertIn(delivery.PEER_SCOPE, notice)
+        self.assertTrue(notice.endswith('bridge.py receive-codex ' + message['id']))
+        self.assertNotIn(message['body'], notice)
+        # A notice that scopes the turn to retrieval leaves the correspondence read and unanswered.
+        self.assertNotIn('notification only', notice)
 
 
 class DefaultDesktopFixture(unittest.TestCase):

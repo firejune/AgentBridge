@@ -157,7 +157,7 @@ class ReceiveCodexTests(unittest.TestCase):
 
             def enqueue(thread, notification, timeout):
                 self.assertEqual(thread, self.thread)
-                self.assertEqual(notification, codex_queue.NOTICE + mid)
+                self.assertEqual(notification, codex_queue.notice(mid))
                 self.assertGreater(timeout, 0)
                 before = checkpoint.read_bytes()
                 durable, = (item for item in json.loads(before)['messages'] if item['id'] == mid)
