@@ -823,7 +823,6 @@ def main(argv=None):
     if args.cmd=='wt':
         return wt.main(args.wt_args,prog='bridge.py wt')
     observation = None
-    creation_model_source = None
     try:
         if args.cmd == 'run':
             return receipts.run(broker_state_dir(args), args.label, args.cwd, args.command)
@@ -928,10 +927,8 @@ def main(argv=None):
             output((service.install if args.cmd == 'install-service' else service.uninstall)(**fields))
             return 0
         if args.cmd=='open':
-            source = new_session_policy(args, args.provider)
+            new_session_policy(args, args.provider)
             result = sessions.open_session(args.provider,args.cwd,args.title,args.model,args.timeout,host=args.host,ide=args.ide)
-            if args.provider == 'codex':
-                result['model_source'] = source
             output(result)
             return 0
         if args.cmd=='retro':
@@ -1009,13 +1006,11 @@ def main(argv=None):
         if args.cmd=='session':
             output(sessions.inspect_session(args.provider,args.id,args.executable,args.codex_mode))
             return 0
-        if args.cmd=='register' and args.new and args.transport in ('agy','codex','claude-peer'):
+        if args.cmd=='register' and args.new and args.transport in ('agy','claude-peer'):
             validate_new_registration(args)
             require_free_registration_name(args.socket, args.project, args.name)
-            creation_model_source = new_session_policy(args, 'claude' if args.transport == 'claude-peer' else args.transport)
+            new_session_policy(args, 'claude' if args.transport == 'claude-peer' else args.transport)
         observation = registration(args) if args.cmd=='register' else None
-        if observation and creation_model_source is not None:
-            observation['model_source'] = creation_model_source
         if args.cmd=='deliver':
             result = deliver(args.socket,args.id,args.timeout,args.dry_run)
             output(result)
@@ -1054,8 +1049,6 @@ def main(argv=None):
             result['discovery'] = observation
         if args.cmd == 'register' and args.transport == 'claude-peer' and result.get('session'):
             result['title'] = label_claude(result)
-            if args.cmd == 'register' and args.transport == 'codex' and args.new:
-                result['registered'] = True
         output(result)
         return 2 if args.cmd in ('ask','wait') and result['timed_out'] else 0
     except KeyboardInterrupt:
@@ -1093,11 +1086,7 @@ def main(argv=None):
                 'created':error.created,'adopted':error.adopted,'registered':False,'stage':error.stage})
         return 130 if error.cancelled else 1
     except (ValueError,OSError,subprocess.TimeoutExpired,KeyError,TypeError) as error:
-        result = {'error':str(error)}
-        if observation and args.cmd == 'register' and args.transport == 'codex' and args.new:
-            result.update(created=True, adopted=observation.get('adopted',False), session=observation['session']['id'],
-                          registered=False, discovery=observation)
-        output(with_skew(args, result, error))
+        output(with_skew(args, {'error':str(error)}, error))
         return 1
 
 
