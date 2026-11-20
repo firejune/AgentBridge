@@ -218,7 +218,8 @@ class ArrivalAudit:
             if not self.private(info) or info.st_size > self.max_bytes:
                 raise OSError('Private bounded audit file required')
             if info.st_size + len(data) > self.max_bytes:
-                os.close(fd); fd = None
+                os.close(fd)
+                fd = None
                 if self.previous.exists() or self.previous.is_symlink():
                     if not self.private(self.previous.lstat()):
                         raise OSError('Private audit rotation required')
@@ -316,7 +317,9 @@ class EventService:
         try:
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, 'wb') as stream:
-                stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
             os.replace(temp, self.path)
             directory = os.open(self.path.parent, os.O_RDONLY)
             try:

@@ -227,7 +227,8 @@ def pinned_sessions(config):
         cwd = Path(g['cwd'])
         if not cwd.is_absolute() or not cwd.is_dir() or str(cwd.resolve()) != str(cwd):
             raise ValueError('Canonical existing pinned cwd required')
-        broker.identifier(g['project']); broker.identifier(g['route'])
+        broker.identifier(g['project'])
+        broker.identifier(g['route'])
         datetime.fromisoformat(g['authorized_at'])
         identity = digest([config['principal'], config['tunnel_id'], alias, g])
         sid = 'as_' + identity[:32]
@@ -577,7 +578,8 @@ class Engine:
         binding = digest([config['principal'],config['tunnel_id']])
         self.db.execute('INSERT OR IGNORE INTO metadata VALUES (?,?)',('owner_binding',binding))
         if self.db.execute('SELECT value FROM metadata WHERE key=?',('owner_binding',)).fetchone()[0] != binding:
-            self.db.close(); os.close(self.lock_fd)
+            self.db.close()
+            os.close(self.lock_fd)
             raise ValueError('Ledger belongs to a different private tunnel owner')
         self.db.execute('INSERT OR IGNORE INTO metadata VALUES (?,?)',('cursor_key',secrets.token_hex(32)))
         self.cursor_key = bytes.fromhex(self.db.execute('SELECT value FROM metadata WHERE key=?',('cursor_key',)).fetchone()[0])
@@ -611,12 +613,14 @@ class Engine:
             raise RuntimeError('MCP handler is still active; ledger remains owned')
         if self.events is not None:
             self.events.close()
-        self.stop.set(); self.wake.set()
+        self.stop.set()
+        self.wake.set()
         if self.thread:
             self.thread.join(timeout=195)
             if self.thread.is_alive():
                 raise RuntimeError('Worker still active; ledger remains locked')
-        self.db.close(); os.close(self.lock_fd)
+        self.db.close()
+        os.close(self.lock_fd)
 
     @contextmanager
     def transaction(self):
@@ -673,7 +677,8 @@ class Engine:
 
     def update(self, op, **fields):
         with self.transaction():
-            op.update(fields); self.save(op)
+            op.update(fields)
+            self.save(op)
 
     def session(self, sid, principal):
         if principal == self.principal and sid in pinned_sessions(self.config):
@@ -742,7 +747,8 @@ class Engine:
     def call(self, name, args, principal=None):
         principal = self.principal if principal is None else principal
         try:
-            self.authorized(name,principal); self.validate(name,args)
+            self.authorized(name,principal)
+            self.validate(name,args)
             if name in ('bridge_session_create','bridge_message_send'):
                 data = self.accept(name,args,principal)
             elif name == 'bridge_sessions_list':
@@ -805,7 +811,8 @@ class Engine:
             session = self.session(args['agent_session_id'],principal)
             self.allowed(session)
             payload = {'contract_version':'0.1.0','agent_session_id':args['agent_session_id'],'message':args['message']}
-        key_hash = digest([principal,tool,args['idempotency_key']]); payload_hash = digest(payload)
+        key_hash = digest([principal,tool,args['idempotency_key']])
+        payload_hash = digest(payload)
         with self.transaction():
             row = self.db.execute('SELECT doc,payload_hash FROM operations WHERE principal=? AND tool=? AND key_hash=?',
                                    (principal,tool,key_hash)).fetchone()
@@ -895,7 +902,8 @@ class Engine:
     def run(self):
         while not self.stop.is_set():
             self.tick()
-            self.wake.wait(.2); self.wake.clear()
+            self.wake.wait(.2)
+            self.wake.clear()
 
     def tick(self):
         for op in self.rows():
@@ -919,7 +927,8 @@ class Engine:
                 try:
                     self.fail(op,error=describe(error,message=False))
                 except Exception:
-                    self.stop.set(); return
+                    self.stop.set()
+                    return
 
     def dispatch(self, op):
         try:
@@ -927,7 +936,8 @@ class Engine:
             if op['kind']=='session_create':
                 self.allowed({'alias':op['alias'],'workspace':op['workspace']})
             else:
-                session = self.session(op['agent_session_id'],op['principal']); self.allowed(session)
+                session = self.session(op['agent_session_id'],op['principal'])
+                self.allowed(session)
                 destination = self.destination(session)
                 if op.get('destination', destination) != destination:
                     raise RouteBindingRefusal('Effective destination changed')
@@ -948,7 +958,8 @@ class Engine:
             self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=ROUTE_CHANGED_MESSAGE)
             return
         except Exception:
-            self.fail(op,'BACKEND_UNAVAILABLE',unknown=False); return
+            self.fail(op,'BACKEND_UNAVAILABLE',unknown=False)
+            return
         if op['kind']=='session_create':
             # All facade ledgers on this host share one creation lock. Nonblocking: leave queued.
             fd = private_file(Path(tempfile.gettempdir())/f'agent-bridge-mcp-create-{os.getuid()}.lock')
@@ -974,7 +985,8 @@ class Engine:
                            'created_at':stamp(),'last_activity_at':stamp(),'principal':op['principal'],'registered':False}
                 with self.transaction():
                     self.db.execute('INSERT INTO owned_sessions VALUES (?,?,?)',(session['id'],op['principal'],json.dumps(session)))
-                    op.update(agent_session_id=session['id'],stage='register_intent');self.save(op)
+                    op.update(agent_session_id=session['id'],stage='register_intent')
+                    self.save(op)
                 self.backend.register(session)
                 self.registered(op,session)
             finally:
@@ -999,7 +1011,8 @@ class Engine:
                 return
             self.update(op,stage='posted',backend_id=message['id'],backend_message_state=message['state'])
             if self.backend.instance() != instance:
-                self.fail(op); return
+                self.fail(op)
+                return
             self.update(op,stage='push_intent')
             try:
                 message = self.backend.push(message,session)
@@ -1042,7 +1055,8 @@ class Engine:
                        'created_at':stamp(),'last_activity_at':stamp(),'principal':op['principal'],'registered':False}
             with self.transaction():
                 self.db.execute('INSERT INTO owned_sessions VALUES (?,?,?)',(session['id'],op['principal'],json.dumps(session)))
-                op['agent_session_id'] = session['id']; self.save(op)
+                op['agent_session_id'] = session['id']
+                self.save(op)
         session = self.session(op['agent_session_id'],self.principal)
         self.allowed(session)
         if session['uuid'] != op['backend_session']:
@@ -1079,9 +1093,11 @@ class Engine:
                     else:
                         self.fail(op)
                     return
-                self.observe_error(op,error); return
+                self.observe_error(op,error)
+                return
             if not same:
-                self.fail(op); return
+                self.fail(op)
+                return
             self.observe_at.pop(op['operation_id'],None)
             self.update(op,backend_message_state=state,observe_errors=0)
             if self.settle(op,replies,parent=message,notify_events=notify_events):
@@ -1104,7 +1120,8 @@ class Engine:
         # after the limit the operation closes as unknown and the reply watch takes over.
         count = op.get('observe_errors',0)+1
         if count >= self.observe_retry_limit:
-            self.fail(op,error=describe(error),observe_errors=count); return
+            self.fail(op,error=describe(error),observe_errors=count)
+            return
         self.update(op,observe_errors=count,error=describe(error))
         self.observe_at[op['operation_id']] = time.monotonic()+self.observe_retry_base*2**(count-1)
 
@@ -1152,7 +1169,8 @@ class Engine:
         self.watch_at[op['operation_id']] = time.monotonic()+(self.reply_watch_fast if recent else self.reply_watch_slow)
         try:
             if self.backend.instance()!=op['instance']:
-                self.update(op,reply_watch_closed='instance_changed'); return
+                self.update(op,reply_watch_closed='instance_changed')
+                return
             parent,replies = self.backend.observe(op['backend_id'])
             self.settle(op,replies,late=True,parent=parent)
         except ValueError as error:
@@ -1183,7 +1201,8 @@ class Engine:
 
     def offset(self, token, principal, kind, obj):
         try:
-            data = base64.urlsafe_b64decode(token+'='*(-len(token)%4)); raw,signature = data[:-32],data[-32:]
+            data = base64.urlsafe_b64decode(token+'='*(-len(token)%4))
+            raw,signature = data[:-32],data[-32:]
             if not hmac.compare_digest(signature,hmac.digest(self.cursor_key,raw,'sha256')):
                 raise ValueError()
             p,k,o,offset,expiry = json.loads(raw)
@@ -1210,18 +1229,21 @@ class Engine:
             for s in pinned.values():
                 if s['id'] not in seen_ids and s['uuid'] not in seen_uuids:
                     all_sessions.append(s)
-                    seen_ids.add(s['id']); seen_uuids.add(s['uuid'])
+                    seen_ids.add(s['id'])
+                    seen_uuids.add(s['uuid'])
             if hasattr(self.backend, 'discover'):
                 discovered = self.backend.discover(self.config)
                 discovered_by_uuid = {d['uuid']: d for d in discovered.values()}
                 for s in discovered.values():
                     if s['id'] not in seen_ids and s['uuid'] not in seen_uuids:
                         all_sessions.append(s)
-                        seen_ids.add(s['id']); seen_uuids.add(s['uuid'])
+                        seen_ids.add(s['id'])
+                        seen_uuids.add(s['uuid'])
         owned = [s for s in all_sessions if s['id'] > last]
         owned.sort(key=lambda s:s['id'])
         more = len(owned)>limit
-        owned = owned[:limit]; result = []
+        owned = owned[:limit]
+        result = []
         ops = self.rows()
         observed_now = stamp()
         for s in owned:
@@ -1275,7 +1297,9 @@ class Engine:
             raise Fault('INVALID_ARGUMENT')
         if op['status']=='succeeded' and op['kind']=='message_send':
             offset = self.offset(args['cursor'],principal,'result',op['operation_id']) if 'cursor' in args else 0
-            end = offset+args.get('max_chars',8000); text = op['text']; more = end<len(text)
+            end = offset+args.get('max_chars',8000)
+            text = op['text']
+            more = end<len(text)
             output['result'] = {'type':'message_result','text':text[offset:end],'has_more':more,
                                 'next_cursor':self.cursor(principal,'result',op['operation_id'],end) if more else None}
         return output
