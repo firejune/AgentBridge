@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -13,6 +14,7 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skill/agent-bridge/scripts'))
 import codex_live
 import codex_preview
+import codex_queue
 
 
 class FakeDesktop:
@@ -175,10 +177,81 @@ class CodexLiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {}, clear=True):
             with patch.object(Path, 'home', return_value=Path(temp)):
                 with self.assertRaises(codex_live.EndpointUnavailable) as raised:
-                    codex_live.deliver(self.route, self.message_id, 'PEER_BODY')
+                    codex_live.deliver(self.route, self.message_id, 'PEER_BODY', allow_queue=False)
         self.assertFalse(raised.exception.uncertain)
         self.assertEqual(str(raised.exception),
                          'Codex Desktop IPC (~/.codex/ipc/ipc.sock) is missing. Message was not delivered.')
+
+    def test_only_default_missing_or_refused_socket_uses_queue(self):
+        for name, reason, expected in (
+            (codex_live.EndpointUnavailable.DEFAULT, codex_live.EndpointUnavailable.MISSING, True),
+            (codex_live.EndpointUnavailable.DEFAULT, codex_live.EndpointUnavailable.REFUSED, True),
+            (codex_live.EndpointUnavailable.CONFIGURED, codex_live.EndpointUnavailable.MISSING, False),
+            (codex_live.EndpointUnavailable.DEFAULT, codex_live.EndpointUnavailable.TIMEOUT, False),
+            (codex_live.EndpointUnavailable.DEFAULT, codex_live.EndpointUnavailable.UNSAFE, False),
+            (codex_live.EndpointUnavailable.DEFAULT, codex_live.EndpointUnavailable.INITIALIZE, False),
+        ):
+            with self.subTest(name=name, reason=reason), patch.object(codex_live.Client, 'connect',
+                    side_effect=codex_live.EndpointUnavailable(name, reason)), patch.object(
+                    codex_queue, 'deliver', return_value={'delivery_mode': 'queue'}) as queue:
+                if expected:
+                    result = codex_live.deliver(self.route, self.message_id, 'PEER_BODY')
+                    self.assertEqual(result['delivery_mode'], 'queue')
+                    queue.assert_called_once_with(self.route, self.route['session'], self.message_id, 10, False)
+                else:
+                    with self.assertRaises(codex_live.EndpointUnavailable):
+                        codex_live.deliver(self.route, self.message_id, 'PEER_BODY')
+                    queue.assert_not_called()
+
+    def test_ineligible_queue_preserves_distinct_default_socket_refusal(self):
+        for reason in (codex_live.EndpointUnavailable.MISSING, codex_live.EndpointUnavailable.REFUSED):
+            error = codex_live.EndpointUnavailable(codex_live.EndpointUnavailable.DEFAULT, reason)
+            with self.subTest(reason=reason), patch.object(codex_live.Client, 'connect',
+                    side_effect=error), patch.object(codex_queue, 'deliver',
+                    side_effect=codex_queue.QueueUnavailable):
+                with self.assertRaises(codex_live.EndpointUnavailable) as raised:
+                    codex_live.deliver(self.route, self.message_id, 'PEER_BODY')
+                self.assertIs(raised.exception, error)
+
+    def test_queue_submits_only_pointer_and_requires_exact_receipt(self):
+        thread, item = self.route['session'], str(uuid.uuid4())
+        process = Mock(returncode=0)
+        process.communicate.return_value = (f'Queued message {item} for thread {thread}.\n', None)
+        with patch.object(codex_queue, 'check_route'), patch.object(
+                codex_queue.subprocess, 'Popen', return_value=process) as launch:
+            receipt = codex_queue.deliver(self.route, thread, self.message_id, 1, False)
+            self.assertEqual(receipt['queued_id'], item)
+            self.assertEqual(receipt['delivery_path'], 'codex-desktop-queue')
+            self.assertEqual(launch.call_args.args[0], [
+                str(codex_queue.CLI), 'queue', '--disable', 'daemon_auto_start', '--thread', thread,
+                '--message', codex_queue.NOTICE + self.message_id])
+            process.communicate.return_value = ('PROVIDER PRIVATE ERROR', None)
+            with self.assertRaises(codex_live.DeliveryError) as raised:
+                codex_queue.deliver(self.route, thread, self.message_id, 1, False)
+            self.assertTrue(raised.exception.uncertain)
+            self.assertEqual(str(raised.exception), codex_queue.UNKNOWN)
+
+    def test_launched_queue_timeout_is_uncertain_and_reaps_cli(self):
+        process = Mock()
+        process.poll.return_value = None
+        process.communicate.side_effect = subprocess.TimeoutExpired('PRIVATE', 1)
+        with patch.object(codex_queue, 'check_route'), patch.object(
+                codex_queue.subprocess, 'Popen', return_value=process):
+            with self.assertRaises(codex_live.DeliveryError) as raised:
+                codex_queue.deliver(self.route, self.route['session'], self.message_id, 1, False)
+        self.assertTrue(raised.exception.uncertain)
+        self.assertEqual(str(raised.exception), codex_queue.UNKNOWN)
+        process.kill.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=1)
+
+    def test_queue_route_preflight_is_required_before_launch(self):
+        with patch.object(codex_queue, 'check_route', side_effect=ValueError('PRIVATE PATH')), patch.object(
+                codex_queue.subprocess, 'Popen') as launch:
+            with self.assertRaises(codex_live.DeliveryError) as raised:
+                codex_queue.deliver(self.route, self.route['session'], self.message_id, 1, False)
+            self.assertFalse(raised.exception.uncertain)
+            self.assertEqual(str(raised.exception), codex_queue.UNAVAILABLE)
+            launch.assert_not_called()
 
     def test_connect_timeout_is_a_fixed_prewrite_error(self):
         client_socket = Mock()

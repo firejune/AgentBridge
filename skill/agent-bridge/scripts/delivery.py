@@ -438,9 +438,11 @@ def push_codex(path, m, timeout=10, dry_run=False, *, close_dispatch=False):
         if m['state'] != 'pending':
             raise ValueError('Only pending messages may be delivered')
         rpc('claim', **({'close_id': close_request['close_id']} if close_request else {}))
+    allow_queue = close_request is None and Path(path).expanduser() == broker.DEFAULT_SOCKET
     try:
         receipt = codex_live.deliver(
-            m['route'], m['id'], peer_text(m, path, escape_peer=False), timeout, dry_run=dry_run)
+            m['route'], m['id'], peer_text(m, path, escape_peer=False), timeout, dry_run=dry_run,
+            allow_queue=allow_queue)
     except codex_live.ThreadArchived as error:
         if dry_run:
             return dict(state=m['state'], sent=False, reason=ARCHIVED_REASON, error=str(error))
@@ -460,6 +462,10 @@ def push_codex(path, m, timeout=10, dry_run=False, *, close_dispatch=False):
         raise
     if dry_run:
         return dict(state=m['state'], **receipt)
+    if receipt['delivery_mode'] == 'queue':
+        result = rpc('finish', state='submitted', event='pushed',
+                     note='Codex Desktop queue accepted the Agent Bridge notification')
+        return {**result, 'delivery_path': receipt['delivery_path']}
     result = rpc('finish', state='submitted', event='pushed',
                  note=f"Codex {receipt['delivery_mode']} tool output accepted by turn {receipt['turn_id']}")
     if close_request is not None:

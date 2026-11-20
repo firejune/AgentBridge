@@ -48,6 +48,7 @@ class EndpointUnavailable(DeliveryError):
     INITIALIZE = 'failed the initialization handshake'
 
     def __init__(self, endpoint_name, reason):
+        self.endpoint_name, self.reason = endpoint_name, reason
         super().__init__(f'Codex Desktop IPC ({endpoint_name}) {reason}. Message was not delivered.')
 
     @classmethod
@@ -321,7 +322,7 @@ def exact_saved_workspace(route):
     return None, None
 
 
-def deliver(route, message_id, text, timeout=10, dry_run=False, path=None):
+def deliver(route, message_id, text, timeout=10, dry_run=False, path=None, *, allow_queue=True):
     workspace, archived = exact_saved_workspace(route)
     if archived is True:
         raise ThreadArchived()
@@ -367,6 +368,17 @@ def deliver(route, message_id, text, timeout=10, dry_run=False, path=None):
                 raise DeliveryError('Codex desktop idle submission returned an unconfirmed error', True)
             return dict(session=thread, owner=owner, turn_id=accepted_turn(response),
                         delivery_mode=mode, input_role='toolOutput')
+    except EndpointUnavailable as error:
+        if (allow_queue and not client.mutation_sent
+                and error.endpoint_name == EndpointUnavailable.DEFAULT
+                and error.reason in (EndpointUnavailable.MISSING, EndpointUnavailable.REFUSED)):
+            import codex_queue
+
+            try:
+                return codex_queue.deliver(route, thread, message_id, timeout, dry_run)
+            except codex_queue.QueueUnavailable:
+                raise error from None
+        raise
     except DeliveryError as error:
         if client.mutation_sent:
             error.uncertain = True
