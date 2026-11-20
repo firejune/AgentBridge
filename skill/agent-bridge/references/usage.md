@@ -337,8 +337,23 @@ After archive is confirmed, the broker removes eligible retained correspondence 
 | --- | --- | --- |
 | `claude-peer` | Sends `SIGTERM` to the exact registered CLI process | Archives supported Desktop sessions |
 | `agy` | Detaches an idle conversation | Archives the conversation and checks readback |
-| `codex` | Detaches the route | Archives the exact workspace-matched thread and notifies Desktop |
+| `codex` | Detaches the route | Archives the exact workspace-matched thread and eligible descendants via native app-server RPC |
 | `realtime` / `claude` | Removes the route | — |
+
+### Codex archive sweep
+
+```bash
+(umask 077; python3 "$bridge_cli" archive-sweep --cwd-prefix /absolute/workspace > archive-manifest.json)
+python3 "$bridge_cli" archive-sweep --apply --manifest archive-manifest.json
+```
+
+The default command reads the broker routing snapshot and queries an owner-private temporary copy of the native SQLite database and its WAL. It refuses to generate a manifest if the source changes during copying or a rollback journal exists. SQLite may create bookkeeping files only in the temporary directory during preview. It does not start Codex or send broker requests. `--cwd-prefix` is an absolute, resolved path matched by component and checked for descendants as well as roots. Omit it to survey the entire store. The manifest lists IDs, titles, working directories, last activity (Unix seconds), reasons, descendant sets and refusals. Keep it private. Review it before applying. Apply verifies the SHA-256 digest of the manifest body, binds it to the store, routing directory and scope, and rechecks the reviewed groups. The digest detects edits to the reviewed data and is not a signature. If an explicit prefix is passed to apply, it must match the manifest. Use the broker's actual `--state-dir` when it differs from the socket's `.state` directory. Preview locates `state_5.sqlite` through `CODEX_SQLITE_HOME`, then `CODEX_HOME`, then the default Codex home. For a nondefault SQLite location set `CODEX_SQLITE_HOME` accordingly. Apply checks that the bundled Codex resolves the same database.
+
+Sweep starts with an unarchived root whose working directory is missing or which has an archived spawn ancestor. A qualifying root authorizes its reviewed descendants even if their working directories still exist. Explicit Codex `close --archive` supplies the same working-directory exemption for its exact root and its recorded descendants. Only the exact closing route is exempt from route protection. Other registered endpoints and active channel bindings, current process working directories inside the thread workspace, and activity less than 24 hours old on unarchived threads block archival. A candidate is refused if any descendant is protected, outside the prefix or missing from the reviewed set. Sweep leaves broker routes and correspondence alone.
+
+Direct close and sweep use the bundled Codex saved app-server's `thread/archive`, leaves first, with fresh protection and descendant checks before each call. Completion and `count` come from archive-bit readback. `provider_error` records RPC rejection or uncertainty separately. A partial `not_archived` result exits 1 and other independent candidates can continue. Ancestors of a failed descendant are skipped to avoid retry through a native cascade. Close removes the matching route only after the root archive bit is confirmed, subject to the existing correspondence and route checks.
+
+Protection checks and native archival are separate operations. Routes, process working directories, activity and descendant relationships can change after the final check. If readback finds a newly archived unlisted descendant, the CLI immediately calls `thread/unarchive` on that descendant and verifies the result. `restored_unlisted` lists confirmed recoveries. Failed restoration, detected collateral archive-bit changes or unavailable readback stop further archival with exit 1. There is no automatic retry. Each confirmed archive prints an `undo` command for the same Codex profile. Native unarchive can itself cascade, including to already-archived or subsequently archived descendants, and may fail partway. An undo command therefore does not guarantee restoration of only the printed ID or of the full prior state. Review the current subtree before using it. Sweep and direct close verify stored archive bits. The separate Desktop handoff also verifies the archived rollout file.
 
 ### Native Codex archive handoff
 

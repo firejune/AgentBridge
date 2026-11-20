@@ -184,6 +184,26 @@ def verify_route(route):
         raise ValueError('Session or workspace differs')
 
 
+def read_snapshot(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, 'r', encoding='utf-8') as source:
+        info = os.fstat(source.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o077 or info.st_size > MAX_SNAPSHOT):
+            raise ValueError('Routing snapshot must be an owner-private regular file within size limit')
+        try:
+            data = json.load(source)
+        except (ValueError, UnicodeError):
+            raise ValueError('Invalid routing snapshot; refusing to overwrite it') from None
+    if (not isinstance(data, dict) or data.get('version') not in (1, 2)
+            or not isinstance(data.get('endpoints'), list) or not isinstance(data.get('channels'), list)):
+        raise ValueError('Unsupported routing snapshot; refusing to overwrite it')
+    return data
+
+
 class RouteStore:
     def __init__(self, directory):
         self.directory = Path(directory).expanduser().absolute()
@@ -216,22 +236,9 @@ class RouteStore:
         atomic_write(self.path, data, prefix='.routes-')
 
     def load(self):
-        try:
-            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
-        except FileNotFoundError:
+        data = read_snapshot(self.path)
+        if data is None:
             return {}, {}
-        with os.fdopen(fd, 'r', encoding='utf-8') as source:
-            info = os.fstat(source.fileno())
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                    or info.st_mode & 0o077 or info.st_size > MAX_SNAPSHOT):
-                raise ValueError('Routing snapshot must be an owner-private regular file within size limit')
-            try:
-                data = json.load(source)
-            except (ValueError, UnicodeError):
-                raise ValueError('Invalid routing snapshot; refusing to overwrite it') from None
-        if (not isinstance(data, dict) or data.get('version') not in (1, 2)
-                or not isinstance(data.get('endpoints'), list) or not isinstance(data.get('channels'), list)):
-            raise ValueError('Unsupported routing snapshot; refusing to overwrite it')
         endpoints, channels = {}, {}
         dropped = False
         verified = set()

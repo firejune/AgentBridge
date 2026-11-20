@@ -18,7 +18,8 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import agy_live
 import broker
-import codex_preview
+import codex_archive
+import codex_preview  # Shared sidebar preview module exposed to CLI callers.
 import codex_new
 # Keep the existing CLI imports of the shared delivery helpers available.
 from delivery import (
@@ -394,7 +395,7 @@ def open_codex_result(args):
     return 130 if cancelled else (1 if result['error'] else 0)
 
 
-def close_session(route, timeout, archive=False):
+def close_session(route, timeout, archive=False, *, directory=None):
     """Stop or detach one route's session; optionally archive it out of the sidebar."""
     transport, sid = route['transport'], route.get('session')
     if transport == 'claude-peer':
@@ -417,7 +418,7 @@ def close_session(route, timeout, archive=False):
         return agy_live.close_agy(sid, timeout=timeout)
     if transport == 'codex':
         if archive:
-            return codex_preview.archive_thread(route, timeout=timeout)
+            return codex_archive.close(route, directory, timeout)
         return {
             'closed': True,
             'method': 'detach',
@@ -521,7 +522,7 @@ def close_participant(args):
     if args.handoff:
         return {**receipt, **prepare_archive_handoff(args, address, route)}
     result = {**receipt, **address, 'transport': route['transport'],
-              **close_session(route, args.timeout, archive=archive)}
+              **close_session(route, args.timeout, archive=archive, directory=broker_state_dir(args).expanduser().resolve())}
     if archive:
         if result.get('archived') is not True or result.get('session') != route['session']:
             result.update(correspondence_removed=False, cleanup_error='Provider archival was not confirmed', route_removed=False)
@@ -704,6 +705,12 @@ def main(argv=None):
     p = sub.add_parser('model',help="Read a participant's model, or switch it with --set (provider-neutral)")
     p.add_argument('name');p.add_argument('--project',required=True);p.add_argument('--set',dest='target')
     p.add_argument('--timeout',type=float,default=30);p.add_argument('--state-dir')
+    p = sub.add_parser('archive-sweep', help='Review or apply a guarded Codex archive manifest')
+    p.add_argument('--cwd-prefix', help='Absolute workspace prefix, matched by path components')
+    p.add_argument('--apply', action='store_true', help='Apply a reviewed manifest')
+    p.add_argument('--manifest', type=Path, help='Reviewed JSON manifest (required with --apply)')
+    p.add_argument('--state-dir', help='Broker routing directory (defaults to the socket .state directory)')
+    p.add_argument('--timeout', type=float, default=10, help='Seconds per Codex RPC')
     p = sub.add_parser('close',help="Close a participant's session without deleting it, then remove its route")
     p.add_argument('name');p.add_argument('--project',required=True)
     archive = p.add_mutually_exclusive_group()
@@ -940,10 +947,26 @@ def main(argv=None):
                 for row in result:
                     print(f"{row['time']} {row['urgency']} {row['card']} {row['runner']} [{','.join(row['tags'])}]\n{row['text'] if row['text'] is not None else row['no_retro']}")
             return 0
+        if args.cmd == 'archive-sweep':
+            if args.apply != (args.manifest is not None):
+                raise ValueError('--apply and --manifest FILE must be supplied together')
+            if not 0 < args.timeout <= 600:
+                raise ValueError('Timeout must be between 0 and 600 seconds')
+            path = codex_archive.sweep_store()
+            directory = broker_state_dir(args).expanduser().resolve()
+            prefix = codex_archive.absolute_path(args.cwd_prefix) if args.cwd_prefix is not None else None
+            if not args.apply:
+                output(codex_archive.plan(path, directory, prefix))
+                return 0
+            with args.manifest.expanduser().open(encoding='utf-8') as source:
+                manifest = json.load(source)
+            result = codex_archive.apply(path, directory, prefix, manifest, args.timeout)
+            output(result)
+            return int(not result['complete'])
         if args.cmd=='close':
             result = close_participant(args)
             output(result)
-            return int(bool(result.get('cleanup_error') or result.get('operator_error')))
+            return int(bool(result.get('cleanup_error') or result.get('operator_error') or result.get('archive_incomplete')))
         if args.cmd=='close-operator':
             caller = os.environ.get('CODEX_THREAD_ID')
             if not caller:
