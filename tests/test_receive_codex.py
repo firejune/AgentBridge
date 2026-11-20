@@ -112,16 +112,25 @@ class ReceiveCodexTests(unittest.TestCase):
                     patch.object(bridge.broker, 'request', return_value=self.message | fields):
                 self.assertEqual(self.receive(), expected)
 
-    def test_addressed_but_unreadable_messages_return_a_fixed_diagnostic(self):
-        invalid_fields = [
-            *({'state': state} for state in ('pending', 'failed', 'done', 'answered')),
-            {'reason': 'archived'}, {'body_expired': True}, {'close_request': {}}, {'body': None},
+    def test_addressed_but_unreadable_messages_name_their_cause(self):
+        # Was one fixed text for all of these (issue #164: an error names its cause).
+        causes = [
+            ({'state': 'pending'}, 'The addressed correspondence has not been dispatched yet.'),
+            ({'state': 'failed'}, 'The addressed correspondence is already failed; nothing is left to receive.'),
+            ({'state': 'done'}, 'The addressed correspondence is already done; nothing is left to receive.'),
+            ({'state': 'answered'}, 'The addressed correspondence is already answered; nothing is left to receive.'),
+            ({'state': 'failed', 'reason': 'archived'},
+             'The addressed correspondence failed because this thread is archived.'),
+            ({'reason': 'archived'}, 'The addressed correspondence failed because this thread is archived.'),
+            ({'body_expired': True, 'body': None}, 'The addressed correspondence body has expired; only its record remains.'),
+            ({'close_request': {}}, 'The addressed message is a close handoff; claim it with close-operator.'),
+            ({'body': None}, 'Agent Bridge broker did not return a usable message response.'),
+            ({'state': 'private text'}, 'Agent Bridge broker did not return a usable message response.'),
         ]
-        for fields in invalid_fields:
+        for fields, expected in causes:
             with self.subTest(fields=fields), patch.dict('os.environ', {'CODEX_THREAD_ID': self.thread}), \
                     patch.object(bridge.broker, 'request', return_value=self.message | fields):
-                self.assertEqual(self.receive(), (
-                    1, {'error': 'The addressed correspondence is not available to receive.'}))
+                self.assertEqual(self.receive(), (1, {'error': expected}))
 
     def test_socket_errors_preserve_only_the_error_category(self):
         cases = (

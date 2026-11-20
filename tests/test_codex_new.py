@@ -442,6 +442,20 @@ class NewCodexTests(unittest.TestCase):
             self.assertFalse(failure['registered'])
             self.assertNotIn('secret', json.dumps(failure))
 
+    def test_open_preflight_refusals_name_policy_and_routes_apart(self):
+        with ModelDesktop() as desktop:
+            with patch.object(bridge, 'new_session_policy', side_effect=ValueError('secret /private/config')):
+                code, policy = self.cli_open(desktop)
+            with patch.object(bridge.broker, 'request', side_effect=ValueError('secret reply')):
+                code2, routes = self.cli_open(desktop, '--register', 'worker', '--project', 'demo')
+        self.assertEqual((code, code2), (1, 1))
+        self.assertEqual(policy['error'], 'Codex open stopped: the model policy could not be read; '
+                         'check policy.json in the broker state directory')
+        self.assertEqual(routes['error'], 'Codex open stopped: the broker did not return usable routes for this project')
+        for result in (policy, routes):
+            self.assertEqual((result['created'], result['stage']), (False, 'preflight'))
+            self.assertNotIn('secret', json.dumps(result))
+
     def test_issue44_diagnostics_effective_permissions_and_update(self):
         with ModelDesktop(refuse_permissions=True) as desktop, self.assertRaises(codex_new.CreationError) as caught:
             expected = json.loads(json.dumps(desktop.permissions))

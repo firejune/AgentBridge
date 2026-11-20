@@ -84,7 +84,6 @@ def receive_codex(args):
         raise ValueError(invalid) from None
 
     unmatched = 'No correspondence matches this Codex thread and message ID.'
-    unavailable = 'The addressed correspondence is not available to receive.'
     bad_response = 'Agent Bridge broker did not return a usable message response.'
     try:
         message = broker.request(args.socket, {'op': 'show', 'id': args.id})
@@ -107,12 +106,20 @@ def receive_codex(args):
     route = message['route']
     if message.get('id') != args.id or route.get('transport') != 'codex' or route.get('session') != thread_id:
         raise ValueError(unmatched)
-    if (message.get('state') not in ('dispatching', 'submitted', 'uncertain', 'received', 'in_progress')
-            or message.get('reason') == ARCHIVED_REASON
-            or message.get('body_expired') or 'close_request' in message
-            or not isinstance(message.get('body'), str)):
-        raise ValueError(unavailable)
-    if not isinstance(message.get('sender'), str):
+    if 'close_request' in message:
+        raise ValueError('The addressed message is a close handoff; claim it with close-operator.')
+    if message.get('reason') == ARCHIVED_REASON:
+        raise ValueError('The addressed correspondence failed because this thread is archived.')
+    if message.get('body_expired'):
+        raise ValueError('The addressed correspondence body has expired; only its record remains.')
+    state = message.get('state')
+    if state == 'pending':
+        raise ValueError('The addressed correspondence has not been dispatched yet.')
+    if state in broker.TERMINAL_STATES:
+        raise ValueError(f'The addressed correspondence is already {state}; nothing is left to receive.')
+    if state not in ('dispatching', 'submitted', 'uncertain', 'received', 'in_progress'):
+        raise ValueError(bad_response)  # Not a state this CLI knows; never echo it.
+    if not isinstance(message.get('body'), str) or not isinstance(message.get('sender'), str):
         raise ValueError(bad_response)
     try:
         # The same text direct delivery hands the thread: envelope, body and reply contract.
@@ -312,6 +319,7 @@ def open_codex_result(args):
     result = codex_new.open_result()
     source, cancelled = None, False
     default_title = None
+    step = 'input'
     try:
         if args.cmd == 'open':
             if (args.register is None) != (args.project is None):
@@ -325,9 +333,12 @@ def open_codex_result(args):
                     broker.identifier(value)
                 except ValueError:
                     raise codex_new.CreationError(f'Codex route {label} must be a lowercase identifier') from None
+        step = 'policy'
         source = new_session_policy(args, 'codex')
+        step = 'routes'
         if name is not None:
             require_free_registration_name(args.socket, args.project, name)
+        step = 'open'
         title = args.title
         if title is None and name:
             title = default_title = f'{args.project}/{name}'
@@ -348,8 +359,12 @@ def open_codex_result(args):
     except sessions.DiscoveryError as error:
         result['error'] = str(error)  # A fixed --host/--ide refusal, before any provider call.
     except (ValueError, OSError, subprocess.TimeoutExpired, KeyError, TypeError):
-        # Policy files and transport exceptions can contain local paths or secrets.
-        result['error'] = 'Codex open preflight failed; check provider, host and model policy'
+        # Policy files and transport exceptions can contain local paths or secrets: name the step, not the text.
+        result['error'] = {
+            'policy': 'Codex open stopped: the model policy could not be read; '
+                      'check policy.json in the broker state directory',
+            'routes': 'Codex open stopped: the broker did not return usable routes for this project',
+        }.get(step, 'Codex open preflight failed; check provider, host and model policy')
     if source is not None:
         result['model_source'] = source
     name = args.register if args.cmd == 'open' else args.name
@@ -485,8 +500,12 @@ def close_participant(args):
         raise ValueError('Timeout must be between 0 and 600 seconds')
     address = {'name': args.name, 'project': args.project}
     if args.finish:
-        if not args.expect_session or args.keep_route or args.handoff:
-            raise ValueError('--finish requires --expect-session and removes the verified route')
+        if not args.expect_session:
+            raise ValueError('--finish requires --expect-session')
+        if args.keep_route:
+            raise ValueError('--finish removes the verified route and cannot be combined with --keep-route')
+        if args.handoff:
+            raise ValueError('--finish completes a prepared handoff and cannot be combined with --handoff')
         if args.retro_file or args.no_retro:
             raise ValueError('Record the retrospective when preparing the archive handoff')
         closed = broker.request(args.socket, {'op': 'close-finish', **address,
@@ -503,8 +522,13 @@ def close_participant(args):
     if args.expect_session and str(uuid.UUID(args.expect_session)) != route['session']:
         raise ValueError('Endpoint does not match --expect-session')
     archive = args.archive
-    if args.handoff and (not archive or args.keep_route or route['transport'] != 'codex'):
-        raise ValueError('--handoff requires a Codex route and --archive and removes the verified route')
+    if args.handoff:
+        if not archive:
+            raise ValueError('--handoff requires --archive')
+        if args.keep_route:
+            raise ValueError('--handoff removes the verified route and cannot be combined with --keep-route')
+        if route['transport'] != 'codex':
+            raise ValueError('--handoff requires a Codex route')
     if 'closing' in route and not args.handoff:
         raise ValueError('Codex route is closing; finish the native archive handoff')
     if archive and 'closing' not in route:

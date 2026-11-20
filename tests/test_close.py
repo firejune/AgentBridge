@@ -250,6 +250,27 @@ class CloseCodexTests(unittest.TestCase):
         retro = [] if '--finish' in flags else ['--no-retro', 'native archive fixture']
         return run(['--socket', self.server.path, 'close', 'target', '--project', 'p', *retro, *flags])
 
+    def test_finish_and_handoff_flag_refusals_name_the_flag(self):
+        close_id = str(uuid.uuid4())
+        cases = [
+            (('--finish', close_id), '--finish requires --expect-session'),
+            (('--finish', close_id, '--expect-session', self.sid, '--keep-route'),
+             '--finish removes the verified route and cannot be combined with --keep-route'),
+            (('--finish', close_id, '--expect-session', self.sid, '--handoff'),
+             '--finish completes a prepared handoff and cannot be combined with --handoff'),
+            (('--handoff',), '--handoff requires --archive'),
+            (('--archive', '--handoff', '--keep-route'),
+             '--handoff removes the verified route and cannot be combined with --keep-route'),
+        ]
+        for flags, expected in cases:
+            with self.subTest(flags=flags):
+                self.assertEqual(self.close(*flags), (1, {'error': expected}))
+        self.server.call('register', project='p', name='plain', cwd=str(self.cwd))
+        self.assertEqual(run(['--socket', self.server.path, 'close', 'plain', '--project', 'p', '--no-retro', 'x',
+                              '--archive', '--handoff']), (1, {'error': '--handoff requires a Codex route'}))
+        route, = [row for row in self.server.call('routes', project='p') if row['name'] == 'target']
+        self.assertNotIn('closing', route)
+
     def enroll(self, session=None):
         self.operator_sid = session or str(uuid.uuid4())
         self.server.call('register', project='ops', name='archive', cwd=str(self.cwd), transport='codex',
