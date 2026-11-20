@@ -128,8 +128,8 @@ def require_owned_store(path):
         raise ValueError('Codex native store is not owned and protected')
 
 
-def _saved_thread_row(route, include_rollout=False):
-    path = state_path(route.get('executable'))
+def _saved_thread_row(route, include_rollout=False, *, path=None):
+    path = path if path is not None else state_path(route.get('executable'))
     require_owned_store(path)
     sid = str(uuid.UUID(route['session']))
     fields = 'cwd, archived, rollout_path' if include_rollout else 'cwd, archived'

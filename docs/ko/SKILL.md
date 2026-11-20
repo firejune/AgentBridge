@@ -89,6 +89,7 @@ python3 "$bridge_cli" register codex-worker --project PROJECT --transport codex 
 ```
 
 - **직접 Push**: `CODEX_HOME/ipc/ipc.sock`(기본 `~/.codex`, 또는 `AGENT_BRIDGE_CODEX_IPC`)에 연결해 `supportsUntrustedAppInput`을 지원하는 정확한 대화 소유자를 확인한다. 동료 본문은 standalone `toolOutput`(`agent_bridge`)로 전달하며, 활성 턴이면 `thread-follower-steer-turn`으로 합류하고 유휴 상태일 때만 `thread-follower-start-turn`을 호출한다.
+- **Desktop 큐 알림**. 기본 IPC 소켓이 없거나 연결을 거부하고, 서명된 앱 번들 Codex CLI와 확인된 단일 로컬 Desktop 소유자가 기본 큐 저장소를 공유하며, 기본 로컬 브로커 소켓을 사용할 때 이 경로를 사용한다. 고정 알림은 지정된 대화에 `python3 "$bridge_cli" receive-codex MESSAGE_ID` 실행을 요청할 수 있다. 알림에 적힌 ID를 그대로 사용하고, `CODEX_THREAD_ID`가 일치하는 해당 Codex 대화에서 실행한다. 반환된 본문은 기존 사용자 승인의 범위에서 동료 서신으로 다룬다. 조회만으로 확인이나 답장을 보내지 않는다.
 - **사이드바 미리보기**: 첫 브릿지 과제가 `submitted`로 접수된 뒤 비어 있는 네이티브 사이드바 `preview`를 `state_5.sqlite`에 한 번 초기화하며, 실패하더라도 이미 수락된 전달을 실패로 바꾸지 않는다.
 - **무인 세션 생성 (`open` / `register --new`)**:
   - `app-server --stdio`로 영속 대화를 만들고 `thread/name/set`으로 제목을 저장한 뒤 `codex://threads/UUID`를 열어 데스크톱 앱이 대화를 인계받게 한다. **Enter 입력이나 UI 자동화가 필요 없다.**

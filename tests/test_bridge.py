@@ -3,6 +3,7 @@ import concurrent.futures
 from contextlib import redirect_stdout
 from io import StringIO
 import json
+import socket
 import sqlite3
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ import uuid
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import bridge
 import broker
+import delivery
 from support import RunningBroker
 from test_codex_live import FakeDesktop
 
@@ -380,6 +382,26 @@ class SocketTests(unittest.TestCase):
             self.assertEqual(failure['message']['state'],'pending')
             self.assertNotIn('SECRET_PEER_BODY',result.stdout)
             self.assertNotIn('SECRET_PEER_BODY',result.stderr)
+
+    def test_codex_stale_socket_returns_pending_and_fixed_public_detail(self):
+        self.codex_route(executable=str(Path(self.server.temp.name, 'missing-codex')))
+        stale_path = str(Path(self.server.temp.name) / 'stale-ipc.sock')
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stale:
+            stale.bind(stale_path)
+        result = subprocess.run([sys.executable, bridge.__file__, '--socket', self.server.path,
+            'send', '--project', 'demo', '--from-channel', 'beta', '--channel', 'alpha',
+            '--key', 'stale', '--file', '-'], input='SECRET_PEER_BODY', text=True, capture_output=True,
+            env={**os.environ, 'AGENT_BRIDGE_CODEX_IPC': stale_path}, timeout=3)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        failure = json.loads(result.stdout)
+        self.assertEqual(failure['message']['state'], 'pending')
+        detail = 'Codex Desktop IPC (configured IPC endpoint) has no listening server. Message was not delivered.'
+        self.assertEqual(failure['error'], detail)
+        stored = self.server.call('show', id=failure['message']['id'])
+        self.assertEqual(stored['state'], 'pending')
+        self.assertEqual(delivery.codex_prewrite_detail(stored), detail)
+        for private in ('SECRET_PEER_BODY', stale_path):
+            self.assertNotIn(private, result.stdout + result.stderr)
 
     def test_codex_archived_delivery_is_terminal_and_retained(self):
         route = self.codex_route()

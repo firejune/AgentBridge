@@ -54,9 +54,11 @@ flowchart LR
 | 환경 | Transport | 전달 메커니즘 |
 | --- | --- | --- |
 | **Claude Code / Desktop** | `claude-peer` | 살아 있는 세션의 메시징 소켓(`peerProtocol 1`)으로 직접 주입해 별도 CLI 프로세스를 띄우지 않고 다음 턴에 전달한다. |
-| **Codex / ChatGPT Desktop** | `codex` | `CODEX_HOME/ipc/ipc.sock`의 정확한 대화 소유자에 연결해 활성 턴이면 `thread-follower-steer-turn`(`toolOutput`)으로 합류하고, 유휴 상태면 새 턴을 시작한다. |
+| **Codex / ChatGPT Desktop** | `codex` | 등록된 정확한 Desktop 대화의 활성 턴이나 유휴 상태의 새 턴에 IPC 도구 결과로 전달하거나 Codex 큐 알림을 보낸다. |
 | **Antigravity IDE & Desktop** | `agy` | 로컬 `language_server` / `agy --hub`의 ConnectRPC에 연결해 활성 턴에는 `<SYSTEM_MESSAGE>`(`SendAgentMessage`)로 합류하고, 유휴/대기 상태에는 빈 `SendUserCascadeMessage`(`NEXT_INVOCATION`)로 즉시 깨운다. |
 | **CLI 워커** | `realtime` / `claude` | `realtime`은 `watch`로 JSONL 이벤트를 구독한다. `claude`는 **쉬고 있는 전용 CLI 세션**만 `deliver` 시 읽기 전용 `plan` 모드로 `--resume`한다(라이브 세션에는 절대 사용하지 않는다). |
+
+기본 IPC 소켓이 없거나 연결을 거부하고, 서명된 앱 번들 Codex CLI와 확인된 단일 로컬 Desktop 소유자가 기본 큐 저장소를 공유하며, 기본 로컬 브로커 소켓을 사용할 때 이 경로를 사용한다. Codex 큐 경로는 `codex queue`로 브로커 메시지 UUID만 담은 고정 알림을 보낸다. 지정된 대화가 `bridge.py receive-codex MESSAGE_ID`를 실행하면 동료 본문이 도구 결과로 들어온다. 발신 CLI와 Desktop 소유자가 같은 큐 저장소를 사용해야 하며, 정확한 대화가 로드되어 유휴 턴을 시작할 수 있어야 한다. 큐 접수만으로 대화가 깨어났거나 본문을 읽었다고 판정하지 않는다. 브리지는 대화를 자동 재개하거나 결과가 모호한 큐 쓰기를 재시도하지 않는다. Codex 대화 열기와 재매핑은 별도의 IPC 검사를 사용한다.
 
 Claude peer 전송은 소켓 쓰기와 연결 종료 대기에 시간 제한을 둔다. `deliver ID --timeout SECONDS`는 Claude peer 전송의 조회, claim, peer I/O에 적용된다. 쓰기가 시작됐을 수 있다면 결과 기록에 최대 10초를 더 쓸 수 있다. peer에 쓰기 전 보호된 claim 응답을 잃으면, claim 접수 한도가 지난 뒤 자기 예약을 푸는 데 최대 2초를 더 쓴다. 결과가 미확정인 전송은 수신자에게 중복 전송되지 않도록 계속 보호한다. `show`와 CLI `inbox`는 대기 중인 메시지에 `pending behind <id> since <time>`을 표시한다.
 
@@ -142,7 +144,7 @@ Codex Desktop의 네이티브 보관은 `close --archive --handoff`로 요청한
 
 Claude 데스크톱은 세션을 스스로 닫는다. 화면에 안 보이는 세션은 마지막 턴 뒤 900초가 지나면 멈추고, 메모리가 부족하면 가장 오래 쉰 세션을 내린다. 그러면 CLI가 끝나고 레지스트리 기록과 inbox 소켓이 사라진다. 이런 라우트로 `claude-peer` push가 오면 브릿지가 먼저 세션을 깨운다. 데스크톱 메타데이터에서 `cliSessionId`로 찾은 `claude://claude.ai/epitaxy/<local_id>`를 열면, 앱이 같은 세션 ID와 대화 기록을 새 PID로 이어 받는다. 새 inbox 소켓이 뜨면 메시지를 한 번만 push한다. 그때까지 메시지는 `dispatching`이고, 다른 결과면 아무것도 보내지 않은 채 `pending`으로 돌아간다. 브릿지는 스스로 다시 열거나 다시 보내지 않는다. `bridge.py wake NAME --project P`는 같은 단계를 명시적으로 한다. 링크를 열면 앱이 그 세션으로 포커스를 옮기고 앞으로 올 수 있다. 예약 작업 세션(앱이 세션 간 메시징을 끈 채 띄운다)과 IDE 세션은 `unsupported`다.
 
-정확한 Codex Desktop 소유자 조회가 시간 초과되거나 불가능하거나 외부 입력을 지원하는 소유자가 없으면 전달은 `pending`에 머문다. CLI와 MCP는 조회 결과와 확인된 작업 경로 누락을 보고하며, 대화를 자동으로 다시 열거나 메시지를 재전송하지 않는다.
+IPC 경로에서 정확한 Codex Desktop 소유자 조회가 시간 초과되거나 불가능하거나 외부 입력을 지원하는 소유자가 없으면 전달은 `pending`에 머문다. CLI와 MCP는 조회 결과와 확인된 작업 경로 누락을 보고하며, 대화를 자동으로 다시 열거나 메시지를 재전송하지 않는다.
 
 `bridge.py remap`은 브로커의 모든 프로젝트에서 보관되지 않은 등록 Codex 세션을 다시 연다. 저장된 작업 디렉터리를 확인하고 Desktop 소유자가 이미 붙은 세션은 건너뛴다. 결과는 엔드포인트별로 출력한다. 세션을 다시 열 때 Codex Desktop이 화면 앞으로 올 수 있다. UUID와 대기 중인 메시지는 그대로 유지한다.
 

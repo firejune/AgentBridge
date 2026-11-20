@@ -48,6 +48,34 @@ def registered_route(args):
     return route
 
 
+def receive_codex(args):
+    """Read one retained peer message in the Codex thread it targets."""
+    invalid = 'Run receive-codex from the addressed Codex thread with an exact message UUID'
+    caller = os.environ.get('CODEX_THREAD_ID')
+    try:
+        if not caller or str(uuid.UUID(args.id)) != args.id:
+            raise ValueError(invalid)
+        thread_id = str(uuid.UUID(caller))
+    except ValueError:
+        raise ValueError(invalid) from None
+
+    unavailable = 'No dispatched peer correspondence is available for this Codex thread and message ID'
+    try:
+        message = broker.request(args.socket, {'op': 'show', 'id': args.id})
+    except ValueError:
+        raise ValueError(unavailable) from None
+    route = message.get('route', {})
+    if (message.get('id') != args.id or route.get('transport') != 'codex'
+            or route.get('session') != thread_id
+            or message.get('state') not in ('dispatching', 'submitted', 'uncertain', 'received', 'in_progress')
+            or message.get('reason') == ARCHIVED_REASON
+            or message.get('body_expired') or 'close_request' in message
+            or not isinstance(message.get('body'), str)):
+        raise ValueError(unavailable)
+    return {'id': args.id, 'sender': message['sender'], 'body': message['body'],
+            'provenance': 'agent_bridge_peer', 'authorization': 'none'}
+
+
 def wake_participant(args):
     """bridge.py wake NAME --project P: bring an idle-closed claude-peer session back (issue #115)."""
     route = registered_route(args)
@@ -809,6 +837,8 @@ def main(argv=None):
     p = sub.add_parser('wait');p.add_argument('id');p.add_argument('--timeout',type=float,default=60)
     for cmd in ('show','conversation','ack'):
         p = sub.add_parser(cmd);p.add_argument('id')
+    p = sub.add_parser('receive-codex', help='Read one dispatched peer message from its addressed Codex thread')
+    p.add_argument('id', metavar='MESSAGE_ID')
     p = sub.add_parser('progress');p.add_argument('id');p.add_argument('--note',required=True)
     p = sub.add_parser('deliver');p.add_argument('id');p.add_argument('--dry-run',action='store_true');p.add_argument('--timeout',type=float,default=180)
     p = sub.add_parser('resolve');p.add_argument('id');p.add_argument('--state',choices=['pending','submitted','done'],required=True);p.add_argument('--note',required=True)
@@ -953,6 +983,9 @@ def main(argv=None):
             target = request['target']
             output({key: target[key] for key in ('project', 'name', 'session', 'cwd')}
                    | {'close_id': request['close_id']})
+            return 0
+        if args.cmd=='receive-codex':
+            output(receive_codex(args))
             return 0
         if args.cmd=='wake':
             result = wake_participant(args)

@@ -288,10 +288,12 @@ python3 "$bridge_cli" channel-bind modal-view --project my-app --owner codex-age
   - 구버전 브로커가 보호된 claim 작업을 명시적으로 거부한 뒤에만 기존 claim 방식을 사용한다. 기존 방식의 응답을 잃으면 예약을 보호 상태로 둔다. claim, 해제, finish가 미확정이면 종료 코드 1과 `id`, `stage`(`claim`, `claim-release` 또는 `finish`), `uncertain: true`를 출력한다. 기록된 메시지 상태는 `show ID`로 조회한다.
   - 세션의 라이브 기록이 없으면 같은 한도 안에서 push용 5초를 남기고 먼저 한 번 깨우고(「유휴로 닫힌 Claude 세션 깨우기」), inbox가 뜨면 한 번 push한다. peer 쓰기 전(조회 · 깨우기 · 프레임)에 실패하거나 중단되면 `push_failed` 이벤트와 함께 `pending`으로 돌아간다. `uncertain`은 쓰기가 일어났을 수 있을 때만 기록한다.
 - **Codex (`codex`)**:
-  - 저장된 메타데이터에서 정확한 수신 Codex 대화의 보관이 확인되면 CLI는 Desktop에 연결하기 전에 `state: "failed"`와 `reason: "archived"`를 반환한다. 종료 코드는 1이다. `send`, `ask`, `reply`, `deliver`의 실패 메시지와 이유는 브로커 재시작 뒤에도 남는다. `deliver --dry-run`은 메시지를 바꾸지 않고 이유만 반환한다. 저장된 메타데이터를 읽을 수 없으면 일반 IPC 전달 검사를 적용한다.
-  - 정확한 Desktop 소유자 조회의 시간이 초과되거나, 조회할 수 없거나, 외부 입력을 지원하는 소유자가 없으면 전달은 `pending`에 머문다. CLI와 MCP는 조회 결과를 구분해 보고하며, 저장된 정확한 작업 경로가 없음을 확인하면 함께 알린다. 브리지는 대화를 자동으로 다시 열거나 메시지를 재전송하지 않는다.
+  - 저장된 메타데이터에서 정확한 수신 Codex 대화의 보관이 확인되면 CLI는 Desktop에 연결하기 전에 `state: "failed"`와 `reason: "archived"`를 반환한다. 종료 코드는 1이다. `send`, `ask`, `reply`, `deliver`의 실패 메시지와 이유는 브로커 재시작 뒤에도 남는다. `deliver --dry-run`은 메시지를 바꾸지 않고 이유만 반환한다. 저장된 메타데이터를 읽을 수 없으면 선택된 전달 경로의 검사를 적용한다.
+  - IPC 경로에서 정확한 Desktop 소유자 조회의 시간이 초과되거나, 조회할 수 없거나, 외부 입력을 지원하는 소유자가 없으면 전달은 `pending`에 머문다. CLI와 MCP는 조회 결과를 구분해 보고하며, 저장된 정확한 작업 경로가 없음을 확인하면 함께 알린다. 브리지는 대화를 자동으로 다시 열거나 메시지를 재전송하지 않는다.
   - `CODEX_HOME/ipc/ipc.sock`(또는 `AGENT_BRIDGE_CODEX_IPC`)에서 정확한 대화 소유자에 연결한다.
   - 동료 본문을 standalone `toolOutput`(`agent_bridge`)로 전달하며, 활성 턴이면 `thread-follower-steer-turn`을 먼저 호출해 현재 턴에 합류하고 유휴 상태일 때만 `thread-follower-start-turn`을 호출한다.
+  - 기본 IPC 소켓이 없거나 연결을 거부하고, 서명된 앱 번들 Codex CLI와 확인된 단일 로컬 Desktop 소유자가 기본 큐 저장소를 공유하며, 기본 로컬 브로커 소켓을 사용할 때 이 경로를 사용한다. Desktop 큐 경로는 브릿지 메시지 UUID만 담은 고정 알림을 큐에 넣는다. Desktop 소유자와 같은 큐 저장소를 사용하며 `--resume`을 쓰지 않는다. 로드된 대화는 턴을 시작할 수 있을 때 알림을 가져간다. 로드되지 않았거나 중단된 대화는 알림을 큐에 남겨 둘 수 있다. 큐 접수(`delivery_path: "codex-desktop-queue"`)만으로 대화가 깨어났거나 본문을 읽었다고 판정하지 않는다. 결과가 모호한 쓰기는 자동 재시도하지 않는다.
+  - 수신 Codex 대화에서 `python3 "$bridge_cli" receive-codex MESSAGE_ID`를 실행한다. 정확한 브로커 ID, 메시지에 고정된 Codex 목적지, 환경의 `CODEX_THREAD_ID`를 대조해 메시지 ID·발신자·본문·동료 출처만 반환한다. 이미 전달을 시도했고 보관 중인 서신을 읽으며 상태는 변경하지 않는다. 네이티브 종료 인계는 별도 IPC 경로를 사용한다.
   - 첫 과제가 `submitted`로 수락된 뒤 비어 있는 네이티브 사이드바 `preview`를 `state_5.sqlite`에 한 번 초기화한다(잠금 대기 100ms 제한; 미리보기 실패가 전달 성공을 뒤집거나 재전송을 유발하지 않음).
 - **Antigravity (`agy`)**:
   - 로컬 `language_server` / `agy --hub`의 ConnectRPC로 정확한 `conversationId`와 워크스페이스를 검증한다.
