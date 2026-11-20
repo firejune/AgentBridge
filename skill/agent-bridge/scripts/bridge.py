@@ -90,7 +90,12 @@ def receive_codex(args):
         raise ValueError(unavailable)
     if not isinstance(message.get('sender'), str):
         raise ValueError(bad_response)
-    return {'id': args.id, 'sender': message['sender'], 'body': message['body'],
+    try:
+        # The same text direct delivery hands the thread: envelope, body and reply contract.
+        text = peer_text(message, args.socket, escape_peer=False)
+    except (KeyError, TypeError):
+        raise ValueError(bad_response) from None
+    return {'id': args.id, 'sender': message['sender'], 'text': text,
             'provenance': 'agent_bridge_peer', 'authorization': 'none'}
 
 
