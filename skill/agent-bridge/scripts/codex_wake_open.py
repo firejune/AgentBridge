@@ -127,20 +127,39 @@ def _saved_rollout(desktop, route):
     return cwd, path
 
 
-def _permissions(context):
+def _workspace_profile(cwd):
+    entries = [
+        {'path': {'type': 'special', 'value': {'kind': 'root'}}, 'access': 'read'},
+        {'path': {'type': 'path', 'path': str(cwd)}, 'access': 'write'},
+        {'path': {'type': 'special', 'value': {'kind': 'slash_tmp'}}, 'access': 'write'},
+        {'path': {'type': 'special', 'value': {'kind': 'tmpdir'}}, 'access': 'write'},
+    ]
+    entries.extend({'path': {'type': 'path', 'path': str(cwd / name)}, 'access': 'read',
+                    'missing_path_behavior': 'skip'} for name in ('.git', '.agents', '.codex', '.aws'))
+    return {'type': 'managed', 'network': 'restricted',
+            'file_system': {'type': 'restricted', 'entries': entries}}
+
+
+def _permissions(context, cwd):
     profile = context.get('active_permission_profile')
     settings = context.get('permission_profile')
     approval, sandbox = context.get('approval_policy'), context.get('sandbox_policy')
     if (profile == {'id': ':read-only'} and settings == READ_ONLY_PROFILE
             and approval == 'on-request' and sandbox == {'type': 'read-only'}):
-        public_sandbox = 'readOnly'
+        public_sandbox = {'type': 'readOnly'}
     elif (profile == {'id': ':danger-full-access'} and settings == {'type': 'disabled'}
             and approval == 'never' and sandbox == {'type': 'danger-full-access'}):
-        public_sandbox = 'dangerFullAccess'
+        public_sandbox = {'type': 'dangerFullAccess'}
+    elif (profile == {'id': ':workspace'} and approval == 'on-request'
+            and isinstance(sandbox, dict)
+            and set(sandbox) == {'type', 'network_access', 'exclude_tmpdir_env_var', 'exclude_slash_tmp'}
+            and sandbox['type'] == 'workspace-write'
+            and all(sandbox[key] is False for key in ('network_access', 'exclude_tmpdir_env_var', 'exclude_slash_tmp'))
+            and settings == _workspace_profile(cwd)):
+        public_sandbox = {'type': 'workspaceWrite', 'networkAccess': False}
     else:
         raise WakeError('The Codex Desktop wake turn used unrecognized permission settings')
-    return {'activePermissionProfile': profile, 'approvalPolicy': approval,
-            'sandboxPolicy': {'type': public_sandbox}}
+    return {'activePermissionProfile': profile, 'approvalPolicy': approval, 'sandboxPolicy': public_sandbox}
 
 
 class _Attestation:
@@ -168,7 +187,7 @@ class _Attestation:
                 raise WakeError(EVIDENCE_ERROR)
             if payload.get('model') != self.model:
                 raise WakeError('The Codex Desktop wake turn used a different model')
-            self.permissions = _permissions(payload)
+            self.permissions = _permissions(payload, self.cwd)
         elif event in ('model_reroute', 'error', 'turn_aborted'):
             raise WakeError(EVIDENCE_ERROR)
         elif event == 'item_completed':

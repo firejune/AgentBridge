@@ -757,8 +757,6 @@ class NewCodexTests(unittest.TestCase):
         real_open = codex_new.open_codex
         turn_id = str(uuid.uuid4())
         prepared = object()
-        permissions = {'activePermissionProfile': {'id': ':read-only'},
-                       'approvalPolicy': 'on-request', 'sandboxPolicy': {'type': 'readOnly'}}
         command = ['open', '--provider', 'codex', '--cwd', self.root, '--register', 'worker',
                    '--project', 'demo', '--state-dir', self.root, '--model', 'requested-model']
 
@@ -779,9 +777,14 @@ class NewCodexTests(unittest.TestCase):
             return {'model': model, 'permission_settings': permissions, 'turn_id': turn_id}
 
         endpoint = codex_live.EndpointUnavailable
-        for reason in (endpoint.MISSING, endpoint.REFUSED):
+        cases = ((endpoint.MISSING, ':read-only', {'type': 'readOnly'}, 'read-only'),
+                 (endpoint.REFUSED, ':workspace', {'type': 'workspaceWrite', 'networkAccess': False},
+                  'workspace-write'))
+        for reason, profile, sandbox, label in cases:
+            permissions = {'activePermissionProfile': {'id': profile}, 'approvalPolicy': 'on-request',
+                           'sandboxPolicy': sandbox}
             self.calls.clear()
-            with self.subTest(reason=reason), patch.object(codex_new, 'open_codex', side_effect=create), \
+            with self.subTest(reason=reason, profile=profile), patch.object(codex_new, 'open_codex', side_effect=create), \
                     patch.object(codex_live, 'Client', side_effect=endpoint(endpoint.DEFAULT, reason)) as ipc, \
                     patch.object(codex_wake_open, 'prepare', side_effect=prepare_context) as prepare, \
                     patch.object(codex_wake_open, 'adopt', side_effect=adopt) as wake, \
@@ -806,6 +809,7 @@ class NewCodexTests(unittest.TestCase):
             self.assertEqual(result['permission_settings'], permissions)
             self.assertEqual(result['permission_settings_source'], 'Desktop wake turn context')
             self.assertEqual(result['warning']['code'], 'CODEX_DESKTOP_WAKE_RESTRICTED')
+            self.assertIn(f'{label} sandbox and on-request approval', result['warning']['message'])
             self.assertEqual(result['model'], 'requested-model')
             self.assertEqual(result['creator_settings']['sandbox']['type'], 'dangerFullAccess')
             self.assertEqual([method for method, _, _ in self.calls].count('thread/start'), 1)
@@ -850,8 +854,15 @@ class NewCodexTests(unittest.TestCase):
         def create(**kwargs):
             return real_open(**kwargs, client_factory=self.factory, opener=self.urls.append)
 
+        workspace = dict(permissions, activePermissionProfile={'id': ':workspace'})
+        invalid_sandboxes = ({'type': 'workspaceWrite'},
+                             {'type': 'workspaceWrite', 'networkAccess': True},
+                             {'type': 'workspaceWrite', 'networkAccess': 0},
+                             {'type': 'workspaceWrite', 'networkAccess': False, 'extra': True})
         confirmations = [('model', 'substituted', permissions),
-                         ('permissions', 'requested-model', dict(permissions, activePermissionProfile=None))]
+                         ('permissions', 'requested-model', dict(permissions, activePermissionProfile=None)),
+                         *[('permissions', 'requested-model', dict(workspace, sandboxPolicy=sandbox))
+                           for sandbox in invalid_sandboxes]]
         endpoint = codex_live.EndpointUnavailable
         for stage, model, observed in confirmations:
             self.calls.clear()

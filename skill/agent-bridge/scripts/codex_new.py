@@ -20,10 +20,6 @@ import new_session_policy
 
 FULL_ACCESS_PROFILE = ':danger-full-access'
 QUEUE_ADOPTION = 'desktop-queue-wake'
-RESTRICTED_WARNING = {
-    'code': 'CODEX_DESKTOP_WAKE_RESTRICTED',
-    'message': 'Desktop started this thread with read-only sandbox and on-request approval.',
-}
 PERMISSION_SETTLE_SECONDS = 2
 PERMISSION_SETTLE_ATTEMPTS = 20
 # New threads request this model when --model is omitted, so they never
@@ -394,11 +390,23 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
             result.update(permission_settings=permissions,
                           permission_settings_source='Desktop wake turn context')
             if not has_full_access(permissions):
-                if (permissions['sandboxPolicy'] != {'type': 'readOnly'}
-                        or permissions['approvalPolicy'] != 'on-request'
-                        or (permissions['activePermissionProfile'] or {}).get('id') != ':read-only'):
+                profile = raw_permissions['activePermissionProfile']
+                sandbox = raw_permissions.get('sandboxPolicy')
+                if permissions['approvalPolicy'] != 'on-request':
                     raise CreationError('Codex Desktop wake returned unconfirmed permission settings')
-                result['warning'] = dict(RESTRICTED_WARNING)
+                if profile == {'id': ':read-only'} and sandbox == {'type': 'readOnly'}:
+                    sandbox_name = 'read-only'
+                elif (profile == {'id': ':workspace'}
+                      and sandbox == {'type': 'workspaceWrite', 'networkAccess': False}
+                      and sandbox['networkAccess'] is False):
+                    sandbox_name = 'workspace-write'
+                    permissions['sandboxPolicy']['networkAccess'] = False
+                else:
+                    raise CreationError('Codex Desktop wake returned unconfirmed permission settings')
+                result['warning'] = {
+                    'code': 'CODEX_DESKTOP_WAKE_RESTRICTED',
+                    'message': f'Desktop started this thread with {sandbox_name} sandbox and on-request approval.',
+                }
             stage = 'adoption'
             turn_id = confirmed.get('turn_id')
             if not isinstance(turn_id, str) or str(uuid.UUID(turn_id)) != turn_id:

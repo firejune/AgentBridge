@@ -24,6 +24,30 @@ def event(event_type, turn=TURN, **fields):
     return {'type': 'event_msg', 'payload': {'type': event_type, 'turn_id': turn, **fields}}
 
 
+def workspace_permissions():
+    # Native Desktop turn_context, with only the workspace path anonymized.
+    return {
+        'active_permission_profile': {'id': ':workspace'},
+        'approval_policy': 'on-request',
+        'sandbox_policy': {
+            'type': 'workspace-write', 'network_access': False,
+            'exclude_tmpdir_env_var': False, 'exclude_slash_tmp': False,
+        },
+        'permission_profile': {
+            'type': 'managed', 'network': 'restricted',
+            'file_system': {'type': 'restricted', 'entries': [
+                {'path': {'type': 'special', 'value': {'kind': 'root'}}, 'access': 'read'},
+                {'path': {'type': 'path', 'path': str(CWD)}, 'access': 'write'},
+                {'path': {'type': 'special', 'value': {'kind': 'slash_tmp'}}, 'access': 'write'},
+                {'path': {'type': 'special', 'value': {'kind': 'tmpdir'}}, 'access': 'write'},
+                *({'path': {'type': 'path', 'path': str(CWD / child)},
+                   'access': 'read', 'missing_path_behavior': 'skip'}
+                  for child in ('.git', '.agents', '.codex', '.aws')),
+            ]},
+        },
+    }
+
+
 def startup_records(turn=TURN, trigger='queue', model=MODEL, prompt=PROMPT, reply=REPLY):
     return [
         {'type': 'session_meta', 'payload': {'id': THREAD, 'session_id': THREAD, 'cwd': str(CWD)}},
@@ -64,6 +88,44 @@ class DesktopWakeAttestationTests(unittest.TestCase):
         self.assertEqual(result['permission_settings']['approvalPolicy'], 'on-request')
         self.assertEqual(result['permission_settings']['sandboxPolicy']['type'], 'readOnly')
         self.assertEqual(result['permission_settings']['activePermissionProfile'], {'id': ':read-only'})
+
+    def test_exact_queued_turn_reports_scoped_workspace_write_permissions(self):
+        startup = startup_records()
+        startup[2]['payload'].update(workspace_permissions())
+        result, = self.feed(startup)
+        self.assertEqual(result, {
+            'turn_id': TURN, 'model': MODEL, 'permission_settings': {
+                'activePermissionProfile': {'id': ':workspace'},
+                'approvalPolicy': 'on-request',
+                'sandboxPolicy': {'type': 'workspaceWrite', 'networkAccess': False},
+            },
+        })
+
+    def test_workspace_turn_refuses_broader_root_or_network_and_unknown_permissions(self):
+        def root_write(context):
+            context['permission_profile']['file_system']['entries'][0]['access'] = 'write'
+
+        def outside_workspace(context):
+            context['permission_profile']['file_system']['entries'][1]['path']['path'] = str(CWD.parent)
+
+        def sandbox_network(context):
+            context['sandbox_policy']['network_access'] = True
+
+        def profile_network(context):
+            context['permission_profile']['network'] = 'enabled'
+
+        def unknown_profile(context):
+            context['active_permission_profile']['id'] = ':custom'
+
+        for mutate in (root_write, outside_workspace, sandbox_network, profile_network, unknown_profile):
+            with self.subTest(mutation=mutate.__name__):
+                startup = startup_records()
+                context = startup[2]['payload']
+                context.update(workspace_permissions())
+                mutate(context)
+                self.attestation = codex_wake_open._Attestation(THREAD, CWD, MODEL, PROMPT)
+                with self.assertRaises(codex_wake_open.WakeError):
+                    self.feed(startup)
 
     def test_composer_turn_with_matching_marker_cannot_attest(self):
         with self.assertRaises(codex_wake_open.WakeError):
