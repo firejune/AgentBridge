@@ -124,6 +124,14 @@ def public_message(message):
     return result
 
 
+def build_id(root=None):
+    """Name the source a process runs: a digest of every module beside this one."""
+    digest = hashlib.sha256()
+    for path in sorted(Path(root or Path(__file__).resolve().parent).glob('*.py')):
+        digest.update(path.name.encode() + b'\0' + path.read_bytes() + b'\0')
+    return digest.hexdigest()[:12]
+
+
 class BrokerConnectError(ValueError):
     """A socket connection failed before a broker request was sent."""
 
@@ -146,6 +154,7 @@ class State:
         if max_messages < 1:
             raise ValueError('Message retention size must be positive')
         self.instance = str(uuid.uuid4())
+        self.build = build_id()  # Read once: the source this process started from.
         self.max_messages = max_messages
         if retention_ttl and max_messages > 2048:
             raise ValueError('TTL active-message limit cannot exceed 2048')
@@ -942,7 +951,8 @@ class State:
         if op in ('inbox_list', 'inbox_get', 'inbox_ack', 'inbox_reply'):
             return self.inbox_action(args)
         if op == 'ping':
-            return {'instance':self.instance,'messages':len(self.messages),'subscribers':len(self.subscribers),
+            return {'instance':self.instance,'build':self.build,
+                    'messages':len(self.messages),'subscribers':len(self.subscribers),
                     'correspondence_lost': bool(self.correspondence and self.correspondence.loss),
                     'correspondence_over_limit': len(self.messages) > self.max_messages,
                     'retention_ttl_enabled': self.retention_ttl,

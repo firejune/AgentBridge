@@ -48,6 +48,30 @@ def registered_route(args):
     return route
 
 
+def build_skew(path, ping=None):
+    """Name a CLI and broker running different builds; None when equal or unanswered."""
+    try:
+        if ping is None:
+            ping = broker.request(path, {'op': 'ping'}, deadline=time.monotonic() + 1)
+        mine, theirs = broker.build_id(), ping.get('build')
+    except (ValueError, OSError, AttributeError):
+        return None
+    if theirs == mine:
+        return None
+    found = f'is build {theirs}' if isinstance(theirs, str) else 'predates build reporting'
+    return (f'BROKER_BUILD_SKEW: the running broker {found} and this CLI is build {mine}. '
+            'Bring both to the same build before trusting a failure.')
+
+
+def with_skew(args, result, error):
+    """An operation the broker does not know is the mismatch itself: say so beside it.
+
+    Only that definite refusal earns the extra read; no other failure touches the broker again.
+    """
+    warning = build_skew(args.socket) if str(error) == 'Unknown operation' else None
+    return result if warning is None else {**result, 'warning': warning}
+
+
 def receive_codex(args):
     """Read one retained peer message in the Codex thread it targets."""
     invalid = 'Run receive-codex from the addressed Codex thread with an exact message UUID'
@@ -1014,6 +1038,11 @@ def main(argv=None):
             output({'type':'sent','message':sent} | ({} if found is None else {'usage': found}))
             fields = {'op':'wait','id':sent['id'],'timeout':args.timeout}
         result = broker.request(args.socket,fields,timeout=args.timeout+5 if args.cmd in ('ask','wait') else 10)
+        if args.cmd == 'ping':
+            result['cli_build'] = broker.build_id()
+            warning = build_skew(args.socket, result)
+            if warning is not None:
+                result['warning'] = warning
         if args.cmd=='routes' and not args.no_model:
             with_models(result, models.load_policy(broker_state_dir(args)), 5)
         if observation:
@@ -1063,7 +1092,7 @@ def main(argv=None):
         if observation and args.cmd == 'register' and args.transport == 'codex' and args.new:
             result.update(created=True, adopted=observation.get('adopted',False), session=observation['session']['id'],
                           registered=False, discovery=observation)
-        output(result)
+        output(with_skew(args, result, error))
         return 1
 
 

@@ -444,6 +444,8 @@ fork·subagent는 `subagent_history_start_ordinal` 경계 또는 부모 snapshot
 하위 에이전트 수치를 분리한다. provider reader는 독립적인 결과 객체 목록으로 `subagents`를
 채울 수 있으며 캐시 입력 정규화는 notes와 fixture 테스트에 명시한다.
 
+`ping`은 `build`(브로커가 시작할 때 읽은 모듈의 다이제스트)와 `cli_build`(이 CLI의 같은 다이제스트)도 반환한다. 둘이 다르거나 브로커가 `build`를 보고하지 않으면 `warning: BROKER_BUILD_SKEW …`를 붙이고 종료 코드는 0을 유지한다. 브로커가 `Unknown operation`으로 거절한 명령에도 같은 경고가 붙는다.
+
 `ping`은 `checkpoint_last_save_seconds`, `checkpoint_max_save_seconds`, `checkpoint_bytes`를 반환한다. 각각 마지막 저장 시도 시간, 브로커 시작 이후 최대 시간(실패한 시도 포함, 초), 마지막으로 성공한 `correspondence.json` 페이로드 크기(메타데이터 인덱스 제외, 바이트)다. 저장소가 없으면 각각 `null`, `0.0`, `0`이다. 저장이 1초를 넘으면 `checkpoint_save_slow` JSON 로그 한 줄을 stderr에 남긴다. `duration_seconds`, `bytes`, `retained_count`만 포함하며 실패 시 `bytes`는 마지막 성공 크기다. 시간에는 검증·직렬화·영속 쓰기가 포함되며 변경 상태 준비는 제외한다. 계측은 재시작하면 초기화된다. 저장 중 `ping`은 마지막으로 끝난 저장 시도와 커밋된 메시지 수를 반환한다. watch 이벤트는 해당 저장이 끝난 뒤 공개된다. 상태 변경, inbox 스냅샷 작업, wait 등록은 진행 중인 저장이 끝날 때까지 기다린다. 브로커가 종료되면 이미 시작한 커밋을 마친 뒤 상태 잠금을 해제한다.
 
 Codex `open` / `register --new`는 권한 확인에 실패하면 라우트를 등록하지 않는다. 성공·실패 단계와 확인된 `approvalPolicy`, 샌드박스 유형을 stderr 한 줄에 출력한다.
