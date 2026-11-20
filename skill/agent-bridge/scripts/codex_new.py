@@ -174,7 +174,7 @@ def open_result():
             'adoption_mode': None, 'wake_turn_id': None,
             'creator_settings': None, 'permission_settings': None, 'permission_settings_source': None,
             'settings_update': {'applied': None, 'resultType': None},
-            'existing_sessions': [], 'warning': None}
+            'existing_sessions': [], 'route_conflict': None, 'recovery': None, 'warning': None}
 
 
 def permission_settings(client, sid, owner):

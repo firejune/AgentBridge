@@ -221,6 +221,10 @@ def output(value):
 class RegistrationConflict(ValueError):
     """A known occupied name, before any external creation."""
 
+    def __init__(self, route):
+        super().__init__(broker.REGISTER_CONFLICT_ERROR)
+        self.route = {key: route.get(key) for key in ('transport', 'session', 'cwd')}
+
 
 def require_free_registration_name(path, project, name):
     broker.identifier(project)
@@ -228,8 +232,9 @@ def require_free_registration_name(path, project, name):
     rows = broker.request(path, {'op': 'routes', 'project': project})
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
         raise ValueError('Registration preflight returned invalid routes')
-    if any(row.get('name') == name for row in rows):
-        raise RegistrationConflict(broker.REGISTER_CONFLICT_ERROR)
+    holder = next((row for row in rows if row.get('name') == name), None)
+    if holder is not None:
+        raise RegistrationConflict(holder)
 
 
 def validate_new_registration(args):
@@ -305,7 +310,9 @@ def open_codex_result(args):
         result = sessions.open_session('codex', cwd=args.cwd, title=title, model=args.model,
             timeout=args.timeout, host=args.host, ide=args.ide, force_new=args.new, allow_queue_wake=True)
     except RegistrationConflict as error:
-        result['error'] = str(error)
+        result.update(error=str(error), route_conflict=error.route)
+    except broker.BrokerConnectError:
+        result['error'] = 'Agent Bridge broker is unavailable for this socket; no Codex thread was created'
     except codex_new.CreationError as error:
         result = error.result
         if default_title is not None and result['stage'] == 'duplicate':
@@ -314,6 +321,8 @@ def open_codex_result(args):
     except KeyboardInterrupt:
         result['error'] = 'Codex open interrupted before a result was available'
         cancelled = True
+    except sessions.DiscoveryError as error:
+        result['error'] = str(error)  # A fixed --host/--ide refusal, before any provider call.
     except (ValueError, OSError, subprocess.TimeoutExpired, KeyError, TypeError):
         # Policy files and transport exceptions can contain local paths or secrets.
         result['error'] = 'Codex open preflight failed; check provider, host and model policy'
@@ -343,6 +352,14 @@ def open_codex_result(args):
             cancelled = True
             if result['error'] is None:
                 result.update(error=result['registration_error'], stage='registration')
+    if result['error'] and result['created'] and result['session']['id'] and not result['registered']:
+        # A thread exists that no route points at. Name the one way back to it.
+        sid = result['session']['id']
+        result['recovery'] = (
+            f'Codex thread {sid} exists and is not registered. Never repeat open or register --new for it. '
+            'Inspect that thread in Codex Desktop, then bind it with: '
+            f"register {name or 'NAME'} --project {args.project or 'PROJECT'} "
+            f'--transport codex --session {sid} --discover')
     permissions = result.get('permission_settings') or {}
     approval = permissions.get('approvalPolicy')
     sandbox = (permissions.get('sandboxPolicy') or {}).get('type')
