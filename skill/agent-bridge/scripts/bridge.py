@@ -624,10 +624,8 @@ def with_models(rows, policy, timeout, key='session'):
     return rows
 
 
-def build_parser():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--socket',default=str(broker.DEFAULT_SOCKET))
-    sub = parser.add_subparsers(dest='cmd',required=True)
+def add_broker_commands(sub):
+    """The broker itself: serve, its retention and usage reads, ping, stop and the launchd service."""
     p = sub.add_parser('serve',help='Run the local broker in the foreground')
     p.add_argument('--max-messages',type=int,default=2048,help='Active-message cap; TTL mode refuses admission when no safely expired body exists')
     retention_mode = p.add_mutually_exclusive_group()
@@ -680,6 +678,10 @@ def build_parser():
             mode = p.add_mutually_exclusive_group()
             mode.add_argument('--retention-prepare',action='store_true',help='Generate service arguments for non-deleting timestamp warm-up')
             mode.add_argument('--retention-ttl',action='store_true',help='Generate service arguments for opt-in TTL cleanup')
+
+
+def add_session_commands(sub):
+    """Routes and the sessions behind them: register, open, model, close."""
     p = sub.add_parser('register',help='Bind an unused project/name or retry its exact existing identity')
     p.add_argument('name')
     p.add_argument('--project',required=True)
@@ -739,6 +741,10 @@ def build_parser():
     p.add_argument('--state-dir')
     p = sub.add_parser('close-operator', help='Claim an authorized Codex native archive handoff from its enrolled chat')
     p.add_argument('id', metavar='MESSAGE_ID')
+
+
+def add_record_commands(sub):
+    """Owner-private records: retrospectives, run receipts and verified handovers."""
     p = sub.add_parser('retro',help='Append and inspect project retrospectives')
     retro_sub = p.add_subparsers(dest='retro_cmd',required=True)
     for action in ('add','list','tally'):
@@ -773,6 +779,10 @@ def build_parser():
     p.add_argument('--to',dest='recipient')
     p.add_argument('--card')
     p.add_argument('--note-file')
+
+
+def add_lookup_commands(sub):
+    """Reads of sessions, policy, routes and channels, and the two channel writes."""
     p = sub.add_parser('wake',help="Bring an idle-closed claude-peer session back in its own host; prints woken, already-live, unsupported, failed or uncertain")
     p.add_argument('name')
     p.add_argument('--project',required=True)
@@ -822,6 +832,10 @@ def build_parser():
     p.add_argument('name')
     p.add_argument('--project',required=True)
     p.add_argument('--expect-generation',type=int,required=True)
+
+
+def add_message_commands(sub):
+    """Correspondence: send, ask, reply, the reads and the delivery outcomes."""
     for cmd in ('send','ask'):
         p = sub.add_parser(cmd)
         p.add_argument('--project',required=True)
@@ -877,6 +891,17 @@ def build_parser():
     p.add_argument('--note',required=True)
     p = sub.add_parser('wt',add_help=False,help='Agent worktrees: new, list, sweep, adopt (bridge.py wt --help)')
     p.add_argument('wt_args',nargs=argparse.REMAINDER)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--socket',default=str(broker.DEFAULT_SOCKET))
+    sub = parser.add_subparsers(dest='cmd',required=True)
+    add_broker_commands(sub)
+    add_session_commands(sub)
+    add_record_commands(sub)
+    add_lookup_commands(sub)
+    add_message_commands(sub)
     return parser
 
 
