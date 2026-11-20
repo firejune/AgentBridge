@@ -499,10 +499,7 @@ def close_participant(args):
         result.update({key: closed[key] for key in ('route_removed', 'correspondence_cleanup',
                        'cleanup_error', 'route_error', 'operator_receipt', 'operator_error') if key in closed})
         return result
-    route = next((r for r in broker.request(args.socket,{'op':'routes','project':args.project})
-                  if r['name'] == args.name), None)
-    if route is None:
-        raise ValueError(f'No participant {args.name!r} is registered in project {args.project!r}')
+    route = registered_route(args)
     if args.expect_session and str(uuid.UUID(args.expect_session)) != route['session']:
         raise ValueError('Endpoint does not match --expect-session')
     archive = args.archive
@@ -1070,10 +1067,7 @@ def wake_command(args):
 
 
 def title_command(args):
-    route = next((r for r in broker.request(args.socket,{'op':'routes','project':args.project})
-                  if r['name'] == args.name), None)
-    if route is None:
-        raise ValueError(f'No participant {args.name!r} is registered in project {args.project!r}')
+    route = registered_route(args)
     if route['transport'] != 'claude-peer':
         raise models.Unsupported(f"{route['transport']}: titles are set at creation; only claude-peer routes are labelled")
     found = label_claude(route, force=args.force)
@@ -1090,10 +1084,7 @@ def model_command(args):
     if not 0 < args.timeout <= 3600:
         raise ValueError('Timeout must be between 0 and 3600 seconds')
     policy = models.load_policy(broker_state_dir(args))
-    route = next((r for r in broker.request(args.socket,{'op':'routes','project':args.project})
-                  if r['name'] == args.name), None)
-    if route is None:
-        raise ValueError(f'No participant {args.name!r} is registered in project {args.project!r}')
+    route = registered_route(args)
     if args.target is None:
         output({'name':args.name,**models.flag(policy, models.read(route, min(args.timeout, 30)))})
         return 0
