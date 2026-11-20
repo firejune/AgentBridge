@@ -814,6 +814,348 @@ def build_parser():
     return parser
 
 
+def run_command(args):
+    return receipts.run(broker_state_dir(args), args.label, args.cwd, args.command)
+
+
+def handover_command(args):
+    checked = receipts.check(broker_state_dir(args), args.rows, args.head)
+    if args.action == 'check':
+        output({'verified': True, 'head': args.head, 'rows': checked})
+        return 0
+    if not all(getattr(args, name) and getattr(args, name).strip()
+               for name in ('project', 'sender', 'recipient', 'card')):
+        raise ValueError('HANDOVER_UNVERIFIED: send requires --project, --from, --to and --card')
+    note = None
+    if args.note_file:
+        with Path(args.note_file).expanduser().open(encoding='utf-8', newline='') as source:
+            note = source.read()
+    body = receipts.message(args.card, args.head, checked, note)
+    # Identical verified content has one durable broker idempotency key. No retry on uncertainty.
+    key_data = json.dumps([args.project, args.sender, args.recipient, body], ensure_ascii=False).encode('utf-8')
+    sent = broker.request(args.socket, {'op': 'send', 'project': args.project,
+        'sender': args.sender, 'recipient': args.recipient, 'body': body,
+        'key': 'handover-' + hashlib.sha256(key_data).hexdigest()})
+    output(push_if_peer(args.socket, sent))
+    return 0
+
+
+def serve_command(args):
+    if args.max_messages<1:
+        raise ValueError('Message limit must be positive')
+    if args.usage_interval and args.usage_interval<usage.MIN_INTERVAL_MINUTES:
+        raise ValueError(f'Usage interval must be 0 (off) or at least {usage.MIN_INTERVAL_MINUTES} minutes')
+    asyncio.run(broker.serve(args.socket,args.max_messages,args.state_dir,
+                             args.usage_interval,args.codex_executable,args.claude_live,
+                             args.codex_failure_interval,
+                             tuple(int(value) for value in args.provider_retry_backoff.split(',')),
+                             args.provider_retry_cap,
+                             args.agy_failure_interval, args.retention_ttl, args.retention_prepare))
+    return 0
+
+
+def retention_command(args):
+    if args.live:
+        output(broker.request(args.socket, {'op': 'retention-plan'}))
+    else:
+        if not 1 <= args.max_messages <= 2048:
+            raise ValueError('TTL active-message limit must be 1..2048')
+        store = broker.message_store.MessageStore(broker_state_dir(args), args.max_messages)
+        output(store.retention_dry_run())
+    return 0
+
+
+def session_usage_command(args):
+    if args.name:
+        if not args.project or args.provider or args.id:
+            raise ValueError('Use NAME --project P or --provider PROVIDER --id ID')
+        route = registered_route(args)
+        provider = {'claude-peer': 'claude', 'claude': 'claude', 'codex': 'codex', 'agy': 'agy'}.get(route['transport'])
+        if provider is None:
+            raise ValueError('Registered transport has no session usage reader')
+        sid = route['session']
+    else:
+        if not args.provider or not args.id or args.project:
+            raise ValueError('Use NAME --project P or --provider PROVIDER --id ID')
+        provider, sid = args.provider, args.id
+    result = session_usage.query(provider, sid, args.prices)
+    if args.json:
+        output(result)
+    else:
+        print(session_usage.format_line(result), flush=True)
+    return 0
+
+
+def usage_command(args):
+    state_dir = args.state_dir or Path(args.socket).expanduser().absolute().with_suffix('.state')
+    if args.seed_announcements:
+        output(usage.seed_announcements(state_dir, args.seed_announcements))
+        return 0
+    if args.refresh and args.provider in ('all', 'agy'):
+        usage.refresh_agy(state_dir)
+    records, summary, moment = usage.query(state_dir, args.since, args.provider)
+    warning = usage.claude_caller_warning(summary, args.provider)
+    if warning and not args.json:
+        print(warning, flush=True)  # First, before any Claude bucket (#125).
+    extra = {} if warning is None else {'warning': warning}
+    if args.events:
+        if args.json:
+            output(dict(**extra, announcements=summary['announcements'],
+                        buckets=[{key: row[key] for key in ('limit_id','slot','resets_at','events','early_reset',
+                                                            'spend_horizon','spend_basis','stop_risk_horizon')}
+                                 for row in summary['buckets']]))
+        else:
+            print(usage.format_events(summary, summary['announcements']), flush=True)
+    elif args.json:
+        cutoff = moment-usage.parse_since(args.since)
+        payload = {k: v for k, v in summary.items() if k != 'summaries'}
+        output(dict(**extra, records=[r for r in records if usage.parse_time(r['observed_at'])>=cutoff],
+                    **payload))
+    else:
+        print(usage.format_summary(summary, moment), flush=True)
+    return 0
+
+
+def service_command(args):
+    fields = dict(socket=args.socket, state_dir=args.state_dir, plist=args.plist,
+                  generate_only=args.generate_only)
+    if args.cmd == 'install-service':
+        fields.update(max_messages=args.max_messages, retention_prepare=args.retention_prepare, retention_ttl=args.retention_ttl)
+    output((service.install if args.cmd == 'install-service' else service.uninstall)(**fields))
+    return 0
+
+
+def open_command(args):
+    if args.provider == 'codex':
+        return open_codex_result(args)
+    if args.register or args.project or args.new:
+        raise ValueError('--register, --project and --new on open apply only to --provider codex')
+    new_session_policy(args, args.provider)
+    result = sessions.open_session(args.provider,args.cwd,args.title,args.model,args.timeout,host=args.host,ide=args.ide)
+    output(result)
+    return 0
+
+
+def retro_output_command(args):
+    result = retro_command(args)
+    if args.json or args.retro_cmd == 'add':
+        output(result)
+    elif args.retro_cmd == 'tally':
+        for row in result:
+            print(f"{row['tag']}\t{row['count']}\t{row['first']}\t{row['last']}\t{', '.join(str(c) for c in row['cards'])}")
+    else:
+        for row in result:
+            print(f"{row['time']} {row['urgency']} {row['card']} {row['runner']} [{','.join(row['tags'])}]\n{row['text'] if row['text'] is not None else row['no_retro']}")
+    return 0
+
+
+def close_command(args):
+    result = close_participant(args)
+    output(result)
+    return int(bool(result.get('cleanup_error') or result.get('operator_error')))
+
+
+def close_operator_command(args):
+    caller = os.environ.get('CODEX_THREAD_ID')
+    if not caller:
+        raise ValueError('Run close-operator from the enrolled Codex Desktop chat')
+    request = broker.request(args.socket, {'op':'close-operator', 'id':str(uuid.UUID(args.id)),
+                              'operator_session':str(uuid.UUID(caller))})
+    target = request['target']
+    output({key: target[key] for key in ('project', 'name', 'session', 'cwd')}
+           | {'close_id': request['close_id']})
+    return 0
+
+
+def receive_codex_command(args):
+    output(receive_codex(args))
+    return 0
+
+
+def wake_command(args):
+    result = wake_participant(args)
+    output(result)
+    return 0 if result['state'] in ('woken','already-live') else 1
+
+
+def title_command(args):
+    route = next((r for r in broker.request(args.socket,{'op':'routes','project':args.project})
+                  if r['name'] == args.name), None)
+    if route is None:
+        raise ValueError(f'No participant {args.name!r} is registered in project {args.project!r}')
+    if route['transport'] != 'claude-peer':
+        raise models.Unsupported(f"{route['transport']}: titles are set at creation; only claude-peer routes are labelled")
+    found = label_claude(route, force=args.force)
+    output({'name':args.name,'project':args.project,'session':route['session'],**found})
+    return 0 if found['state'] != 'skipped' else 1
+
+
+def policy_command(args):
+    output(models.load_policy(broker_state_dir(args)))
+    return 0
+
+
+def model_command(args):
+    if not 0 < args.timeout <= 3600:
+        raise ValueError('Timeout must be between 0 and 3600 seconds')
+    policy = models.load_policy(broker_state_dir(args))
+    route = next((r for r in broker.request(args.socket,{'op':'routes','project':args.project})
+                  if r['name'] == args.name), None)
+    if route is None:
+        raise ValueError(f'No participant {args.name!r} is registered in project {args.project!r}')
+    if args.target is None:
+        output({'name':args.name,**models.flag(policy, models.read(route, min(args.timeout, 30)))})
+        return 0
+    output({'name':args.name,**models.switch(route, args.target, policy, args.timeout, ModelRelay(args.socket))})
+    return 0
+
+
+def codex_model_command(args):
+    policy = models.load_policy(broker_state_dir(args))
+    route = {'transport':'codex','session':args.id}
+    output(models.switch(route, args.model, policy, args.timeout))
+    return 0
+
+
+def sessions_command(args):
+    result = sessions.discover(args.provider,args.cwd,args.search,args.limit,args.codex_executable,args.claude_executable,args.codex_mode)
+    if args.with_model:
+        policy = models.load_policy(broker_state_dir(args))
+        for name in ('codex','agy','claude'):
+            if name in result['providers']:
+                with_models(result['providers'][name]['sessions'], policy, 10)
+    output(result)
+    return 1 if result['errors'] else 0
+
+
+def session_command(args):
+    output(sessions.inspect_session(args.provider,args.id,args.executable,args.codex_mode))
+    return 0
+
+
+REQUEST_OPS = {'stop': 'shutdown', 'ask': 'send'}
+NOT_REQUEST_FIELDS = ('cmd', 'socket', 'file', 'discover', 'new', 'title', 'model', 'codex_mode', 'state_dir', 'no_model')
+
+
+def request_fields(args):
+    """The broker request a plain command sends: its own options under its operation name."""
+    fields = {key: value for key, value in vars(args).items()
+              if key not in NOT_REQUEST_FIELDS and not (key == 'timeout' and args.cmd == 'register')}
+    fields['op'] = REQUEST_OPS.get(args.cmd, args.cmd)
+    return fields
+
+
+def message_fields(args):
+    """request_fields for send, ask and reply, with the body read from --file."""
+    fields = request_fields(args)
+    if args.cmd in ('send', 'ask') and (fields.get('one_way') or fields.get('reply_deadline_seconds') is not None):
+        # A distinct operation is rejected before mutation by older brokers,
+        # including when the broker restarts between separate CLI calls.
+        fields['op'] = 'send-with-retention'
+    fields['body'] = sys.stdin.read() if args.file == '-' else Path(args.file).read_text(encoding='utf-8')
+    return fields
+
+
+def require_wait_timeout(args):
+    if not 0 < args.timeout <= 3600:
+        raise ValueError('Timeout must be between 0 and 3600 seconds')
+
+
+def request_command(args):
+    output(broker.request(args.socket, request_fields(args)))
+    return 0
+
+
+def ping_command(args):
+    result = broker.request(args.socket, request_fields(args))
+    result['cli_build'] = broker.build_id()
+    warning = build_skew(args.socket, result)
+    if warning is not None:
+        result['warning'] = warning
+    output(result)
+    return 0
+
+
+def routes_command(args):
+    result = broker.request(args.socket, request_fields(args))
+    if not args.no_model:
+        with_models(result, models.load_policy(broker_state_dir(args)), 5)
+    output(result)
+    return 0
+
+
+def register_command(args):
+    if args.transport == 'codex' and args.new:
+        return open_codex_result(args)
+    if args.new and args.transport in ('agy', 'claude-peer'):
+        validate_new_registration(args)
+        require_free_registration_name(args.socket, args.project, args.name)
+        new_session_policy(args, 'claude' if args.transport == 'claude-peer' else args.transport)
+    observation = registration(args)  # Fills args.session and args.cwd before the request is built.
+    result = broker.request(args.socket, request_fields(args))
+    if observation:
+        result['discovery'] = observation
+    if args.transport == 'claude-peer' and result.get('session'):
+        result['title'] = label_claude(result)
+    output(result)
+    return 0
+
+
+def deliver_command(args):
+    result = deliver(args.socket, args.id, args.timeout, args.dry_run)
+    output(result)
+    return int(result['state'] in ('failed', 'uncertain') or result.get('reason') == ARCHIVED_REASON)
+
+
+def watch_command(args):
+    for event in broker.stream(args.socket, request_fields(args)):
+        output(event)
+    return 0
+
+
+def send_command(args):
+    output(with_usage(args, push_if_peer(args.socket, broker.request(args.socket, message_fields(args)))))
+    return 0
+
+
+def wait_result(args, fields):
+    result = broker.request(args.socket, fields, timeout=args.timeout + 5)
+    output(result)
+    return 2 if result['timed_out'] else 0
+
+
+def ask_command(args):
+    fields = message_fields(args)
+    require_wait_timeout(args)
+    sent = push_if_peer(args.socket, broker.request(args.socket, fields))
+    found = message_usage(args, sent)
+    output({'type': 'sent', 'message': sent} | ({} if found is None else {'usage': found}))
+    return wait_result(args, {'op': 'wait', 'id': sent['id'], 'timeout': args.timeout})
+
+
+def wait_command(args):
+    require_wait_timeout(args)
+    return wait_result(args, request_fields(args))
+
+
+COMMANDS = {
+    'run': run_command, 'handover': handover_command, 'serve': serve_command,
+    'retention': retention_command, 'session-usage': session_usage_command, 'usage': usage_command,
+    'install-service': service_command, 'uninstall-service': service_command,
+    'open': open_command, 'register': register_command,
+    'retro': retro_output_command, 'close': close_command, 'close-operator': close_operator_command,
+    'receive-codex': receive_codex_command, 'wake': wake_command, 'title': title_command,
+    'policy': policy_command, 'model': model_command, 'codex-model': codex_model_command,
+    'sessions': sessions_command, 'session': session_command,
+    'deliver': deliver_command, 'watch': watch_command,
+    'send': send_command, 'reply': send_command, 'ask': ask_command, 'wait': wait_command,
+    'ping': ping_command, 'routes': routes_command,
+    # Plain requests: the parsed options are the broker operation.
+    **{name: request_command for name in ('stop', 'channels', 'channel-bind', 'channel-close', 'inbox',
+                                          'show', 'conversation', 'ack', 'progress', 'resolve')},
+}
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ['wt']:  # Own parser, so `wt --help` and leading options reach it.
@@ -822,235 +1164,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.cmd=='wt':
         return wt.main(args.wt_args,prog='bridge.py wt')
-    observation = None
     try:
-        if args.cmd == 'run':
-            return receipts.run(broker_state_dir(args), args.label, args.cwd, args.command)
-        if args.cmd == 'handover':
-            checked = receipts.check(broker_state_dir(args), args.rows, args.head)
-            if args.action == 'check':
-                output({'verified': True, 'head': args.head, 'rows': checked})
-                return 0
-            if not all(getattr(args, name) and getattr(args, name).strip()
-                       for name in ('project', 'sender', 'recipient', 'card')):
-                raise ValueError('HANDOVER_UNVERIFIED: send requires --project, --from, --to and --card')
-            note = None
-            if args.note_file:
-                with Path(args.note_file).expanduser().open(encoding='utf-8', newline='') as source:
-                    note = source.read()
-            body = receipts.message(args.card, args.head, checked, note)
-            # Identical verified content has one durable broker idempotency key. No retry on uncertainty.
-            key_data = json.dumps([args.project, args.sender, args.recipient, body], ensure_ascii=False).encode('utf-8')
-            sent = broker.request(args.socket, {'op': 'send', 'project': args.project,
-                'sender': args.sender, 'recipient': args.recipient, 'body': body,
-                'key': 'handover-' + hashlib.sha256(key_data).hexdigest()})
-            output(push_if_peer(args.socket, sent))
-            return 0
-        if ((args.cmd == 'open' and args.provider == 'codex') or
-                (args.cmd == 'register' and args.transport == 'codex' and args.new)):
-            return open_codex_result(args)
-        if args.cmd == 'open' and (args.register or args.project or args.new):
-            raise ValueError('--register, --project and --new on open apply only to --provider codex')
-        if args.cmd=='serve':
-            if args.max_messages<1:
-                raise ValueError('Message limit must be positive')
-            if args.usage_interval and args.usage_interval<usage.MIN_INTERVAL_MINUTES:
-                raise ValueError(f'Usage interval must be 0 (off) or at least {usage.MIN_INTERVAL_MINUTES} minutes')
-            asyncio.run(broker.serve(args.socket,args.max_messages,args.state_dir,
-                                     args.usage_interval,args.codex_executable,args.claude_live,
-                                     args.codex_failure_interval,
-                                     tuple(int(value) for value in args.provider_retry_backoff.split(',')),
-                                     args.provider_retry_cap,
-                                     args.agy_failure_interval, args.retention_ttl, args.retention_prepare))
-            return 0
-        if args.cmd == 'retention':
-            if args.live:
-                output(broker.request(args.socket, {'op': 'retention-plan'}))
-            else:
-                if not 1 <= args.max_messages <= 2048:
-                    raise ValueError('TTL active-message limit must be 1..2048')
-                store = broker.message_store.MessageStore(broker_state_dir(args), args.max_messages)
-                output(store.retention_dry_run())
-            return 0
-        if args.cmd == 'session-usage':
-            if args.name:
-                if not args.project or args.provider or args.id:
-                    raise ValueError('Use NAME --project P or --provider PROVIDER --id ID')
-                route = registered_route(args)
-                provider = {'claude-peer': 'claude', 'claude': 'claude', 'codex': 'codex', 'agy': 'agy'}.get(route['transport'])
-                if provider is None:
-                    raise ValueError('Registered transport has no session usage reader')
-                sid = route['session']
-            else:
-                if not args.provider or not args.id or args.project:
-                    raise ValueError('Use NAME --project P or --provider PROVIDER --id ID')
-                provider, sid = args.provider, args.id
-            result = session_usage.query(provider, sid, args.prices)
-            if args.json:
-                output(result)
-            else:
-                print(session_usage.format_line(result), flush=True)
-            return 0
-        if args.cmd=='usage':
-            state_dir = args.state_dir or Path(args.socket).expanduser().absolute().with_suffix('.state')
-            if args.seed_announcements:
-                output(usage.seed_announcements(state_dir, args.seed_announcements))
-                return 0
-            if args.refresh and args.provider in ('all', 'agy'):
-                usage.refresh_agy(state_dir)
-            records, summary, moment = usage.query(state_dir, args.since, args.provider)
-            warning = usage.claude_caller_warning(summary, args.provider)
-            if warning and not args.json:
-                print(warning, flush=True)  # First, before any Claude bucket (#125).
-            extra = {} if warning is None else {'warning': warning}
-            if args.events:
-                if args.json:
-                    output(dict(**extra, announcements=summary['announcements'],
-                                buckets=[{key: row[key] for key in ('limit_id','slot','resets_at','events','early_reset',
-                                                                    'spend_horizon','spend_basis','stop_risk_horizon')}
-                                         for row in summary['buckets']]))
-                else:
-                    print(usage.format_events(summary, summary['announcements']), flush=True)
-            elif args.json:
-                cutoff = moment-usage.parse_since(args.since)
-                payload = {k: v for k, v in summary.items() if k != 'summaries'}
-                output(dict(**extra, records=[r for r in records if usage.parse_time(r['observed_at'])>=cutoff],
-                            **payload))
-            else:
-                print(usage.format_summary(summary, moment), flush=True)
-            return 0
-        if args.cmd in ('install-service','uninstall-service'):
-            fields = dict(socket=args.socket, state_dir=args.state_dir, plist=args.plist,
-                          generate_only=args.generate_only)
-            if args.cmd == 'install-service':
-                fields.update(max_messages=args.max_messages, retention_prepare=args.retention_prepare, retention_ttl=args.retention_ttl)
-            output((service.install if args.cmd == 'install-service' else service.uninstall)(**fields))
-            return 0
-        if args.cmd=='open':
-            new_session_policy(args, args.provider)
-            result = sessions.open_session(args.provider,args.cwd,args.title,args.model,args.timeout,host=args.host,ide=args.ide)
-            output(result)
-            return 0
-        if args.cmd=='retro':
-            result = retro_command(args)
-            if args.json or args.retro_cmd == 'add':
-                output(result)
-            elif args.retro_cmd == 'tally':
-                for row in result:
-                    print(f"{row['tag']}\t{row['count']}\t{row['first']}\t{row['last']}\t{', '.join(str(c) for c in row['cards'])}")
-            else:
-                for row in result:
-                    print(f"{row['time']} {row['urgency']} {row['card']} {row['runner']} [{','.join(row['tags'])}]\n{row['text'] if row['text'] is not None else row['no_retro']}")
-            return 0
-        if args.cmd=='close':
-            result = close_participant(args)
-            output(result)
-            return int(bool(result.get('cleanup_error') or result.get('operator_error')))
-        if args.cmd=='close-operator':
-            caller = os.environ.get('CODEX_THREAD_ID')
-            if not caller:
-                raise ValueError('Run close-operator from the enrolled Codex Desktop chat')
-            request = broker.request(args.socket, {'op':'close-operator', 'id':str(uuid.UUID(args.id)),
-                                      'operator_session':str(uuid.UUID(caller))})
-            target = request['target']
-            output({key: target[key] for key in ('project', 'name', 'session', 'cwd')}
-                   | {'close_id': request['close_id']})
-            return 0
-        if args.cmd=='receive-codex':
-            output(receive_codex(args))
-            return 0
-        if args.cmd=='wake':
-            result = wake_participant(args)
-            output(result)
-            return 0 if result['state'] in ('woken','already-live') else 1
-        if args.cmd=='title':
-            route = next((r for r in broker.request(args.socket,{'op':'routes','project':args.project})
-                          if r['name'] == args.name), None)
-            if route is None:
-                raise ValueError(f'No participant {args.name!r} is registered in project {args.project!r}')
-            if route['transport'] != 'claude-peer':
-                raise models.Unsupported(f"{route['transport']}: titles are set at creation; only claude-peer routes are labelled")
-            found = label_claude(route, force=args.force)
-            output({'name':args.name,'project':args.project,'session':route['session'],**found})
-            return 0 if found['state'] != 'skipped' else 1
-        if args.cmd=='policy':
-            output(models.load_policy(broker_state_dir(args)))
-            return 0
-        if args.cmd=='model':
-            if not 0 < args.timeout <= 3600:
-                raise ValueError('Timeout must be between 0 and 3600 seconds')
-            policy = models.load_policy(broker_state_dir(args))
-            route = next((r for r in broker.request(args.socket,{'op':'routes','project':args.project})
-                          if r['name'] == args.name), None)
-            if route is None:
-                raise ValueError(f'No participant {args.name!r} is registered in project {args.project!r}')
-            if args.target is None:
-                output({'name':args.name,**models.flag(policy, models.read(route, min(args.timeout, 30)))})
-                return 0
-            output({'name':args.name,**models.switch(route, args.target, policy, args.timeout, ModelRelay(args.socket))})
-            return 0
-        if args.cmd=='codex-model':
-            policy = models.load_policy(broker_state_dir(args))
-            route = {'transport':'codex','session':args.id}
-            output(models.switch(route, args.model, policy, args.timeout))
-            return 0
-        if args.cmd=='sessions':
-            result = sessions.discover(args.provider,args.cwd,args.search,args.limit,args.codex_executable,args.claude_executable,args.codex_mode)
-            if args.with_model:
-                policy = models.load_policy(broker_state_dir(args))
-                for name in ('codex','agy','claude'):
-                    if name in result['providers']:
-                        with_models(result['providers'][name]['sessions'], policy, 10)
-            output(result)
-            return 1 if result['errors'] else 0
-        if args.cmd=='session':
-            output(sessions.inspect_session(args.provider,args.id,args.executable,args.codex_mode))
-            return 0
-        if args.cmd=='register' and args.new and args.transport in ('agy','claude-peer'):
-            validate_new_registration(args)
-            require_free_registration_name(args.socket, args.project, args.name)
-            new_session_policy(args, 'claude' if args.transport == 'claude-peer' else args.transport)
-        observation = registration(args) if args.cmd=='register' else None
-        if args.cmd=='deliver':
-            result = deliver(args.socket,args.id,args.timeout,args.dry_run)
-            output(result)
-            return int(result['state'] in ('failed','uncertain') or result.get('reason') == ARCHIVED_REASON)
-        fields = {k:v for k,v in vars(args).items() if k not in ('cmd','socket','file','discover','new','title','model','codex_mode','state_dir','no_model') and not (k=='timeout' and args.cmd=='register')}
-        fields['op'] = {'stop':'shutdown','ask':'send'}.get(args.cmd,args.cmd)
-        if args.cmd in ('send','ask') and (fields.get('one_way') or fields.get('reply_deadline_seconds') is not None):
-            # A distinct operation is rejected before mutation by older brokers,
-            # including when the broker restarts between separate CLI calls.
-            fields['op'] = 'send-with-retention'
-        if args.cmd in ('send','ask','reply'):
-            fields['body'] = sys.stdin.read() if args.file=='-' else Path(args.file).read_text(encoding='utf-8')
-        if args.cmd in ('wait','ask') and not 0<args.timeout<=3600:
-            raise ValueError('Timeout must be between 0 and 3600 seconds')
-        if args.cmd=='watch':
-            for event in broker.stream(args.socket,fields):
-                output(event)
-            return 0
-        if args.cmd in ('send','reply'):
-            output(with_usage(args, push_if_peer(args.socket,broker.request(args.socket,fields))))
-            return 0
-        if args.cmd=='ask':
-            sent = push_if_peer(args.socket,broker.request(args.socket,fields))
-            found = message_usage(args, sent)
-            output({'type':'sent','message':sent} | ({} if found is None else {'usage': found}))
-            fields = {'op':'wait','id':sent['id'],'timeout':args.timeout}
-        result = broker.request(args.socket,fields,timeout=args.timeout+5 if args.cmd in ('ask','wait') else 10)
-        if args.cmd == 'ping':
-            result['cli_build'] = broker.build_id()
-            warning = build_skew(args.socket, result)
-            if warning is not None:
-                result['warning'] = warning
-        if args.cmd=='routes' and not args.no_model:
-            with_models(result, models.load_policy(broker_state_dir(args)), 5)
-        if observation:
-            result['discovery'] = observation
-        if args.cmd == 'register' and args.transport == 'claude-peer' and result.get('session'):
-            result['title'] = label_claude(result)
-        output(result)
-        return 2 if args.cmd in ('ask','wait') and result['timed_out'] else 0
+        return COMMANDS[args.cmd](args)
     except KeyboardInterrupt:
         return 130
     except ClaudeDispatchUnknown as error:
