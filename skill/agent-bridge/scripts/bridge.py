@@ -265,8 +265,7 @@ def remap(args):
     if (thread['id'] != target or not Path(thread['cwd']).is_absolute()
             or Path(thread['cwd']).resolve(strict=True) != Path(route['cwd']).resolve(strict=True)):
         raise ValueError('Codex session identity or workspace differs')
-    with codex_live.Client(timeout=5) as client:
-        client.owner(target)
+    require_codex_owner(target, 5)
     return broker.request(args.socket, {'op':'remap', 'project':args.project, 'name':args.name,
                                         'expected_route':route, 'session':target})
 
@@ -308,19 +307,33 @@ def refresh_codex_routes(path):
     current = read_routes()
     for sid, routes in groups.items():
         if outcomes[sid]['status'] in ('already_live', 'reopened'):
-            if any(route not in current for route in routes) or not has_codex_owner(sid, 1):
-                outcomes[sid] = {'status':'failed', 'error':'Endpoint or Desktop owner changed before final verification'}
+            try:
+                if any(route not in current for route in routes) or not has_codex_owner(sid, 1):
+                    raise ValueError('Endpoint or Desktop owner changed before final verification')
+            except (ValueError, OSError) as error:
+                outcomes[sid] = {'status':'failed', 'error':str(error)}
     return [{'project':route['project'], 'name':route['name'], 'session':sid, **outcomes[sid]}
             for sid, routes in groups.items() for route in routes]
 
 
-def has_codex_owner(target, timeout):
+def require_codex_owner(target, timeout):
     try:
         with codex_live.Client(timeout=timeout) as client:
-            client.owner(target)
+            return client.owner(target)
+    except codex_live.EndpointUnavailable as error:
+        raise ValueError(error.diagnosis()) from None
+    except OSError:
+        raise ValueError('Codex Desktop owner transport was unavailable') from None
+
+
+def has_codex_owner(target, timeout):
+    try:
+        require_codex_owner(target, timeout)
         return True
-    except (codex_live.DeliveryError, OSError, TypeError, KeyError):
-        return False
+    except codex_live.OwnerUnavailable as error:
+        if str(error) == codex_live.OwnerUnavailable.NO_OWNER:
+            return False
+        raise
 
 
 def refresh_codex(target, timeout=10):

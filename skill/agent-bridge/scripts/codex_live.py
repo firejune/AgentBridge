@@ -49,7 +49,10 @@ class EndpointUnavailable(DeliveryError):
 
     def __init__(self, endpoint_name, reason):
         self.endpoint_name, self.reason = endpoint_name, reason
-        super().__init__(f'Codex Desktop IPC ({endpoint_name}) {reason}. Message was not delivered.')
+        super().__init__(self.diagnosis() + ' Message was not delivered.')
+
+    def diagnosis(self):
+        return f'Codex Desktop IPC ({self.endpoint_name}) {self.reason}.'
 
     @classmethod
     def details(cls):
