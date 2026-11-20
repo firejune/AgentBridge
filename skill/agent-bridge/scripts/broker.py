@@ -2,9 +2,11 @@
 import asyncio
 from collections import deque, namedtuple
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from copy import copy, deepcopy
 from datetime import datetime, timezone
 import fcntl
+from functools import partial
 import hashlib
 import json
 import os
@@ -44,6 +46,7 @@ PROVIDER_NOTICE_KEY_PREFIXES = tuple(event + ':' for event in (
 CLOSE_OPERATOR_FILE = 'close-operator.json'
 CLOSING_ROUTE_ERROR = 'Codex route is closing'
 READ_ONLY_OPS = ('ping', 'routes', 'codex-routes', 'channels', 'show', 'conversation', 'inbox', 'retention-plan')
+TIMED_CLAIM_OPS = ('claim', 'claim-guarded', 'release-claim')
 CHECKPOINT_FIELDS = ('messages', 'compact_messages', 'keys', 'inbox_receipts', 'inbox_snapshots')
 Checkpoint = namedtuple('Checkpoint', CHECKPOINT_FIELDS)
 
@@ -155,6 +158,7 @@ class State:
         self.inbox_receipts = {}
         self.mutation_lock = asyncio.Lock()
         self.active_mutation = None
+        self.claim_log = None
         self.mutations_closed = False
         self.checkpoint_executor = checkpoint_executor
         self.store = store
@@ -734,6 +738,13 @@ class State:
     async def action_async(self, args, *, admit=None):
         if args['op'] in READ_ONLY_OPS:
             return self.apply_action(args)
+        if args['op'] in TIMED_CLAIM_OPS:
+            queued_at = time.monotonic()
+
+            async def commit_claim():
+                return await self.commit_action(args, queued_at=queued_at)
+
+            return await self.serialized(commit_claim, admit=admit)
         return await self.serialized(self.commit_action, args, admit=admit)
 
     async def serialized(self, operation, *args, admit=None):
@@ -767,19 +778,53 @@ class State:
         if self.active_mutation is not None:
             await asyncio.gather(asyncio.shield(self.active_mutation), return_exceptions=True)
 
-    async def commit_action(self, args, *, verified_close=False):
-        result, staged = self.stage_action(args, verified_close=verified_close)
-        if staged is not None:
-            # These maps are private to the stage. Give the worker the
-            # checkpoint data and a store copy, with no live asyncio objects.
-            checkpoint = Checkpoint(*(getattr(staged, field) for field in CHECKPOINT_FIELDS))
-            store = copy(self.correspondence)
-            try:
-                await asyncio.get_running_loop().run_in_executor(self.checkpoint_executor, store.save, checkpoint)
-            finally:
-                self.correspondence.update_save_status(store)
-            self.publish_action(staged, args['op'])
-        return result
+    async def commit_action(self, args, *, verified_close=False, queued_at=None):
+        measure = nullcontext
+        profile_claim = queued_at is not None and args['op'] in TIMED_CLAIM_OPS
+        if profile_claim:
+            timings = dict(queue_wait=time.monotonic() - queued_at, stage_prepare=0.0,
+                           durable_save=0.0)
+
+            def measure(stage):
+                return message_store.measure_stage(timings, stage)
+
+        outcome = 'failed'
+        try:
+            with measure('stage_prepare'):
+                result, staged = self.stage_action(args, verified_close=verified_close)
+                if staged is not None:
+                    # These maps are private to the stage. Give the worker the
+                    # checkpoint data and a store copy, with no live asyncio objects.
+                    checkpoint = Checkpoint(*(getattr(staged, field) for field in CHECKPOINT_FIELDS))
+                    store = copy(self.correspondence)
+            if staged is not None:
+                with measure('durable_save'):
+                    try:
+                        await asyncio.get_running_loop().run_in_executor(
+                            self.checkpoint_executor, store.save, checkpoint)
+                    finally:
+                        self.correspondence.update_save_status(store)
+                self.publish_action(staged, args['op'])
+            outcome = 'saved' if staged is not None else 'no_save'
+            return result
+        finally:
+            if profile_claim:
+                elapsed = time.monotonic() - queued_at
+                if elapsed > message_store.SLOW_SECONDS:
+                    self.log_claim_timing(args['op'], outcome, elapsed, timings)
+
+    def log_claim_timing(self, operation, outcome, elapsed, timings):
+        # Stderr can block. Keep one outstanding diagnostic off the broker
+        # loop and the dedicated checkpoint executor.
+        if self.claim_log is not None and not self.claim_log.done():
+            return
+        try:
+            write = partial(message_store.log_slow, 'claim_mutation_slow', timestamp=now(),
+                            operation=operation, outcome=outcome, duration_seconds=elapsed,
+                            stages_seconds=timings)
+            self.claim_log = asyncio.get_running_loop().run_in_executor(None, write)
+        except Exception:
+            pass  # A failed diagnostic submission cannot change the result.
 
     def stage_action(self, args, *, verified_close=False):
         # Stage mutations in isolation. A failed durable write must not acknowledge

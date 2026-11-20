@@ -1,4 +1,5 @@
 """Owner-private, atomic routing snapshots. Never stores message/delivery data."""
+from contextlib import nullcontext
 import errno
 import fcntl
 import json
@@ -18,11 +19,13 @@ CHANNEL_FIELDS = ('project', 'name', 'owner', 'description', 'generation', 'acti
 MAX_SNAPSHOT = 4 * 1024 * 1024
 
 
-def sync_descriptor(fd):
-    os.fsync(fd)
+def sync_descriptor(fd, measure=nullcontext):
+    with measure('fsync'):
+        os.fsync(fd)
     if hasattr(fcntl, 'F_FULLFSYNC'):
         try:
-            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+            with measure('fullfsync'):
+                fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
         except OSError as error:
             # macOS filesystems may support a full flush on regular files but
             # only fsync on directories. Other I/O failures remain failures.
@@ -38,17 +41,21 @@ def sync_directory(directory):
         os.close(fd)
 
 
-def atomic_write(path, data, prefix='.correspondence-'):
+def atomic_write(path, data, prefix='.correspondence-', *, measure=nullcontext):
     name = None
     try:
-        fd, name = tempfile.mkstemp(prefix=prefix, dir=path.parent)
+        with measure('write'):
+            fd, name = tempfile.mkstemp(prefix=prefix, dir=path.parent)
         with os.fdopen(fd, 'wb') as output:
-            output.write(data)
-            output.flush()
-            sync_descriptor(output.fileno())
-        os.replace(name, path)
+            with measure('write'):
+                output.write(data)
+                output.flush()
+            sync_descriptor(output.fileno(), measure)
+        with measure('rename'):
+            os.replace(name, path)
         name = None
-        sync_directory(path.parent)
+        with measure('directory_sync'):
+            sync_directory(path.parent)
     finally:
         if name is not None:
             Path(name).unlink(missing_ok=True)
