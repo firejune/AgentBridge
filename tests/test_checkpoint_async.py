@@ -97,7 +97,7 @@ class CheckpointSocketTests(unittest.IsolatedAsyncioTestCase):
         write = message_store.atomic_write
         paused = False
 
-        def pause(path, data):
+        def pause(path, data, *, measure=None):
             nonlocal paused
             if path == self.checkpoint and not paused:
                 paused = True
@@ -107,7 +107,7 @@ class CheckpointSocketTests(unittest.IsolatedAsyncioTestCase):
                     raise AssertionError('Test did not release the checkpoint worker')
                 if fail:
                     raise OSError('fixture checkpoint write failed')
-            write(path, data)
+            write(path, data, measure=measure)
 
         with patch.object(message_store, 'atomic_write', side_effect=pause):
             try:
@@ -271,13 +271,13 @@ import broker, message_store
 path, state = map(pathlib.Path, sys.argv[1:])
 write = message_store.atomic_write
 
-def pause(target, data):
+def pause(target, data, *, measure=None):
     if target.name == 'correspondence.json' and any(
             item['body'] == 'interrupted' for item in json.loads(data)['messages']):
         print('paused', flush=True)
         if not threading.Event().wait(15):
             raise OSError('test checkpoint was never interrupted')
-    write(target, data)
+    write(target, data, measure=measure)
 
 message_store.atomic_write = pause
 asyncio.run(broker.serve(path, state_dir=state, usage_interval=0,

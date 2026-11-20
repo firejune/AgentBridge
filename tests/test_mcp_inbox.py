@@ -41,10 +41,10 @@ class BackendPingBudgetTests(unittest.TestCase):
             path = str(Path(root) / 'test.sock')
             failures = []
             original = message_store.atomic_write
-            def slow_save(target, data):
+            def slow_save(target, data, *, measure=None):
                 if target == state.correspondence.path:
                     time.sleep(.7)
-                original(target, data)
+                original(target, data, measure=measure)
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
                 server.bind(path)
                 server.listen(1)

@@ -1,5 +1,6 @@
 """Owner-private correspondence checkpoint. Runtime credentials never enter it."""
-from datetime import datetime
+from contextlib import contextmanager
+from datetime import datetime, timezone
 import json
 import math
 import os
@@ -30,6 +31,29 @@ RESTORE_MESSAGES = 2048
 atomic_write = route_store.atomic_write
 
 MALFORMED_CONTENT = (ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError, OverflowError)
+
+
+SLOW_SECONDS = 1
+WRITE_STAGES = ('write', 'fsync', 'fullfsync', 'rename', 'directory_sync')
+
+
+@contextmanager
+def measure_stage(totals, stage):
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        totals[stage] += time.monotonic() - started
+
+
+def log_slow(event, *, timestamp=None, **fields):
+    # Volatile diagnostics with fixed labels only. Stderr is best effort.
+    try:
+        record = dict(event=event, timestamp=timestamp or datetime.now(timezone.utc).isoformat(), **fields)
+        sys.stderr.write(json.dumps(record) + '\n')
+        sys.stderr.flush()
+    except Exception:
+        pass  # A diagnostic cannot change durable acceptance.
 
 
 class UnsafeCheckpointError(ValueError):
@@ -308,20 +332,22 @@ class MessageStore:
 
     def save(self, state):
         started = time.monotonic()
+        cpu_started = time.thread_time()
+        stages = dict(validation_serialize=0.0,
+                      manifest=dict.fromkeys(WRITE_STAGES, 0.0),
+                      payload=dict.fromkeys(WRITE_STAGES, 0.0))
+        outcome = 'failed'
         try:
-            self._save(state)
+            self._save(state, stages)
+            outcome = 'saved'
         finally:
             self.last_save_seconds = time.monotonic() - started
             self.max_save_seconds = max(self.max_save_seconds, self.last_save_seconds)
-            if self.last_save_seconds > 1:
-                # Volatile diagnostics only: never expose bodies, routes or paths.
-                try:
-                    print(json.dumps(dict(event='checkpoint_save_slow',
-                                          duration_seconds=self.last_save_seconds,
-                                          bytes=self.checkpoint_bytes,
-                                          retained_count=len(state.messages))), file=sys.stderr, flush=True)
-                except (OSError, ValueError):
-                    pass  # A diagnostic cannot change durable acceptance.
+            if self.last_save_seconds > SLOW_SECONDS:
+                log_slow('checkpoint_save_slow', duration_seconds=self.last_save_seconds,
+                         thread_cpu_seconds=time.thread_time() - cpu_started,
+                         bytes=self.checkpoint_bytes, retained_count=len(state.messages),
+                         outcome=outcome, stages_seconds=stages)
 
     def update_save_status(self, saved):
         """Copy a worker's finished save status on the broker loop."""
@@ -330,7 +356,7 @@ class MessageStore:
         self.max_save_seconds = saved.max_save_seconds
         self.checkpoint_bytes = saved.checkpoint_bytes
 
-    def _save(self, state):
+    def _encode_checkpoint(self, state):
         compact = [message_record(m) for m in state.compact_messages.values()]
         if len(compact) > retention.MAX_COMPACT or any(len(encoded(m)) > retention.MAX_COMPACT_BYTES for m in compact):
             raise ValueError('Compact correspondence limit reached')
@@ -356,18 +382,34 @@ class MessageStore:
         data = encoded(dict(version=version, messages=messages, compact=compact, keys=keys, receipts=receipts, snapshots=snapshots))
         if len(data) > self.max_bytes:
             raise ValueError('Correspondence checkpoint byte limit reached')
+        index = [{key: m[key] for key in ('id', 'sender', 'recipient', 'created')} for m in messages]
+        return data, index, len(messages)
+
+    def _save(self, state, stages):
+        with measure_stage(stages, 'validation_serialize'):
+            data, index, message_count = self._encode_checkpoint(state)
+
+        def write_manifest():
+            with measure_stage(stages, 'validation_serialize'):
+                manifest_data = encoded(dict(version=1, messages=index))
+            atomic_write(self.manifest, manifest_data,
+                         measure=lambda stage: measure_stage(stages['manifest'], stage))
+
+        def write_payload():
+            atomic_write(self.path, data,
+                         measure=lambda stage: measure_stage(stages['payload'], stage))
+
         # After initialization, commit the bounded metadata index first. It is
         # never replayed as mail. Truncation leaves IDs diagnosable.
-        index = [{key: m[key] for key in ('id', 'sender', 'recipient', 'created')} for m in messages]
         if not self.path.exists():
             # No accepted checkpoint exists yet. Write the payload first so an
             # interrupted initial save cannot leave a speculative loss index.
-            atomic_write(self.path, data)
-            atomic_write(self.manifest, encoded(dict(version=1, messages=index)))
+            write_payload()
+            write_manifest()
         else:
-            atomic_write(self.manifest, encoded(dict(version=1, messages=index)))
-            atomic_write(self.path, data)
-        self.retained_limit = max(self.max_messages, len(messages))
+            write_manifest()
+            write_payload()
+        self.retained_limit = max(self.max_messages, message_count)
         self.checkpoint_bytes = len(data)
 
     def load(self):

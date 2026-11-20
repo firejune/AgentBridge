@@ -449,10 +449,10 @@ class CheckpointFollowupTests(unittest.TestCase):
         self.addCleanup(initial_store.close)
         path = initial_store.directory / 'correspondence.json'
         original = message_store.atomic_write
-        def interrupt(target, data):
+        def interrupt(target, data, *, measure=None):
             if target == path:
                 raise OSError('interrupted startup payload')
-            original(target, data)
+            original(target, data, measure=measure)
         with patch.object(message_store, 'atomic_write', side_effect=interrupt):
             with self.assertRaisesRegex(OSError, 'interrupted startup payload'):
                 broker.State(max_messages=5, store=initial_store)

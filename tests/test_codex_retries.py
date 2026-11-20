@@ -345,12 +345,12 @@ class RetryTests(unittest.TestCase):
             loop = asyncio.get_running_loop()
             started = asyncio.Event()
 
-            def pause(path, data):
+            def pause(path, data, *, measure=None):
                 if path == self.state.correspondence.path and b'"status": "reserved"' in data:
                     loop.call_soon_threadsafe(started.set)
                     if not release.wait(5):
                         raise AssertionError('test did not release the checkpoint worker')
-                write(path, data)
+                write(path, data, measure=measure)
 
             with patch.object(adapter, 'read_codex_observation',
                               return_value=dict(owner='fixture-owner', snapshot=snapshot())), \

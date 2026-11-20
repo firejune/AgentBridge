@@ -1,5 +1,6 @@
 """Checkpoint telemetry never changes delivery or persistence semantics."""
 from contextlib import redirect_stderr
+from datetime import datetime, timedelta
 import io
 import json
 from pathlib import Path
@@ -60,7 +61,24 @@ class CheckpointTelemetryTests(unittest.TestCase):
             self.assertEqual(record['duration_seconds'], slow['checkpoint_last_save_seconds'])
             self.assertEqual(record['bytes'], slow['checkpoint_bytes'])
             self.assertEqual(record['retained_count'], 0)
-            self.assertEqual(set(record), {'event', 'duration_seconds', 'bytes', 'retained_count'})
+            self.assertEqual(set(record), {'event', 'timestamp', 'duration_seconds',
+                                           'thread_cpu_seconds', 'bytes', 'retained_count',
+                                           'outcome', 'stages_seconds'})
+            self.assertEqual(datetime.fromisoformat(record['timestamp']).utcoffset(), timedelta(0))
+            self.assertEqual(record['outcome'], 'saved')
+            self.assertIsInstance(record['thread_cpu_seconds'], float)
+            self.assertGreaterEqual(record['thread_cpu_seconds'], 0)
+            stages = record['stages_seconds']
+            self.assertEqual(set(stages), {'validation_serialize', 'manifest', 'payload'})
+            timings = [stages['validation_serialize']]
+            for file_stage in ('manifest', 'payload'):
+                self.assertEqual(set(stages[file_stage]),
+                                 {'write', 'fsync', 'fullfsync', 'rename', 'directory_sync'})
+                timings.extend(stages[file_stage].values())
+            for seconds in timings:
+                self.assertIsInstance(seconds, float)
+                self.assertGreaterEqual(seconds, 0)
+                self.assertLessEqual(seconds, record['duration_seconds'])
             with redirect_stderr(io.StringIO()):
                 state.correspondence.save(state)
             fast = state.action({'op': 'ping'})
