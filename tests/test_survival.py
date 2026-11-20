@@ -22,6 +22,7 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bridge
 import broker
+import codex_live
 import route_store
 import message_store
 import service
@@ -477,10 +478,6 @@ class PersistenceTests(unittest.TestCase):
             self.state.action(dict(op='unregister', project='demo', name='alpha'))
         return self.state.action(dict(op='register', project='demo', name='alpha', cwd=str(self.root), **extra))
 
-    def remap_fixture(self, session):
-        return self.state.action(dict(op='remap', project='demo', name='alpha',
-            expected_route=self.state.route('demo', 'alpha'), session=session))
-
     def plant_registration_fixture(self, **extra):
         # Restore tests model a legacy/external replacement while retaining an
         # exact old pinned generation. Do not use public register to overwrite it.
@@ -616,7 +613,7 @@ class PersistenceTests(unittest.TestCase):
         parent = self.state.action(dict(send, key='first-parent'))
         another = self.state.action(dict(send, key='second-parent'))
         original = parent['return_route']
-        self.remap_fixture(str(uuid.uuid4()))
+        self.register(transport='codex', session=str(uuid.uuid4()))
         args = dict(op='inbox_reply', owner='a' * 64, context='b' * 64, instance=self.state.instance,
                     routes=[dict(slot='slot', route=self.state.route('demo', name='beta'))],
                     id=parent['id'], body='answer', key='reply-key', recipient='beta',
@@ -715,7 +712,7 @@ class PersistenceTests(unittest.TestCase):
         old = str(uuid.uuid4()); new = str(uuid.uuid4())
         self.register(transport='codex', session=old)
         channel = deepcopy(self.bind())
-        self.remap_fixture(new)
+        self.plant_registration_fixture(session=new)
         seen = []
         with patch.object(route_store, 'verify_route', side_effect=lambda route: seen.append(route['session'])):
             loaded = broker.State(store=self.store)
@@ -795,7 +792,7 @@ class PersistenceTests(unittest.TestCase):
                      transport='codex', executable=None)
         target = dict(id=sid, cwd=str(self.root), runtime_observed=True, status='idle')
         with patch.object(route_store.sessions, 'inspect_session', return_value={'session': target}) as discover, \
-                patch.object(bridge.codex_live, 'Client', side_effect=AssertionError('No owner IPC')) as client:
+                patch.object(codex_live, 'Client', side_effect=AssertionError('No owner IPC')) as client:
             route_store.verify_route(route)
             discover.assert_called_once_with('codex', sid, None, codex_mode='auto')
             client.assert_not_called()
@@ -816,7 +813,7 @@ class PersistenceTests(unittest.TestCase):
                           ordinaryUsageAllowed=False)
             with self.subTest(status=status), \
                     patch.object(route_store.sessions, 'inspect_session', return_value={'session': target}) as discover, \
-                    patch.object(bridge.codex_live, 'Client', side_effect=AssertionError('No owner IPC')) as client:
+                    patch.object(codex_live, 'Client', side_effect=AssertionError('No owner IPC')) as client:
                 loaded = broker.State(store=self.store)
             discover.assert_called_once_with('codex', sid, None, codex_mode='auto')
             client.assert_not_called()
@@ -849,7 +846,7 @@ class PersistenceTests(unittest.TestCase):
                       subprocess.TimeoutExpired('SECRET', 1), KeyError('cwd'), TypeError('SECRET')):
             with self.subTest(error=type(error).__name__), \
                     patch.object(route_store.sessions, 'inspect_session', side_effect=error) as discover, \
-                    patch.object(bridge.codex_live, 'Client', side_effect=AssertionError('No owner IPC')), \
+                    patch.object(codex_live, 'Client', side_effect=AssertionError('No owner IPC')), \
                     redirect_stderr(io.StringIO()) as diagnostic:
                 loaded = broker.State(store=self.store)
             self.assertEqual((loaded.endpoints, loaded.channels), before)
@@ -935,7 +932,7 @@ class PersistenceTests(unittest.TestCase):
         old, new = str(uuid.uuid4()), str(uuid.uuid4())
         self.register(transport='codex', session=old)
         channel = deepcopy(self.bind())
-        self.remap_fixture(new)
+        self.plant_registration_fixture(session=new)
         def inspect(provider, sid, executable, codex_mode):
             if sid == new:
                 raise route_store.sessions.DiscoveryError('temporarily unavailable')

@@ -13,9 +13,9 @@ metadata:
 
 ## 등록 이름 보호
 
-`register`는 `(project, name)`을 보호한다. 다른 transport·세션 UUID·정규화된 작업 경로로 덮어쓰려 하면 `Route name is already in use; use a different name`으로 거절한다. 프로젝트가 다르면 같은 이름을 쓸 수 있다. 동일 바인딩 재시도는 파일을 다시 쓰지 않고 기존 경로를 반환한다. `--executable`을 생략하면 기존 값을 유지하며, 명시적으로 다른 실행 파일을 지정해도 거절한다. 채널과 기존 메시지의 고정 경로는 유지되고, 명시적 Codex `remap` 규칙은 그대로다.
+`register`는 `(project, name)`을 보호한다. 다른 transport·세션 UUID·정규화된 작업 경로로 덮어쓰려 하면 `Route name is already in use; use a different name`으로 거절한다. 프로젝트가 다르면 같은 이름을 쓸 수 있다. 동일 바인딩 재시도는 파일을 다시 쓰지 않고 기존 경로를 반환한다. `--executable`을 생략하면 기존 값을 유지하며, 명시적으로 다른 실행 파일을 지정해도 거절한다. 채널과 기존 메시지의 고정 경로는 유지된다.
 
-새 세션 등록 명령은 세션을 열기 전에 이름 점유를 확인하고, 브로커는 최종 등록 시 원자적으로 다시 검사한다. Codex 결과에서 확정된 최종 충돌은 생성된 세션을 보존한 채 `registered: false`, `uncertain: false`로 보고하고, 불명확한 등록 쓰기는 uncertain으로 남긴다. 자동 unregister·재매핑·재시도는 하지 않는다. 이 보호에는 업데이트된 브로커가 필요하며, 클라이언트 사전 확인은 이름 예약이 아니다.
+새 세션 등록 명령은 세션을 열기 전에 이름 점유를 확인하고, 브로커는 최종 등록 시 원자적으로 다시 검사한다. Codex 결과에서 확정된 최종 충돌은 생성된 세션을 보존한 채 `registered: false`, `uncertain: false`로 보고하고, 불명확한 등록 쓰기는 uncertain으로 남긴다. 등록을 자동으로 제거하거나 다시 시도하지 않는다. 이 보호에는 업데이트된 브로커가 필요하며, 클라이언트 사전 확인은 이름 예약이 아니다.
 
 ## 실행 경로
 
@@ -33,11 +33,9 @@ python3 "$bridge_cli" --help
 1. **세션 조회 및 검증**: `sessions`로 실제 세션을 찾고 `session`으로 정확한 UUID·제목·작업 경로(`cwd`)를 확인한다. 제목 유사성이나 최신순만으로 상대를 고르지 않는다. **후보가 하나로 좁혀지지 않으면 임의로 보내지 말고 사용자에게 어느 세션인지 확인한다.**
 2. **브로커 확인**: `ping`으로 브로커를 확인하고 이미 실행 중이면 재사용한다. 실행 중이 아니고 브릿지 운영이 요청 범위라면 `serve`를 실행해 `ready`를 확인한다.
 3. **라우트 및 채널 등록**: 등록 전에 `routes`와 `channels`를 확인해 다른 세션의 연결을 덮어쓰지 않는다. 라이브 세션은 `claude-peer`, `codex`, `agy`로 등록하고 `channel-bind`로 역할 채널을 연결한다.
-   Codex `open`과 `register --new`는 스레드를 만들기 전에 Desktop IPC 초기화 응답을 확인한다. 소유권을 확인할 IPC에 연결할 수 없으면 원인을 보고하고 스레드를 생성하거나 열지 않는다. 이 경우 `remap`도 링크를 열거나 UUID를 교체하지 않고 원인을 보고한다. 큐 전송 경로는 메시지 전달에 쓰인다. 열기와 재매핑은 Desktop IPC에서 소유권을 확인한다.
+   Codex `open`과 `register --new`는 스레드를 만들기 전에 Desktop IPC 초기화 응답을 확인한다. 소유권을 확인할 IPC에 연결할 수 없으면 원인을 보고하고 스레드를 생성하거나 열지 않는다.
 
-   `bridge.py remap`은 브로커의 모든 프로젝트에서 보관되지 않은 등록 Codex 세션을 다시 연다. 저장된 작업 디렉터리를 확인하고 Desktop 소유자가 이미 붙은 세션은 건너뛴다. 결과는 엔드포인트별로 출력한다. 세션을 다시 열 때 Codex Desktop이 화면 앞으로 올 수 있다. UUID와 대기 중인 메시지는 그대로 유지한다.
-
-   `bridge.py remap NAME --project PROJECT --expect-session OLD_UUID --session NEW_UUID`로 등록된 Codex 엔드포인트의 UUID를 교체할 수 있다. 새 세션에는 라이브 데스크톱 소유자가 있어야 하며 작업 디렉터리는 기존과 같아야 한다. 참가자 이름으로 직접 보내는 새 메시지에 교체된 UUID를 사용한다. 채널 바인딩과 기존 메시지는 원래 라우트를 유지한다.
+   기존에 등록한 Codex 라우트에는 평소대로 메시지를 보낸다. 큐 전송 조건은 아래의 Desktop 큐 알림 항목을 참고한다.
 
 4. **직접 Push (폴링 루프 금지)**: `watch`는 `realtime` CLI 워커 전용이다. **`claude-peer`, `codex`, `agy`는 별도의 `watch` 폴링 루프나 새 CLI 프로세스 없이 기존 라이브 세션에 직접 push한다.**
 
@@ -91,7 +89,7 @@ python3 "$bridge_cli" register codex-worker --project PROJECT --transport codex 
 ```
 
 - **직접 Push**: `CODEX_HOME/ipc/ipc.sock`(기본 `~/.codex`, 또는 `AGENT_BRIDGE_CODEX_IPC`)에 연결해 `supportsUntrustedAppInput`을 지원하는 정확한 대화 소유자를 확인한다. 동료 본문은 standalone `toolOutput`(`agent_bridge`)로 전달하며, 활성 턴이면 `thread-follower-steer-turn`으로 합류하고 유휴 상태일 때만 `thread-follower-start-turn`을 호출한다.
-- **Desktop 큐 알림**. 기본 IPC 소켓이 없거나 연결을 거부하고, 서명된 앱 번들 Codex CLI와 확인된 단일 로컬 Desktop 소유자가 기본 큐 저장소를 공유하며, 기본 로컬 브로커 소켓을 사용할 때 이 경로를 사용한다. 고정 알림은 지정된 대화에 `python3 "$bridge_cli" receive-codex MESSAGE_ID` 실행을 요청할 수 있다. 알림에 적힌 ID를 그대로 사용하고, `CODEX_THREAD_ID`가 일치하는 해당 Codex 대화에서 실행한다. 반환된 본문은 기존 사용자 승인의 범위에서 동료 서신으로 다룬다. 조회만으로 확인이나 답장을 보내지 않는다.
+- **Desktop 큐 알림**. 기본 IPC 소켓이 없거나 연결을 거부하고, 서명된 앱 번들 Codex CLI와 확인된 단일 로컬 Desktop 소유자가 기본 큐 저장소를 공유하며, 기본 로컬 브로커 소켓을 사용할 때 공식 `codex queue`를 사용한다. Desktop에 지정된 스레드가 로드되어 있고 유휴 턴을 시작할 수 있어야 알림을 처리한다. 고정 알림은 지정된 대화에 `python3 "$bridge_cli" receive-codex MESSAGE_ID` 실행을 요청할 수 있다. 알림에 적힌 ID를 그대로 사용하고, `CODEX_THREAD_ID`가 일치하는 해당 Codex 대화에서 실행한다. 반환된 본문은 기존 사용자 승인의 범위에서 동료 서신으로 다룬다. 조회만으로 확인이나 답장을 보내지 않는다.
 - **사이드바 미리보기**: 첫 브릿지 과제가 `submitted`로 접수된 뒤 비어 있는 네이티브 사이드바 `preview`를 `state_5.sqlite`에 한 번 초기화하며, 실패하더라도 이미 수락된 전달을 실패로 바꾸지 않는다.
 - **무인 세션 생성 (`open` / `register --new`)**:
   - `app-server --stdio`로 영속 대화를 만들고 `thread/name/set`으로 제목을 저장한 뒤 `codex://threads/UUID`를 열어 데스크톱 앱이 대화를 인계받게 한다. **Enter 입력이나 UI 자동화가 필요 없다.**
@@ -186,7 +184,7 @@ python3 "$bridge_cli" usage --events
 
 ## 원격 MCP 파사드
 
-브로커에 메시지를 기록하기 전에 라우트 또는 세션 충돌이 확인되면 `BACKEND_UNAVAILABLE`과 고정된 `ROUTE_CHANGED:` 메시지를 반환한다. 최초 접수에서 발견하면 작업을 만들지 않고 도구 오류를 반환하며, 접수 후 발견하면 해당 작업을 `failed`로 끝내 점유를 해제한다. 파사드는 자동 재매핑·재전송하지 않는다. 브로커 send를 시도한 뒤 발견한 라우트 불일치는 `unknown`으로 남긴다.
+브로커에 메시지를 기록하기 전에 라우트 또는 세션 충돌이 확인되면 `BACKEND_UNAVAILABLE`과 고정된 `ROUTE_CHANGED:` 메시지를 반환한다. 최초 접수에서 발견하면 작업을 만들지 않고 도구 오류를 반환하며, 접수 후 발견하면 해당 작업을 `failed`로 끝내 점유를 해제한다. 파사드는 라우트를 자동으로 바꾸거나 메시지를 다시 보내지 않는다. 브로커 send를 시도한 뒤 발견한 라우트 불일치는 `unknown`으로 남긴다.
 
 - 로컬 에이전트는 항상 `scripts/bridge.py` 파이썬 CLI를 직접 사용하며, 로컬 MCP 서버로 중복 등록하지 않는다.
 - `scripts/mcp_server.py`는 비공개 원격 터널(`stdio` 기반 `--phase1-config`) 단일 커넥터 전용이다: [remote-mcp.md](../../skill/agent-bridge/references/remote-mcp.md).

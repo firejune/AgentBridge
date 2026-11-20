@@ -35,6 +35,11 @@ class ArchiveCorrespondenceTests(unittest.TestCase):
     def send(self, key, sender='worker', recipient='other'):
         return self.call('send', project='p', sender=sender, recipient=recipient, body=key, key=key)
 
+    def replace_worker(self):
+        self.call('unregister', project='p', name='worker')
+        return self.call('register', project='p', name='worker', session=str(uuid.uuid4()),
+                         cwd=self.temp.name, transport='codex')
+
     def purge(self, **args):
         return self.call('archive-correspondence', expected_route=self.route, **args)
 
@@ -64,8 +69,7 @@ class ArchiveCorrespondenceTests(unittest.TestCase):
 
     def test_reused_name_different_session_workspace_or_transport_is_untouched(self):
         old = self.send('old')
-        replacement = self.call('remap', project='p', name='worker', session=str(uuid.uuid4()),
-                                expected_route=self.route)
+        replacement = self.replace_worker()
         fresh = self.send('replacement')
         with self.assertRaisesRegex(ValueError, 'changed'):
             self.purge(archived=True)
@@ -94,7 +98,7 @@ class ArchiveCorrespondenceTests(unittest.TestCase):
             self.purge(archived=False)
         self.assertEqual(self.state.correspondence.path.read_bytes(), before)
         self.assertIn(message['id'], self.state.messages)
-        self.call('remap', project='p', name='worker', session=str(uuid.uuid4()), expected_route=self.route)
+        self.replace_worker()
         with self.assertRaisesRegex(ValueError, 'changed'):
             self.purge(check_only=True)
         with self.assertRaisesRegex(ValueError, 'changed'):

@@ -48,15 +48,16 @@ class RegistrationGuardTests(unittest.TestCase):
                 self.assertEqual(self.state.route('demo', 'worker'), self.original)
                 self.assertEqual(self.store.path.read_bytes(), before)
 
-    def test_project_namespace_and_explicit_codex_remap_remain_independent(self):
+    def test_project_namespace_and_codex_name_reuse_remain_independent(self):
         other = self.state.action(dict(self.args, project='other', session=str(uuid.uuid4())))
         self.assertNotEqual(other['session'], self.original['session'])
         codex = self.state.action(dict(self.args, name='codex-worker', transport='codex'))
+        self.state.action(dict(op='unregister', project='demo', name='codex-worker'))
         replacement = str(uuid.uuid4())
-        mapped = self.state.action(dict(op='remap', project='demo', name='codex-worker',
-                                       expected_route=codex, session=replacement))
-        self.assertEqual(mapped, dict(codex, session=replacement))
+        self.assertEqual(self.state.action(dict(self.args, name='codex-worker', transport='codex',
+                                               session=replacement)), dict(codex, session=replacement))
         self.assertEqual(self.state.route('demo', 'worker'), self.original)
+        self.assertEqual(self.state.route('other', 'worker'), other)
 
     def test_refused_competitor_preserves_pinned_channel_and_next_send_after_restart(self):
         self.state.action(dict(op='register', project='demo', name='sender', cwd=self.temp.name))

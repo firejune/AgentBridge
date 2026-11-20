@@ -11,9 +11,9 @@ A shared local real-time bridge for **Claude Code / Desktop (`claude-peer`) ↔ 
 
 ## Registration ownership
 
-`register` protects each `(project, name)`: another transport, session UUID or canonical workspace is refused with `Route name is already in use; use a different name`. Same names in different projects are independent. Exact-binding retries return the existing route without rewriting it. An omitted `--executable` preserves the old value; an explicitly different executable is also refused. Existing channels and message routes stay pinned. Explicit Codex `remap` keeps its existing rules.
+`register` protects each `(project, name)`: another transport, session UUID or canonical workspace is refused with `Route name is already in use; use a different name`. Same names in different projects are independent. Exact-binding retries return the existing route without rewriting it. An omitted `--executable` preserves the old value; an explicitly different executable is also refused. Existing channels and message routes stay pinned.
 
-New-session registration commands check an occupied name before opening a session; the broker still checks atomically at final registration. In the Codex result, a known final conflict preserves the created session with `registered: false` and `uncertain: false`; an ambiguous registration write stays uncertain. Neither path automatically unregisters, remaps or retries. This protection requires the updated broker; client preflight does not reserve a name.
+New-session registration commands check an occupied name before opening a session; the broker still checks atomically at final registration. In the Codex result, a known final conflict preserves the created session with `registered: false` and `uncertain: false`; an ambiguous registration write stays uncertain. Neither path automatically removes the registration or retries it. This protection requires the updated broker; client preflight does not reserve a name.
 
 ## Entrypoint
 
@@ -31,11 +31,9 @@ If installed elsewhere, use the sibling `scripts/bridge.py` next to the `SKILL.m
 1. **Discover and verify sessions**: Run `sessions` to list live sessions and `session` to verify the exact UUID, title, and working directory (`cwd`). When multiple candidates exist, disambiguate using the current task and user instructions. Never pick a target by recency or fuzzy title matching alone. **If multiple candidates remain ambiguous, ask the user which session to use before sending.**
 2. **Check the broker**: Run `ping`. Reuse an existing broker if running. If no broker is running and bridge operation is within scope, start `serve` and confirm the `ready` output.
 3. **Register routes and channels**: Inspect `routes` and `channels` first so you do not overwrite another active session's binding. Register live sessions with `claude-peer`, `codex`, or `agy`, and bind project channels via `channel-bind`.
-   Codex `open` and `register --new` require the Desktop IPC handshake before creating a thread. If the exact-owner transport is unavailable, they report the endpoint failure without creating or opening a thread. In that case, `remap` reports the failure without opening a link or replacing a UUID. The queue transport serves correspondence delivery. Open and remap use Desktop IPC to confirm ownership.
+   Codex `open` and `register --new` require the Desktop IPC handshake before creating a thread. If the exact-owner transport is unavailable, they report the endpoint failure without creating or opening a thread.
 
-   Run `bridge.py remap` to reopen non-archived Codex sessions registered across all broker projects. The command checks the saved workspace, skips sessions that already have a Desktop owner, and reports the result for each endpoint. Reopening can bring Codex Desktop to the foreground. The command preserves UUIDs and leaves messages queued.
-
-   Use `bridge.py remap NAME --project PROJECT --expect-session OLD_UUID --session NEW_UUID` to replace a registered Codex endpoint. The replacement must have a live Desktop owner and the same workspace. New messages addressed directly to the participant use the replacement UUID. Channel bindings and existing messages keep their original routes.
+   To reach an existing Codex thread, send to its registered route as usual. See the Desktop queue notice below for delivery requirements.
 
    **Give every session you open a title that identifies it.** The person reads the session list in the desktop apps and has to tell the sessions apart without opening each one. Use `PROJECT/NAME · WORK`, where NAME is the route name and WORK is the card or purpose in a few words, for example `rig-c/naru-49 · create#49 ground ask`.
    - Codex: `register NAME --project PROJECT --transport codex --new` and `open --provider codex --register NAME --project PROJECT` default to `PROJECT/NAME` when `--title` is absent. An explicit `--title` wins. Prefer an explicit `PROJECT/NAME · WORK` title to include the purpose. `open --provider codex` without `--register` has no default title, so pass `--title` to name it.
@@ -97,7 +95,7 @@ python3 "$bridge_cli" register codex-worker --project PROJECT --transport codex 
 ```
 
 - **Direct push**: Connects to `ipc/ipc.sock` under `CODEX_HOME` (default `~/.codex`, or `AGENT_BRIDGE_CODEX_IPC`) and verifies the exact thread owner advertising `supportsUntrustedAppInput`. Delivers peer messages as standalone `toolOutput` (`agent_bridge`), calling `thread-follower-steer-turn` first to join an active turn and falling back to `thread-follower-start-turn` only when inactive.
-- **Desktop queue notice**. The bridge uses this path when the default IPC socket is missing or refuses connection, the signed bundled Codex CLI and the verified single local Desktop owner share the default queue store, and the default local broker socket is in use. A fixed notice can ask the exact addressed thread to run `python3 "$bridge_cli" receive-codex MESSAGE_ID`. Use the opaque ID in the notice and run the command in that Codex thread so `CODEX_THREAD_ID` matches. Treat the returned body as peer correspondence within existing human authorization. Reading sends no acknowledgment or reply.
+- **Desktop queue notice**. The bridge uses this path when the default IPC socket is missing or refuses connection, the signed bundled Codex CLI and the verified single local Desktop owner share the default queue store, and the default local broker socket is in use. The bridge uses the official `codex queue`. Desktop can process the notice when the exact thread is loaded and eligible to start an idle turn. A fixed notice can ask the exact addressed thread to run `python3 "$bridge_cli" receive-codex MESSAGE_ID`. Use the opaque ID in the notice and run the command in that Codex thread so `CODEX_THREAD_ID` matches. Treat the returned body as peer correspondence within existing human authorization. Reading sends no acknowledgment or reply.
 - **Sidebar preview**: After the first task is accepted (`submitted`), an empty native sidebar `preview` is initialized once in `state_5.sqlite` without altering identity or failing the delivery if unavailable.
 - **Autonomous creation (`open` / `register --new`)**:
   - Creates a persistent thread via `app-server --stdio`, sets its title via `thread/name/set`, opens `codex://threads/UUID` so Desktop adopts it, and verifies the exact Desktop owner — **no Enter or UI automation required**.
@@ -192,7 +190,7 @@ python3 "$bridge_cli" usage --events
 
 ## Remote MCP Facade
 
-A confirmed route/session conflict before broker posting returns `BACKEND_UNAVAILABLE` with a fixed `ROUTE_CHANGED:` message. Initial acceptance returns a tool error without creating an operation; a conflict detected after acceptance ends that operation as `failed`, releasing its slot. The facade never remaps or resends. A route mismatch discovered after the broker send was attempted remains `unknown`.
+A confirmed route/session conflict before broker posting returns `BACKEND_UNAVAILABLE` with a fixed `ROUTE_CHANGED:` message. Initial acceptance returns a tool error without creating an operation; a conflict detected after acceptance ends that operation as `failed`, releasing its slot. The facade never changes the route or resends. A route mismatch discovered after the broker send was attempted remains `unknown`.
 
 - Local agents always use `scripts/bridge.py` directly via the Python CLI; do not register `mcp_server.py` as a local MCP server.
 - `scripts/mcp_server.py` is for a single private remote tunnel (`--phase1-config` over `stdio`): see [remote-mcp.md](references/remote-mcp.md).

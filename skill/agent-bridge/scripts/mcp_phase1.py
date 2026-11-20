@@ -864,7 +864,7 @@ class Engine:
             if pinned_sessions(self.config).get(session['id']) != session:
                 raise Fault('NOT_AUTHORIZED')
             return
-        # An alias remap cannot silently retarget a previously accepted operation.
+        # An alias bound to a different route cannot retarget a previously accepted operation.
         if self.config['workspaces'].get(session['alias']) != session['workspace']:
             raise Fault('WORKSPACE_NOT_ALLOWED')
         validate_workspaces({session['alias']:session['workspace']})

@@ -971,20 +971,6 @@ class State:
                 # An omitted executable never clears an execution-bearing value.
                 return current
             return self.routing_change('endpoints', (project,name), item)
-        if op == 'remap':
-            key = (identifier(args['project']), identifier(args['name']))
-            current = self.endpoints.get(key)
-            if current is None or current != args['expected_route']:
-                raise ValueError('Endpoint is missing or changed')
-            if current['transport'] != 'codex':
-                raise ValueError('Remap requires a Codex endpoint')
-            self.require_open_route(current)
-            sid = str(uuid.UUID(args['session']))
-            if sid == current['session']:
-                raise ValueError('Replacement UUID must differ from the current UUID')
-            replacement = dict(current, session=sid)
-            self.require_open_route(replacement)
-            return self.routing_change('endpoints', key, replacement)
         if op == 'routes':
             return [x for (p,_),x in self.endpoints.items() if p==args['project']]
         if op == 'codex-routes':

@@ -466,7 +466,9 @@ class CloseCodexTests(unittest.TestCase):
             self.assertEqual(code, 0)
             current = next(route for route in self.server.call('routes', project='ops')
                            if route['name'] == 'archive')
-            self.server.call('remap', project='ops', name='archive', expected_route=current,
+            self.server.call('unregister', project='ops', name='archive')
+            self.server.call('register', project='ops', name='archive', cwd=current['cwd'],
+                             transport=current['transport'], executable=current['executable'],
                              session=str(uuid.uuid4()))
             self.assertEqual(self.operator(prepared['operator_message_id'], self.operator_sid)[0], 1)
             self.assertEqual(self.close('--archive', '--handoff')[1]['operator_message_id'], prepared['operator_message_id'])
