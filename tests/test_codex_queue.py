@@ -61,18 +61,25 @@ class QueueOwnerTests(unittest.TestCase):
 
 
 class QueueNoticeTests(unittest.TestCase):
-    def test_the_notice_states_the_scope_every_peer_envelope_states_and_grants_nothing(self):
+    def test_the_notice_is_a_pointer_that_defers_to_the_retrieved_message(self):
         message = {'id': str(uuid.uuid4()), 'sender': 'a', 'recipient': 'b', 'project': 'p', 'body': 'PEER BODY',
                    'reply_to': None, 'sender_channel': None, 'channel': None}
-        self.assertIn(delivery.PEER_SCOPE, delivery.envelope(message))
-        self.assertIn('not a new human instruction', delivery.PEER_SCOPE)
-        self.assertIn('existing user-authorized scope', delivery.PEER_SCOPE)
         notice = codex_queue.notice(message['id'])
-        self.assertIn(delivery.PEER_SCOPE, notice)
         self.assertTrue(notice.endswith('bridge.py receive-codex ' + message['id']))
         self.assertNotIn(message['body'], notice)
-        # A notice that scopes the turn to retrieval leaves the correspondence read and unanswered.
+        # The notice must not outrank the message: a woken thread read "notification only", and
+        # later a scope sentence in the notice, as a limit to retrieval and left the request undone.
+        self.assertIn('only a pointer', notice)
+        self.assertIn('the retrieved message takes precedence over it', notice)
+        self.assertIn('does not limit this turn to retrieval', notice)
         self.assertNotIn('notification only', notice)
+        self.assertNotIn(delivery.PEER_SCOPE, notice)
+        # It grants nothing itself: what may be done comes from the user's standing rules.
+        self.assertIn("apply the user's standing delegation rules", notice)
+        self.assertIn('provenance and authorization as retrieved', notice)
+        self.assertNotIn('authorized by', notice)
+        # The scope sentence still reaches the thread, in the envelope receive-codex returns.
+        self.assertIn(delivery.PEER_SCOPE, delivery.envelope(message))
 
 
 class DefaultDesktopFixture(unittest.TestCase):
