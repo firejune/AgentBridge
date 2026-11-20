@@ -242,12 +242,10 @@ python3 "$bridge_cli" register codex-worker --project PROJECT --transport codex 
   --new --cwd /path/to/workspace --title "작업 세션" --model MODEL --timeout 180
 ```
 
-- **무인 인계 흐름**: 설치된 CLI의 `app-server --stdio` JSON-RPC로 영속 대화를 하나 만들고 `thread/name/set`으로 실제 이름을 저장한 뒤, `codex://threads/UUID`를 열어 데스크톱 앱이 인계받게 한다. 정확한 IPC 소유자가 `supportsUntrustedAppInput`을 광고하고 대화를 재개했는지 확인한 뒤 등록한다. **Enter 입력, 가짜 사용자 프롬프트, 모델 턴, UI 자동화가 필요 없다.**
-- **모델 및 권한 검증**:
-  - 모델 선택 순서: `--model` > `AGENT_BRIDGE_CODEX_MODEL` > `policy.json` `defaults.codex` > `gpt-6.2-sol` (앱 기본 모델이나 `gpt-6-astra`는 코딩 세션에 사용하지 않음). 데스크톱 소유자의 설정 재조회로 일치를 확인한다.
-  - 항상 Full Access 프로필(`:danger-full-access`, `approvalPolicy: never`, `dangerFullAccess` 샌드박스)을 요청하고 데스크톱 소유자의 `latestThreadSettings` 스냅샷에서 재확인한다.
+- **Desktop 인계**. Codex `open`과 `register --new`는 저장 스레드를 하나 만들고 정확한 ID를 확인한 뒤 Desktop에 인계한다. IPC에 연결되면 정확한 소유자에게 설정을 재조회해 Full Access와 승인 정책 `never`를 확인한다. 로컬 CLI의 `bridge.py open`과 `bridge.py register --new`에서 기본 IPC 소켓이 없거나 연결을 거부하면 서명된 로컬 Desktop `26.1117.31558` (빌드 `29513`)과 기본 큐 저장소를 사용한다. IPC 엔드포인트를 명시했거나 원격 MCP에서 생성하는 경우에는 스레드를 만들기 전에 IPC 초기화 응답을 확인해야 한다. 열기 요청으로 승인된 무해한 시작 프롬프트 하나를 큐에 넣고 정확한 UUID를 깨운다. 지정한 모델로 실행된 해당 Desktop 턴의 완료를 확인해야 성공한다. 성공하면 `adoption_mode: "desktop-queue-wake"`와 `wake_turn_id`에 인계 방식과 턴 ID가 표시된다. `permission_settings`는 해당 자동 턴의 실효 권한이다. `readOnly`와 승인 정책 `on-request`로 실행된 경우 경고 코드 `CODEX_DESKTOP_WAKE_RESTRICTED`가 표시된다. 이후 Desktop 입력창에서 Full Access를 쓸 수 있으며 이후 턴의 실제 권한은 별도로 확인한다. 결과가 모호해도 생성, 큐 제출, 깨우기를 자동으로 반복하지 않는다.
+- **모델 선택**. 우선순위는 `--model` → `AGENT_BRIDGE_CODEX_MODEL` → `policy.json`의 `defaults.codex` → `gpt-6.2-sol`이다.
 - **중복 생성 방지**: `--title`이 있는 일반 `open --provider codex`는 보관되지 않은 저장 세션에서 동일한 제목과 정규화한 `cwd`를 검사해 일치 항목이 있으면 종료 코드 1·`stage: "duplicate"`(`existing_sessions`)로 거부한다. `open --new` 또는 `register --new`는 중복 검사를 건너뛴다.
-- **출력 JSON 필드**: `created`, `adopted`, `registered`, `uncertain`, `stage`, `error`, `registration_error`, `warning`, `session`, `owner`, `url`, `model`, `model_source`, `creator_settings`, `permission_settings`, `permission_settings_source`, `settings_update`, `existing_sessions`를 고정 키로 반환한다. 실패하거나 `uncertain`인 생성을 자동 재시도하지 않는다.
+- **출력 JSON 필드**: `created`, `adopted`, `registered`, `uncertain`, `adoption_mode`, `wake_turn_id`, `stage`, `error`, `registration_error`, `warning`, `session`, `owner`, `url`, `model`, `model_source`, `creator_settings`, `permission_settings`, `permission_settings_source`, `settings_update`, `existing_sessions`를 고정 키로 반환한다. 실패하거나 `uncertain`인 생성을 자동 재시도하지 않는다.
 
 Codex 공급자 실패는 등록된 모든 Codex 스레드를 대상으로 관찰하며 관찰 회차 사이 기본 간격은 10초다. `serve --codex-failure-interval SECONDS`로 주기를 정하며 `0`은 관찰을 끈다. 등록된 스레드·현재 Desktop 소유자·최신 최종 턴를 고정하고, 실행 상태가 idle이며 최신 턴의 완료 상태가 `failed`이고 일치하는 최종 오류가 `willRetry: false`일 때 알려진 네트워크·스트림 실패를 감지한다. 원래 메시지의 고정 반환 주소로 정규화한 `provider_failure_detected` 알림 하나를 남긴다. 소유자의 `inbox`에서 ID를 찾고 `show ID`로 읽거나 MCP inbox를 사용한다. 원본 작업 상태는 유지하며 완료된 도구 호출이 있는 턴도 감지한다.
 
@@ -260,9 +258,6 @@ Codex 복구는 네이티브 Resume와 같은 기존 스레드 ID·빈 `input`·
 Antigravity (`agy`) 공급자 실패 관찰은 등록된 모든 `agy` 라우트를 대상으로 기본 10초마다 서버당 `GetAllCascadeTrajectories`를 1회 폴링하며(`serve --agy-failure-interval SECONDS`, `0`은 비활성화), 세션이 `IDLE`이고 `stepCount`가 바뀌었을 때만 마지막 스텝(`GetCascadeTrajectorySteps`, `stepOffset = stepCount - 1`)을 조회한다. 내부 재시도(`1–8`차, `RUNNING` 상태이거나 `shouldShowUser: true`가 없는 스텝)는 무시한다. 최종 사용자 노출 오류(`shouldShowUser: true`, `CORTEX_STEP_STATUS_DONE`, 뒤따르는 스텝 없음)는 `(sid, step_index, errorId)`로 중복을 방지하고 `agy:<step_index>` 상관 ID를 사용한다. `WAKE_ELIGIBLE_ERROR_SUBSTRINGS`(`"http2: timeout awaiting response headers"`)와 일치하는 최종 스텝만 공통 `15/30/60`초·최대 `3`회 정책(`provider_retry` k/N, `provider_retry_exhausted`, `provider_retry_unsafe`, `provider_retry_uncertain`)으로 예약 후 `wake_session`(빈 `items`의 `SendUserCascadeMessage`, `NEXT_INVOCATION`)으로 깨우며, 그 외 최종 오류 스텝은 `provider_failure_detected`만 기록하고 깨우지 않는다. 진행 중 메시지 유무와 관계없이 알림은 해당 라우트의 마지막 보관 발신자(없으면 라우트 자신의 inbox)로 전달된다. 깨운 뒤 다음 폴링 주기에 `stepCount`가 늘지 않고 `RUNNING`도 아니면 `provider_retry_uncertain`을 기록하고 다시 깨우지 않는다. 메모리 내 스텝 캐시는 브로커 재시작 시 초기화된다.
 
 ### 4. 세션 인계 (Handoff)
-
-Codex `open`과 `register --new`는 스레드를 만들기 전에 Desktop IPC 초기화 응답을 확인한다. 소유권을 확인할 IPC에 연결할 수 없으면 원인을 보고하고 스레드를 생성하거나 열지 않는다.
-
 기존에 등록한 Codex 라우트에는 평소대로 메시지를 보낸다. 기본 IPC 소켓이 없거나 연결을 거부할 때 큐 전송 조건이 충족되면 브리지는 공식 `codex queue`로 해당 스레드에 알림을 넣는다. Desktop에 지정된 스레드가 로드되어 있고 유휴 턴을 시작할 수 있어야 알림을 처리한다.
 
 프로젝트 채널은 고정 주소 역할을 하며 채널 바인딩마다 세대 번호(`generation`)를 관리한다:

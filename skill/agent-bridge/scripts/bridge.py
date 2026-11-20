@@ -279,7 +279,7 @@ def open_codex_result(args):
         if title is None and name:
             title = default_title = f'{args.project}/{name}'
         result = sessions.open_session('codex', cwd=args.cwd, title=title, model=args.model,
-            timeout=args.timeout, host=args.host, ide=args.ide, force_new=args.new)
+            timeout=args.timeout, host=args.host, ide=args.ide, force_new=args.new, allow_queue_wake=True)
     except RegistrationConflict as error:
         result['error'] = str(error)
     except codex_new.CreationError as error:

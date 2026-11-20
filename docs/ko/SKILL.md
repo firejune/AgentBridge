@@ -33,7 +33,7 @@ python3 "$bridge_cli" --help
 1. **세션 조회 및 검증**: `sessions`로 실제 세션을 찾고 `session`으로 정확한 UUID·제목·작업 경로(`cwd`)를 확인한다. 제목 유사성이나 최신순만으로 상대를 고르지 않는다. **후보가 하나로 좁혀지지 않으면 임의로 보내지 말고 사용자에게 어느 세션인지 확인한다.**
 2. **브로커 확인**: `ping`으로 브로커를 확인하고 이미 실행 중이면 재사용한다. 실행 중이 아니고 브릿지 운영이 요청 범위라면 `serve`를 실행해 `ready`를 확인한다.
 3. **라우트 및 채널 등록**: 등록 전에 `routes`와 `channels`를 확인해 다른 세션의 연결을 덮어쓰지 않는다. 라이브 세션은 `claude-peer`, `codex`, `agy`로 등록하고 `channel-bind`로 역할 채널을 연결한다.
-   Codex `open`과 `register --new`는 스레드를 만들기 전에 Desktop IPC 초기화 응답을 확인한다. 소유권을 확인할 IPC에 연결할 수 없으면 원인을 보고하고 스레드를 생성하거나 열지 않는다.
+   Codex 새 세션의 Desktop 인계와 시작 턴 조건은 아래 Codex 항목을 참고한다.
 
    기존에 등록한 Codex 라우트에는 평소대로 메시지를 보낸다. 큐 전송 조건은 아래의 Desktop 큐 알림 항목을 참고한다.
 
@@ -92,8 +92,8 @@ python3 "$bridge_cli" register codex-worker --project PROJECT --transport codex 
 - **Desktop 큐 알림**. 기본 IPC 소켓이 없거나 연결을 거부하고, 서명된 앱 번들 Codex CLI와 확인된 단일 로컬 Desktop 소유자가 기본 큐 저장소를 공유하며, 기본 로컬 브로커 소켓을 사용할 때 공식 `codex queue`를 사용한다. Desktop에 지정된 스레드가 로드되어 있고 유휴 턴을 시작할 수 있어야 알림을 처리한다. 고정 알림은 지정된 대화에 `python3 "$bridge_cli" receive-codex MESSAGE_ID` 실행을 요청할 수 있다. 알림에 적힌 ID를 그대로 사용하고, `CODEX_THREAD_ID`가 일치하는 해당 Codex 대화에서 실행한다. 반환된 본문은 기존 사용자 승인의 범위에서 동료 서신으로 다룬다. 조회만으로 확인이나 답장을 보내지 않는다.
 - **사이드바 미리보기**: 첫 브릿지 과제가 `submitted`로 접수된 뒤 비어 있는 네이티브 사이드바 `preview`를 `state_5.sqlite`에 한 번 초기화하며, 실패하더라도 이미 수락된 전달을 실패로 바꾸지 않는다.
 - **무인 세션 생성 (`open` / `register --new`)**:
-  - `app-server --stdio`로 영속 대화를 만들고 `thread/name/set`으로 제목을 저장한 뒤 `codex://threads/UUID`를 열어 데스크톱 앱이 대화를 인계받게 한다. **Enter 입력이나 UI 자동화가 필요 없다.**
-  - 모델 정책 및 재조회 검증(`--model` > `AGENT_BRIDGE_CODEX_MODEL` > `policy.json` `defaults.codex` > `gpt-6.2-sol`; `gpt-6-astra`로 코딩 세션을 열지 않음)과 Full Access 권한(`:danger-full-access`, `approvalPolicy: never`)을 강제한다.
+  - Codex `open`과 `register --new`는 저장 스레드를 하나 만들고 정확한 ID를 확인한 뒤 Desktop에 인계한다. IPC에 연결되면 정확한 소유자에게 설정을 재조회해 Full Access와 승인 정책 `never`를 확인한다. 로컬 CLI의 `bridge.py open`과 `bridge.py register --new`에서 기본 IPC 소켓이 없거나 연결을 거부하면 서명된 로컬 Desktop `26.1117.31558` (빌드 `29513`)과 기본 큐 저장소를 사용한다. IPC 엔드포인트를 명시했거나 원격 MCP에서 생성하는 경우에는 스레드를 만들기 전에 IPC 초기화 응답을 확인해야 한다. 열기 요청으로 승인된 무해한 시작 프롬프트 하나를 큐에 넣고 정확한 UUID를 깨운다. 지정한 모델로 실행된 해당 Desktop 턴의 완료를 확인해야 성공한다. 성공하면 `adoption_mode: "desktop-queue-wake"`와 `wake_turn_id`에 인계 방식과 턴 ID가 표시된다. `permission_settings`는 해당 자동 턴의 실효 권한이다. `readOnly`와 승인 정책 `on-request`로 실행된 경우 경고 코드 `CODEX_DESKTOP_WAKE_RESTRICTED`가 표시된다. 이후 Desktop 입력창에서 Full Access를 쓸 수 있으며 이후 턴의 실제 권한은 별도로 확인한다. 결과가 모호해도 생성, 큐 제출, 깨우기를 자동으로 반복하지 않는다.
+  - 모델 선택 순서는 `--model` → `AGENT_BRIDGE_CODEX_MODEL` → `policy.json`의 `defaults.codex` → `gpt-6.2-sol`이다.
   - 일반 `open --provider codex --title TITLE`은 동일한 제목·`cwd`의 보관되지 않은 기존 스레드가 있으면 중복 생성을 거부(`stage: "duplicate"`)하며, `--new`를 주면 중복 검사를 건너뛴다. 실패하거나 `uncertain`인 생성을 자동 재실행하지 않는다.
 
 Codex 공급자 실패는 등록된 모든 Codex 스레드를 대상으로 관찰하며 관찰 회차 사이 기본 간격은 10초다. `serve --codex-failure-interval SECONDS`로 주기를 정하며 `0`은 관찰을 끈다. 등록된 스레드·현재 Desktop 소유자·최신 최종 턴를 고정하고, 실행 상태가 idle이며 최신 턴의 완료 상태가 `failed`이고 일치하는 최종 오류가 `willRetry: false`일 때 알려진 네트워크·스트림 실패를 감지한다. 원래 메시지의 고정 반환 주소로 정규화한 `provider_failure_detected` 알림 하나를 남긴다. 소유자의 `inbox`에서 ID를 찾고 `show ID`로 읽거나 MCP inbox를 사용한다. 원본 작업 상태는 유지하며 완료된 도구 호출이 있는 턴도 감지한다.
