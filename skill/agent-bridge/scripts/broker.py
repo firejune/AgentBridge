@@ -951,96 +951,19 @@ class State:
         if op in ('inbox_list', 'inbox_get', 'inbox_ack', 'inbox_reply'):
             return self.inbox_action(args)
         if op == 'ping':
-            return {'instance':self.instance,'build':self.build,
-                    'messages':len(self.messages),'subscribers':len(self.subscribers),
-                    'correspondence_lost': bool(self.correspondence and self.correspondence.loss),
-                    'correspondence_over_limit': len(self.messages) > self.max_messages,
-                    'retention_ttl_enabled': self.retention_ttl,
-                    'retention_prepare_enabled': self.retention_prepare, 'retention_protocol': 1,
-                    'compact_receipts': len(self.compact_messages),
-                    'checkpoint_last_save_seconds': self.correspondence.last_save_seconds if self.correspondence else None,
-                    'checkpoint_max_save_seconds': self.correspondence.max_save_seconds if self.correspondence else 0.0,
-                    'checkpoint_bytes': self.correspondence.checkpoint_bytes if self.correspondence else 0,
-                    'max_messages': self.max_messages}
+            return self.ping_result()
         if op == 'register':
-            project, name = identifier(args['project']), identifier(args['name'])
-            transport = args.get('transport','realtime')
-            if transport not in ('realtime','codex','claude','claude-peer','agy'):
-                raise ValueError('Unknown transport')
-            cwd = str(Path(args['cwd']).expanduser().resolve(strict=True))
-            if not Path(cwd).is_dir():
-                raise ValueError('Working directory must be a directory')
-            sid = args.get('session')
-            if transport != 'realtime' or sid:
-                sid = str(uuid.UUID(sid or ''))
-            executable = args.get('executable')
-            if executable is not None and not isinstance(executable, str):
-                raise ValueError('Executable must be a string')
-            item = dict(project=project,name=name,transport=transport,cwd=cwd,
-                        session=sid,executable=executable)
-            self.require_open_route(item)
-            current = self.endpoints.get((project, name))
-            if current is not None:
-                self.require_open_route(current)
-                # One event-loop turn: this authoritative check precedes every
-                # routing write, regardless of any caller's read-only preflight.
-                if (any(current.get(field) != item[field] for field in ('transport', 'cwd', 'session'))
-                        or executable is not None and current.get('executable') != executable):
-                    raise ValueError(REGISTER_CONFLICT_ERROR)
-                # An omitted executable never clears an execution-bearing value.
-                return current
-            return self.routing_change('endpoints', (project,name), item)
+            return self.register_route(args)
         if op == 'routes':
             return [x for (p,_),x in self.endpoints.items() if p==args['project']]
-        if op == 'close-prepare':
-            return self.prepare_close(args)
-        if op == 'close-dispatch':
-            return self.dispatch_close(args)
-        if op == 'close-operator':
-            return self.claim_close(args)
         if op in ('unregister', 'unregister-if-current', 'unregister-archived'):
-            key = (args['project'], args['name'])
-            current = self.endpoints.get(key)
-            # A distinct wire operation prevents an older broker from ignoring
-            # the comparison and removing a replacement endpoint by name.
-            if op == 'unregister-archived' and (args.get('archived') is not True
-                    or current != args.get('expected_route')):
-                raise ValueError('Confirmed archive endpoint is missing or changed')
-            if current is None:
-                raise ValueError(f'No participant {args["name"]!r} is registered in project {args["project"]!r}')
-            self.require_open_route(current)
-            if op == 'unregister-if-current' and current != args['expected_route']:
-                raise ValueError('Endpoint changed during close; its current route was kept')
-            owned = sorted(name for (project,name),item in self.channels.items()
-                           if project==args['project'] and item.get('active') and item['owner']==args['name'])
-            if owned:
-                raise ValueError(f'{args["name"]!r} owns active channel(s) {", ".join(owned)}; close or hand them off first')
-            return self.routing_remove('endpoints', key)
+            return self.unregister_route(args)
         if op == 'channel-bind':
-            project, name = args['project'], identifier(args['name'])
-            existing = self.channels.get((project,name))
-            generation = existing['generation'] if existing else 0
-            if args.get('expect_generation',0) != generation:
-                raise ValueError(f'Channel generation changed; current generation is {generation}')
-            if not args['description'].strip():
-                raise ValueError('Channel description is required')
-            route = self.route(project,args['owner'])
-            route.update(channel=name,generation=generation+1)
-            item = dict(project=project,name=name,owner=args['owner'],description=args['description'],
-                        route=route,generation=generation+1,active=True)
-            return self.routing_change('channels', (project,name), item)
+            return self.bind_channel(args)
         if op == 'channels':
-            result = []
-            for (project,_),item in self.channels.items():
-                if project==args['project']:
-                    result.append({**item,'subscribers':sum(sub['route']==route_key(item['route']) for sub in self.subscribers)})
-            return result
+            return self.list_channels(args)
         if op == 'channel-close':
-            item = self.channels.get((args['project'],args['name']))
-            if not item or item['generation']!=args['expect_generation']:
-                raise ValueError('Channel missing or generation changed')
-            item = dict(item, active=False, generation=item['generation']+1)
-            return self.routing_change('channels', (args['project'],args['name']), item)
+            return self.close_channel(args)
         if op in ('send','send-with-retention','reply'):
             return public_message(self.post(args, args.get('id') if op=='reply' else None))
         if op == 'show':
@@ -1052,111 +975,221 @@ class State:
             cid = self.get(args['id'])['conversation']
             return [public_message(m) for m in (self.messages | self.compact_messages).values() if m['conversation']==cid]
         if op == 'inbox':
-            if not args.get('name') and not args.get('channel'):
-                raise ValueError('Select a recipient or channel')
-            blockers = self.delivery_blockers()
-            return [{k:m[k] for k in ('id','sender','recipient','state','channel','sender_channel','reply_to','created')}
-                    | {'session':m['route']['session'],'generation':m['route'].get('generation')}
-                    | self.pending_delivery(m, blockers)
-                    for m in self.messages.values() if m['project']==args['project']
-                    and (not args.get('name') or m['recipient']==args['name'])
-                    and (not args.get('channel') or m['channel']==args['channel'])
-                    and (not args.get('session') or m['route']['session']==args['session'])
-                    and (args.get('all') or m['state'] not in ('done','answered'))]
+            return self.inbox_rows(args)
         if op in ('ack','progress','resolve','claim','claim-guarded','release-claim','note-pending','finish'):
-            m = self.get(args['id'])
-            if m.get('body_expired'):
-                raise ValueError('Message body expired; only lookup and correlated replies remain available')
-            if op == 'note-pending':
-                # Annotate a message only while it is still pending: never rewrite a claim
-                # another caller took meanwhile, and never change its state.
-                note = args.get('note')
-                if not isinstance(note, str) or not note.strip():
-                    raise ValueError('A pending note requires an explanation')
-                if m['state'] != 'pending':
-                    return {'noted':False}
-                self.status(m, 'pending', note)
-                return {'noted':True}
-            if op == 'release-claim':
-                token, admit_until = guarded_claim_fields(args)
-                if time.monotonic() < admit_until:
-                    raise ValueError('Delivery claim admission is still open')
-                if (m['state'] != 'dispatching' or m.get('dispatch_claim') != token
-                        or m.get('dispatch_claim_deadline') != admit_until):
-                    return {'released':False}
-                self.status(m, 'pending', CLAIM_RELEASE_NOTE, 'push_failed')
-                return {'released':True}
-            if op in ('claim', 'claim-guarded'):
-                if retention.request_status(m, time.time()).get('request_status') == 'expired':
-                    raise ValueError('Request reply deadline expired; delivery is not retried')
-                if m['state']!='pending':
-                    raise ValueError('Only pending messages may be delivered')
-                self.require_open_route(m['route'])
-                self.require_open_route(m['return_route'])
-                if 'close_request' in m:
-                    if args.get('close_id') != m['close_request']['close_id']:
-                        raise ValueError('A close handoff cannot be delivered manually')
-                    self.check_close_operator(m)
-                destination = delivery_destination(m['route'])
-                for other in self.messages.values():
-                    if (other.get('provider_retry', {}).get('status') == 'reserved'
-                            and delivery_destination(other['return_route']) == destination):
-                        raise ValueError('Recipient has a reserved provider continuation')
-                blocker = self.delivery_blockers().get(destination)
-                if blocker:
-                    note = self.delivery_wait(blocker)['note']
-                    raise ValueError(f"Recipient has an active or uncertain delivery. Message {m['id']} {note}")
-                if op == 'claim-guarded':
-                    token, admit_until = guarded_claim_fields(args)
-                    if time.monotonic() >= admit_until:
-                        raise ValueError('Delivery claim admission expired')
-                    self.status(m, 'dispatching')
-                    m.update(dispatch_claim=token, dispatch_claim_deadline=admit_until)
-                    return {'dispatch_claim':token}
-                self.status(m,'dispatching')
-                if args.get('guarded') is True:
-                    m['dispatch_claim'] = str(uuid.uuid4())
-                    return {'dispatch_claim':m['dispatch_claim']}
-                return m
-            if op=='finish':
-                if m['state'] not in ('dispatching', 'pending', 'uncertain'):
-                    return m
-                if args.get('expect_dispatch_claim') != m.get('dispatch_claim'):
-                    raise ValueError('Delivery claim changed. Inspect the current state.')
-                if m['state']!='dispatching':
-                    return m
-                if args['state'] not in ('submitted','failed','uncertain','pending'):
-                    raise ValueError('Invalid delivery result')
-                event = args.get('event')
-                if event not in (None,'pushed','push_failed'):
-                    raise ValueError('Invalid delivery event')
-                if args['state']=='pending' and (event!='push_failed' or not args.get('note','').strip()):
-                    # A failed push stays deliverable, but never silently.
-                    raise ValueError('Returning to pending requires a push_failed event and reason')
-                reason = args.get('reason')
-                if reason is not None and (reason != message_store.ARCHIVED_REASON
-                        or args['state'] != 'failed' or m['route']['transport'] != 'codex'):
-                    raise ValueError('Invalid delivery reason')
-                # Keep the normalized wake outcome on the message before it is published (#121).
-                peer_wake.record_wake(m, args.get('wake'))
-                return self.status(m,args['state'],args.get('note'),event,reason)
-            if m['state'] in ('done','answered'):
-                raise ValueError('Message is already complete')
-            if 'close_request' in m and (op != 'resolve' or args.get('state') != 'done'
-                    or self.close_target(m['close_request']) is not None):
-                raise ValueError('Codex close handoffs use native archive verification')
-            if op in ('ack','progress') and m['state'] in ('dispatching','uncertain'):
-                raise ValueError('Resolve delivery outcome first')
-            state = {'ack':'received','progress':'in_progress'}.get(op,args.get('state'))
-            if op=='resolve' and (state not in ('pending','submitted','done') or not args.get('note','').strip()):
-                raise ValueError('Recovery requires a supported state and explanation')
-            if state not in TERMINAL_STATES:
-                self.require_open_route(m['route'])
-                self.require_open_route(m['return_route'])
-                if m.get('reason') == message_store.ARCHIVED_REASON:
-                    raise ValueError('Archived delivery is terminal')
-            return self.status(m,state,args.get('note'))
+            return self.message_action(args)
         raise ValueError('Unknown operation')
+
+    def ping_result(self):
+        return {'instance':self.instance,'build':self.build,
+                'messages':len(self.messages),'subscribers':len(self.subscribers),
+                'correspondence_lost': bool(self.correspondence and self.correspondence.loss),
+                'correspondence_over_limit': len(self.messages) > self.max_messages,
+                'retention_ttl_enabled': self.retention_ttl,
+                'retention_prepare_enabled': self.retention_prepare, 'retention_protocol': 1,
+                'compact_receipts': len(self.compact_messages),
+                'checkpoint_last_save_seconds': self.correspondence.last_save_seconds if self.correspondence else None,
+                'checkpoint_max_save_seconds': self.correspondence.max_save_seconds if self.correspondence else 0.0,
+                'checkpoint_bytes': self.correspondence.checkpoint_bytes if self.correspondence else 0,
+                'max_messages': self.max_messages}
+
+    def register_route(self, args):
+        project, name = identifier(args['project']), identifier(args['name'])
+        transport = args.get('transport','realtime')
+        if transport not in ('realtime','codex','claude','claude-peer','agy'):
+            raise ValueError('Unknown transport')
+        cwd = str(Path(args['cwd']).expanduser().resolve(strict=True))
+        if not Path(cwd).is_dir():
+            raise ValueError('Working directory must be a directory')
+        sid = args.get('session')
+        if transport != 'realtime' or sid:
+            sid = str(uuid.UUID(sid or ''))
+        executable = args.get('executable')
+        if executable is not None and not isinstance(executable, str):
+            raise ValueError('Executable must be a string')
+        item = dict(project=project,name=name,transport=transport,cwd=cwd,
+                    session=sid,executable=executable)
+        self.require_open_route(item)
+        current = self.endpoints.get((project, name))
+        if current is not None:
+            self.require_open_route(current)
+            # One event-loop turn: this authoritative check precedes every
+            # routing write, regardless of any caller's read-only preflight.
+            if (any(current.get(field) != item[field] for field in ('transport', 'cwd', 'session'))
+                    or executable is not None and current.get('executable') != executable):
+                raise ValueError(REGISTER_CONFLICT_ERROR)
+            # An omitted executable never clears an execution-bearing value.
+            return current
+        return self.routing_change('endpoints', (project,name), item)
+
+    def unregister_route(self, args):
+        op = args['op']
+        key = (args['project'], args['name'])
+        current = self.endpoints.get(key)
+        # A distinct wire operation prevents an older broker from ignoring
+        # the comparison and removing a replacement endpoint by name.
+        if op == 'unregister-archived' and (args.get('archived') is not True
+                or current != args.get('expected_route')):
+            raise ValueError('Confirmed archive endpoint is missing or changed')
+        if current is None:
+            raise ValueError(f'No participant {args["name"]!r} is registered in project {args["project"]!r}')
+        self.require_open_route(current)
+        if op == 'unregister-if-current' and current != args['expected_route']:
+            raise ValueError('Endpoint changed during close; its current route was kept')
+        owned = sorted(name for (project,name),item in self.channels.items()
+                       if project==args['project'] and item.get('active') and item['owner']==args['name'])
+        if owned:
+            raise ValueError(f'{args["name"]!r} owns active channel(s) {", ".join(owned)}; close or hand them off first')
+        return self.routing_remove('endpoints', key)
+
+    def bind_channel(self, args):
+        project, name = args['project'], identifier(args['name'])
+        existing = self.channels.get((project,name))
+        generation = existing['generation'] if existing else 0
+        if args.get('expect_generation',0) != generation:
+            raise ValueError(f'Channel generation changed; current generation is {generation}')
+        if not args['description'].strip():
+            raise ValueError('Channel description is required')
+        route = self.route(project,args['owner'])
+        route.update(channel=name,generation=generation+1)
+        item = dict(project=project,name=name,owner=args['owner'],description=args['description'],
+                    route=route,generation=generation+1,active=True)
+        return self.routing_change('channels', (project,name), item)
+
+    def list_channels(self, args):
+        result = []
+        for (project,_),item in self.channels.items():
+            if project==args['project']:
+                result.append({**item,'subscribers':sum(sub['route']==route_key(item['route']) for sub in self.subscribers)})
+        return result
+
+    def close_channel(self, args):
+        item = self.channels.get((args['project'],args['name']))
+        if not item or item['generation']!=args['expect_generation']:
+            raise ValueError('Channel missing or generation changed')
+        item = dict(item, active=False, generation=item['generation']+1)
+        return self.routing_change('channels', (args['project'],args['name']), item)
+
+    def inbox_rows(self, args):
+        if not args.get('name') and not args.get('channel'):
+            raise ValueError('Select a recipient or channel')
+        blockers = self.delivery_blockers()
+        return [{k:m[k] for k in ('id','sender','recipient','state','channel','sender_channel','reply_to','created')}
+                | {'session':m['route']['session'],'generation':m['route'].get('generation')}
+                | self.pending_delivery(m, blockers)
+                for m in self.messages.values() if m['project']==args['project']
+                and (not args.get('name') or m['recipient']==args['name'])
+                and (not args.get('channel') or m['channel']==args['channel'])
+                and (not args.get('session') or m['route']['session']==args['session'])
+                and (args.get('all') or m['state'] not in ('done','answered'))]
+
+    def message_action(self, args):
+        op = args['op']
+        m = self.get(args['id'])
+        if m.get('body_expired'):
+            raise ValueError('Message body expired; only lookup and correlated replies remain available')
+        if op == 'note-pending':
+            return self.note_pending(m, args)
+        if op == 'release-claim':
+            return self.release_claim(m, args)
+        if op in ('claim', 'claim-guarded'):
+            return self.claim_message(m, args)
+        if op=='finish':
+            return self.finish_delivery(m, args)
+        if m['state'] in ('done','answered'):
+            raise ValueError('Message is already complete')
+        if 'close_request' in m and (op != 'resolve' or args.get('state') != 'done'
+                or self.close_target(m['close_request']) is not None):
+            raise ValueError('Codex close handoffs use native archive verification')
+        if op in ('ack','progress') and m['state'] in ('dispatching','uncertain'):
+            raise ValueError('Resolve delivery outcome first')
+        state = {'ack':'received','progress':'in_progress'}.get(op,args.get('state'))
+        if op=='resolve' and (state not in ('pending','submitted','done') or not args.get('note','').strip()):
+            raise ValueError('Recovery requires a supported state and explanation')
+        if state not in TERMINAL_STATES:
+            self.require_open_route(m['route'])
+            self.require_open_route(m['return_route'])
+            if m.get('reason') == message_store.ARCHIVED_REASON:
+                raise ValueError('Archived delivery is terminal')
+        return self.status(m,state,args.get('note'))
+
+    def note_pending(self, m, args):
+        # Annotate a message only while it is still pending: never rewrite a claim
+        # another caller took meanwhile, and never change its state.
+        note = args.get('note')
+        if not isinstance(note, str) or not note.strip():
+            raise ValueError('A pending note requires an explanation')
+        if m['state'] != 'pending':
+            return {'noted':False}
+        self.status(m, 'pending', note)
+        return {'noted':True}
+
+    def release_claim(self, m, args):
+        token, admit_until = guarded_claim_fields(args)
+        if time.monotonic() < admit_until:
+            raise ValueError('Delivery claim admission is still open')
+        if (m['state'] != 'dispatching' or m.get('dispatch_claim') != token
+                or m.get('dispatch_claim_deadline') != admit_until):
+            return {'released':False}
+        self.status(m, 'pending', CLAIM_RELEASE_NOTE, 'push_failed')
+        return {'released':True}
+
+    def claim_message(self, m, args):
+        op = args['op']
+        if retention.request_status(m, time.time()).get('request_status') == 'expired':
+            raise ValueError('Request reply deadline expired; delivery is not retried')
+        if m['state']!='pending':
+            raise ValueError('Only pending messages may be delivered')
+        self.require_open_route(m['route'])
+        self.require_open_route(m['return_route'])
+        if 'close_request' in m:
+            if args.get('close_id') != m['close_request']['close_id']:
+                raise ValueError('A close handoff cannot be delivered manually')
+            self.check_close_operator(m)
+        destination = delivery_destination(m['route'])
+        for other in self.messages.values():
+            if (other.get('provider_retry', {}).get('status') == 'reserved'
+                    and delivery_destination(other['return_route']) == destination):
+                raise ValueError('Recipient has a reserved provider continuation')
+        blocker = self.delivery_blockers().get(destination)
+        if blocker:
+            note = self.delivery_wait(blocker)['note']
+            raise ValueError(f"Recipient has an active or uncertain delivery. Message {m['id']} {note}")
+        if op == 'claim-guarded':
+            token, admit_until = guarded_claim_fields(args)
+            if time.monotonic() >= admit_until:
+                raise ValueError('Delivery claim admission expired')
+            self.status(m, 'dispatching')
+            m.update(dispatch_claim=token, dispatch_claim_deadline=admit_until)
+            return {'dispatch_claim':token}
+        self.status(m,'dispatching')
+        if args.get('guarded') is True:
+            m['dispatch_claim'] = str(uuid.uuid4())
+            return {'dispatch_claim':m['dispatch_claim']}
+        return m
+
+    def finish_delivery(self, m, args):
+        if m['state'] not in ('dispatching', 'pending', 'uncertain'):
+            return m
+        if args.get('expect_dispatch_claim') != m.get('dispatch_claim'):
+            raise ValueError('Delivery claim changed. Inspect the current state.')
+        if m['state']!='dispatching':
+            return m
+        if args['state'] not in ('submitted','failed','uncertain','pending'):
+            raise ValueError('Invalid delivery result')
+        event = args.get('event')
+        if event not in (None,'pushed','push_failed'):
+            raise ValueError('Invalid delivery event')
+        if args['state']=='pending' and (event!='push_failed' or not args.get('note','').strip()):
+            # A failed push stays deliverable, but never silently.
+            raise ValueError('Returning to pending requires a push_failed event and reason')
+        reason = args.get('reason')
+        if reason is not None and (reason != message_store.ARCHIVED_REASON
+                or args['state'] != 'failed' or m['route']['transport'] != 'codex'):
+            raise ValueError('Invalid delivery reason')
+        # Keep the normalized wake outcome on the message before it is published (#121).
+        peer_wake.record_wake(m, args.get('wake'))
+        return self.status(m,args['state'],args.get('note'),event,reason)
 
     def prepare_close(self, args):
         key = (identifier(args['project']), identifier(args['name']))
