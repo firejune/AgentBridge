@@ -174,7 +174,7 @@ def open_result():
             'adoption_mode': None, 'wake_turn_id': None,
             'creator_settings': None, 'permission_settings': None, 'permission_settings_source': None,
             'settings_update': {'applied': None, 'resultType': None},
-            'existing_sessions': [], 'warning': None}
+            'existing_sessions': [], 'route_conflict': None, 'recovery': None, 'warning': None}
 
 
 def permission_settings(client, sid, owner):
@@ -321,9 +321,7 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                 with owners(timeout=min(remaining(), 2)):
                     pass
             except codex_live.EndpointUnavailable as error:
-                if (not allow_queue_wake or error.endpoint_name != codex_live.EndpointUnavailable.DEFAULT
-                        or error.reason not in (codex_live.EndpointUnavailable.MISSING,
-                                                codex_live.EndpointUnavailable.REFUSED)):
+                if not allow_queue_wake or not error.default_absent:
                     raise
                 # The saved app-server can hold the same queue database open.
                 scope.close()
@@ -405,7 +403,9 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                     raise CreationError('Codex Desktop wake returned unconfirmed permission settings')
                 result['warning'] = {
                     'code': 'CODEX_DESKTOP_WAKE_RESTRICTED',
-                    'message': f'Desktop started this thread with {sandbox_name} sandbox and on-request approval.',
+                    'message': f'The Desktop wake turn ran with {sandbox_name} sandbox, no network access and '
+                               'on-request approval, not the Full Access the bridge requested. '
+                               'Later turns are not verified.',
                 }
             stage = 'adoption'
             turn_id = confirmed.get('turn_id')

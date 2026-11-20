@@ -43,7 +43,7 @@ PROVIDER_NOTICE_KEY_PREFIXES = tuple(event + ':' for event in (
     provider_failures.UNSAFE, provider_failures.UNCERTAIN))
 CLOSE_OPERATOR_FILE = 'close-operator.json'
 CLOSING_ROUTE_ERROR = 'Codex route is closing'
-READ_ONLY_OPS = ('ping', 'routes', 'codex-routes', 'channels', 'show', 'conversation', 'inbox', 'retention-plan')
+READ_ONLY_OPS = ('ping', 'routes', 'channels', 'show', 'conversation', 'inbox', 'retention-plan')
 CHECKPOINT_FIELDS = ('messages', 'compact_messages', 'keys', 'inbox_receipts', 'inbox_snapshots')
 Checkpoint = namedtuple('Checkpoint', CHECKPOINT_FIELDS)
 
@@ -124,6 +124,14 @@ def public_message(message):
     return result
 
 
+def build_id(root=None):
+    """Name the source a process runs: a digest of every module beside this one."""
+    digest = hashlib.sha256()
+    for path in sorted(Path(root or Path(__file__).resolve().parent).glob('*.py')):
+        digest.update(path.name.encode() + b'\0' + path.read_bytes() + b'\0')
+    return digest.hexdigest()[:12]
+
+
 class BrokerConnectError(ValueError):
     """A socket connection failed before a broker request was sent."""
 
@@ -146,6 +154,7 @@ class State:
         if max_messages < 1:
             raise ValueError('Message retention size must be positive')
         self.instance = str(uuid.uuid4())
+        self.build = build_id()  # Read once: the source this process started from.
         self.max_messages = max_messages
         if retention_ttl and max_messages > 2048:
             raise ValueError('TTL active-message limit cannot exceed 2048')
@@ -942,7 +951,8 @@ class State:
         if op in ('inbox_list', 'inbox_get', 'inbox_ack', 'inbox_reply'):
             return self.inbox_action(args)
         if op == 'ping':
-            return {'instance':self.instance,'messages':len(self.messages),'subscribers':len(self.subscribers),
+            return {'instance':self.instance,'build':self.build,
+                    'messages':len(self.messages),'subscribers':len(self.subscribers),
                     'correspondence_lost': bool(self.correspondence and self.correspondence.loss),
                     'correspondence_over_limit': len(self.messages) > self.max_messages,
                     'retention_ttl_enabled': self.retention_ttl,
@@ -982,9 +992,6 @@ class State:
             return self.routing_change('endpoints', (project,name), item)
         if op == 'routes':
             return [x for (p,_),x in self.endpoints.items() if p==args['project']]
-        if op == 'codex-routes':
-            return [route for route in self.endpoints.values()
-                    if route['transport'] == 'codex' and 'closing' not in route]
         if op == 'close-prepare':
             return self.prepare_close(args)
         if op == 'close-dispatch':

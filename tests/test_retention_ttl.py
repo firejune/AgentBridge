@@ -541,9 +541,9 @@ class RetentionCLITests(unittest.TestCase):
                                 '--one-way', '--key', 'k', '--file', '-'])
         self.assertEqual(code, 1)
         self.assertIn('Unknown operation', output.getvalue())
-        self.assertEqual(request.call_count, 1)
-        self.assertEqual(request.call_args.args[1]['op'], 'send-with-retention')
-        self.assertTrue(request.call_args.args[1]['one_way'])
+        # One send, never repeated; the definite refusal is followed only by a read-only build check.
+        self.assertEqual([call.args[1]['op'] for call in request.call_args_list], ['send-with-retention', 'ping'])
+        self.assertTrue(request.call_args_list[0].args[1]['one_way'])
 
     @staticmethod
     def old_created_broker(mode='--retention-ttl'):

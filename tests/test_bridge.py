@@ -124,6 +124,8 @@ class SocketTests(unittest.TestCase):
             request.assert_not_called()
         with self.assertRaisesRegex(ValueError, '^Unknown operation$'):
             self.server.call('remap', project='demo', name='worker', expected_route=route, session=replacement)
+        with self.assertRaisesRegex(ValueError, '^Unknown operation$'):
+            self.server.call('codex-routes')  # Read by the removed sweep only.
         self.assertIn(route, self.server.call('routes', project='demo'))
         self.assertEqual(routes_path.read_bytes(), before)
 

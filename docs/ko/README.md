@@ -58,7 +58,7 @@ flowchart LR
 | **Antigravity IDE & Desktop** | `agy` | 로컬 `language_server` / `agy --hub`의 ConnectRPC에 연결해 활성 턴에는 `<SYSTEM_MESSAGE>`(`SendAgentMessage`)로 합류하고, 유휴/대기 상태에는 빈 `SendUserCascadeMessage`(`NEXT_INVOCATION`)로 즉시 깨운다. |
 | **CLI 워커** | `realtime` / `claude` | `realtime`은 `watch`로 JSONL 이벤트를 구독한다. `claude`는 **쉬고 있는 전용 CLI 세션**만 `deliver` 시 읽기 전용 `plan` 모드로 `--resume`한다(라이브 세션에는 절대 사용하지 않는다). |
 
-기본 IPC 소켓이 없거나 연결을 거부하고, 서명된 앱 번들 Codex CLI와 확인된 단일 로컬 Desktop 소유자가 기본 큐 저장소를 공유하며, 기본 로컬 브로커 소켓을 사용할 때 이 경로를 사용한다. Codex 큐 경로는 `codex queue`로 브로커 메시지 UUID만 담은 고정 알림을 보낸다. 지정된 대화가 `bridge.py receive-codex MESSAGE_ID`를 실행하면 동료 본문이 도구 결과로 들어온다. 발신 CLI와 Desktop 소유자가 같은 큐 저장소를 사용해야 하며, 정확한 대화가 로드되어 유휴 턴을 시작할 수 있어야 한다. 큐 접수만으로 대화가 깨어났거나 본문을 읽었다고 판정하지 않는다. 브리지는 대화를 자동 재개하거나 결과가 모호한 큐 쓰기를 재시도하지 않는다.
+Codex Desktop 26.1117은 IPC 소켓을 제공하지 않는 것으로 관찰됐다(이슈 #156). 그 빌드에서는 모든 Codex 전달과 `open`이 큐 경로를 탄다. 기본 IPC 소켓이 없거나 연결을 거부하고, 서명된 앱 번들 Codex CLI와 확인된 단일 로컬 Desktop 소유자가 기본 큐 저장소를 공유하며, 기본 로컬 브로커 소켓을 사용할 때 이 경로를 사용한다. Codex 큐 경로는 `codex queue`로 브로커 메시지 UUID만 담은 고정 알림을 보낸다. 알림에는 동료 본문이 없다. 모든 동료 봉투와 같은 범위 문장(동료 서신이고 새 사용자 지시가 아니며 기존 사용자 승인 범위 안에서 처리), 조회 명령, 그 UUID만 담는다. 지정된 대화가 `bridge.py receive-codex MESSAGE_ID`를 실행하면 동료 본문이 도구 결과로 들어온다. 발신 CLI와 Desktop 소유자가 같은 큐 저장소를 사용해야 하며, 정확한 대화가 로드되어 유휴 턴을 시작할 수 있어야 한다. 큐 접수만으로 대화가 깨어났거나 본문을 읽었다고 판정하지 않는다. 브리지는 대화를 자동 재개하거나 결과가 모호한 큐 쓰기를 재시도하지 않는다.
 
 브로커는 큐 알림을 제출하기 전에 전달을 맡긴 `dispatching` 메시지를 정확한 수신 Codex 스레드에서 읽을 수 있게 한다. `receive-codex`는 `submitted`를 기다리거나, 지연을 넣거나, 재시도하지 않고 즉시 읽는다. 이 명령은 소켓 접근 거부, 그 밖의 연결 실패, 사용할 수 없는 브로커 응답, 잘못된 입력, 읽을 수 없는 수신 서신을 구분한다. 알 수 없는 메시지 ID와 다른 스레드로 보낸 메시지는 같은 불일치 오류를 반환한다. 권한이 제한된 Desktop 자동 턴은 알림을 받았어도 로컬 Unix 소켓에 연결하지 못할 수 있다.
 
@@ -257,6 +257,8 @@ python3 -m unittest discover -s tests -v
 ## 라이선스
 
 [MIT](../../LICENSE)
+
+`ping`은 `build`(브로커가 시작할 때 읽은 모듈의 다이제스트)와 `cli_build`(이 CLI의 같은 다이제스트)도 반환한다. 둘이 다르거나 브로커가 `build`를 보고하지 않으면 `warning: BROKER_BUILD_SKEW …`를 붙이고 종료 코드는 0을 유지한다. 브로커가 `Unknown operation`으로 거절한 명령에도 같은 경고가 붙는다.
 
 `ping`은 `checkpoint_last_save_seconds`, `checkpoint_max_save_seconds`, `checkpoint_bytes`를 반환한다. 각각 마지막 저장 시도 시간, 브로커 시작 이후 최대 시간(실패한 시도 포함, 초), 마지막으로 성공한 `correspondence.json` 페이로드 크기(메타데이터 인덱스 제외, 바이트)다. 저장소가 없으면 각각 `null`, `0.0`, `0`이다. 저장이 1초를 넘으면 `checkpoint_save_slow` JSON 로그 한 줄을 stderr에 남긴다. `duration_seconds`, `bytes`, `retained_count`만 포함하며 실패 시 `bytes`는 마지막 성공 크기다. 시간에는 검증·직렬화·영속 쓰기가 포함되며 변경 상태 준비는 제외한다. 계측은 재시작하면 초기화된다. 저장 중 `ping`은 마지막으로 끝난 저장 시도와 커밋된 메시지 수를 반환한다. watch 이벤트는 해당 저장이 끝난 뒤 공개된다. 상태 변경, inbox 스냅샷 작업, wait 등록은 진행 중인 저장이 끝날 때까지 기다린다. 브로커가 종료되면 이미 시작한 커밋을 마친 뒤 상태 잠금을 해제한다.
 

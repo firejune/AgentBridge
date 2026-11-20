@@ -7,7 +7,6 @@ from pathlib import Path
 import plistlib
 import stat
 import subprocess
-import sys
 import time
 import uuid
 
@@ -73,19 +72,14 @@ def prepare(timeout=10):
     """Validate the sole supported local app and default owner/store before creation."""
     remaining = budget(timeout)
     try:
-        if sys.platform != 'darwin' or any(os.getenv(key) for key in (
-                'CODEX_HOME', 'CODEX_SQLITE_HOME', 'CODEX_EXEC_SERVER_URL', 'AGENT_BRIDGE_CODEX_IPC')):
-            raise WakeError(CONTEXT_ERROR)
-        home = Path.home() / '.codex'
-        state, queue = home / codex_preview.STATE_FILE, home / 'queue_1.sqlite'
+        state, queue = codex_queue.default_stores()
         app = codex_queue.APP
         with (app / 'Contents/Info.plist').open('rb') as source:
             metadata = plistlib.load(source)
         if (metadata.get('CFBundleShortVersionString'), metadata.get('CFBundleVersion')) != APP_BUILD:
             raise WakeError('This Codex Desktop build has not been verified for queue wake')
         for bundle, signature in ((app, APP_SIGNATURE), (codex_queue.CLI_BUNDLE, codex_queue.SIGNATURE)):
-            codex_queue.checked_output(['/usr/bin/codesign', '--verify', '--strict', '-R=' + signature,
-                                        str(bundle)], timeout=min(5, remaining()))
+            codex_queue.verify_signature(bundle, signature, min(5, remaining()))
         # The existing public config reader has a bounded independent budget.
         if remaining() < codex_preview.CONFIG_TIMEOUT or codex_preview.state_path(str(codex_queue.CLI)) != state:
             raise WakeError(CONTEXT_ERROR)

@@ -809,7 +809,10 @@ class NewCodexTests(unittest.TestCase):
             self.assertEqual(result['permission_settings'], permissions)
             self.assertEqual(result['permission_settings_source'], 'Desktop wake turn context')
             self.assertEqual(result['warning']['code'], 'CODEX_DESKTOP_WAKE_RESTRICTED')
-            self.assertIn(f'{label} sandbox and on-request approval', result['warning']['message'])
+            # The claim covers the one turn that was read, and says the bridge asked for more.
+            self.assertEqual(result['warning']['message'],
+                             f'The Desktop wake turn ran with {label} sandbox, no network access and on-request '
+                             'approval, not the Full Access the bridge requested. Later turns are not verified.')
             self.assertEqual(result['model'], 'requested-model')
             self.assertEqual(result['creator_settings']['sandbox']['type'], 'dangerFullAccess')
             self.assertEqual([method for method, _, _ in self.calls].count('thread/start'), 1)
@@ -1083,6 +1086,37 @@ class NewCodexTests(unittest.TestCase):
             self.assertFalse(value['registered'])
             self.assertIsNone(value['session']['id'])
             self.assertEqual(create.call_count,0)
+            self.assertEqual(value['error'],'Agent Bridge broker is unavailable for this socket; no Codex thread was created')
+
+    def test_unadopted_thread_names_its_recovery_and_that_recovery_registers_it(self):
+        refusal='The Codex Desktop wake turn used unrecognized permission settings'
+        failure=codex_new.CreationError(refusal,True,self.sid,False,'adoption')
+        saved={'session':sessions.codex_row(self.thread,'saved'),'warning':None}
+        with RunningBroker() as server:
+            command=['--socket',server.path,'open','--provider','codex','--new','--cwd',self.root,
+                     '--register','worker','--project','demo']
+            out=io.StringIO()
+            with patch.object(codex_new,'open_codex',side_effect=failure), patch('sys.stdout',out):
+                self.assertEqual(bridge.main(command),1)
+            value=json.loads(out.getvalue())
+            self.assertEqual((value['error'],value['uncertain'],value['registered']),(refusal,True,False))
+            self.assertEqual(server.call('routes',project='demo'),[])
+            recover=f'register worker --project demo --transport codex --session {self.sid} --discover'
+            self.assertIn(recover,value['recovery'])
+            out=io.StringIO()
+            with patch.object(sessions,'inspect_session',return_value=saved), patch('sys.stdout',out):
+                self.assertEqual(bridge.main(['--socket',server.path,*recover.split()]),0,out.getvalue())
+            route,=server.call('routes',project='demo')
+            self.assertEqual((route['name'],route['transport'],route['session']),('worker','codex',self.sid))
+            # The name now belongs to that thread: a second open names the holder and creates nothing.
+            out=io.StringIO()
+            with patch.object(codex_new,'open_codex') as create, patch('sys.stdout',out):
+                self.assertEqual(bridge.main(command[:5]+command[6:]),1)
+            value=json.loads(out.getvalue())
+            self.assertEqual(create.call_count,0)
+            self.assertEqual(value['error'],broker.REGISTER_CONFLICT_ERROR)
+            self.assertEqual(value['route_conflict'],{'transport':'codex','session':self.sid,'cwd':route['cwd']})
+            self.assertIsNone(value['recovery'])
 
     def test_partial_failure_cli_reports_stage_and_never_registers(self):
         failure=codex_new.CreationError('failed',True,self.sid,True,'model')

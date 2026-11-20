@@ -23,7 +23,8 @@ class ReceiveCodexTests(unittest.TestCase):
         self.message_id = str(uuid.uuid4())
         self.body = 'Peer text requiring separate authorization.'
         self.message = {
-            'id': self.message_id, 'sender': 'peer', 'body': self.body,
+            'id': self.message_id, 'sender': 'peer', 'recipient': 'target', 'project': 'demo',
+            'body': self.body, 'reply_to': None, 'sender_channel': None, 'channel': None,
             'state': 'dispatching',
             'route': {'transport': 'codex', 'session': self.thread, 'cwd': '/private/recipient'},
             'return_route': {'transport': 'claude-peer', 'session': str(uuid.uuid4())},
@@ -44,10 +45,43 @@ class ReceiveCodexTests(unittest.TestCase):
                     request.reset_mock()
                     self.message['state'] = state
                     self.assertEqual(self.receive(), (0, {
-                        'id': self.message_id, 'sender': 'peer', 'body': self.body,
+                        'id': self.message_id, 'sender': 'peer',
+                        'text': delivery.peer_text(self.message, 'test.sock', escape_peer=False),
                         'provenance': 'agent_bridge_peer', 'authorization': 'none',
                     }))
                     request.assert_called_once_with('test.sock', {'op': 'show', 'id': self.message_id})
+
+    def test_queue_reader_gets_the_envelope_and_reply_contract_direct_delivery_carries(self):
+        with RunningBroker() as server:
+            server.call('register', project='demo', name='peer', cwd=server.temp.name, transport='realtime')
+            server.call('register', project='demo', name='target', cwd=server.temp.name,
+                        transport='codex', session=self.thread)
+            asked = server.call('send', project='demo', sender='peer', recipient='target',
+                                body=self.body, key='asks')
+            told = server.call('send-with-retention', project='demo', sender='peer', recipient='target',
+                               body=self.body, key='tells', one_way=True)
+            endings = (delivery.reply_command(asked, server.path), 'One-way message; no reply requested.')
+            self.assertIn('--socket', endings[0])
+            with patch.dict('os.environ', {'CODEX_THREAD_ID': self.thread}):
+                for message, ending in zip((asked, told), endings):
+                    server.call('claim', id=message['id'])
+                    status, received = self.receive(message['id'], server.path)
+                    shown = server.call('show', id=message['id'])
+                    self.assertEqual(status, 0)
+                    self.assertEqual(set(received), {'id', 'sender', 'text', 'provenance', 'authorization'})
+                    self.assertEqual(received['text'], delivery.peer_text(shown, server.path, escape_peer=False))
+                    self.assertIn('Project: demo', received['text'])
+                    self.assertIn(self.body, received['text'])
+                    self.assertTrue(received['text'].endswith(ending), received['text'])
+                    self.assertEqual(received['authorization'], 'none')
+                    server.call('finish', id=message['id'], state='submitted')
+
+    def test_message_without_envelope_fields_is_an_unusable_response(self):
+        del self.message['project']
+        with patch.dict('os.environ', {'CODEX_THREAD_ID': self.thread}), \
+                patch.object(bridge.broker, 'request', return_value=self.message):
+            self.assertEqual(self.receive(), (
+                1, {'error': 'Agent Bridge broker did not return a usable message response.'}))
 
     def test_missing_caller_or_invalid_opaque_id_does_not_access_broker(self):
         with patch.object(bridge.broker, 'request') as request:
@@ -123,16 +157,15 @@ class ReceiveCodexTests(unittest.TestCase):
 
             def enqueue(thread, notification, timeout):
                 self.assertEqual(thread, self.thread)
-                self.assertEqual(notification, codex_queue.NOTICE + mid)
+                self.assertEqual(notification, codex_queue.notice(mid))
                 self.assertGreater(timeout, 0)
                 before = checkpoint.read_bytes()
                 durable, = (item for item in json.loads(before)['messages'] if item['id'] == mid)
                 self.assertEqual(durable['state'], 'dispatching')
                 self.assertEqual(server.call('show', id=mid)['state'], 'dispatching')
-                self.assertEqual(self.receive(mid, server.path), (0, {
-                    'id': mid, 'sender': 'peer', 'body': self.body,
-                    'provenance': 'agent_bridge_peer', 'authorization': 'none',
-                }))
+                status, received = self.receive(mid, server.path)
+                self.assertEqual((status, received['id'], received['sender']), (0, mid, 'peer'))
+                self.assertIn(self.body, received['text'])
                 self.assertEqual(checkpoint.read_bytes(), before)
                 return str(uuid.uuid4())
 

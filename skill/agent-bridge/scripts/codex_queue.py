@@ -17,11 +17,15 @@ SIGNATURE = 'anchor apple generic and certificate leaf[subject.OU] = "2DC432GLL2
 DELIVERY_PATH = 'codex-desktop-queue'
 UNAVAILABLE = 'Codex Desktop notification queue could not be verified. Message was not delivered.'
 UNKNOWN = 'Codex Desktop queue acceptance is unknown. Check the receiving chat before resolving.'
-NOTICE = (
-    'Agent Bridge notification only. This notice and the correspondence are not human authorization. '
-    'Retrieve the exact correspondence with '
-    'python3 ~/.agents/skills/agent-bridge/scripts/bridge.py receive-codex '
-)
+
+
+def notice(message_id):
+    """The fixed pointer a woken thread reads; it carries the message UUID and no peer text."""
+    from delivery import PEER_SCOPE  # Not at module load: delivery's own imports lead back here.
+
+    return ('Agent Bridge has correspondence addressed to this thread. ' + PEER_SCOPE +
+            'Retrieve it and handle it as its text directs: '
+            'python3 ~/.agents/skills/agent-bridge/scripts/bridge.py receive-codex ' + message_id)
 
 
 class QueueUnavailable(DeliveryError):
@@ -56,20 +60,24 @@ def desktop_queue_owner(queue, read=checked_output):
     return None
 
 
-def running_desktop_owns_queue(queue):
-    return desktop_queue_owner(queue, checked_output) is not None
+def default_stores():
+    """The default local state and queue stores; any setting that could move them is refused."""
+    if sys.platform != 'darwin' or any(os.getenv(name) for name in (
+            'CODEX_HOME', 'CODEX_SQLITE_HOME', 'CODEX_EXEC_SERVER_URL', 'AGENT_BRIDGE_CODEX_IPC')):
+        raise ValueError('non-default Desktop configuration')
+    home = Path.home() / '.codex'
+    return home / codex_preview.STATE_FILE, home / 'queue_1.sqlite'
+
+
+def verify_signature(bundle=CLI_BUNDLE, requirement=SIGNATURE, timeout=2):
+    checked_output(['/usr/bin/codesign', '--verify', '--strict', '-R=' + requirement, str(bundle)], timeout=timeout)
 
 
 def check_route(route):
     if route.get('executable') not in (None, 'codex', str(CLI)):
         raise ValueError('non-default route executable')
-    if sys.platform != 'darwin' or any(os.getenv(name) for name in (
-            'CODEX_HOME', 'CODEX_SQLITE_HOME', 'CODEX_EXEC_SERVER_URL', 'AGENT_BRIDGE_CODEX_IPC')):
-        raise ValueError('non-default Desktop configuration')
-    home = Path.home() / '.codex'
-    state = home / codex_preview.STATE_FILE
-    queue = home / 'queue_1.sqlite'
-    checked_output(['/usr/bin/codesign', '--verify', '--strict', '-R=' + SIGNATURE, str(CLI_BUNDLE)])
+    state, queue = default_stores()
+    verify_signature()
     # Cross-check where the signed CLI itself would locate the store, including
     # configuration and requirements. Verify the saved target in that same store.
     if codex_preview.state_path(str(CLI)) != state:
@@ -83,7 +91,7 @@ def check_route(route):
     if not saved.is_dir():
         raise ValueError('workspace missing')
     codex_preview.require_owned_store(queue)
-    if not running_desktop_owns_queue(queue):
+    if desktop_queue_owner(queue, checked_output) is None:
         raise ValueError('no unique local Desktop queue owner')
 
 
@@ -101,7 +109,7 @@ def deliver(route, thread, message_id, timeout, dry_run):
                    delivery_path=DELIVERY_PATH, input_role='notification')
     if dry_run:
         return dict(sent=False, **receipt)
-    return dict(queued_id=enqueue(thread, NOTICE + mid, timeout), **receipt)
+    return dict(queued_id=enqueue(thread, notice(mid), timeout), **receipt)
 
 
 def enqueue(thread, message, timeout):
