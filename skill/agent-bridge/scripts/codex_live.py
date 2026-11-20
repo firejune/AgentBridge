@@ -54,6 +54,11 @@ class EndpointUnavailable(DeliveryError):
     def diagnosis(self):
         return f'Codex Desktop IPC ({self.endpoint_name}) {self.reason}.'
 
+    @property
+    def default_absent(self):
+        """The default socket is missing or unserved: the one case the Desktop queue may stand in for."""
+        return self.endpoint_name == self.DEFAULT and self.reason in (self.MISSING, self.REFUSED)
+
     @classmethod
     def details(cls):
         return tuple(str(cls(endpoint_name, reason)) for endpoint_name in (cls.DEFAULT, cls.CONFIGURED)
@@ -372,9 +377,7 @@ def deliver(route, message_id, text, timeout=10, dry_run=False, path=None, *, al
             return dict(session=thread, owner=owner, turn_id=accepted_turn(response),
                         delivery_mode=mode, input_role='toolOutput')
     except EndpointUnavailable as error:
-        if (allow_queue and not client.mutation_sent
-                and error.endpoint_name == EndpointUnavailable.DEFAULT
-                and error.reason in (EndpointUnavailable.MISSING, EndpointUnavailable.REFUSED)):
+        if allow_queue and not client.mutation_sent and error.default_absent:
             import codex_queue
 
             try:

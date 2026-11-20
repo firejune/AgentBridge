@@ -321,9 +321,7 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                 with owners(timeout=min(remaining(), 2)):
                     pass
             except codex_live.EndpointUnavailable as error:
-                if (not allow_queue_wake or error.endpoint_name != codex_live.EndpointUnavailable.DEFAULT
-                        or error.reason not in (codex_live.EndpointUnavailable.MISSING,
-                                                codex_live.EndpointUnavailable.REFUSED)):
+                if not allow_queue_wake or not error.default_absent:
                     raise
                 # The saved app-server can hold the same queue database open.
                 scope.close()
