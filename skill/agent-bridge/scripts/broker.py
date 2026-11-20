@@ -43,7 +43,7 @@ PROVIDER_NOTICE_KEY_PREFIXES = tuple(event + ':' for event in (
     provider_failures.UNSAFE, provider_failures.UNCERTAIN))
 CLOSE_OPERATOR_FILE = 'close-operator.json'
 CLOSING_ROUTE_ERROR = 'Codex route is closing'
-READ_ONLY_OPS = ('ping', 'routes', 'codex-routes', 'channels', 'show', 'conversation', 'inbox', 'retention-plan')
+READ_ONLY_OPS = ('ping', 'routes', 'channels', 'show', 'conversation', 'inbox', 'retention-plan')
 CHECKPOINT_FIELDS = ('messages', 'compact_messages', 'keys', 'inbox_receipts', 'inbox_snapshots')
 Checkpoint = namedtuple('Checkpoint', CHECKPOINT_FIELDS)
 
@@ -992,9 +992,6 @@ class State:
             return self.routing_change('endpoints', (project,name), item)
         if op == 'routes':
             return [x for (p,_),x in self.endpoints.items() if p==args['project']]
-        if op == 'codex-routes':
-            return [route for route in self.endpoints.values()
-                    if route['transport'] == 'codex' and 'closing' not in route]
         if op == 'close-prepare':
             return self.prepare_close(args)
         if op == 'close-dispatch':

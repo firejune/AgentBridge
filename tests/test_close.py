@@ -278,7 +278,8 @@ class CloseCodexTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(recovered, {k: v for k, v in prepared.items()
                                      if k not in ('retro_id', 'store', 'notification')})
-        self.assertEqual(self.server.call('codex-routes'), [])
+        route, = self.server.call('routes', project='p')
+        self.assertEqual(route['closing'], prepared['close_id'])
         finish = ('--finish', prepared['close_id'], '--expect-session')
         for wrong in (str(uuid.uuid4()), self.sid):
             with self.subTest(session=wrong):
