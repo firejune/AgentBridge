@@ -3,6 +3,7 @@ import functools
 import io
 import json
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -249,7 +250,7 @@ class NewCodexTests(unittest.TestCase):
             self.assertEqual(caught.exception.session, self.sid)
             self.assertFalse(caught.exception.adopted)
             self.assertEqual(self.urls, [])
-            self.assertEqual(desktop.calls, [])
+            self.assertEqual([call['method'] for call in desktop.calls], ['initialize'])
             self.assertEqual(sum(method == 'thread/start' for method, _, _ in self.calls), 1)
             self.assertEqual([client.creator for method, _, client in self.calls if method == 'thread/read'],
                              [True, False] if reader_expected else [True])
@@ -569,7 +570,7 @@ class NewCodexTests(unittest.TestCase):
         self.assertFalse(result['created'])
         self.assertIsNone(result['session']['id'])
         self.assertEqual(sum(m=='thread/start' for m,_,_ in self.calls), 1)
-        self.assertEqual(desktop.calls, [])
+        self.assertEqual([call['method'] for call in desktop.calls], ['initialize'])
 
     def test_issue44_registration_both_failures_preserve_refusal_and_one_attempt(self):
         with ModelDesktop(refuse_permissions=True) as desktop, \
@@ -716,6 +717,38 @@ class NewCodexTests(unittest.TestCase):
         self.assertTrue(caught.exception.created)
         self.assertEqual(caught.exception.stage,'persistence')
         self.assertEqual(self.urls,[])
+
+    def test_issue156_open_with_missing_or_refused_watcher_creates_no_thread(self):
+        real_open = codex_new.open_codex
+        endpoint = Path(self.root, 'ipc.sock')
+        command = ['open', '--provider', 'codex', '--cwd', self.root,
+                   '--state-dir', self.root, '--register', 'worker', '--project', 'demo']
+
+        def create(**kwargs):
+            kwargs['timeout'] = .05
+            return real_open(**kwargs, client_factory=self.factory, opener=self.urls.append, poll=.005)
+
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as inactive:
+            for reason in (codex_live.EndpointUnavailable.MISSING, codex_live.EndpointUnavailable.REFUSED):
+                if reason == codex_live.EndpointUnavailable.REFUSED:
+                    inactive.bind(str(endpoint))  # Bound socket with no listening server.
+                self.calls.clear()
+                self.urls.clear()
+                out = io.StringIO()
+                with self.subTest(reason=reason), patch.object(codex_live, 'endpoint', return_value=endpoint), \
+                        patch.object(codex_new, 'open_codex', side_effect=create), patch('sys.stdout', out), \
+                        patch.object(broker, 'request', side_effect=empty_registration_rpc) as rpc:
+                    self.assertEqual(bridge.main(command), 1)
+                    self.assertNotIn('thread/start', [method for method, _, _ in self.calls])
+                    self.assertEqual(self.urls, [])
+                    result = json.loads(out.getvalue())
+                    for key in ('created', 'adopted', 'registered', 'uncertain'):
+                        self.assertFalse(result[key], key)
+                    self.assertIsNone(result['session']['id'])
+                    self.assertEqual(result['stage'], 'preflight')
+                    self.assertIn(reason, result['error'])
+                    self.assertNotIn(str(endpoint), result['error'])
+                    self.assertEqual([call.args[1]['op'] for call in rpc.call_args_list], ['routes'])
 
     def test_no_owner_never_registers_or_creates_replacement(self):
         with ModelDesktop(behavior='no-owner') as desktop, self.assertRaises(codex_new.CreationError) as caught:
@@ -939,6 +972,7 @@ class NewCodexTests(unittest.TestCase):
         exe.write_text('#!'+sys.executable+'\n'+f'''
 import json,sys
 from pathlib import Path
+import socket
 assert sys.argv[1:]==['app-server','--stdio']
 state=Path({str(state)!r});log=Path({str(log)!r})
 for line in sys.stdin:

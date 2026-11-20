@@ -303,6 +303,10 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
             stage = 'preflight'
             require_full_access_profile(creator, folder, remaining)
             require_model(creator, model, remaining, missing)
+            # Initializing the owner transport is read-only. Do this before
+            # thread/start, which may persist a thread we could never adopt.
+            with owners(timeout=min(remaining(), 2)):
+                pass
             params = {'cwd': str(folder), 'ephemeral': False, 'allowProviderModelFallback': False,
                       'permissions': FULL_ACCESS_PROFILE, 'approvalPolicy': 'never', 'model': model}
             stage, attempted = 'create', True
@@ -405,6 +409,8 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                         raise CreationError('Exact Codex Desktop owner did not confirm Full Access with approvalPolicy never'
                                             + ' (mismatched fields: ' + '; '.join(mismatches) + ')')
                     break
+            except codex_live.EndpointUnavailable:
+                raise
             except (codex_live.DeliveryError, OSError):
                 if adopted:
                     raise  # Never replay a possibly sent settings mutation.
@@ -418,8 +424,12 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
     except BaseException as error:
         if not isinstance(error, (Exception, KeyboardInterrupt)):
             raise
-        message = str(error) if isinstance(error, CreationError) else (
-            'Codex creation/adoption failed; do not create another thread automatically')
+        if isinstance(error, codex_live.EndpointUnavailable):
+            message = error.diagnosis()
+        elif isinstance(error, CreationError):
+            message = str(error)
+        else:
+            message = 'Codex creation/adoption failed; do not create another thread automatically'
         failure = CreationError(message, attempted, sid, adopted, stage, result=result)
         failure.cancelled = isinstance(error, KeyboardInterrupt)
         raise failure from None

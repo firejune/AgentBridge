@@ -146,6 +146,8 @@ Claude Desktop closes sessions on its own: a hidden session is paused 900 s afte
 
 On the IPC path, if the exact Codex Desktop owner lookup times out, is unavailable, or finds no owner supporting untrusted input, delivery stays `pending`. The CLI and MCP report the outcome and any verified missing saved workspace without automatically reopening or resending.
 
+Codex `open` and `register --new` require the Desktop IPC handshake before creating a thread. If the exact-owner transport is unavailable, they report the endpoint failure without creating or opening a thread. In that case, `remap` reports the failure without opening a link or replacing a UUID. The queue transport serves correspondence delivery. Open and remap use Desktop IPC to confirm ownership.
+
 Run `bridge.py remap` to reopen non-archived Codex sessions registered across all broker projects. The command checks the saved workspace, skips sessions that already have a Desktop owner, and reports the result for each endpoint. Reopening can bring Codex Desktop to the foreground. The command preserves UUIDs and leaves messages queued.
 
 Use `bridge.py remap NAME --project PROJECT --expect-session OLD_UUID --session NEW_UUID` to replace a registered Codex endpoint. The replacement must have a live Desktop owner and the same workspace. New messages addressed directly to the participant use the replacement UUID. Channel bindings and existing messages keep their original routes.
