@@ -809,7 +809,10 @@ class NewCodexTests(unittest.TestCase):
             self.assertEqual(result['permission_settings'], permissions)
             self.assertEqual(result['permission_settings_source'], 'Desktop wake turn context')
             self.assertEqual(result['warning']['code'], 'CODEX_DESKTOP_WAKE_RESTRICTED')
-            self.assertIn(f'{label} sandbox and on-request approval', result['warning']['message'])
+            # The claim covers the one turn that was read, and says the bridge asked for more.
+            self.assertEqual(result['warning']['message'],
+                             f'The Desktop wake turn ran with {label} sandbox, no network access and on-request '
+                             'approval, not the Full Access the bridge requested. Later turns are not verified.')
             self.assertEqual(result['model'], 'requested-model')
             self.assertEqual(result['creator_settings']['sandbox']['type'], 'dangerFullAccess')
             self.assertEqual([method for method, _, _ in self.calls].count('thread/start'), 1)

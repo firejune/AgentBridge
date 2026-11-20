@@ -403,7 +403,9 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                     raise CreationError('Codex Desktop wake returned unconfirmed permission settings')
                 result['warning'] = {
                     'code': 'CODEX_DESKTOP_WAKE_RESTRICTED',
-                    'message': f'Desktop started this thread with {sandbox_name} sandbox and on-request approval.',
+                    'message': f'The Desktop wake turn ran with {sandbox_name} sandbox, no network access and '
+                               'on-request approval, not the Full Access the bridge requested. '
+                               'Later turns are not verified.',
                 }
             stage = 'adoption'
             turn_id = confirmed.get('turn_id')
