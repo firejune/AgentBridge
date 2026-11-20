@@ -17,7 +17,6 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import agy_live
 import broker
-import codex_live
 import codex_preview
 import codex_new
 # Keep the existing CLI imports of the shared delivery helpers available.
@@ -81,9 +80,8 @@ def wake_participant(args):
     route = registered_route(args)
     base = {'name':args.name, 'project':args.project, 'transport':route['transport'], 'session':route['session']}
     if route['transport'] != 'claude-peer':
-        hint = {'codex':' (Codex: bridge.py remap reopens Desktop owners)'}.get(route['transport'], '')
         return {**base, 'state':'unsupported', 'host':None,
-                'reason':f"{route['transport']}: wake covers claude-peer routes only{hint}"}
+                'reason':f"{route['transport']}: wake covers claude-peer routes only"}
     return {**base, **public_wake(sessions.wake_claude(route['session'], timeout=args.timeout))}
 
 
@@ -246,108 +244,6 @@ def registration(args):
     if not args.cwd:
         raise ValueError('Provide --cwd or use --discover to infer it')
     return observation
-
-
-def remap(args):
-    if not all((args.name, args.project, args.expect_session, args.session)):
-        raise ValueError('Provide NAME, --project, --expect-session and --session to replace a UUID')
-    expected = str(uuid.UUID(args.expect_session))
-    target = str(uuid.UUID(args.session))
-    route = next((row for row in broker.request(args.socket, {'op':'routes', 'project':args.project})
-                  if row['name'] == args.name), None)
-    if route is None or route['session'] != expected:
-        raise ValueError('Endpoint is missing or does not match --expect-session')
-    if route['transport'] != 'codex':
-        raise ValueError('Remap requires a Codex endpoint')
-    if target == expected:
-        raise ValueError('Replacement UUID must differ from the current UUID')
-    thread = sessions.read_codex(target, executable=route['executable'] or 'codex')['session']
-    if (thread['id'] != target or not Path(thread['cwd']).is_absolute()
-            or Path(thread['cwd']).resolve(strict=True) != Path(route['cwd']).resolve(strict=True)):
-        raise ValueError('Codex session identity or workspace differs')
-    require_codex_owner(target, 5)
-    return broker.request(args.socket, {'op':'remap', 'project':args.project, 'name':args.name,
-                                        'expected_route':route, 'session':target})
-
-
-def refresh_codex_routes(path):
-    def read_routes():
-        return broker.request(path, {'op':'codex-routes'})
-
-    groups = {}
-    for route in read_routes():
-        groups.setdefault(route['session'], []).append(route)
-    outcomes = {}
-    for sid, routes in groups.items():
-        try:
-            identities = {(Path(route['cwd']).resolve(strict=True), route['executable'] or 'codex')
-                          for route in routes}
-            if len(identities) != 1:
-                raise ValueError('Registered routes disagree on Codex workspace or executable')
-            cwd, archived = codex_preview.saved_thread(routes[0])
-            if not Path(cwd).is_absolute() or Path(cwd).resolve(strict=True) != next(iter(identities))[0]:
-                raise ValueError('Saved Codex session workspace differs')
-            current = read_routes()
-            if any(route not in current for route in routes):
-                raise ValueError('Endpoint changed before Desktop refresh')
-        except (ValueError, OSError, RuntimeError, subprocess.TimeoutExpired) as error:
-            outcome = {'status':'unresolved', 'error':str(error)}
-        else:
-            try:
-                status = 'archived' if archived else refresh_codex(sid)
-                current = read_routes()
-                if any(route not in current for route in routes):
-                    raise ValueError('Endpoint changed during Desktop refresh')
-                outcome = {'status':status}
-            except (ValueError, OSError, TypeError, KeyError, subprocess.TimeoutExpired) as error:
-                outcome = {'status':'failed', 'error':str(error)}
-        outcomes[sid] = outcome
-    # Opening a later thread can change Desktop ownership. Check each success
-    # once more without opening any links or dispatching queued correspondence.
-    current = read_routes()
-    for sid, routes in groups.items():
-        if outcomes[sid]['status'] in ('already_live', 'reopened'):
-            try:
-                if any(route not in current for route in routes) or not has_codex_owner(sid, 1):
-                    raise ValueError('Endpoint or Desktop owner changed before final verification')
-            except (ValueError, OSError) as error:
-                outcomes[sid] = {'status':'failed', 'error':str(error)}
-    return [{'project':route['project'], 'name':route['name'], 'session':sid, **outcomes[sid]}
-            for sid, routes in groups.items() for route in routes]
-
-
-def require_codex_owner(target, timeout):
-    try:
-        with codex_live.Client(timeout=timeout) as client:
-            return client.owner(target)
-    except codex_live.EndpointUnavailable as error:
-        raise ValueError(error.diagnosis()) from None
-    except OSError:
-        raise ValueError('Codex Desktop owner transport was unavailable') from None
-
-
-def has_codex_owner(target, timeout):
-    try:
-        require_codex_owner(target, timeout)
-        return True
-    except codex_live.OwnerUnavailable as error:
-        if str(error) == codex_live.OwnerUnavailable.NO_OWNER:
-            return False
-        raise
-
-
-def refresh_codex(target, timeout=10):
-    deadline = time.monotonic() + timeout
-    if has_codex_owner(target, min(timeout, 1)):
-        return 'already_live'
-    remaining = deadline - time.monotonic()
-    if remaining > 0:
-        codex_new.open_link(codex_new.adoption_url(target), timeout=remaining)
-    while (remaining := deadline - time.monotonic()) > 0:
-        if has_codex_owner(target, min(remaining, 1)):
-            return 'reopened'
-        time.sleep(min(0.25, max(0, deadline - time.monotonic())))
-    raise ValueError('Timed out waiting for the exact Codex Desktop owner')
 
 
 def broker_state_dir(args):
@@ -730,10 +626,6 @@ def main(argv=None):
     p.add_argument('--ide',choices=sorted(sessions.CLAUDE_IDES),help=f'IDE for --host ide (default {sessions.DEFAULT_IDE})')
     p.add_argument('--codex-mode',choices=['auto','shared','saved'],default='auto')
     p.add_argument('--state-dir',help='Broker state directory holding policy.json (default: socket path with .state suffix)')
-    p = sub.add_parser('remap',help='Restore registered Codex sessions or replace one endpoint UUID')
-    p.add_argument('name',nargs='?');p.add_argument('--project')
-    p.add_argument('--expect-session',help='Current registered UUID for replacement')
-    p.add_argument('--session',help='Replacement live Codex UUID')
     p = sub.add_parser('open',help='Open a new live session (Claude Code, Codex, Antigravity; desktop or IDE)')
     p.add_argument('--provider',choices=['agy','claude','codex'],default='agy')
     p.add_argument('--cwd',required=True);p.add_argument('--title');p.add_argument('--model', help=f'New-session model (Codex: flag > AGENT_BRIDGE_CODEX_MODEL > policy defaults.codex > {codex_new.DEFAULT_MODEL})')
@@ -1004,13 +896,6 @@ def main(argv=None):
             result = wake_participant(args)
             output(result)
             return 0 if result['state'] in ('woken','already-live') else 1
-        if args.cmd=='remap':
-            if all(value is None for value in (args.name, args.project, args.expect_session, args.session)):
-                results = refresh_codex_routes(args.socket)
-                output({'routes':results})
-                return int(any(row['status'] in ('unresolved', 'failed') for row in results))
-            output(remap(args))
-            return 0
         if args.cmd=='title':
             route = next((r for r in broker.request(args.socket,{'op':'routes','project':args.project})
                           if r['name'] == args.name), None)

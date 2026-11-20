@@ -534,7 +534,7 @@ class WakeCommandTests(WakeFixture):
             self.assertEqual(result.returncode,1)
             out = json.loads(result.stdout)
             self.assertEqual(out['state'],'unsupported')
-            self.assertIn('remap',out['reason'])
+            self.assertIn('wake covers claude-peer routes only', out['reason'])
 
     def test_closed_route_without_desktop_session_is_unsupported(self):
         with RunningBroker() as server:

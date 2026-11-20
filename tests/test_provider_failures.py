@@ -193,7 +193,7 @@ class NoticeTests(unittest.TestCase):
         self.assertEqual(self.state.sequence, sequence)
         self.assertEqual(provider_failures.last_sender_message(self.state, self.route)['id'], self.source['id'])
 
-    def test_remap_and_newer_delivery_refuse_old_observation(self):
+    def test_endpoint_replacement_and_newer_delivery_refuse_old_observation(self):
         self.state.endpoints[('demo', 'worker')]['session'] = str(uuid.uuid4())
         with self.assertRaisesRegex(ValueError, 'changed'):
             self.notify()

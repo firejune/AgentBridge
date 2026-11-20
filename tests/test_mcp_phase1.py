@@ -200,7 +200,7 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual((result['error']['code'], result['error']['message']),
                          ('BACKEND_UNAVAILABLE', phase.ROUTE_CHANGED_MESSAGE))
         self.assertEqual(len(self.engine.rows()), before)
-        self.assertEqual(routes[0]['session'], other)  # Never remap either live session.
+        self.assertEqual(routes[0]['session'], other)  # Neither live session was replaced.
         self.assertFalse(any(op in ('send', 'register') for op, _ in calls))
         push.assert_not_called()
 
@@ -304,7 +304,7 @@ class PhaseTest(unittest.TestCase):
                         self.assertTrue(next_send['ok'])
                         self.engine.fail(self.engine.operation(next_send['data']['operation_id'], 'owner-a'), 'BACKEND_UNAVAILABLE', False)
 
-    def test_post_response_route_race_remains_unknown_with_no_push_or_remap(self):
+    def test_post_response_route_race_remains_unknown_without_push_or_route_mutation(self):
         sid, session, backend, routes, calls = self.route_checked_owned_session()
         with patch.object(phase.sessions, 'resolve_agy_peer', return_value={'id': session['uuid'], 'cwd': str(self.root), 'status': 'idle'}), patch.object(backend, 'push') as push:
             accepted = self.send(sid)['data']

@@ -161,7 +161,7 @@ change before an accepted creation runs.
 
 ## Restart and manual recovery
 
-A confirmed route/session conflict before broker posting returns `BACKEND_UNAVAILABLE` with a fixed `ROUTE_CHANGED:` message. Initial acceptance returns a tool error without creating an operation; a conflict detected after acceptance ends that operation as `failed`, releasing its slot. The facade never remaps or resends. A route mismatch discovered after the broker send was attempted remains `unknown`.
+A confirmed route/session conflict before broker posting returns `BACKEND_UNAVAILABLE` with a fixed `ROUTE_CHANGED:` message. Initial acceptance returns a tool error without creating an operation; a conflict detected after acceptance ends that operation as `failed`, releasing its slot. The facade never changes the route or resends. A route mismatch discovered after the broker send was attempted remains `unknown`.
 
 Preflight reads the bindings without changing them. A discovered session can be missing both generated bindings. A pinned session can be missing its generated sender binding but requires its target to exist. The facade checks both bindings before creating any missing one and translates the broker’s exact duplicate-name refusal into the same route error.
 

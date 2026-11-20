@@ -8,9 +8,9 @@ The broker keeps owner-private routing in `routes.json` and bounded corresponden
 
 ## Registration ownership
 
-`register` protects each `(project, name)`: another transport, session UUID or canonical workspace is refused with `Route name is already in use; use a different name`. Same names in different projects are independent. Exact-binding retries return the existing route without rewriting it. An omitted `--executable` preserves the old value; an explicitly different executable is also refused. Existing channels and message routes stay pinned. Explicit Codex `remap` keeps its existing rules.
+`register` protects each `(project, name)`: another transport, session UUID or canonical workspace is refused with `Route name is already in use; use a different name`. Same names in different projects are independent. Exact-binding retries return the existing route without rewriting it. An omitted `--executable` preserves the old value; an explicitly different executable is also refused. Existing channels and message routes stay pinned.
 
-New-session registration commands check an occupied name before opening a session; the broker still checks atomically at final registration. In the Codex result, a known final conflict preserves the created session with `registered: false` and `uncertain: false`; an ambiguous registration write stays uncertain. Neither path automatically unregisters, remaps or retries. This protection requires the updated broker; client preflight does not reserve a name.
+New-session registration commands check an occupied name before opening a session; the broker still checks atomically at final registration. In the Codex result, a known final conflict preserves the created session with `registered: false` and `uncertain: false`; an ambiguous registration write stays uncertain. Neither path automatically removes the registration or retries it. This protection requires the updated broker; client preflight does not reserve a name.
 
 ## Architecture
 
@@ -264,11 +264,9 @@ Antigravity (`agy`) provider failure observation checks every registered `agy` r
 
 ### 4. Session Handoff
 
-Codex `open` and `register --new` require the Desktop IPC handshake before creating a thread. If the exact-owner transport is unavailable, they report the endpoint failure without creating or opening a thread. In that case, `remap` reports the failure without opening a link or replacing a UUID. The queue transport serves correspondence delivery. Open and remap use Desktop IPC to confirm ownership.
+Codex `open` and `register --new` require the Desktop IPC handshake before creating a thread. If the exact-owner transport is unavailable, they report the endpoint failure without creating or opening a thread.
 
-Run `bridge.py remap` to reopen non-archived Codex sessions registered across all broker projects. The command checks the saved workspace, skips sessions that already have a Desktop owner, and reports the result for each endpoint. Reopening can bring Codex Desktop to the foreground. The command preserves UUIDs and leaves messages queued.
-
-Use `bridge.py remap NAME --project PROJECT --expect-session OLD_UUID --session NEW_UUID` to replace a registered Codex endpoint. The replacement must have a live Desktop owner and the same workspace. New messages addressed directly to the participant use the replacement UUID. Channel bindings and existing messages keep their original routes.
+To reach an existing Codex thread, send to its registered route as usual. If the default IPC socket is missing or refuses connection and the queue checks pass, the bridge uses the official `codex queue` to enqueue a notice for that thread. Desktop can process the notice when the exact thread is loaded and eligible to start an idle turn.
 
 Project channels act as stable addresses. Agent registration and channel binding are separate, and each channel binding tracks its own generation counter:
 
@@ -390,7 +388,7 @@ On the private MCP facade, `bridge_models_list` uses `bridge:read` to list model
 
 ## Private MCP Independent Inbox
 
-A confirmed route/session conflict before broker posting returns `BACKEND_UNAVAILABLE` with a fixed `ROUTE_CHANGED:` message. Initial acceptance returns a tool error without creating an operation; a conflict detected after acceptance ends that operation as `failed`, releasing its slot. The facade never remaps or resends. A route mismatch discovered after the broker send was attempted remains `unknown`.
+A confirmed route/session conflict before broker posting returns `BACKEND_UNAVAILABLE` with a fixed `ROUTE_CHANGED:` message. Initial acceptance returns a tool error without creating an operation; a conflict detected after acceptance ends that operation as `failed`, releasing its slot. The facade never changes the route or resends. A route mismatch discovered after the broker send was attempted remains `unknown`.
 
 The CLI `inbox`/`ack` contract above is unchanged. The private MCP facade (`scripts/mcp_server.py`) supports an explicit `"inbox_enabled": true` opt-in in `--phase1-config` for independent (`reply_to: null`) inbound messages via four tools. Read with `bridge_inbox_list` and `bridge_message_get` without consuming the message. Use `bridge_message_ack` to record receipt or `bridge_message_reply({message_id, message, idempotency_key})` to answer using the message's signed inbox ID. Both mutations require `bridge:message:send`. The reply follows the frozen return route, and its parent normally becomes `answered`. While the original handle and broker record are retained, passing the same reply arguments reads the recorded delivery state without resending. An ambiguous write is never retried automatically. Correlated replies remain operation-only (`bridge_operation_get`). See [remote-mcp.md](remote-mcp.md#independent-inbox-issue-48-explicit-opt-in) for pagination, limits, restart semantics, and owner deployment gates.
 
