@@ -171,3 +171,85 @@ class DesktopWakeAttestationTests(unittest.TestCase):
             opener.assert_called_once()
             self.assertEqual(enqueue.call_args.args[0], THREAD)
             self.assertEqual(opener.call_args.args[0][-1], 'codex://threads/wake/' + THREAD)
+
+
+class DesktopWakeRolloutTests(unittest.TestCase):
+    """adopt() over a real rollout file: only the queue write, the app link and the store row are faked."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name).resolve()
+        self.cwd = root / 'workspace'
+        self.log = root / 'home' / 'sessions' / f'rollout-2026-01-01T00-00-00-{THREAD}.jsonl'
+        self.cwd.mkdir()
+        self.log.parent.mkdir(parents=True)
+        self.desktop = codex_wake_open.Desktop(root / 'home' / 'state.sqlite', root / 'home' / 'queue.sqlite',
+                                               ('owner', 'parent', 'app'))
+        self.route = {'transport': 'codex', 'session': THREAD, 'cwd': str(self.cwd)}
+        self.append(self.records(PROMPT)[:1])
+        self.queued = []
+        for target, name, value in (
+                (codex_wake_open.codex_preview, '_saved_thread_row',
+                 lambda route, include_rollout=False, path=None: (str(self.cwd), 0, str(self.log))),
+                (codex_wake_open, '_owner', lambda queue, remaining: self.desktop.owner),
+                (codex_wake_open.codex_queue, 'enqueue', self.enqueue)):
+            patcher = patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        opener = patch.object(codex_wake_open.subprocess, 'run')
+        self.opener = opener.start()
+        self.addCleanup(opener.stop)
+
+    def records(self, prompt, **changes):
+        text = json.dumps(startup_records(prompt=prompt, **changes)).replace(str(CWD), str(self.cwd))
+        return json.loads(text)
+
+    def append(self, records):
+        with self.log.open('a') as output:
+            output.write(''.join(json.dumps(record) + '\n' for record in records))
+
+    def enqueue(self, thread, proof, timeout):
+        self.queued.append((thread, proof))
+        self.desktop_turn(proof)
+
+    def desktop_turn(self, proof):
+        self.append(self.records(proof)[1:])
+
+    def test_the_queued_turn_written_after_the_call_is_the_evidence(self):
+        result = codex_wake_open.adopt(self.desktop, self.route, MODEL, timeout=5)
+        (thread, proof), = self.queued
+        self.assertEqual(thread, THREAD)
+        self.assertTrue(proof.startswith(codex_wake_open.PROMPT))
+        self.assertEqual(result, {'model': MODEL, 'turn_id': TURN, 'permission_settings': {
+            'activePermissionProfile': {'id': ':read-only'}, 'approvalPolicy': 'on-request',
+            'sandboxPolicy': {'type': 'readOnly'}}})
+        self.opener.assert_called_once()
+
+    def test_a_turn_already_in_the_file_or_carrying_another_nonce_is_not_evidence(self):
+        earlier = codex_wake_open.PROMPT + '00000000-0000-4000-8000-000000000999'
+        self.append(self.records(earlier)[1:])  # A complete matching-looking turn before the call.
+        self.desktop_turn = lambda proof: self.append(self.records(earlier, turn=UNRELATED_TURN)[1:])
+        with self.assertRaisesRegex(codex_wake_open.WakeError, codex_wake_open.EVIDENCE_ERROR):
+            codex_wake_open.adopt(self.desktop, self.route, MODEL, timeout=5)
+        self.assertEqual(len(self.queued), 1)
+
+    def test_no_turn_ends_at_the_deadline_with_one_queue_write(self):
+        self.desktop_turn = lambda proof: None
+        with self.assertRaisesRegex(codex_wake_open.WakeError, 'deadline expired'):
+            codex_wake_open.adopt(self.desktop, self.route, MODEL, timeout=.4)
+        self.assertEqual(len(self.queued), 1)
+        self.opener.assert_called_once()
+
+    def test_a_rollout_outside_the_sessions_store_or_for_another_workspace_is_refused_before_queueing(self):
+        for route in (dict(self.route, cwd=str(self.cwd.parent)), dict(self.route, transport='agy')):
+            with self.subTest(route=route), self.assertRaisesRegex(codex_wake_open.WakeError,
+                                                                   codex_wake_open.TARGET_ERROR):
+                codex_wake_open.adopt(self.desktop, route, MODEL, timeout=5)
+        moved = self.log.parent.parent / self.log.name
+        self.log.rename(moved)
+        self.log = moved
+        with self.assertRaisesRegex(codex_wake_open.WakeError, codex_wake_open.TARGET_ERROR):
+            codex_wake_open.adopt(self.desktop, self.route, MODEL, timeout=5)
+        self.assertEqual(self.queued, [])
+        self.opener.assert_not_called()
