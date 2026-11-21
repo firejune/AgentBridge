@@ -263,7 +263,7 @@ never be committed to source control.
 
 An owner may add optional `inbox_route_prefixes` to the private config. It maps
 an approved workspace `project` to a list of route-name prefixes, for example
-`{"king-maker": ["nana-"]}`. The facade then adopts a live broker route into the
+`{"my-project": ["coord-"]}`. The facade then adopts a live broker route into the
 owner's inbox when all four conditions hold: its project is a key of the map and
 the project of an approved workspace; its name starts with one of that project's
 prefixes; its transport is `realtime`; and it has no session. Nothing else about
