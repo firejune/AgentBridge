@@ -297,6 +297,14 @@ class ArchiveCloseCommandTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 2)
         self.assertIn('not confirmed', result['cleanup_error'])
 
+    def test_partial_archive_exits_nonzero_even_if_confirmed_root_route_is_removed(self):
+        self.archive_result.update(archive_incomplete=True, count=1,
+                                   results=[{'status': 'not_archived', 'archived': True}])
+        code, result, _ = self.run_close('--archive')
+        self.assertEqual((code, result['archived'], result['route_removed'], result['count']),
+                         (1, True, True, 1))
+        self.assertEqual(self.calls[-1]['op'], 'unregister-archived')
+
     def test_failed_purge_reports_confirmed_archive_without_retry(self):
         self.request_error = ('purge', OSError('socket disconnected'))
         code, result, _ = self.run_close('--archive')
