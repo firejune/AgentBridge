@@ -365,6 +365,17 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                 except sessions.CodexRpcError as error:
                     if (error.code, error.message) != (-32601, 'list_turns is not supported yet'):
                         raise
+            if wake is not None:
+                # thread/start applies Full Access to the creator's loaded thread only. Desktop
+                # resumes a queue-woken thread from the settings saved in its rollout, and with
+                # none saved it falls back to workspace-write with on-request approval, where an
+                # unattended turn waits on an approval nobody gives (issue #172). Saving the
+                # settings here is what the wake turn and every later queue turn inherit. It has
+                # to follow the calls above: an update sent before the rollout exists is not saved.
+                stage = 'settings'
+                creator.timeout = remaining()
+                creator.call('thread/settings/update', {
+                    'threadId': sid, 'permissions': FULL_ACCESS_PROFILE, 'approvalPolicy': 'never'})
         # Close the creator before proving persistence and exact Desktop adoption.
         stage = 'persistence'
         with factory(mode='saved', timeout=remaining()) as reader:
