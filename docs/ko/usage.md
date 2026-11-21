@@ -242,7 +242,7 @@ python3 "$bridge_cli" register codex-worker --project PROJECT --transport codex 
   --new --cwd /path/to/workspace --title "작업 세션" --model MODEL --timeout 180
 ```
 
-- **Desktop 인계**. Codex `open`과 `register --new`는 저장 스레드를 하나 만들고 정확한 ID를 확인한 뒤 Desktop에 인계한다. IPC에 연결되면 정확한 소유자에게 설정을 재조회해 Full Access와 승인 정책 `never`를 확인한다. 로컬 CLI의 `bridge.py open`과 `bridge.py register --new`에서 기본 IPC 소켓이 없거나 연결을 거부하면 서명된 로컬 Desktop `26.1117.31558` (빌드 `29513`)과 기본 큐 저장소를 사용한다. IPC 엔드포인트를 명시했거나 원격 MCP에서 생성하는 경우에는 스레드를 만들기 전에 IPC 초기화 응답을 확인해야 한다. 열기 요청으로 승인된 무해한 시작 프롬프트 하나를 큐에 넣고 정확한 UUID를 깨운다. 지정한 모델로 실행된 해당 Desktop 턴의 완료를 확인해야 성공한다. 성공하면 `adoption_mode: "desktop-queue-wake"`와 `wake_turn_id`에 인계 방식과 턴 ID가 표시된다. `permission_settings`는 해당 자동 턴의 실효 권한이다. `readOnly` 또는 `workspaceWrite`와 승인 정책 `on-request`로 실행된 경우 경고 코드 `CODEX_DESKTOP_WAKE_RESTRICTED`가 표시된다. 지원하는 `:workspace` 프로필의 쓰기 범위는 지정한 작업 공간과 OS 기본 임시 경로이며 네트워크 접근은 제한된다. 이후 Desktop 입력창에서 Full Access를 쓸 수 있으며 이후 턴의 실제 권한은 별도로 확인한다. 결과가 모호해도 생성, 큐 제출, 깨우기를 자동으로 반복하지 않는다.
+- **Desktop 인계**. Codex `open`과 `register --new`는 저장 스레드를 하나 만들고 정확한 ID를 확인한 뒤 Desktop에 인계한다. IPC에 연결되면 정확한 소유자에게 설정을 재조회해 Full Access와 승인 정책 `never`를 확인한다. 로컬 CLI의 `bridge.py open`과 `bridge.py register --new`에서 기본 IPC 소켓이 없거나 연결을 거부하면 서명된 로컬 Desktop `26.1117.31558` (빌드 `29513`)과 기본 큐 저장소를 사용한다. IPC 엔드포인트를 명시했거나 원격 MCP에서 생성하는 경우에는 스레드를 만들기 전에 IPC 초기화 응답을 확인해야 한다. 열기 요청으로 승인된 무해한 시작 프롬프트 하나를 큐에 넣고 정확한 UUID를 깨운다. 지정한 모델로 실행된 해당 Desktop 턴의 완료를 확인해야 성공한다. 성공하면 `adoption_mode: "desktop-queue-wake"`와 `wake_turn_id`에 인계 방식과 턴 ID가 표시된다. `permission_settings`는 해당 자동 턴의 실효 권한이다. 깨우기 전에 새 스레드에 Full Access와 승인 정책 `never`를 저장한다(`thread/settings/update`). Desktop은 큐로 깨운 스레드를 저장된 설정으로 실행하며, 저장된 설정이 없으면 `workspaceWrite`와 `on-request`로 실행해 무인 턴이 승인 대기에서 멈추기 때문이다. `readOnly` 또는 `workspaceWrite`와 승인 정책 `on-request`로 실행된 경우 경고 코드 `CODEX_DESKTOP_WAKE_RESTRICTED`가 표시된다. 지원하는 `:workspace` 프로필의 쓰기 범위는 지정한 작업 공간과 OS 기본 임시 경로이며 네트워크 접근은 제한된다. 이후 Desktop 입력창에서 Full Access를 쓸 수 있으며 이후 턴의 실제 권한은 별도로 확인한다. 결과가 모호해도 생성, 큐 제출, 깨우기를 자동으로 반복하지 않는다.
 - **모델 선택**. 우선순위는 `--model` → `AGENT_BRIDGE_CODEX_MODEL` → `policy.json`의 `defaults.codex` → `gpt-6.2-sol`이다.
 - **중복 생성 방지**: `--title`이 있는 일반 `open --provider codex`는 보관되지 않은 저장 세션에서 동일한 제목과 정규화한 `cwd`를 검사해 일치 항목이 있으면 종료 코드 1·`stage: "duplicate"`(`existing_sessions`)로 거부한다. `open --new` 또는 `register --new`는 중복 검사를 건너뛴다.
 - **출력 JSON 필드**: `created`, `adopted`, `registered`, `uncertain`, `adoption_mode`, `wake_turn_id`, `stage`, `error`, `registration_error`, `warning`, `session`, `owner`, `url`, `model`, `model_source`, `creator_settings`, `permission_settings`, `permission_settings_source`, `settings_update`, `existing_sessions`를 고정 키로 반환한다. 실패하거나 `uncertain`인 생성을 자동 재시도하지 않는다. 대화는 만들어졌는데 그것을 가리키는 경로가 없으면 결과의 `recovery`가 정확한 대화와 그것을 묶는 명령 하나(`register NAME --project P --transport codex --session UUID --discover`)를 알려 준다. 요청한 이름이 이미 쓰이고 있으면 `route_conflict`가 그 경로의 transport·세션·작업 폴더를 알려 주고 아무것도 만들지 않는다. 브로커에 연결할 수 없으면 대화를 만들기 전에 그 사실을 알린다.
@@ -271,6 +271,8 @@ python3 "$bridge_cli" channel-bind modal-view --project my-app --owner codex-age
 `--expect-generation`이 현재 세대와 일치할 때만 인계된다. 새 요청은 새 세대로 가고, 이미 진행 중인 요청의 답장 주소는 원래 세대를 유지한다. 채널을 닫을 때는 `channel-close modal-view --project my-app --expect-generation 2`를 사용한다.
 
 ## 라이브 세션 Push 및 전달 메커니즘
+
+[Codex Desktop 큐 수신 및 작업 실행 문제 해결](codex-desktop-troubleshooting.md)
 
 `codex`, `claude-peer`, `agy`는 `send`·`ask`·`reply` 시 자동으로 대상 라이브 세션에 push하며, `pending` 실패 후에는 `deliver`로 명시적 재시도가 가능하다. 쉬고 있는 전용 `claude` CLI 세션은 `deliver`로 실행한다.
 
@@ -334,8 +336,23 @@ python3 "$bridge_cli" close NAME --project PROJECT --finish CLOSE_ID --expect-se
 | --- | --- | --- |
 | `claude-peer` | 정확히 등록된 CLI 프로세스에 `SIGTERM`을 보낸다 | 지원되는 Desktop 세션을 보관한다 |
 | `agy` | 대기 중인 대화를 분리한다 | 대화를 보관하고 상태를 재확인한다 |
-| `codex` | 라우트를 분리한다 | 정확한 작업 경로의 대화를 보관하고 Desktop에 알린다 |
+| `codex` | 라우트를 분리한다 | 정확한 작업 경로의 스레드와 보관 가능한 하위 스레드를 네이티브 앱 서버 RPC로 보관한다 |
 | `realtime` / `claude` | 라우트를 제거한다 | — |
+
+### Codex 일괄 보관
+
+```bash
+(umask 077; python3 "$bridge_cli" archive-sweep --cwd-prefix /absolute/workspace > archive-manifest.json)
+python3 "$bridge_cli" archive-sweep --apply --manifest archive-manifest.json
+```
+
+기본 명령은 브로커 라우팅 스냅샷을 읽고 네이티브 SQLite DB와 WAL을 소유자 전용 임시 디렉터리에 복사해 조회한다. 복사 중 원본이 바뀌거나 롤백 저널이 있으면 매니페스트 생성을 거부한다. 미리보기에서 SQLite의 보조 파일은 임시 디렉터리에만 생성될 수 있다. Codex를 시작하거나 브로커에 요청을 보내지 않는다. 절대 경로 `--cwd-prefix`는 경로를 정규화하고 구성 요소 단위로 하위 스레드까지 검사한다. 생략하면 저장소 전체를 조사한다. 매니페스트에 ID, 제목, 작업 경로, 마지막 활동 시각(Unix 초), 사유, 하위 스레드 집합, 거부 내역이 담긴다. 비공개로 보관하고 적용 전에 검토한다. 적용은 본문의 SHA-256 다이제스트, 저장소, 라우팅 디렉터리, 범위를 확인하고 검토한 그룹을 재검사한다. 다이제스트는 편집 검사용이며 서명은 아니다. 적용 시 접두사를 명시하면 매니페스트와 같아야 한다. 브로커가 소켓의 `.state`와 다른 디렉터리를 쓰면 실제 `--state-dir`을 지정한다. 미리보기는 `CODEX_SQLITE_HOME`, `CODEX_HOME`, 기본 Codex 홈 순서로 `state_5.sqlite`를 찾는다. SQLite가 다른 위치에 있으면 `CODEX_SQLITE_HOME`을 지정한다. 적용할 때 번들 Codex도 같은 DB를 사용해야 한다.
+
+일괄 적용은 작업 경로가 사라졌거나 보관된 생성 조상이 있는 미보관 스레드를 후보로 삼는다. 이 후보에 속한 검토된 하위 스레드는 작업 경로가 남아 있어도 대상이 될 수 있다. Codex 직접 종료(`close --archive`)도 지정한 루트와 기록된 하위 스레드에 같은 작업 경로 예외를 적용한다. 라우트 보호에서 제외되는 라우트는 정확한 종료 대상뿐이다. 다른 등록 라우트, 활성 채널 바인딩, 스레드 작업 공간 안에 현재 작업 경로를 둔 프로세스는 보관을 막는다. 일괄 보관은 미보관 스레드의 마지막 활동이 24시간 미만이면 거부한다. 직접 종료에서는 지정한 루트와 기록된 하위 스레드에 활동 시각 제한을 적용하지 않는다. 하위 스레드가 보호 대상이거나 접두사 밖이거나 검토 목록에 없으면 후보를 거부한다. 일괄 보관은 브로커 라우트와 서신을 유지한다.
+
+직접 종료와 일괄 보관은 번들 Codex의 저장 모드 앱 서버에서 `thread/archive`를 하위 스레드부터 호출한다. 호출마다 보호 조건과 하위 집합을 다시 확인한다. 완료 여부와 `count`는 보관 비트를 다시 읽어 판정한다. RPC 거부나 응답 불확실성은 `provider_error`에 별도로 담는다. 일부가 `not_archived`면 종료 코드는 1이며 독립 후보는 계속 처리할 수 있다. 실패한 하위 스레드의 조상은 연쇄 보관으로 재시도하지 않도록 건너뛴다. 직접 종료는 루트 보관 비트가 확인된 뒤 기존 서신·라우트 검사를 거쳐 일치하는 라우트를 제거한다.
+
+보호 조건 확인과 네이티브 보관은 별도 동작이다. 마지막 확인 뒤에 라우트, 프로세스 작업 경로, 활동, 하위 관계가 바뀔 수 있다. 검토 목록 밖 스레드가 새로 보관되면 해당 하위 스레드 UUID로 즉시 `thread/unarchive`를 호출해 결과를 다시 읽는다. `restored_unlisted`는 복구를 확인한 목록이다. 복구 실패, 다른 스레드의 보관 비트 변경, 상태 확인 불가를 감지하면 추가 보관을 중단하고 종료 코드 1을 반환한다. 자동 재시도는 없다. 확인된 보관에는 같은 Codex 프로필에서 실행할 `undo` 명령을 출력한다. 네이티브 보관 해제는 이미 보관되어 있거나 이후 보관된 하위 스레드에도 연쇄 적용될 수 있으며 일부만 처리될 수도 있다. 따라서 출력된 ID만 해제하거나 앞선 상태를 모두 복원한다고 보장할 수 없다. 실행 전에 현재 하위 집합을 검토한다. 일괄 보관과 직접 종료는 저장된 보관 비트를 확인한다. 별도의 Desktop 종료 인계는 보관된 원문 파일까지 확인한다.
 
 ### Codex 네이티브 보관 인계
 
@@ -446,7 +463,7 @@ fork·subagent는 `subagent_history_start_ordinal` 경계 또는 부모 snapshot
 
 `ping`은 `build`(브로커가 시작할 때 읽은 모듈의 다이제스트)와 `cli_build`(이 CLI의 같은 다이제스트)도 반환한다. 둘이 다르거나 브로커가 `build`를 보고하지 않으면 `warning: BROKER_BUILD_SKEW …`를 붙이고 종료 코드는 0을 유지한다. 브로커가 `Unknown operation`으로 거절한 명령에도 같은 경고가 붙는다.
 
-`ping`은 `checkpoint_last_save_seconds`, `checkpoint_max_save_seconds`, `checkpoint_bytes`를 반환한다. 각각 마지막 저장 시도 시간, 브로커 시작 이후 최대 시간(실패한 시도 포함, 초), 마지막으로 성공한 `correspondence.json` 페이로드 크기(메타데이터 인덱스 제외, 바이트)다. 저장소가 없으면 각각 `null`, `0.0`, `0`이다. 저장이 1초를 넘으면 `checkpoint_save_slow` JSON 로그 한 줄을 stderr에 남긴다. `duration_seconds`, `bytes`, `retained_count`만 포함하며 실패 시 `bytes`는 마지막 성공 크기다. 시간에는 검증·직렬화·영속 쓰기가 포함되며 변경 상태 준비는 제외한다. 계측은 재시작하면 초기화된다. 저장 중 `ping`은 마지막으로 끝난 저장 시도와 커밋된 메시지 수를 반환한다. watch 이벤트는 해당 저장이 끝난 뒤 공개된다. 상태 변경, inbox 스냅샷 작업, wait 등록은 진행 중인 저장이 끝날 때까지 기다린다. 브로커가 종료되면 이미 시작한 커밋을 마친 뒤 상태 잠금을 해제한다.
+`ping`은 `checkpoint_last_save_seconds`, `checkpoint_max_save_seconds`, `checkpoint_bytes`를 반환한다. 각각 마지막 저장 시도 시간, 브로커 시작 이후 최대 시간(실패한 시도 포함, 초), 마지막으로 성공한 `correspondence.json` 페이로드 크기(메타데이터 인덱스 제외, 바이트)다. 저장소가 없으면 각각 `null`, `0.0`, `0`이다. 저장이 1초를 넘으면 `checkpoint_save_slow` JSON 로그 한 줄을 stderr에 남긴다. `event`의 값은 `checkpoint_save_slow`이며, 로그에는 `timestamp`(UTC), `duration_seconds`, `thread_cpu_seconds`, `bytes`(실패 시 마지막 성공 페이로드 크기), `retained_count`, `outcome`(`saved` 또는 `failed`), `stages_seconds`(검증과 직렬화, 인덱스 쓰기, 페이로드 쓰기의 시간)가 포함된다. 시간에는 검증·직렬화·영속 쓰기가 포함되며 변경 상태 준비는 제외한다. 계측은 재시작하면 초기화된다. 저장 중 `ping`은 마지막으로 끝난 저장 시도와 커밋된 메시지 수를 반환한다. watch 이벤트는 해당 저장이 끝난 뒤 공개된다. 상태 변경, inbox 스냅샷 작업, wait 등록은 진행 중인 저장이 끝날 때까지 기다린다. 브로커가 종료되면 이미 시작한 커밋을 마친 뒤 상태 잠금을 해제한다.
 
 Codex `open` / `register --new`는 권한 확인에 실패하면 라우트를 등록하지 않는다. 성공·실패 단계와 확인된 `approvalPolicy`, 샌드박스 유형을 stderr 한 줄에 출력한다.
 

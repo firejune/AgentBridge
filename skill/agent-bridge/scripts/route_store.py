@@ -1,4 +1,5 @@
 """Owner-private, atomic routing snapshots. Never stores message/delivery data."""
+from contextlib import nullcontext
 import errno
 import fcntl
 import json
@@ -18,11 +19,13 @@ CHANNEL_FIELDS = ('project', 'name', 'owner', 'description', 'generation', 'acti
 MAX_SNAPSHOT = 4 * 1024 * 1024
 
 
-def sync_descriptor(fd):
-    os.fsync(fd)
+def sync_descriptor(fd, measure=nullcontext):
+    with measure('fsync'):
+        os.fsync(fd)
     if hasattr(fcntl, 'F_FULLFSYNC'):
         try:
-            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+            with measure('fullfsync'):
+                fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
         except OSError as error:
             # macOS filesystems may support a full flush on regular files but
             # only fsync on directories. Other I/O failures remain failures.
@@ -38,17 +41,21 @@ def sync_directory(directory):
         os.close(fd)
 
 
-def atomic_write(path, data, prefix='.correspondence-'):
+def atomic_write(path, data, prefix='.correspondence-', *, measure=nullcontext):
     name = None
     try:
-        fd, name = tempfile.mkstemp(prefix=prefix, dir=path.parent)
+        with measure('write'):
+            fd, name = tempfile.mkstemp(prefix=prefix, dir=path.parent)
         with os.fdopen(fd, 'wb') as output:
-            output.write(data)
-            output.flush()
-            sync_descriptor(output.fileno())
-        os.replace(name, path)
+            with measure('write'):
+                output.write(data)
+                output.flush()
+            sync_descriptor(output.fileno(), measure)
+        with measure('rename'):
+            os.replace(name, path)
         name = None
-        sync_directory(path.parent)
+        with measure('directory_sync'):
+            sync_directory(path.parent)
     finally:
         if name is not None:
             Path(name).unlink(missing_ok=True)
@@ -177,6 +184,26 @@ def verify_route(route):
         raise ValueError('Session or workspace differs')
 
 
+def read_snapshot(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, 'r', encoding='utf-8') as source:
+        info = os.fstat(source.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o077 or info.st_size > MAX_SNAPSHOT):
+            raise ValueError('Routing snapshot must be an owner-private regular file within size limit')
+        try:
+            data = json.load(source)
+        except (ValueError, UnicodeError):
+            raise ValueError('Invalid routing snapshot; refusing to overwrite it') from None
+    if (not isinstance(data, dict) or data.get('version') not in (1, 2)
+            or not isinstance(data.get('endpoints'), list) or not isinstance(data.get('channels'), list)):
+        raise ValueError('Unsupported routing snapshot; refusing to overwrite it')
+    return data
+
+
 class RouteStore:
     def __init__(self, directory):
         self.directory = Path(directory).expanduser().absolute()
@@ -209,22 +236,9 @@ class RouteStore:
         atomic_write(self.path, data, prefix='.routes-')
 
     def load(self):
-        try:
-            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
-        except FileNotFoundError:
+        data = read_snapshot(self.path)
+        if data is None:
             return {}, {}
-        with os.fdopen(fd, 'r', encoding='utf-8') as source:
-            info = os.fstat(source.fileno())
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                    or info.st_mode & 0o077 or info.st_size > MAX_SNAPSHOT):
-                raise ValueError('Routing snapshot must be an owner-private regular file within size limit')
-            try:
-                data = json.load(source)
-            except (ValueError, UnicodeError):
-                raise ValueError('Invalid routing snapshot; refusing to overwrite it') from None
-        if (not isinstance(data, dict) or data.get('version') not in (1, 2)
-                or not isinstance(data.get('endpoints'), list) or not isinstance(data.get('channels'), list)):
-            raise ValueError('Unsupported routing snapshot; refusing to overwrite it')
         endpoints, channels = {}, {}
         dropped = False
         verified = set()

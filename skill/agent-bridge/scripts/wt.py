@@ -283,9 +283,12 @@ def live_sessions(providers=PROVIDERS):
     return rows, errors
 
 
-def open_files(skip=()):
+def open_files(skip=(), *, cwd_only=False):
     """Every (pid, command, path) the user's processes hold open, cwd included. One lsof call."""
-    process = subprocess.Popen(['lsof', '-nP', '-w', '-F', 'pcn'], stdout=subprocess.PIPE,
+    args = ['lsof', '-nP', '-w', '-F', 'pcn']
+    if cwd_only:
+        args.extend(('-d', 'cwd'))
+    process = subprocess.Popen(args, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, text=True)
     try:
         stdout, _ = process.communicate(timeout=120)
@@ -305,7 +308,12 @@ def open_files(skip=()):
         elif tag == 'c':
             cmd = value
         elif tag == 'n' and value.startswith('/') and pid not in skip:
-            rows.append((pid, cmd, value.split(' (', 1)[0]))
+            if cwd_only:
+                rows.append((pid, cmd, value))
+                if value.endswith(' (deleted)'):
+                    rows.append((pid, cmd, value.removesuffix(' (deleted)')))
+            else:
+                rows.append((pid, cmd, value.split(' (', 1)[0]))
     return rows
 
 

@@ -303,6 +303,17 @@ def create_thread(attempt, result, creator, folder, title, model, queue_wake, re
         except sessions.CodexRpcError as error:
             if (error.code, error.message) != (-32601, 'list_turns is not supported yet'):
                 raise
+    if queue_wake:
+        # thread/start applies Full Access to the creator's loaded thread only. Desktop
+        # resumes a queue-woken thread from the settings saved in its rollout, and with
+        # none saved it falls back to workspace-write with on-request approval, where an
+        # unattended turn waits on an approval nobody gives (issue #172). Saving the
+        # settings here is what the wake turn and every later queue turn inherit. It has
+        # to follow the calls above: an update sent before the rollout exists is not saved.
+        attempt.stage = 'settings'
+        creator.timeout = remaining()
+        creator.call('thread/settings/update', {
+            'threadId': sid, 'permissions': FULL_ACCESS_PROFILE, 'approvalPolicy': 'never'})
     return sid
 
 

@@ -15,6 +15,7 @@ import uuid
 import agy_live
 import bridge
 import codex_live
+import codex_archive
 import codex_preview
 import sessions
 from support import RunningBroker
@@ -312,7 +313,7 @@ class CloseCodexTests(unittest.TestCase):
         self.record_archive(self.archive)  # A missing archive file is also insufficient.
         self.assertEqual(self.close(*finish, self.sid)[0], 1)
         self.assertEqual(self.server.call('routes', project='p')[0]['closing'], prepared['close_id'])
-        with mock.patch.object(codex_preview, 'archive_thread') as direct:
+        with mock.patch.object(codex_archive, 'close') as direct:
             self.assertEqual(self.close('--archive')[0], 1)
             direct.assert_not_called()
         self.rollout.rename(self.archive)
@@ -543,13 +544,24 @@ class CloseCommandTests(unittest.TestCase):
             state_db = Path(cwd) / 'state_5.sqlite'
             os.chmod(cwd, 0o700)
             with closing(sqlite3.connect(state_db)) as conn, conn:
-                conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, archived INTEGER NOT NULL DEFAULT 0, archived_at INTEGER)")
-                conn.execute('INSERT INTO threads VALUES (?, ?, 0, NULL)', (codex_sid, cwd))
+                conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, archived INTEGER NOT NULL DEFAULT 0, archived_at INTEGER, title TEXT, updated_at INTEGER)")
+                conn.execute("INSERT INTO threads VALUES (?, ?, 0, NULL, 'fixture', 1)", (codex_sid, cwd))
+                conn.execute('CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)')
             os.chmod(state_db, 0o600)
             server.call('register', project='p', name='n-arch', cwd=cwd, transport='codex', session=codex_sid)
+            def archive(method, params):
+                self.assertEqual((method, params), ('thread/archive', {'threadId': codex_sid}))
+                with closing(sqlite3.connect(state_db)) as conn, conn:
+                    conn.execute('UPDATE threads SET archived=1, archived_at=2 WHERE id=?', (codex_sid,))
+                return {}
+
             with mock.patch.object(codex_preview, 'state_path', return_value=state_db), \
-                    mock.patch.object(codex_live, 'Client', side_effect=OSError('offline fixture')):
-                code_na, out_na = run(['--socket', server.path, 'close', 'n-arch', '--project', 'p', '--archive', '--no-retro', 'provider behavior fixture'])
+                    mock.patch.object(codex_archive, 'executable', return_value='/fixture/codex'), \
+                    mock.patch.object(codex_archive.wt, 'open_files', return_value=[]), \
+                    mock.patch.object(sessions, 'CodexClient') as native:
+                native.return_value.__enter__.return_value.call.side_effect = archive
+                code_na, out_na = run(['--socket', server.path, 'close', 'n-arch', '--project', 'p', '--archive', '--state-dir', server.state_dir,
+                                       '--no-retro', 'provider behavior fixture'])
             self.assertEqual(
                 (code_na, out_na['closed'], out_na['method'], out_na['archived'], out_na['route_removed']),
                 (0, True, 'archive', True, True),

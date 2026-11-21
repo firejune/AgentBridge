@@ -32,6 +32,7 @@
 | 상세 CLI 및 프로토콜 레퍼런스 | [skill/agent-bridge/references/usage.md](../../skill/agent-bridge/references/usage.md) | [docs/ko/usage.md](usage.md) |
 | 원격 MCP 명세 | [skill/agent-bridge/references/remote-mcp.md](../../skill/agent-bridge/references/remote-mcp.md) | — |
 | Antigravity IDE 내부 명령어 | — | [docs/ko/antigravity-commands.md](antigravity-commands.md) |
+| launchd 운영 설치 배포 | [docs/DEPLOY.md](../DEPLOY.md) (`tools/deploy.py`) | — |
 
 ## 아키텍처 및 전송 방식
 
@@ -125,7 +126,7 @@ Python CLI의 `sessions`는 기본적으로 세션별 모델 조회를 건너뛴
 | --- | --- | --- | --- |
 | **Antigravity (`agy`)** | `language_server` / `agy --hub`(`StartCascade`)로 무인 생성 및 프로젝트·워크트리 환경 자동 연결 | 데스크톱과 동일 (`StartCascade` + 통합 허브 프로젝트·환경 자동 연결) | 기본은 대화 스택 유지(`--archive` 시 `{archived: true}` 보관) 후 라우트 제거 |
 | **Claude (`claude-peer`)** | `claude://code/new`로 첫 메시지를 채운 입력창을 열고 사용자의 Enter 대기 | IDE CLI + `<scheme>://anthropic.claude-code/open`으로 무인 생성 | CLI 프로세스에 `SIGTERM` 전송 후 기본은 대화 스택 유지(`--archive` 시 데스크톱 `isArchived: true` 보관) 및 라우트 제거 |
-| **Codex (`codex`)** | `app-server --stdio`로 저장 스레드 생성 후 IPC 또는 검증된 큐 시작 턴으로 Desktop 인계 | 미지원 | 기본은 사이드바 대화 유지(`--archive` 시 `state_5.sqlite` `archived=1` 및 IPC 알림) 후 라우트 제거 |
+| **Codex (`codex`)** | `app-server --stdio`로 저장 스레드 생성 후 IPC 또는 검증된 큐 시작 턴으로 Desktop 인계 | 미지원 | 기본은 사이드바 대화 유지(`--archive` 시 하위 스레드부터 네이티브 보관 및 검증) 후 라우트 제거 |
 
 ```bash
 # 단독 생성 또는 생성과 동시에 브로커 등록:
@@ -144,11 +145,13 @@ python3 "$bridge_cli" wake claude-tower --project my-app [--timeout 30]
 
 Codex Desktop의 네이티브 보관은 `close --archive --handoff`로 요청한다. Desktop에서 정확한 대화를 직접 보관하거나 등록된 담당자를 이용하고, `close --finish CLOSE_ID --expect-session UUID`로 완료를 확인한다. [세션 닫기](usage.md#세션-닫기) 참고.
 
+`archive-sweep --cwd-prefix /absolute/workspace`로 Codex 보관 후보와 거부 사유를 읽기 전용으로 확인한다. 비공개 JSON을 검토한 뒤 `archive-sweep --apply --manifest FILE`로 적용한다. 직접 종료와 일괄 보관 모두 네이티브 상태를 다시 읽어 확인한다. 되돌리기는 하위 스레드에도 영향을 줄 수 있다. [Codex 일괄 보관](usage.md#codex-일괄-보관).
+
 Claude 데스크톱은 세션을 스스로 닫는다. 화면에 안 보이는 세션은 마지막 턴 뒤 900초가 지나면 멈추고, 메모리가 부족하면 가장 오래 쉰 세션을 내린다. 그러면 CLI가 끝나고 레지스트리 기록과 inbox 소켓이 사라진다. 이런 라우트로 `claude-peer` push가 오면 브릿지가 먼저 세션을 깨운다. 데스크톱 메타데이터에서 `cliSessionId`로 찾은 `claude://claude.ai/epitaxy/<local_id>`를 열면, 앱이 같은 세션 ID와 대화 기록을 새 PID로 이어 받는다. 새 inbox 소켓이 뜨면 메시지를 한 번만 push한다. 그때까지 메시지는 `dispatching`이고, 다른 결과면 아무것도 보내지 않은 채 `pending`으로 돌아간다. 브릿지는 스스로 다시 열거나 다시 보내지 않는다. `bridge.py wake NAME --project P`는 같은 단계를 명시적으로 한다. 링크를 열면 앱이 그 세션으로 포커스를 옮기고 앞으로 올 수 있다. 예약 작업 세션(앱이 세션 간 메시징을 끈 채 띄운다)과 IDE 세션은 `unsupported`다.
 
 IPC 경로에서 정확한 Codex Desktop 소유자 조회가 시간 초과되거나 불가능하거나 외부 입력을 지원하는 소유자가 없으면 전달은 `pending`에 머문다. CLI와 MCP는 조회 결과와 확인된 작업 경로 누락을 보고하며, 대화를 자동으로 다시 열거나 메시지를 재전송하지 않는다.
 
-Codex `open`과 `register --new`는 저장 스레드를 하나 만들고 정확한 ID를 확인한 뒤 Desktop에 인계한다. IPC에 연결되면 정확한 소유자에게 설정을 재조회해 Full Access와 승인 정책 `never`를 확인한다. 로컬 CLI의 `bridge.py open`과 `bridge.py register --new`에서 기본 IPC 소켓이 없거나 연결을 거부하면 서명된 로컬 Desktop `26.1117.31558` (빌드 `29513`)과 기본 큐 저장소를 사용한다. IPC 엔드포인트를 명시했거나 원격 MCP에서 생성하는 경우에는 스레드를 만들기 전에 IPC 초기화 응답을 확인해야 한다. 열기 요청으로 승인된 무해한 시작 프롬프트 하나를 큐에 넣고 정확한 UUID를 깨운다. 지정한 모델로 실행된 해당 Desktop 턴의 완료를 확인해야 성공한다. 성공하면 `adoption_mode: "desktop-queue-wake"`와 `wake_turn_id`에 인계 방식과 턴 ID가 표시된다. `permission_settings`는 해당 자동 턴의 실효 권한이다. `readOnly` 또는 `workspaceWrite`와 승인 정책 `on-request`로 실행된 경우 경고 코드 `CODEX_DESKTOP_WAKE_RESTRICTED`가 표시된다. 지원하는 `:workspace` 프로필의 쓰기 범위는 지정한 작업 공간과 OS 기본 임시 경로이며 네트워크 접근은 제한된다. 이후 Desktop 입력창에서 Full Access를 쓸 수 있으며 이후 턴의 실제 권한은 별도로 확인한다. 결과가 모호해도 생성, 큐 제출, 깨우기를 자동으로 반복하지 않는다.
+Codex `open`과 `register --new`는 저장 스레드를 하나 만들고 정확한 ID를 확인한 뒤 Desktop에 인계한다. IPC에 연결되면 정확한 소유자에게 설정을 재조회해 Full Access와 승인 정책 `never`를 확인한다. 로컬 CLI의 `bridge.py open`과 `bridge.py register --new`에서 기본 IPC 소켓이 없거나 연결을 거부하면 서명된 로컬 Desktop `26.1117.31558` (빌드 `29513`)과 기본 큐 저장소를 사용한다. IPC 엔드포인트를 명시했거나 원격 MCP에서 생성하는 경우에는 스레드를 만들기 전에 IPC 초기화 응답을 확인해야 한다. 열기 요청으로 승인된 무해한 시작 프롬프트 하나를 큐에 넣고 정확한 UUID를 깨운다. 지정한 모델로 실행된 해당 Desktop 턴의 완료를 확인해야 성공한다. 성공하면 `adoption_mode: "desktop-queue-wake"`와 `wake_turn_id`에 인계 방식과 턴 ID가 표시된다. `permission_settings`는 해당 자동 턴의 실효 권한이다. 깨우기 전에 새 스레드에 Full Access와 승인 정책 `never`를 저장한다(`thread/settings/update`). Desktop은 큐로 깨운 스레드를 저장된 설정으로 실행하며, 저장된 설정이 없으면 `workspaceWrite`와 `on-request`로 실행해 무인 턴이 승인 대기에서 멈추기 때문이다. `readOnly` 또는 `workspaceWrite`와 승인 정책 `on-request`로 실행된 경우 경고 코드 `CODEX_DESKTOP_WAKE_RESTRICTED`가 표시된다. 지원하는 `:workspace` 프로필의 쓰기 범위는 지정한 작업 공간과 OS 기본 임시 경로이며 네트워크 접근은 제한된다. 이후 Desktop 입력창에서 Full Access를 쓸 수 있으며 이후 턴의 실제 권한은 별도로 확인한다. 결과가 모호해도 생성, 큐 제출, 깨우기를 자동으로 반복하지 않는다.
 
 기존에 등록한 Codex 라우트에는 평소대로 메시지를 보낸다. 기본 IPC 소켓이 없거나 연결을 거부할 때 큐 전송 조건이 충족되면 브리지는 공식 `codex queue`로 해당 스레드에 알림을 넣는다. Desktop에 지정된 스레드가 로드되어 있고 유휴 턴을 시작할 수 있어야 알림을 처리한다.
 
@@ -260,7 +263,7 @@ python3 -m unittest discover -s tests -v
 
 `ping`은 `build`(브로커가 시작할 때 읽은 모듈의 다이제스트)와 `cli_build`(이 CLI의 같은 다이제스트)도 반환한다. 둘이 다르거나 브로커가 `build`를 보고하지 않으면 `warning: BROKER_BUILD_SKEW …`를 붙이고 종료 코드는 0을 유지한다. 브로커가 `Unknown operation`으로 거절한 명령에도 같은 경고가 붙는다.
 
-`ping`은 `checkpoint_last_save_seconds`, `checkpoint_max_save_seconds`, `checkpoint_bytes`를 반환한다. 각각 마지막 저장 시도 시간, 브로커 시작 이후 최대 시간(실패한 시도 포함, 초), 마지막으로 성공한 `correspondence.json` 페이로드 크기(메타데이터 인덱스 제외, 바이트)다. 저장소가 없으면 각각 `null`, `0.0`, `0`이다. 저장이 1초를 넘으면 `checkpoint_save_slow` JSON 로그 한 줄을 stderr에 남긴다. `duration_seconds`, `bytes`, `retained_count`만 포함하며 실패 시 `bytes`는 마지막 성공 크기다. 시간에는 검증·직렬화·영속 쓰기가 포함되며 변경 상태 준비는 제외한다. 계측은 재시작하면 초기화된다. 저장 중 `ping`은 마지막으로 끝난 저장 시도와 커밋된 메시지 수를 반환한다. watch 이벤트는 해당 저장이 끝난 뒤 공개된다. 상태 변경, inbox 스냅샷 작업, wait 등록은 진행 중인 저장이 끝날 때까지 기다린다. 브로커가 종료되면 이미 시작한 커밋을 마친 뒤 상태 잠금을 해제한다.
+`ping`은 `checkpoint_last_save_seconds`, `checkpoint_max_save_seconds`, `checkpoint_bytes`를 반환한다. 각각 마지막 저장 시도 시간, 브로커 시작 이후 최대 시간(실패한 시도 포함, 초), 마지막으로 성공한 `correspondence.json` 페이로드 크기(메타데이터 인덱스 제외, 바이트)다. 저장소가 없으면 각각 `null`, `0.0`, `0`이다. 저장이 1초를 넘으면 `checkpoint_save_slow` JSON 로그 한 줄을 stderr에 남긴다. `event`의 값은 `checkpoint_save_slow`이며, 로그에는 `timestamp`(UTC), `duration_seconds`, `thread_cpu_seconds`, `bytes`(실패 시 마지막 성공 페이로드 크기), `retained_count`, `outcome`(`saved` 또는 `failed`), `stages_seconds`(검증과 직렬화, 인덱스 쓰기, 페이로드 쓰기의 시간)가 포함된다. 시간에는 검증·직렬화·영속 쓰기가 포함되며 변경 상태 준비는 제외한다. 계측은 재시작하면 초기화된다. 저장 중 `ping`은 마지막으로 끝난 저장 시도와 커밋된 메시지 수를 반환한다. watch 이벤트는 해당 저장이 끝난 뒤 공개된다. 상태 변경, inbox 스냅샷 작업, wait 등록은 진행 중인 저장이 끝날 때까지 기다린다. 브로커가 종료되면 이미 시작한 커밋을 마친 뒤 상태 잠금을 해제한다.
 
 Codex `open` / `register --new`는 권한 확인에 실패하면 라우트를 등록하지 않는다. 성공·실패 단계와 확인된 `approvalPolicy`, 샌드박스 유형을 stderr 한 줄에 출력한다.
 

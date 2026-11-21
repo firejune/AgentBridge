@@ -147,6 +147,8 @@ class NewCodexTests(unittest.TestCase):
                             'cwd':test.root, 'approvalPolicy':'never' if test.creator_full_access else 'on-request',
                             'activePermissionProfile':{'id':codex_new.FULL_ACCESS_PROFILE},
                             'sandbox':{'type':'dangerFullAccess' if test.creator_full_access else 'workspaceWrite'}}
+                if method == 'thread/settings/update':
+                    return {}
                 if method == 'thread/name/set':
                     test.materialized = True
                     test.thread['name'] = params['name'];return {}
@@ -833,6 +835,14 @@ class NewCodexTests(unittest.TestCase):
             self.assertEqual([(method, params.get('includeTurns')) for method, params, client in self.calls
                               if client.creator and method in ('thread/name/set', 'thread/read')],
                              [('thread/name/set', None), ('thread/read', True)])
+            # Full Access is saved on the thread once, before the wake (issue #172).
+            methods = [method for method, _, _ in self.calls]
+            self.assertEqual([params for method, params, _ in self.calls if method == 'thread/settings/update'],
+                             [{'threadId': self.sid, 'permissions': codex_new.FULL_ACCESS_PROFILE,
+                               'approvalPolicy': 'never'}])
+            # After the calls that materialize the rollout; an earlier update is not saved.
+            self.assertEqual(methods.index('thread/settings/update'),
+                             max(i for i, (method, _, client) in enumerate(self.calls) if client.creator))
 
     def test_queue_wake_preflight_refuses_without_creating_or_retrying(self):
         endpoint = codex_live.EndpointUnavailable
