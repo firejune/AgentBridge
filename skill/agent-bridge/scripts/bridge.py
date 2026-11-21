@@ -22,6 +22,7 @@ import codex_archive
 import codex_live
 import codex_preview  # Shared sidebar preview module exposed to CLI callers.
 import codex_new
+import codex_queue
 # Keep the existing CLI imports of the shared delivery helpers available.
 from delivery import (
     ARCHIVED_REASON, BEHIND_GRACE, BUSY_CLAIM, DELIVERED, FRESH_SESSION,
@@ -129,8 +130,25 @@ def receive_codex(args):
         text = peer_text(message, args.socket, escape_peer=False)
     except (KeyError, TypeError):
         raise ValueError(bad_response) from None
+    # A message already received or in progress was read before; acking again would add an event
+    # (or move in_progress back) for nothing (issue #153).
+    marked = state not in ('received', 'in_progress') and mark_received(args.socket, args.id)
     return {'id': args.id, 'sender': message['sender'], 'text': text,
-            'provenance': 'agent_bridge_peer', 'authorization': 'none'}
+            'provenance': 'agent_bridge_peer', 'authorization': 'none', 'marked_received': marked}
+
+
+def mark_received(path, mid):
+    """Record that the addressed Codex thread retrieved the message: `submitted` becomes `received`.
+
+    Best-effort and bounded. The broker refuses while delivery is unresolved (`dispatching`,
+    `uncertain`), once the message is complete, or while the route is closing; any refusal or
+    broker error leaves the read exactly as it was and reports False.
+    """
+    try:
+        marked = broker.request(path, {'op': 'ack', 'id': mid}, deadline=time.monotonic() + 5)
+    except Exception:  # The read already succeeded; nothing about the marker may fail it.
+        return False
+    return isinstance(marked, dict) and marked.get('state') == 'received'
 
 
 def wake_participant(args):
@@ -1295,12 +1313,86 @@ def request_command(args):
     return 0
 
 
+READ_STATES = frozenset(('received', 'in_progress', 'answered', 'done'))
+
+
+def show_command(args):
+    """`show ID`, plus whether a Codex recipient's thread has retrieved the message (issue #153).
+
+    For a Codex route `submitted` only means the queue accepted the notice; `receive-codex`
+    moves it to `received`. Derived here at print time; the broker payload is unchanged.
+    """
+    result = broker.request(args.socket, request_fields(args))
+    route = result.get('route') if isinstance(result, dict) else None
+    if isinstance(route, dict) and route.get('transport') == 'codex':
+        if result.get('state') == 'submitted':
+            result['read_by_recipient'] = False
+        elif result.get('state') in READ_STATES:
+            result['read_by_recipient'] = True
+    output(result)
+    return 0
+
+
+CODEX_HEALTH_SECONDS = 2
+
+
+def codex_delivery_health(budget=CODEX_HEALTH_SECONDS):
+    """Which path a Codex delivery would take now, checked client-side within `budget` seconds.
+
+    Read-only: connects to the legacy IPC socket and closes it without sending, then checks the
+    Desktop queue store and its single owner. No codesign. The reason is a fixed string; paths,
+    pids and ids never appear. Never raises.
+    """
+    deadline = time.monotonic() + budget
+    try:
+        client = codex_live.Client(timeout=budget / 4)
+        try:
+            client.connect()
+            return {'path': 'ipc', 'reason': None}
+        except codex_live.EndpointUnavailable as error:
+            # Only a missing or unserved default socket falls back to the queue; delivery fails otherwise.
+            if error.endpoint_name != error.DEFAULT:
+                return {'path': 'unavailable', 'reason': 'non-default Codex configuration'}
+            if not error.default_absent:
+                return {'path': 'unavailable', 'reason': 'Codex IPC socket unusable'}
+        finally:
+            client.close()
+        try:
+            _, queue = codex_queue.default_stores()
+        except ValueError:
+            return {'path': 'unavailable', 'reason': 'non-default Codex configuration'}
+        try:
+            codex_preview.require_owned_store(queue)
+        except (OSError, ValueError):
+            return {'path': 'unavailable', 'reason': 'queue store missing or not owned'}
+
+        def read(argv):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(argv, 0)
+            return codex_queue.checked_output(argv, timeout=remaining)
+
+        try:
+            owner = codex_queue.desktop_queue_owner(queue, read)
+        except subprocess.TimeoutExpired:
+            return {'path': 'unavailable', 'reason': 'queue owner check timed out'}
+        except (OSError, subprocess.SubprocessError, ValueError):
+            owner = None
+        if owner is None:  # Also a second app-server (another tool's `codex app-server`) holding the store.
+            return {'path': 'unavailable', 'reason': 'no single Desktop queue owner'}
+        return {'path': 'desktop-queue', 'reason': None}
+    except Exception:
+        return {'path': 'unavailable', 'reason': 'health check failed'}
+
+
 def ping_command(args):
     result = broker.request(args.socket, request_fields(args))
     result['cli_build'] = broker.build_id()
     warning = build_skew(args.socket, result)
     if warning is not None:
         result['warning'] = warning
+    if sys.platform == 'darwin':
+        result['codex_delivery'] = codex_delivery_health()
     output(result)
     return 0
 
@@ -1378,10 +1470,10 @@ COMMANDS = {
     'sessions': sessions_command, 'session': session_command,
     'deliver': deliver_command, 'watch': watch_command,
     'send': send_command, 'reply': send_command, 'ask': ask_command, 'wait': wait_command,
-    'ping': ping_command, 'routes': routes_command,
+    'ping': ping_command, 'routes': routes_command, 'show': show_command,
     # Plain requests: the parsed options are the broker operation.
     **{name: request_command for name in ('stop', 'channels', 'channel-bind', 'channel-close', 'inbox',
-                                          'show', 'conversation', 'ack', 'progress', 'resolve')},
+                                          'conversation', 'ack', 'progress', 'resolve')},
 }
 
 
