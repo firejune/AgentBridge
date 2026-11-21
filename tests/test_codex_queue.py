@@ -1,7 +1,12 @@
-"""The Desktop queue's own checks, run against fakes: no process, store or app is read."""
+"""The Desktop queue's checks, run without accessing a live Desktop app or store."""
+from contextlib import closing, redirect_stdout
+import io
+import json
 import os
 from pathlib import Path
 import plistlib
+import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -10,11 +15,15 @@ from unittest.mock import patch
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skill/agent-bridge/scripts'))
+import bridge
+import codex_archive
+import codex_live
 import codex_preview
 import codex_queue
 import codex_wake_open
 import delivery
 from codex_live import ThreadArchived
+from support import RunningBroker
 
 UID = str(os.getuid())
 HELPER = (str(codex_queue.APP) + '/Contents/Frameworks/Codex Framework.framework/Versions/158.0/'
@@ -82,6 +91,172 @@ class QueueNoticeTests(unittest.TestCase):
         self.assertIn(delivery.PEER_SCOPE, delivery.envelope(message))
 
 
+class CloseHandoffQueueTests(unittest.TestCase):
+    def setUp(self):
+        profile = tempfile.TemporaryDirectory()
+        self.addCleanup(profile.cleanup)
+        self.profile = Path(profile.name).resolve()
+        env = patch.dict(os.environ, {'CODEX_HOME': str(self.profile), 'CODEX_SQLITE_HOME': str(self.profile)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.server = RunningBroker()
+        self.server.__enter__()
+        self.addCleanup(self.server.__exit__, None, None, None)
+        self.operator, self.target = str(uuid.uuid4()), str(uuid.uuid4())
+        self.cwd = str(Path(self.server.temp.name).resolve())
+        db_path = self.profile / codex_preview.STATE_FILE
+        with closing(sqlite3.connect(db_path)) as db, db:
+            db.execute('CREATE TABLE threads (id TEXT, title TEXT, cwd TEXT, updated_at INTEGER, '
+                       'archived INTEGER, archived_at INTEGER)')
+            db.execute("INSERT INTO threads VALUES (?, 'fixture', ?, 1, 0, NULL)", (self.target, self.cwd))
+            db.execute('CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)')
+        self.server.call('register', project='work', name='worker', cwd=self.cwd,
+                         transport='codex', session=self.target)
+        self.server.call('register', project='ops', name='operator', cwd=self.cwd,
+                         transport='codex', session=self.operator)
+        self.server.call('register', project='ops', name='requester', cwd=self.cwd, transport='realtime')
+        config = Path(self.server.state_dir) / 'close-operator.json'
+        config.write_text(json.dumps({'project': 'ops', 'name': 'operator', 'session': self.operator,
+                                      'sender': 'requester', 'prefer_native_for_direct': True}), encoding='utf-8')
+        config.chmod(0o600)
+        endpoint = codex_live.EndpointUnavailable
+        for patcher in (
+            patch.object(bridge.broker, 'DEFAULT_SOCKET', Path(self.server.path)),
+            patch.object(codex_archive, 'executable', return_value='/fixture/codex'),
+            patch.object(codex_archive.wt, 'open_files', return_value=[]),
+            patch.object(codex_preview, 'state_path', return_value=db_path),
+            patch.object(codex_live, 'exact_saved_workspace', return_value=(None, None)),
+            patch.object(codex_live.Client, 'connect', side_effect=endpoint(endpoint.DEFAULT, endpoint.MISSING)),
+            patch.object(codex_queue, 'check_route'),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def cli(self, *args):
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            result = bridge.main(list(args))
+        return result, json.loads(stdout.getvalue())
+
+    def handoff(self, *flags):
+        return self.cli('--socket', self.server.path, 'close', 'worker', '--project', 'work',
+                        '--archive', '--state-dir', self.server.state_dir, '--no-retro', 'fake queue fixture', *flags)
+
+    def claim_during_enqueue(self, thread, notification, timeout):
+        self.assertEqual(thread, self.operator)
+        self.assertGreater(timeout, 0)
+        command = shlex.split(notification.splitlines()[1])
+        self.assertEqual(command[:-1],
+                         ['python3', '~/.agents/skills/agent-bridge/scripts/bridge.py', 'close-operator'])
+        mid = command[-1]
+        message = self.server.call('show', id=mid)
+        self.assertEqual(message['state'], 'dispatching')
+        self.assertNotIn(self.target, notification)
+        self.assertNotIn(self.cwd, notification)
+        self.assertNotIn(message['body'], notification)
+        self.assertNotIn('receive-codex', notification)
+        self.assertIn('confirm the thread is local with no active turn (idle or notLoaded)', notification)
+        self.assertIn('Call set_thread_archived once with the exact threadId, hostId local', notification)
+        self.assertIn('--finish CLOSE_ID --expect-session UUID', notification)
+        with patch.dict(os.environ, {'CODEX_THREAD_ID': self.target}):
+            self.assertEqual(self.cli(*command[2:])[0], 1)
+        with patch.dict(os.environ, {'CODEX_THREAD_ID': self.operator}):
+            self.assertEqual(self.cli('receive-codex', mid), (1, {
+                'error': 'The addressed message is a close handoff; claim it with close-operator.'}))
+            self.assertEqual(self.cli(*command[2:]), (0, {
+                'project': 'work', 'name': 'worker', 'session': self.target, 'cwd': self.cwd,
+                'close_id': message['close_request']['close_id'],
+            }))
+            self.assertEqual(self.cli(*command[2:])[0], 1)
+
+    def test_queue_receipt_preserves_an_early_close_operator_claim(self):
+        def enqueue(thread, notification, timeout):
+            self.claim_during_enqueue(thread, notification, timeout)
+            return str(uuid.uuid4())
+
+        with patch.object(codex_queue, 'enqueue', side_effect=enqueue) as submit:
+            code, receipt = self.handoff()
+            self.assertEqual((code, receipt['operator_delivery']), (1, 'in_progress'))
+            self.assertEqual(self.handoff()[1]['operator_message_id'], receipt['operator_message_id'])
+        submit.assert_called_once()
+        self.assertEqual(self.server.call('show', id=receipt['operator_message_id'])['state'], 'in_progress')
+
+    def test_early_claim_confirms_handoff_when_queue_receipt_is_lost(self):
+        def enqueue(thread, notification, timeout):
+            self.claim_during_enqueue(thread, notification, timeout)
+            raise codex_live.DeliveryError(codex_queue.UNKNOWN, uncertain=True)
+
+        with patch.object(codex_queue, 'enqueue', side_effect=enqueue) as submit:
+            code, receipt = self.handoff()
+        submit.assert_called_once()
+        self.assertEqual((code, receipt['operator_delivery']), (1, 'in_progress'))
+        self.assertNotIn('operator_error', receipt)
+
+    def test_ambiguous_queue_without_operator_claim_is_never_replayed(self):
+        error = codex_live.DeliveryError(codex_queue.UNKNOWN, uncertain=True)
+        with patch.object(codex_queue, 'enqueue', side_effect=error) as submit:
+            code, receipt = self.handoff()
+            self.assertEqual((code, receipt['operator_delivery']), (1, 'uncertain'))
+            self.assertEqual(self.handoff()[1]['operator_message_id'], receipt['operator_message_id'])
+        submit.assert_called_once()
+        message = self.server.call('show', id=receipt['operator_message_id'])
+        with self.assertRaisesRegex(ValueError, 'cannot be delivered manually'):
+            delivery.push_codex(self.server.path, message)
+
+    def test_custom_broker_socket_does_not_use_desktop_queue(self):
+        with patch.object(bridge.broker, 'DEFAULT_SOCKET', Path(self.cwd) / 'other.sock'), \
+                patch.object(codex_queue, 'enqueue') as submit:
+            code, receipt = self.handoff()
+        self.assertEqual(code, 1)
+        self.assertIn('Enrolled Codex close operator is unavailable', receipt['error'])
+        route, = self.server.call('routes', project='work')
+        self.assertNotIn('closing', route)
+        submit.assert_not_called()
+
+    def test_explicit_handoff_does_not_gain_desktop_queue_dispatch(self):
+        with patch.object(codex_queue, 'enqueue') as submit:
+            code, receipt = self.handoff('--handoff')
+        self.assertEqual((code, receipt['operator_delivery']), (1, 'pending'))
+        self.assertEqual(self.server.call('show', id=receipt['operator_message_id'])['state'], 'pending')
+        submit.assert_not_called()
+
+    def test_late_process_keeps_guarded_close_and_withholds_target_from_operator(self):
+        with patch.object(codex_queue, 'enqueue', return_value=str(uuid.uuid4())):
+            _, receipt = self.handoff()
+        mid = receipt['operator_message_id']
+        holder = (12345, 'shell', str(Path(self.cwd) / 'nested'))
+        with patch.dict(os.environ, {'CODEX_THREAD_ID': self.operator}), \
+                patch.object(codex_archive.wt, 'open_files', return_value=[holder]) as scan:
+            self.assertEqual(self.cli('close-operator', mid), (1, {
+                'error': 'A running process uses the Codex native close workspace. Closing route kept.'}))
+        scan.assert_called_once()
+        route, = self.server.call('routes', project='work')
+        self.assertEqual(route['closing'], receipt['close_id'])
+        self.assertEqual(self.server.call('show', id=mid)['state'], 'in_progress')
+
+    def test_guarded_claim_requires_updated_operator_cli(self):
+        with patch.object(codex_queue, 'enqueue', return_value=str(uuid.uuid4())):
+            _, receipt = self.handoff()
+        mid = receipt['operator_message_id']
+        for guard in ({}, {'native_guard_version': True}, {'native_guard_version': 2}):
+            with self.subTest(guard=guard):
+                with self.assertRaisesRegex(ValueError, 'requires an updated close-operator CLI'):
+                    self.server.call('close-operator', id=mid, operator_session=self.operator, **guard)
+                self.assertEqual(self.server.call('show', id=mid)['state'], 'submitted')
+        with patch.dict(os.environ, {'CODEX_THREAD_ID': self.operator}):
+            code, target = self.cli('close-operator', mid)
+        self.assertEqual((code, target['session']), (0, self.target))
+        self.assertEqual(self.server.call('show', id=mid)['state'], 'in_progress')
+
+    def test_process_scan_error_withholds_guarded_target(self):
+        with patch.object(codex_queue, 'enqueue', return_value=str(uuid.uuid4())):
+            _, receipt = self.handoff()
+        with patch.dict(os.environ, {'CODEX_THREAD_ID': self.operator}), \
+                patch.object(codex_archive.wt, 'open_files', side_effect=OSError('private diagnostics')):
+            self.assertEqual(self.cli('close-operator', receipt['operator_message_id']), (1, {
+                'error': 'Codex native close could not verify process working directories. Closing route kept.'}))
+
+
 class DefaultDesktopFixture(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -102,6 +277,7 @@ class DefaultDesktopFixture(unittest.TestCase):
             return ''
 
         for target, name, value in (
+                (sys, 'platform', 'darwin'),
                 (codex_queue, 'checked_output', checked),
                 (codex_preview, 'state_path', lambda executable: self.state),
                 (codex_preview, 'require_owned_store', self.owned.append),

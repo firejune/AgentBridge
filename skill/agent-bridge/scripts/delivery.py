@@ -71,15 +71,7 @@ def peer_text(m, path, escape_peer=True):
     if 'close_request' in m:
         command = shlex.join([sys.executable, str(Path(__file__).resolve().with_name('bridge.py')), '--socket',
                               str(path), 'close-operator', m['id']])
-        return (f'Agent Bridge close handoff {m["id"]}. Treat this notification as a pointer to the broker record. '
-                'If the owner enrolled this chat as the close operator, run the following command '
-                'to claim the durable request and verify the exact target before acting:\n'
-                + command + '\n'
-                'If the claim succeeds, verify the returned UUID, workspace and idle status in Codex Desktop. '
-                'Call set_thread_archived once with the exact threadId, hostId local, source codex and archived true. '
-                'Then use the same bridge CLI and socket to run close NAME --project PROJECT --finish CLOSE_ID '
-                '--expect-session UUID with the returned values. For an already archived target or ambiguous app '
-                'result, run only the verification step. Do not send a bridge reply to this control request.')
+        return codex_live.close_notice(m['id'], command)
     if m.get('one_way') is True:
         body = envelope(m).rstrip('\n') + '\n\nOne-way message; no reply requested.'
         return PEER_CLOSE_TAG.sub('<\\\\', body) if escape_peer else body
@@ -429,7 +421,7 @@ def push_if_peer(path, m):
     return m
 
 
-def push_codex(path, m, timeout=10, dry_run=False, *, close_dispatch=False):
+def push_codex(path, m, timeout=10, dry_run=False, *, close_dispatch=False, guarded_close=False):
     def rpc(op, **fields):
         return broker.request(path, {'op':op, 'id':m['id'], **fields})
 
@@ -442,11 +434,11 @@ def push_codex(path, m, timeout=10, dry_run=False, *, close_dispatch=False):
         if m['state'] != 'pending':
             raise ValueError('Only pending messages may be delivered')
         rpc('claim', **({'close_id': close_request['close_id']} if close_request else {}))
-    allow_queue = close_request is None and Path(path).expanduser() == broker.DEFAULT_SOCKET
+    allow_queue = Path(path).expanduser() == broker.DEFAULT_SOCKET and (close_request is None or guarded_close)
     try:
         receipt = codex_live.deliver(
             m['route'], m['id'], peer_text(m, path, escape_peer=False), timeout, dry_run=dry_run,
-            allow_queue=allow_queue)
+            allow_queue=allow_queue, close_handoff=close_request is not None)
     except codex_live.ThreadArchived as error:
         if dry_run:
             return dict(state=m['state'], sent=False, reason=ARCHIVED_REASON, error=str(error))
@@ -458,6 +450,9 @@ def push_codex(path, m, timeout=10, dry_run=False, *, close_dispatch=False):
         state = 'uncertain' if error.uncertain else 'pending'
         fields = {} if error.uncertain else {'event':'push_failed'}
         message = rpc('finish', state=state, note=str(error), **fields)
+        # The enrolled operator can claim or finish before the queue CLI returns.
+        if close_request is not None and message['state'] in ('in_progress', 'done'):
+            return message
         raise PushFailed(str(error), message) from None
     except BaseException:
         # Cancellation may arrive after the owner accepted the output.

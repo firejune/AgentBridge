@@ -142,7 +142,7 @@ python3 "$bridge_cli" ask --project PROJECT --from-channel logic --channel view 
 # Reply on the original return route:
 python3 "$bridge_cli" reply REQUEST_ID --key UNIQUE_REPLY_KEY --file /absolute/answer.txt
 
-# Close a finished worker session and remove its route (add --archive to hide from sidebar):
+# Close a finished worker session and remove its route (add --archive to archive):
 python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.txt [--archive] [--keep-route] [--timeout 10]
 ```
 
@@ -150,8 +150,8 @@ python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.
 - `ack` and `progress` report receipt and status, not final answers. Exit code 2 from `ask` or `wait` means the wait timed out — run `wait REQUEST_ID` again rather than resending.
 - Close sessions you own or have the owner or HQ’s authorization to close. Plain `close` stops the exact Claude CLI process, detaches an idle Antigravity conversation or detaches the Codex route. Pass `--archive` to archive the session.
 - After archive is confirmed, the broker removes eligible retained correspondence for the exact session, including aliases, and expires inbox snapshots affected by removal. Provider transcripts remain available. Ordinary close preserves correspondence. Direct archive with `--keep-route` still cleans correspondence.
-- For a Codex Desktop archive handoff, explicitly request `close --archive --handoff`. Archive the exact thread in Desktop or use an enrolled operator, then verify completion with `close --finish CLOSE_ID --expect-session UUID`. [Closing a session](references/usage.md#closing-a-session).
-- Direct Codex `close --archive` uses native app-server archival, checks registered routes and process working directories, and verifies archive bits before removing the route. `archive-sweep --cwd-prefix /absolute/workspace` previews candidates and refusals. Review its private JSON, then use `archive-sweep --apply --manifest FILE`. Undo may unarchive descendants too. [Codex archive sweep](references/usage.md#codex-archive-sweep).
+- By default, direct Codex `close --archive` verifies the saved archive state. An already open Desktop sidebar may still show the chat. For a native Desktop archive, use `close --archive --handoff` and archive the exact thread in Desktop or use an enrolled operator. The owner can set `"prefer_native_for_direct": true` in `close-operator.json` to make direct `close --archive` hand off the root after archiving its reviewed descendants. This preference applies when the route will be removed. For direct closes that select this preference, the default local broker socket can notify the enrolled operator through the verified Desktop queue if the default Desktop IPC socket is missing or refuses the connection. The operator chat must be loaded and eligible to start a turn. Explicit `--handoff` uses IPC or manual archive in Desktop. A pending direct-close handoff reports `awaiting_native_archive` and exits 1. Use the operator receipt or `close --finish CLOSE_ID --expect-session UUID` to verify completion. [Closing a session](references/usage.md#closing-a-session).
+- Direct Codex `close --archive` checks registered routes and process working directories. The saved-state path verifies archive bits before removing the route. `archive-sweep --cwd-prefix /absolute/workspace` previews candidates and refusals. Review its private JSON, then use `archive-sweep --apply --manifest FILE`. Undo may unarchive descendants too. [Codex archive sweep](references/usage.md#codex-archive-sweep).
 
 - If saved metadata confirms that the exact Codex recipient is archived, the CLI reports `state: "failed"` and `reason: "archived"` and exits 1 before contacting Desktop.
 - If the exact Desktop owner cannot be located for delivery, the message stays `pending`. The CLI and MCP report the reason and any verified missing saved workspace. The bridge never reopens the thread or resends on its own.
@@ -273,7 +273,7 @@ Missing retros (`RETRO_REQUIRED`), blank files (`RETRO_EMPTY`) and blank opt-out
 reasons (`RETRO_REASON_EMPTY`) are refused before any provider action or route
 removal. Towers and HQ use an explicit `--no-retro` reason. A retro is read and
 validated before the provider is touched and saved only after the close is
-confirmed (with `--archive`, after the archive reads back; `--handoff` saves it when the handoff is prepared, since a closing route cannot send the retro notification). A close that fails
+confirmed. The saved-state archive path records it after readback. Explicit and configured native handoffs record it before preparing the handoff because a closing route cannot send the retro notification. A close that fails before that point
 saves none and reports `retro_recorded: false`; repeating it later records once.
 If the session closed but the save failed, `retro_error` names it; add the
 record with `retro add`.

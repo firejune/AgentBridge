@@ -126,7 +126,7 @@ The Python CLI lists sessions without per-session model reads by default. Add `s
 | --- | --- | --- | --- |
 | **Antigravity (`agy`)** | Autonomous via `language_server` / `agy --hub` (`StartCascade`), auto-linked to project & worktree environment | Identical to Desktop (`StartCascade` + project/environment association on unified hub) | Keeps conversation in active stack by default (`--archive` sets `{archived: true}`) and unregisters route |
 | **Claude (`claude-peer`)** | Opens `claude://code/new` composer prefilled with `--title`; waits for user Enter | Autonomous via IDE CLI + `<scheme>://anthropic.claude-code/open` | Sends `SIGTERM` to CLI process; keeps in sidebar by default (`--archive` sets Desktop `isArchived: true`) and unregisters route |
-| **Codex (`codex`)** | Saved thread via `app-server --stdio`, then Desktop adoption over IPC or a verified queued startup turn | N/A | Keeps thread in active sidebar by default (`--archive` uses native Codex archival with leaf-first checks) and unregisters route |
+| **Codex (`codex`)** | Saved thread via `app-server --stdio`, then Desktop adoption over IPC or a verified queued startup turn | N/A | Keeps thread in active sidebar by default (`--archive` checks descendants first and verifies saved archive state) and unregisters route |
 
 ```bash
 # Open without registering, or open + register in one command:
@@ -134,7 +134,7 @@ python3 "$bridge_cli" open --provider agy --host ide --cwd /path/to/workspace --
 python3 "$bridge_cli" register codex-worker --project my-app --transport codex \
   --new --cwd /path/to/workspace --title "Worker" --model gpt-6.2-sol
 
-# Close a finished worker session and remove its route (pass --archive to hide from sidebar):
+# Close a finished worker session and remove its route (pass --archive to archive):
 python3 "$bridge_cli" close agy-worker --project my-app --retro-file /absolute/retro.txt [--archive]
 
 # Bring an idle-closed Claude Desktop session back (prints woken, already-live, unsupported or uncertain):
@@ -143,9 +143,9 @@ python3 "$bridge_cli" wake claude-tower --project my-app [--timeout 30]
 
 After archive is confirmed, the broker removes eligible retained correspondence for the exact session, including aliases, and expires inbox snapshots affected by removal. Provider transcripts remain available. Ordinary close preserves correspondence. Direct archive with `--keep-route` still cleans correspondence. Confirmed archive and the requested route operation succeed when only uncertain correspondence remains, and the broker keeps those records and their idempotency keys.
 
-For a Codex Desktop archive handoff, explicitly request `close --archive --handoff`. Archive the exact thread in Desktop or use an enrolled operator, then verify completion with `close --finish CLOSE_ID --expect-session UUID`. [Closing a session](skill/agent-bridge/references/usage.md#closing-a-session).
+By default, direct Codex `close --archive` verifies the saved archive state. An already open Desktop sidebar may still show the chat. For a native Desktop archive, use `close --archive --handoff` and archive the exact thread in Desktop or use an enrolled operator. The owner can set `"prefer_native_for_direct": true` in `close-operator.json` to make direct `close --archive` hand off the root after archiving its reviewed descendants. This preference applies when the route will be removed. For direct closes that select this preference, the default local broker socket can notify the enrolled operator through the verified Desktop queue if the default Desktop IPC socket is missing or refuses the connection. The operator chat must be loaded and eligible to start a turn. Explicit `--handoff` uses IPC or manual archive in Desktop. A pending direct-close handoff reports `awaiting_native_archive` and exits 1. Use the operator receipt or `close --finish CLOSE_ID --expect-session UUID` to verify completion. [Closing a session](skill/agent-bridge/references/usage.md#closing-a-session).
 
-Use `archive-sweep --cwd-prefix /absolute/workspace` to preview Codex archive candidates and refusals. Apply only with `archive-sweep --apply --manifest FILE` after reviewing the private JSON. Direct Codex close and sweep verify native readback. Undo can also affect descendants. [Codex archive sweep](skill/agent-bridge/references/usage.md#codex-archive-sweep).
+Use `archive-sweep --cwd-prefix /absolute/workspace` to preview Codex archive candidates and refusals. Apply only with `archive-sweep --apply --manifest FILE` after reviewing the private JSON. The saved-state close and sweep verify stored archive bits. Undo can also affect descendants. [Codex archive sweep](skill/agent-bridge/references/usage.md#codex-archive-sweep).
 
 Claude Desktop closes sessions on its own: a hidden session is paused 900 s after its last turn, and the longest-idle session is evicted under memory pressure. The CLI exits and its registry record and inbox socket go away. A `claude-peer` push to such a route wakes it first. The bridge opens `claude://claude.ai/epitaxy/<local_id>` (found in the Desktop metadata by `cliSessionId`), the app resumes the same session ID and transcript under a new PID, and the message is pushed once when the new inbox socket appears. Until then it stays `dispatching`; any other outcome returns it to `pending` with nothing sent. The bridge never reopens or resends on its own. Each wake outcome a push reports is kept with the message as `wakes` (newest last, at most 10) in normalized form only: `state` (`woken`, `already-live`, `unsupported`, `failed` when the opener reported the link was not opened, `uncertain`), a fixed `code` (for example `opener_failed`, `no_desktop_session`, `archived`, `scheduled_task`, `budget_spent`, `record_timeout`, `inbox_timeout`, `host_mismatch`), `elapsed`, `at`, `source` and `attempt`. It survives restarts, the answer and completion; the free-text reason stays in the volatile note and event stream. `bridge.py wake NAME --project P` does the same step explicitly. Opening the link focuses that session in the app and can bring the app forward. Scheduled-task sessions (the app starts them with cross-session messaging off) and IDE sessions are `unsupported`.
 
@@ -281,7 +281,7 @@ Missing retros (`RETRO_REQUIRED`), blank files (`RETRO_EMPTY`) and blank opt-out
 reasons (`RETRO_REASON_EMPTY`) are refused before any provider action or route
 removal. Towers and HQ use an explicit `--no-retro` reason. A retro is read and
 validated before the provider is touched and saved only after the close is
-confirmed (with `--archive`, after the archive reads back; `--handoff` saves it when the handoff is prepared, since a closing route cannot send the retro notification). A close that fails
+confirmed. The saved-state archive path records it after readback. Explicit and configured native handoffs record it before preparing the handoff because a closing route cannot send the retro notification. A close that fails before that point
 saves none and reports `retro_recorded: false`; repeating it later records once.
 If the session closed but the save failed, `retro_error` names it; add the
 record with `retro add`.

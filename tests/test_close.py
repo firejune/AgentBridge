@@ -218,8 +218,11 @@ class CloseCodexTests(unittest.TestCase):
         self.archive.parent.mkdir()
         self.rollout.write_text('test transcript', encoding='utf-8')
         with closing(sqlite3.connect(self.db)) as db, db:
-            db.execute('CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, archived INTEGER, rollout_path TEXT)')
-            db.execute('INSERT INTO threads VALUES (?, ?, 0, ?)', (self.sid, str(self.cwd), str(self.rollout)))
+            db.execute('CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, archived INTEGER, rollout_path TEXT, '
+                       "title TEXT DEFAULT 'fixture', updated_at INTEGER DEFAULT 1, archived_at INTEGER)")
+            db.execute('INSERT INTO threads (id, cwd, archived, rollout_path) VALUES (?, ?, 0, ?)',
+                       (self.sid, str(self.cwd), str(self.rollout)))
+            db.execute('CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)')
         executable = self.home / 'fake-codex'
         executable.write_text(
             '#!/usr/bin/env python3\n'
@@ -272,15 +275,39 @@ class CloseCodexTests(unittest.TestCase):
         route, = [row for row in self.server.call('routes', project='p') if row['name'] == 'target']
         self.assertNotIn('closing', route)
 
-    def enroll(self, session=None):
+    def enroll(self, session=None, *, prefer_native=None):
         self.operator_sid = session or str(uuid.uuid4())
         self.server.call('register', project='ops', name='archive', cwd=str(self.cwd), transport='codex',
                          session=self.operator_sid, executable=self.executable)
         self.server.call('register', project='ops', name='trigger', cwd=str(self.cwd))
         config = Path(self.server.state_dir) / 'close-operator.json'
-        config.write_text(json.dumps({'project': 'ops', 'name': 'archive', 'session': self.operator_sid,
-                                      'sender': 'trigger'}), encoding='utf-8')
+        settings = {'project': 'ops', 'name': 'archive', 'session': self.operator_sid, 'sender': 'trigger'}
+        if prefer_native is not None:
+            settings['prefer_native_for_direct'] = prefer_native
+        config.write_text(json.dumps(settings), encoding='utf-8')
         config.chmod(0o600)
+
+    def add_descendant(self):
+        sid = str(uuid.uuid4())
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute('INSERT INTO threads (id, cwd, archived) VALUES (?, ?, 0)', (sid, str(self.cwd)))
+            db.execute('INSERT INTO thread_spawn_edges VALUES (?, ?)', (self.sid, sid))
+        return sid
+
+    def archive_flags(self):
+        with closing(sqlite3.connect(self.db)) as db:
+            return dict(db.execute('SELECT id, archived FROM threads').fetchall())
+
+    def remove_descendant(self, sid):
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute('DELETE FROM thread_spawn_edges WHERE child_thread_id=?', (sid,))
+            db.execute('DELETE FROM threads WHERE id=?', (sid,))
+
+    def saved_archive(self, method, params):
+        self.assertEqual(method, 'thread/archive')
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute('UPDATE threads SET archived=1, archived_at=2 WHERE id=?', (params['threadId'],))
+        return {}
 
     def operator(self, mid, session):
         with mock.patch.dict(os.environ, {'CODEX_THREAD_ID': session}):
@@ -440,12 +467,13 @@ class CloseCodexTests(unittest.TestCase):
                                   key='ordinary', body='copy of archive notification')
         self.assertEqual(self.operator(forged['id'], self.operator_sid)[0], 1)
         self.assertEqual(self.operator(mid, self.sid)[0], 1)
-        code, target = self.operator(mid, self.operator_sid)
-        self.assertEqual((code, target['project'], target['session'], target['close_id']),
-                         (0, 'p', self.sid, prepared['close_id']))
+        claimed = self.server.call('close-operator', id=mid, operator_session=self.operator_sid)
+        target = claimed['target']
+        self.assertEqual((target['project'], target['session'], claimed['close_id']),
+                         ('p', self.sid, prepared['close_id']))
         self.assertEqual(self.operator(mid, self.operator_sid)[0], 1)
         self.assertTrue(self.server.call('wait', id=mid, timeout=0.01)['timed_out'])
-        finish = ('--finish', target['close_id'], '--expect-session', target['session'])
+        finish = ('--finish', claimed['close_id'], '--expect-session', target['session'])
         self.assertEqual(self.close(*finish)[0], 1)
         self.rollout.rename(self.archive)
         self.record_archive(self.archive)
@@ -453,6 +481,116 @@ class CloseCodexTests(unittest.TestCase):
         self.assertEqual((code, done['route_removed'], done['operator_receipt']), (0, True, 'done'))
         status = self.server.call('wait', id=mid, timeout=1)
         self.assertEqual((status['timed_out'], status['close_status']), (False, 'done'))
+
+    def test_plain_archive_prefers_exact_native_operator_after_archiving_descendants(self):
+        self.enroll(prefer_native=True)
+        descendant = self.add_descendant()
+        queued = {'delivery_mode': 'queue', 'delivery_path': 'codex-desktop-queue'}
+        direct = ('--archive', '--state-dir', self.server.state_dir)
+        with mock.patch.object(codex_archive, 'executable', return_value=self.executable), \
+                mock.patch.object(codex_preview, 'state_path', return_value=self.db), \
+                mock.patch.object(codex_archive.wt, 'open_files', return_value=[]), \
+                mock.patch.object(sessions, 'CodexClient') as client, \
+                mock.patch.object(codex_live, 'deliver', side_effect=[{'sent': False}, queued]) as deliver:
+            archive = client.return_value.__enter__.return_value.call
+            archive.side_effect = self.saved_archive
+            code, receipt = self.close(*direct)
+            self.assertEqual((code, receipt['status'], receipt['closed'], receipt['route_removed'],
+                              receipt['operator_delivery_path'], receipt['archive_incomplete']),
+                             (1, 'awaiting_native_archive', False, False, 'codex-desktop-queue', True))
+            archive.assert_called_once_with('thread/archive', {'threadId': descendant})
+            self.assertEqual(self.archive_flags(), {self.sid: 0, descendant: 1})
+            self.assertEqual([row['status'] for row in receipt['results']], ['archived', 'awaiting_native_archive'])
+            self.assertEqual([call.args[0]['session'] for call in deliver.call_args_list], [self.operator_sid] * 2)
+            self.assertEqual([call.kwargs['dry_run'] for call in deliver.call_args_list], [True, False])
+            self.assertEqual(self.close(*direct)[1]['operator_message_id'], receipt['operator_message_id'])
+            self.assertEqual(deliver.call_count, 2)
+            self.assertEqual(len(self.archive_flags()), 2)
+
+        self.server.restart()
+        route, = self.server.call('routes', project='p')
+        self.assertEqual(route['closing_native_scope'], codex_archive.native_handoff_digest(self.db, (descendant,)))
+        self.assertEqual(json.loads((Path(self.server.state_dir) / 'routes.json').read_text())['version'], 3)
+        mid = receipt['operator_message_id']
+        new_child = self.add_descendant()
+        self.assertIn('unarchived descendant', self.operator(mid, self.operator_sid)[1]['error'])
+        self.assertEqual(self.server.call('show', id=mid)['state'], 'submitted')
+        self.remove_descendant(new_child)
+        with mock.patch.object(codex_archive.wt, 'open_files', return_value=[]):
+            self.assertEqual(self.operator(mid, self.operator_sid)[0], 0)
+        self.rollout.rename(self.archive)
+        self.record_archive(self.archive)
+        finish = ('--finish', receipt['close_id'], '--expect-session', self.sid)
+        cascaded_child = self.add_descendant()
+        self.saved_archive('thread/archive', {'threadId': cascaded_child})
+        code, refused = self.close(*finish)
+        self.assertEqual(code, 1)
+        self.assertIn('subtree or saved profile changed', refused['error'])
+        route, = self.server.call('routes', project='p')
+        self.assertEqual(route['closing'], receipt['close_id'])
+        self.remove_descendant(cascaded_child)
+        code, done = self.close(*finish)
+        self.assertEqual((code, done['route_removed'], done['operator_receipt']), (0, True, 'done'))
+
+    def test_native_operator_preflight_refusal_leaves_root_and_descendants_untouched(self):
+        self.enroll(prefer_native=True)
+        descendant = self.add_descendant()
+        error = codex_live.OwnerUnavailable(codex_live.OwnerUnavailable.NO_OWNER)
+        with mock.patch.object(codex_archive, 'executable', return_value=self.executable), \
+                mock.patch.object(codex_preview, 'state_path', return_value=self.db), \
+                mock.patch.object(codex_archive.wt, 'open_files', return_value=[]), \
+                mock.patch.object(sessions, 'CodexClient') as client, \
+                mock.patch.object(codex_live, 'deliver', side_effect=error) as deliver:
+            archive = client.return_value.__enter__.return_value.call
+            archive.side_effect = self.saved_archive
+            code, refused = self.close('--archive', '--state-dir', self.server.state_dir)
+            self.assertEqual(code, 1)
+            self.assertIn('Enrolled Codex close operator is unavailable', refused['error'])
+            self.assertTrue(deliver.call_args.kwargs['dry_run'])
+            self.assertEqual(self.archive_flags(), {self.sid: 0, descendant: 0})
+            archive.assert_not_called()
+            route, = self.server.call('routes', project='p')
+            self.assertNotIn('closing', route)
+            self.assertEqual(self.server.call('ping')['messages'], 0)
+
+            code, confirmed = self.close('--archive', '--keep-route', '--state-dir', self.server.state_dir)
+            self.assertEqual((code, confirmed['archived'], confirmed['route_removed']), (0, True, False))
+            self.assertEqual(self.archive_flags(), {self.sid: 1, descendant: 1})
+            self.assertEqual([call.args[1]['threadId'] for call in archive.call_args_list], [descendant, self.sid])
+            deliver.assert_called_once()
+
+    def test_native_admissibility_refuses_unfinished_correspondence_before_leaf_archive(self):
+        self.enroll(prefer_native=True)
+        descendant = self.add_descendant()
+        self.server.call('register', project='p', name='peer', cwd=str(self.cwd))
+        pending = self.server.call('send', project='p', sender='peer', recipient='target', body='work', key='fixture')
+        with mock.patch.object(codex_archive, 'executable', return_value=self.executable), \
+                mock.patch.object(codex_preview, 'state_path', return_value=self.db), \
+                mock.patch.object(codex_archive.wt, 'open_files', return_value=[]), \
+                mock.patch.object(sessions, 'CodexClient') as client, \
+                mock.patch.object(codex_live, 'deliver') as deliver:
+            code, refused = self.close('--archive', '--state-dir', self.server.state_dir)
+        self.assertEqual(code, 1)
+        self.assertIn('unfinished correspondence', refused['error'])
+        self.assertEqual(self.archive_flags(), {self.sid: 0, descendant: 0})
+        self.assertEqual(self.server.call('show', id=pending['id'])['state'], 'pending')
+        client.assert_not_called()
+        deliver.assert_not_called()
+
+    def test_existing_operator_config_keeps_default_direct_archive(self):
+        self.enroll()
+        self.assertEqual(self.server.call('close-operator-status'), {'operator': None})
+        with mock.patch.object(codex_archive, 'executable', return_value=self.executable), \
+                mock.patch.object(codex_preview, 'state_path', return_value=self.db), \
+                mock.patch.object(codex_archive.wt, 'open_files', return_value=[]), \
+                mock.patch.object(sessions, 'CodexClient') as client, \
+                mock.patch.object(codex_live, 'deliver') as deliver:
+            archive = client.return_value.__enter__.return_value.call
+            archive.side_effect = self.saved_archive
+            code, result = self.close('--archive', '--state-dir', self.server.state_dir)
+            self.assertEqual((code, result['route_removed'], result['archived']), (0, True, True))
+            archive.assert_called_once_with('thread/archive', {'threadId': self.sid})
+            deliver.assert_not_called()
 
     def test_plain_close_detaches_without_scheduling_enrolled_operator(self):
         self.enroll()

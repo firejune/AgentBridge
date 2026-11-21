@@ -8,7 +8,7 @@ import sys
 import uuid
 
 import codex_preview
-from codex_live import DeliveryError, ThreadArchived
+from codex_live import DeliveryError, ThreadArchived, close_notice
 
 APP = Path('/Applications/ChatGPT.app')
 CLI_BUNDLE = APP / 'Contents/Resources/codex-cli/CodexCLI.app'
@@ -100,7 +100,7 @@ def check_route(route):
         raise ValueError('no unique local Desktop queue owner')
 
 
-def deliver(route, thread, message_id, timeout, dry_run):
+def deliver(route, thread, message_id, timeout, dry_run, *, close_handoff=False):
     try:
         mid = str(uuid.UUID(message_id))
         if mid != message_id or str(uuid.UUID(route['session'])) != thread:
@@ -114,7 +114,9 @@ def deliver(route, thread, message_id, timeout, dry_run):
                    delivery_path=DELIVERY_PATH, input_role='notification')
     if dry_run:
         return dict(sent=False, **receipt)
-    return dict(queued_id=enqueue(thread, notice(mid), timeout), **receipt)
+    notification = (close_notice(mid, 'python3 ~/.agents/skills/agent-bridge/scripts/bridge.py close-operator ' + mid)
+                    if close_handoff else notice(mid))
+    return dict(queued_id=enqueue(thread, notification, timeout), **receipt)
 
 
 def enqueue(thread, message, timeout):

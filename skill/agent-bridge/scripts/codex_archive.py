@@ -168,6 +168,14 @@ def desktop_helpers(rows):
     return helpers
 
 
+def process_cwds(own=None, *, exempt_desktop=False):
+    rows = wt.open_files(skip=(os.getpid(),), cwd_only=True)
+    if own is None:
+        own = desktop_helpers(rows) if exempt_desktop else set()
+    own = frozenset(own)
+    return own, {absolute_path(cwd) for pid, _, cwd in rows if pid not in own}
+
+
 class Protections:
     def __init__(self, directory, prefix=None, close_route=None, own=None):
         snapshot = route_store.read_snapshot(directory / 'routes.json')
@@ -181,15 +189,11 @@ class Protections:
         for route in endpoints + [channel['route'] for channel in channels if channel['active']]:
             if route['transport'] == 'codex' and route != close_route:
                 self.protected.add(route['session'])
-        rows = wt.open_files(skip=(os.getpid(),), cwd_only=True)
         # An explicit close names the thread, so the helpers Desktop itself runs in that
         # thread's folder do not make it "in use" (issue #175). The sweep exempts nothing.
         # They are identified once, before the archive client starts: that client opens the
         # queue store too, and Desktop is then no longer its only owner. Later checks reuse the set.
-        if own is None:
-            own = desktop_helpers(rows) if close_route is not None else set()
-        self.own = frozenset(own)
-        self.holders = {absolute_path(cwd) for pid, _, cwd in rows if pid not in self.own}
+        self.own, self.holders = process_cwds(own, exempt_desktop=close_route is not None)
         self.cutoff = None if close_route is not None else time.time() - MIN_AGE
         self.prefix = prefix
 
@@ -340,6 +344,53 @@ def readback(path, before, sid):
     return after, affected
 
 
+def native_handoff_digest(path, descendants):
+    return digest({'store': str(path), 'descendants': sorted(descendants)})
+
+
+def native_handoff_snapshot(route):
+    """Check the saved Desktop subtree before delegating a root-only native archive."""
+    try:
+        path = sweep_store()
+        snapshot = Snapshot(path)
+        root = route['session']
+        row = snapshot.rows[root]
+        if absolute_path(row['cwd']) != absolute_path(route['cwd']):
+            raise ValueError('workspace mismatch')
+        descendants = snapshot.descendants(root)
+        if not descendants <= snapshot.rows.keys():
+            raise ValueError('descendant missing')
+    except NATIVE_ERRORS + (KeyError,):
+        raise ValueError('Codex native close subtree could not be verified') from None
+    if any(not snapshot.rows[sid]['archived'] for sid in descendants):
+        raise ValueError('Codex native close has an unarchived descendant')
+    return snapshot, descendants, native_handoff_digest(path, descendants)
+
+
+def native_handoff_scope(route):
+    _, descendants, scope = native_handoff_snapshot(route)
+    return descendants, scope
+
+
+def check_native_operator_processes(route, expected_scope):
+    """Recheck process CWDs in the claiming CLI, outside the broker's serialized mutations."""
+    try:
+        _, holders = process_cwds(exempt_desktop=True)
+    except NATIVE_ERRORS:
+        raise ValueError('Codex native close could not verify process working directories. Closing route kept.') from None
+    try:
+        snapshot, descendants, scope = native_handoff_snapshot(route)
+        if scope != expected_scope:
+            raise ValueError('Codex native close subtree or saved profile changed')
+        workspaces = {absolute_path(snapshot.rows[sid]['cwd']) for sid in descendants | {route['session']}}
+        if any(holder.is_relative_to(cwd) for holder in holders for cwd in workspaces):
+            raise ValueError('A running process uses the Codex native close workspace')
+    except ValueError as error:
+        raise ValueError(f'{error}. Closing route kept.') from None
+    except OSError:
+        raise ValueError('Codex native close workspaces could not be verified. Closing route kept.') from None
+
+
 def restore_unlisted(binary, path, timeout, after, late):
     restored, errors = [], []
     while late:
@@ -368,7 +419,7 @@ def restore_unlisted(binary, path, timeout, after, late):
     return after, restored, errors, None
 
 
-def archive_group(binary, path, directory, prefix, item, timeout, close_route=None, own=None):
+def archive_group(binary, path, directory, prefix, item, timeout, close_route=None, own=None, *, defer_native_root=False):
     root = item['id']
     expected = {row['id']: row for row in [item, *item['members']]}
     subtrees = {sid: set(row['descendants']) for sid, row in expected.items()}
@@ -399,7 +450,7 @@ def archive_group(binary, path, directory, prefix, item, timeout, close_route=No
             if not close_route and not root_reason(before, before.rows[root]):
                 check.update(status='refused', blocked=root, reason='existing_cwd_without_archived_parent')
                 return None
-            if before.rows[sid]['archived']:
+            if before.rows[sid]['archived'] and (sid != root or not defer_native_root):
                 check.update(status='already_archived', archived_at=before.rows[sid]['archived_at'])
                 return None
             if any(not before.rows[key]['archived'] for key in subtrees[sid]):
@@ -413,6 +464,14 @@ def archive_group(binary, path, directory, prefix, item, timeout, close_route=No
             continue
         receipt = {'id': sid}
         try:
+            if sid == root and defer_native_root:
+                # Keep the same final review without starting a saved app-server for the root.
+                # A saved archive can succeed while leaving Desktop's active list stale.
+                before = before_call()
+                if before is not None:
+                    check['status'] = 'awaiting_native_archive'
+                receipts.append({**receipt, **check})
+                return receipts, False
             before, error = invoke(binary, timeout, 'thread/archive', sid, before_call)
             if before is None:
                 receipts.append({**receipt, **check})
@@ -476,7 +535,7 @@ def apply(path, directory, prefix, manifest, timeout):
             'complete': all(row['status'] in ('archived', 'already_archived') for row in receipts)}
 
 
-def close(route, directory, timeout):
+def close(route, directory, timeout, *, prefer_native=None):
     route = route_store.endpoint_record(route)
     binary = executable()
     path = codex_preview.state_path(binary).resolve()
@@ -490,12 +549,21 @@ def close(route, directory, timeout):
     if item['refusals']:
         results, stopped = [{'id': sid, 'status': 'refused', 'refusals': item['refusals']}], False
     else:
-        results, stopped = archive_group(binary, path, directory, None, item, timeout, route, guard.own)
+        defer_native_root = prefer_native is not None and prefer_native()
+        if defer_native_root and path != sweep_store():
+            raise ValueError('The enrolled close operator requires the saved Desktop profile')
+        results, stopped = archive_group(binary, path, directory, None, item, timeout, route, guard.own,
+                                         defer_native_root=defer_native_root)
     final = next((result for result in results if result['id'] == sid), {})
     archived = final.get('archived') is True or final.get('status') == 'already_archived'
     incomplete = any(result['status'] not in ('archived', 'already_archived') for result in results)
-    return {'closed': archived, 'method': 'archive', 'archived': archived,
+    result = {'closed': archived, 'method': 'archive', 'archived': archived,
             'session': sid, 'host': 'codex', 'archived_at': final.get('archived_at', row['archived_at']),
             'resumable': True, 'note': 'Native Codex archive checked by saved-state readback.',
             'results': results, 'stopped': stopped, 'archive_incomplete': incomplete,
             'count': sum(result.get('archived') is True for result in results)}
+    if final.get('status') == 'awaiting_native_archive':
+        result.update(status='awaiting_native_archive',
+                      native_scope=native_handoff_digest(path, item['descendants']),
+                      note='The enrolled Codex Desktop operator archives the root.')
+    return result
