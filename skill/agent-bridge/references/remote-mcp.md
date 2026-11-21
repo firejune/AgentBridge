@@ -275,7 +275,7 @@ This widens reading, acknowledging, replying to and being notified about mail on
 those routes only. It grants no session creation, no workspace and no send to
 other routes; `bridge_message_send` refuses an `ar_` ID. A reply goes out as the
 adopted route the mail arrived on. Absent or `{}` keeps the earlier behaviour
-exactly. Each prefix matches `[a-z][a-z0-9_-]{0,31}`; a project may list at most
+exactly. Each prefix matches `[a-z][a-z0-9_-]{0,31}` and may not overlap the facade's own `mcp-` names (`mcp-…`, or a shorter prefix of it such as `m`); a project may list at most
 8 prefixes, the map may name at most 8 projects, and an unknown project is
 refused at start. With the field set, each inbox call reads the broker's routes
 once per configured project; if the broker is unreachable the call returns

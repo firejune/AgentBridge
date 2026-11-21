@@ -164,6 +164,9 @@ def inbox_route_prefixes(config):
         if (not isinstance(names, list) or not names or len(names) > MAX_ADOPTED_PREFIXES
                 or any(not isinstance(n, str) or not re.fullmatch(r'[a-z][a-z0-9_-]{0,31}', n) for n in names)):
             raise ValueError('inbox_route_prefixes needs 1 to 8 lowercase prefixes per project')
+        if any(n.startswith('mcp-') or 'mcp-'.startswith(n) for n in names):
+            # The facade's own sender routes are named mcp-…; a prefix must not reach them.
+            raise ValueError('inbox_route_prefixes must not overlap the reserved mcp- names')
         result[project] = tuple(names)
     return result
 

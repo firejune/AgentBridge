@@ -775,10 +775,12 @@ class AdoptedRouteInboxTests(unittest.TestCase):
 
     def test_owned_sender_wins_over_a_matching_prefix(self):
         baseline = self.engine.inbox_routes(self.engine.principal)
-        self.adopt({'test-project': ['mcp-']})  # Every owned sender also matches.
-        self.assertEqual(self.engine.inbox_routes(self.engine.principal), baseline)
-        self.assertEqual(self.call('bridge_inbox_list',
-            agent_session_id=self.slot(self.owned[0]['sender']))['error']['code'], 'NOT_FOUND')
+        # Validation refuses a prefix that reaches the facade's own mcp- names, so this second
+        # guard is only reachable past it: every owned sender matches, and none is adopted twice.
+        with patch.object(phase, 'inbox_route_prefixes', return_value={'test-project': ('mcp-',)}):
+            self.assertEqual(self.engine.inbox_routes(self.engine.principal), baseline)
+            self.assertEqual(self.call('bridge_inbox_list',
+                agent_session_id=self.slot(self.owned[0]['sender']))['error']['code'], 'NOT_FOUND')
 
     def test_combined_capacity_is_bounded(self):
         self.adopt()
@@ -836,7 +838,9 @@ class AdoptedRouteInboxTests(unittest.TestCase):
                     {'test-project': ['Nana-']}, {'test-project': ['-nana']}, {'test-project': ['nana x']},
                     {'test-project': ['n' * 33]}, {'test-project': 'nana-'}, {'test-project': [7]},
                     {'test-project': ['p%d' % i for i in range(9)]}, ['nana-'],
-                    {'p%d' % i: ['nana-'] for i in range(9)}):
+                    {'p%d' % i: ['nana-'] for i in range(9)},
+                    {'test-project': ['mcp-']}, {'test-project': ['mcp-a']}, {'test-project': ['m']},
+                    {'test-project': ['mc']}, {'test-project': ['nana-', 'mcp']}):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     load(bad)
