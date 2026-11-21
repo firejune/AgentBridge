@@ -23,6 +23,12 @@ def run(*argv):
 
 
 class BuildSkewTests(unittest.TestCase):
+    def setUp(self):
+        # `ping` reads Codex delivery health on macOS; keep this machine's Codex state out of the test.
+        health = patch.object(bridge, 'codex_delivery_health', return_value={'path': 'ipc', 'reason': None})
+        health.start()
+        self.addCleanup(health.stop)
+
     def test_build_names_the_source_and_moves_with_any_module(self):
         with tempfile.TemporaryDirectory() as root:
             for name, text in (('a.py', 'A'), ('b.py', 'B'), ('notes.txt', 'ignored')):

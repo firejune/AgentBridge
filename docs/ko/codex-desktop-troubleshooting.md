@@ -2,6 +2,8 @@
 
 `submitted`와 `delivery_path: "codex-desktop-queue"`가 보이면 Desktop 큐가 알림을 접수한 상태다. 등록된 정확한 수신 대화에서 턴 시작, 본문 조회 성공, 요청한 결과 출력을 각각 확인한다. 대화가 로드되지 않았거나 중단된 상태라면 알림이 큐에 남을 수 있다. 전달이 모호하면 재전송하지 않고 기존 메시지 상태와 수신 대화의 기록을 확인한다. [큐 전달 문제 #156](https://github.com/firejune/AgentBridge/issues/156)
 
+「보냈는데 아무 일도 없다」면 `show ID`로 상태를 먼저 본다. 수신 대화가 `receive-codex`로 본문을 가져가면 메시지는 `received`가 되고 `read_by_recipient`가 `true`로 나온다. `submitted`에 머물고 `read_by_recipient`가 `false`이면 큐는 알림을 접수했지만 그 대화에서 조회가 성공하지 않은 것이다. 대화가 로드되지 않았거나, 턴이 시작되지 않았거나, 조회가 승인 대기·연결 거부에 걸린 경우다(아래 절). `received`인데 결과가 없으면 본문을 읽은 뒤 작업이 멈춘 것이다. 보내기 전에는 `ping`의 `codex_delivery`로 큐 경로가 쓸 수 있는 상태인지 확인할 수 있다. [상태 구분 #153](https://github.com/firejune/AgentBridge/issues/153)
+
 ## 생성 시 지정한 권한과 실제 큐 턴이 다를 때
 
 `thread/start` 응답은 생성 프로세스에 적용된 권한을 보여 준다. Desktop은 큐로 스레드를 깨울 때 rollout에 저장된 설정을 읽는다. 저장된 권한이 빠진 경우 Codex Desktop `26.1117.31558`(빌드 `29513`)의 한 검증에서 생성 응답은 `:workspace / on-request`였지만 실제 큐 턴은 `:read-only / on-request`로 실행됐다.
