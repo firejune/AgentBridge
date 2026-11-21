@@ -262,12 +262,176 @@ def owner_settings(client, sid, owner):
     return settings
 
 
+class _Attempt:
+    """How far one open has got; the failure result is read from here."""
+
+    def __init__(self):
+        self.stage, self.sid, self.adopted, self.attempted = 'preflight', None, False, False
+
+
+def create_thread(attempt, result, creator, folder, title, model, queue_wake, remaining,
+                  *, queue_wake_workspace_write=False):
+    """Start one persistent thread and require what the creator itself reports; returns its UUID."""
+    import sessions
+    params = {'cwd': str(folder), 'ephemeral': False, 'allowProviderModelFallback': False,
+              'permissions': FULL_ACCESS_PROFILE, 'approvalPolicy': 'never', 'model': model}
+    attempt.stage, attempt.attempted = 'create', True
+    creator.timeout = remaining()
+    created = creator.call('thread/start', params)
+    thread = created.get('thread')
+    if not isinstance(thread, dict):
+        raise CreationError('Codex thread/start returned no thread')
+    attempt.sid = sid = str(uuid.UUID(thread['id']))
+    result.update(created=True, url=adoption_url(sid))
+    result['session']['id'] = sid
+    require_thread(thread, sid, folder)
+    result['session'] = sessions.codex_row(thread, 'saved')
+    result['creator_settings'] = permission_diagnostics(created, 'sandbox')
+    if created.get('model') != model:
+        raise CreationError('Codex creator substituted the requested --model')
+    if not has_full_access(created, 'sandbox'):
+        raise CreationError('Codex creator did not confirm Full Access with approvalPolicy never')
+    if title is not None:
+        attempt.stage = 'title'
+        creator.timeout = remaining()
+        creator.call('thread/name/set', {'threadId': sid, 'name': title})
+    if thread.get('historyMode') == 'paginated' and (title is None or queue_wake):
+        attempt.stage = 'persistence'
+        creator.timeout = remaining()
+        # Reading history materializes a loaded paginated thread. Some
+        # app-server builds then fail to list turns on a fresh rollout.
+        try:
+            creator.call('thread/read', {'threadId': sid, 'includeTurns': True})
+        except sessions.CodexRpcError as error:
+            if (error.code, error.message) != (-32601, 'list_turns is not supported yet'):
+                raise
+    if queue_wake:
+        # Desktop queue turns inherit settings saved in the rollout. The
+        # creator's loaded settings alone are insufficient (issue #172).
+        # Update after materialization so the settings can be persisted.
+        profile, approval = ((WORKSPACE_PROFILE, 'on-request') if queue_wake_workspace_write
+                             else (FULL_ACCESS_PROFILE, 'never'))
+        attempt.stage = 'settings'
+        creator.timeout = remaining()
+        creator.call('thread/settings/update', {
+            'threadId': sid, 'permissions': profile, 'approvalPolicy': approval})
+    return sid
+
+
+def adopt_by_wake(attempt, result, wake, sid, folder, model, timeout, *, queue_wake_workspace_write=False):
+    """Wake the exact thread through the Desktop queue and record what that one turn showed."""
+    route = {'session': sid, 'cwd': str(folder), 'transport': 'codex'}
+    confirmed = codex_wake_open.adopt(wake, route, model, timeout)
+    attempt.stage = 'model'
+    if confirmed.get('model') != model:
+        raise CreationError('Codex Desktop wake did not confirm the requested model')
+    attempt.stage = 'permissions'
+    raw_permissions = confirmed.get('permission_settings')
+    if not isinstance(raw_permissions, dict) or ('activePermissionProfile' not in raw_permissions
+            or (raw_permissions['activePermissionProfile'] is not None
+                and not isinstance(raw_permissions['activePermissionProfile'], dict))):
+        raise CreationError('Codex Desktop wake returned malformed permission settings')
+    permissions = permission_diagnostics(raw_permissions)
+    result.update(permission_settings=permissions,
+                  permission_settings_source='Desktop wake turn context')
+    profile = raw_permissions['activePermissionProfile']
+    sandbox = raw_permissions.get('sandboxPolicy')
+    workspace_write = (profile == {'id': WORKSPACE_PROFILE}
+                       and permissions['approvalPolicy'] == 'on-request'
+                       and sandbox == {'type': 'workspaceWrite', 'networkAccess': False}
+                       and sandbox['networkAccess'] is False)
+    if workspace_write:
+        permissions['sandboxPolicy']['networkAccess'] = False
+    if queue_wake_workspace_write:
+        if not workspace_write:
+            raise CreationError('Codex Desktop wake did not confirm the owner policy requirements '
+                                '(:workspace, workspaceWrite with networkAccess false, on-request)')
+    elif not has_full_access(permissions):
+        if permissions['approvalPolicy'] != 'on-request':
+            raise CreationError('Codex Desktop wake returned unconfirmed permission settings')
+        if profile == {'id': ':read-only'} and sandbox == {'type': 'readOnly'}:
+            sandbox_name = 'read-only'
+        elif workspace_write:
+            sandbox_name = 'workspace-write'
+        else:
+            raise CreationError('Codex Desktop wake returned unconfirmed permission settings')
+        result['warning'] = {
+            'code': 'CODEX_DESKTOP_WAKE_RESTRICTED',
+            'message': f'The Desktop wake turn ran with {sandbox_name} sandbox, no network access and '
+                       'on-request approval, not the Full Access the bridge requested. '
+                       'Later turns are not verified.',
+        }
+    attempt.stage = 'adoption'
+    turn_id = confirmed.get('turn_id')
+    if not isinstance(turn_id, str) or str(uuid.UUID(turn_id)) != turn_id:
+        raise CreationError('Codex Desktop wake did not confirm the exact turn ID')
+    attempt.adopted = True
+    result.update(adopted=True, wake_turn_id=turn_id)
+
+
+def adopt_by_owner(attempt, result, client, sid, model, deadline, poll):
+    """Read the exact Desktop owner over IPC and bring a new thread's settings to what was requested."""
+    owner = client.owner(sid)
+    attempt.adopted = True
+    result.update(adopted=True, owner=owner, adoption_mode='desktop-ipc')
+    attempt.stage = 'model'
+    settings = owner_settings(client, sid, owner)
+    attempt.stage = 'permissions'
+    permissions = permission_settings(client, sid, owner)
+    result.update(permission_settings=permissions,
+                  permission_settings_source='Desktop owner latestThreadSettings')
+    updates = {}
+    if not has_full_access(permissions):
+        updates.update(permissions=FULL_ACCESS_PROFILE, approvalPolicy='never')
+    if settings['model'] != model:
+        updates['model'] = model
+    if updates:
+        # Only a thread created by this call can reach this mutation.
+        if 'model' in updates:
+            attempt.stage = 'model'
+        response = client.call('thread-follower-update-thread-settings',
+            {'conversationId': sid, 'threadSettings': updates}, 2, owner, mutation=True)
+        applied = response.get('result')
+        applied = applied.get('applied') if isinstance(applied, dict) else None
+        response_type = response.get('resultType')
+        result['settings_update'] = {
+            'applied': applied if isinstance(applied, bool) else None,
+            'resultType': response_type if response_type in ('success', 'error') else '<unrecognized>'}
+        # Read effective permissions even when the ack refuses the update.
+        result['permission_settings'] = permissions = permission_settings(client, sid, owner)
+        if response_type != 'success' or applied is not True:
+            raise CreationError('Exact Codex Desktop owner did not confirm new-thread settings update')
+        settings = owner_settings(client, sid, owner)
+    if settings['model'] != model:
+        attempt.stage = 'model'
+        raise CreationError('Exact Codex Desktop owner substituted the requested --model')
+    attempt.stage = 'permissions'
+    if 'permissions' in updates:
+        result['permission_settings'] = permissions = settled_permissions(
+            client, sid, owner, permissions, deadline, poll)
+    if not has_full_access(permissions):
+        mismatches = []
+        if (permissions['activePermissionProfile'] or {}).get('id') != FULL_ACCESS_PROFILE:
+            mismatches.append('activePermissionProfile.id: found '
+                              + str((permissions['activePermissionProfile'] or {}).get('id'))
+                              + ', required ' + FULL_ACCESS_PROFILE)
+        if permissions['approvalPolicy'] != 'never':
+            mismatches.append('approvalPolicy: found ' + str(permissions['approvalPolicy'])
+                              + ', required never')
+        if permissions['sandboxPolicy'] != {'type': 'dangerFullAccess'}:
+            mismatches.append('sandboxPolicy.type: found '
+                              + str((permissions['sandboxPolicy'] or {}).get('type'))
+                              + ', required dangerFullAccess')
+        raise CreationError('Exact Codex Desktop owner did not confirm Full Access with approvalPolicy never'
+                            + ' (mismatched fields: ' + '; '.join(mismatches) + ')')
+
+
 def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_factory=None,
                owner_factory=None, poll=0.5, policy=None, force_new=False, *,
                allow_queue_wake=False, queue_wake_workspace_write=False):
     import sessions
     result = open_result()
-    sid, adopted, attempted, stage = None, False, False, 'preflight'
+    attempt = _Attempt()
     try:
         if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not 0 < timeout <= 3600:
             raise CreationError('Timeout must be between 0 and 3600 seconds')
@@ -300,9 +464,8 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
             return min(left, limit)
 
         def validate_creator(creator):
-            nonlocal stage
             if title is not None and not force_new:
-                stage = 'duplicate'
+                attempt.stage = 'duplicate'
                 matches = matching_threads(creator, folder, title, remaining)
                 if matches:
                     result['existing_sessions'] = matches
@@ -311,7 +474,7 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                         result['url'] = adoption_url(matches[0]['id'])
                     raise CreationError(f'Saved Codex thread(s) already match title {title!r} and --cwd; '
                                         'inspect their exact IDs or pass --new intentionally')
-            stage = 'preflight'
+            attempt.stage = 'preflight'
             require_full_access_profile(creator, folder, remaining)
             require_model(creator, model, remaining, missing)
 
@@ -335,103 +498,18 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                     factory = partial(sessions.CodexClient, executable=str(codex_queue.CLI))
                 creator = scope.enter_context(factory(mode='saved', timeout=remaining(), experimental=True))
                 validate_creator(creator)
-            params = {'cwd': str(folder), 'ephemeral': False, 'allowProviderModelFallback': False,
-                      'permissions': FULL_ACCESS_PROFILE, 'approvalPolicy': 'never', 'model': model}
-            stage, attempted = 'create', True
-            creator.timeout = remaining()
-            created = creator.call('thread/start', params)
-            thread = created.get('thread')
-            if not isinstance(thread, dict):
-                raise CreationError('Codex thread/start returned no thread')
-            sid = str(uuid.UUID(thread['id']))
-            result.update(created=True, url=adoption_url(sid))
-            result['session']['id'] = sid
-            require_thread(thread, sid, folder)
-            result['session'] = sessions.codex_row(thread, 'saved')
-            result['creator_settings'] = permission_diagnostics(created, 'sandbox')
-            if created.get('model') != model:
-                raise CreationError('Codex creator substituted the requested --model')
-            if not has_full_access(created, 'sandbox'):
-                raise CreationError('Codex creator did not confirm Full Access with approvalPolicy never')
-            if title is not None:
-                stage = 'title'
-                creator.timeout = remaining()
-                creator.call('thread/name/set', {'threadId': sid, 'name': title})
-            if thread.get('historyMode') == 'paginated' and (title is None or wake is not None):
-                stage = 'persistence'
-                creator.timeout = remaining()
-                # Reading history materializes a loaded paginated thread. Some
-                # app-server builds then fail to list turns on a fresh rollout.
-                try:
-                    creator.call('thread/read', {'threadId': sid, 'includeTurns': True})
-                except sessions.CodexRpcError as error:
-                    if (error.code, error.message) != (-32601, 'list_turns is not supported yet'):
-                        raise
-            if wake is not None:
-                # Desktop queue turns inherit settings saved in the rollout. The
-                # creator's loaded settings alone are insufficient (issue #172).
-                # Update after materialization so the settings can be persisted.
-                profile, approval = ((WORKSPACE_PROFILE, 'on-request') if queue_wake_workspace_write
-                                     else (FULL_ACCESS_PROFILE, 'never'))
-                stage = 'settings'
-                creator.timeout = remaining()
-                creator.call('thread/settings/update', {
-                    'threadId': sid, 'permissions': profile, 'approvalPolicy': approval})
+            sid = create_thread(attempt, result, creator, folder, title, model, wake is not None, remaining,
+                                queue_wake_workspace_write=queue_wake_workspace_write)
         # Close the creator before proving persistence and exact Desktop adoption.
-        stage = 'persistence'
+        attempt.stage = 'persistence'
         with factory(mode='saved', timeout=remaining()) as reader:
             stored = require_thread(reader.call('thread/read', {'threadId': sid, 'includeTurns': False}).get('thread'),
                                     sid, folder, title)
             result['session'] = sessions.codex_row(stored, 'saved')
-        stage = 'adoption'
+        attempt.stage = 'adoption'
         if wake is not None:
-            route = {'session': sid, 'cwd': str(folder), 'transport': 'codex'}
-            confirmed = codex_wake_open.adopt(wake, route, model, remaining(timeout))
-            stage = 'model'
-            if confirmed.get('model') != model:
-                raise CreationError('Codex Desktop wake did not confirm the requested model')
-            stage = 'permissions'
-            raw_permissions = confirmed.get('permission_settings')
-            if not isinstance(raw_permissions, dict) or ('activePermissionProfile' not in raw_permissions
-                    or (raw_permissions['activePermissionProfile'] is not None
-                        and not isinstance(raw_permissions['activePermissionProfile'], dict))):
-                raise CreationError('Codex Desktop wake returned malformed permission settings')
-            permissions = permission_diagnostics(raw_permissions)
-            result.update(permission_settings=permissions,
-                          permission_settings_source='Desktop wake turn context')
-            profile = raw_permissions['activePermissionProfile']
-            sandbox = raw_permissions.get('sandboxPolicy')
-            workspace_write = (profile == {'id': WORKSPACE_PROFILE}
-                               and permissions['approvalPolicy'] == 'on-request'
-                               and sandbox == {'type': 'workspaceWrite', 'networkAccess': False}
-                               and sandbox['networkAccess'] is False)
-            if workspace_write:
-                permissions['sandboxPolicy']['networkAccess'] = False
-            if queue_wake_workspace_write:
-                if not workspace_write:
-                    raise CreationError('Codex Desktop wake did not confirm the owner policy requirements '
-                                        '(:workspace, workspaceWrite with networkAccess false, on-request)')
-            elif not has_full_access(permissions):
-                if permissions['approvalPolicy'] != 'on-request':
-                    raise CreationError('Codex Desktop wake returned unconfirmed permission settings')
-                if profile == {'id': ':read-only'} and sandbox == {'type': 'readOnly'}:
-                    sandbox_name = 'read-only'
-                elif workspace_write:
-                    sandbox_name = 'workspace-write'
-                else:
-                    raise CreationError('Codex Desktop wake returned unconfirmed permission settings')
-                result['warning'] = {
-                    'code': 'CODEX_DESKTOP_WAKE_RESTRICTED',
-                    'message': f'The Desktop wake turn ran with {sandbox_name} sandbox, no network access and '
-                               'on-request approval, not the Full Access the bridge requested. '
-                               'Later turns are not verified.',
-                }
-            stage = 'adoption'
-            turn_id = confirmed.get('turn_id')
-            if not isinstance(turn_id, str) or str(uuid.UUID(turn_id)) != turn_id:
-                raise CreationError('Codex Desktop wake did not confirm the exact turn ID')
-            adopted = True
-            result.update(adopted=True, wake_turn_id=turn_id)
+            adopt_by_wake(attempt, result, wake, sid, folder, model, remaining(timeout),
+                          queue_wake_workspace_write=queue_wake_workspace_write)
         elif opener is None:
             open_link(result['url'], remaining())
         else:
@@ -441,67 +519,15 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
             try:
                 client = owners(timeout=min(remaining(), 2))
                 with client:
-                    owner = client.owner(sid)
-                    adopted = True
-                    result.update(adopted=True, owner=owner, adoption_mode='desktop-ipc')
-                    stage = 'model'
-                    settings = owner_settings(client, sid, owner)
-                    stage = 'permissions'
-                    permissions = permission_settings(client, sid, owner)
-                    result.update(permission_settings=permissions,
-                                  permission_settings_source='Desktop owner latestThreadSettings')
-                    updates = {}
-                    if not has_full_access(permissions):
-                        updates.update(permissions=FULL_ACCESS_PROFILE, approvalPolicy='never')
-                    if settings['model'] != model:
-                        updates['model'] = model
-                    if updates:
-                        # Only a thread created by this call can reach this mutation.
-                        if 'model' in updates:
-                            stage = 'model'
-                        response = client.call('thread-follower-update-thread-settings',
-                            {'conversationId': sid, 'threadSettings': updates}, 2, owner, mutation=True)
-                        applied = response.get('result')
-                        applied = applied.get('applied') if isinstance(applied, dict) else None
-                        response_type = response.get('resultType')
-                        result['settings_update'] = {
-                            'applied': applied if isinstance(applied, bool) else None,
-                            'resultType': response_type if response_type in ('success', 'error') else '<unrecognized>'}
-                        # Read effective permissions even when the ack refuses the update.
-                        result['permission_settings'] = permissions = permission_settings(client, sid, owner)
-                        if response_type != 'success' or applied is not True:
-                            raise CreationError('Exact Codex Desktop owner did not confirm new-thread settings update')
-                        settings = owner_settings(client, sid, owner)
-                    if settings['model'] != model:
-                        stage = 'model'
-                        raise CreationError('Exact Codex Desktop owner substituted the requested --model')
-                    stage = 'permissions'
-                    if 'permissions' in updates:
-                        result['permission_settings'] = permissions = settled_permissions(
-                            client, sid, owner, permissions, deadline, poll)
-                    if not has_full_access(permissions):
-                        mismatches = []
-                        if (permissions['activePermissionProfile'] or {}).get('id') != FULL_ACCESS_PROFILE:
-                            mismatches.append('activePermissionProfile.id: found '
-                                              + str((permissions['activePermissionProfile'] or {}).get('id'))
-                                              + ', required ' + FULL_ACCESS_PROFILE)
-                        if permissions['approvalPolicy'] != 'never':
-                            mismatches.append('approvalPolicy: found ' + str(permissions['approvalPolicy'])
-                                              + ', required never')
-                        if permissions['sandboxPolicy'] != {'type': 'dangerFullAccess'}:
-                            mismatches.append('sandboxPolicy.type: found '
-                                              + str((permissions['sandboxPolicy'] or {}).get('type'))
-                                              + ', required dangerFullAccess')
-                        raise CreationError('Exact Codex Desktop owner did not confirm Full Access with approvalPolicy never'
-                                            + ' (mismatched fields: ' + '; '.join(mismatches) + ')')
+                    adopt_by_owner(attempt, result, client, sid, model, deadline, poll)
                     break
             except codex_live.EndpointUnavailable:
                 raise
             except (codex_live.DeliveryError, OSError):
-                if adopted:
+                if attempt.adopted:
                     raise  # Never replay a possibly sent settings mutation.
                 time.sleep(min(poll, max(0, deadline-time.monotonic())))
-        stage = 'verification'
+        attempt.stage = 'verification'
         with factory(mode='saved', timeout=remaining()) as reader:
             stored = require_thread(reader.call('thread/read', {'threadId': sid, 'includeTurns': False}).get('thread'),
                                     sid, folder, title)
@@ -516,7 +542,7 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
             message = str(error)
         else:
             message = 'Codex creation/adoption failed; do not create another thread automatically'
-        failure = CreationError(message, attempted, sid, adopted, stage, result=result)
+        failure = CreationError(message, attempt.attempted, attempt.sid, attempt.adopted, attempt.stage, result=result)
         failure.cancelled = isinstance(error, KeyboardInterrupt)
         raise failure from None
 

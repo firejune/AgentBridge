@@ -86,7 +86,6 @@ def receive_codex(args):
         raise ValueError(invalid) from None
 
     unmatched = 'No correspondence matches this Codex thread and message ID.'
-    unavailable = 'The addressed correspondence is not available to receive.'
     bad_response = 'Agent Bridge broker did not return a usable message response.'
     try:
         message = broker.request(args.socket, {'op': 'show', 'id': args.id})
@@ -109,12 +108,20 @@ def receive_codex(args):
     route = message['route']
     if message.get('id') != args.id or route.get('transport') != 'codex' or route.get('session') != thread_id:
         raise ValueError(unmatched)
-    if (message.get('state') not in ('dispatching', 'submitted', 'uncertain', 'received', 'in_progress')
-            or message.get('reason') == ARCHIVED_REASON
-            or message.get('body_expired') or 'close_request' in message
-            or not isinstance(message.get('body'), str)):
-        raise ValueError(unavailable)
-    if not isinstance(message.get('sender'), str):
+    if 'close_request' in message:
+        raise ValueError('The addressed message is a close handoff; claim it with close-operator.')
+    if message.get('reason') == ARCHIVED_REASON:
+        raise ValueError('The addressed correspondence failed because this thread is archived.')
+    if message.get('body_expired'):
+        raise ValueError('The addressed correspondence body has expired; only its record remains.')
+    state = message.get('state')
+    if state == 'pending':
+        raise ValueError('The addressed correspondence has not been dispatched yet.')
+    if state in broker.TERMINAL_STATES:
+        raise ValueError(f'The addressed correspondence is already {state}; nothing is left to receive.')
+    if state not in ('dispatching', 'submitted', 'uncertain', 'received', 'in_progress'):
+        raise ValueError(bad_response)  # Not a state this CLI knows; never echo it.
+    if not isinstance(message.get('body'), str) or not isinstance(message.get('sender'), str):
         raise ValueError(bad_response)
     try:
         # The same text direct delivery hands the thread: envelope, body and reply contract.
@@ -314,6 +321,7 @@ def open_codex_result(args):
     result = codex_new.open_result()
     source, cancelled = None, False
     default_title = None
+    step = 'input'
     try:
         if args.cmd == 'open':
             if (args.register is None) != (args.project is None):
@@ -327,9 +335,12 @@ def open_codex_result(args):
                     broker.identifier(value)
                 except ValueError:
                     raise codex_new.CreationError(f'Codex route {label} must be a lowercase identifier') from None
+        step = 'policy'
         source = new_session_policy(args, 'codex')
+        step = 'routes'
         if name is not None:
             require_free_registration_name(args.socket, args.project, name)
+        step = 'open'
         title = args.title
         if title is None and name:
             title = default_title = f'{args.project}/{name}'
@@ -353,8 +364,12 @@ def open_codex_result(args):
     except CodexDesktopWakePolicyError as error:
         result['error'] = str(error)  # Fixed text, with no policy path or contents.
     except (ValueError, OSError, subprocess.TimeoutExpired, KeyError, TypeError):
-        # Policy files and transport exceptions can contain local paths or secrets.
-        result['error'] = 'Codex open preflight failed; check provider, host and model policy'
+        # Policy files and transport exceptions can contain local paths or secrets: name the step, not the text.
+        result['error'] = {
+            'policy': 'Codex open stopped: the model policy could not be read; '
+                      'check policy.json in the broker state directory',
+            'routes': 'Codex open stopped: the broker did not return usable routes for this project',
+        }.get(step, 'Codex open preflight failed; check provider, host and model policy')
     if source is not None:
         result['model_source'] = source
     name = args.register if args.cmd == 'open' else args.name
@@ -490,8 +505,12 @@ def close_participant(args):
         raise ValueError('Timeout must be between 0 and 600 seconds')
     address = {'name': args.name, 'project': args.project}
     if args.finish:
-        if not args.expect_session or args.keep_route or args.handoff:
-            raise ValueError('--finish requires --expect-session and removes the verified route')
+        if not args.expect_session:
+            raise ValueError('--finish requires --expect-session')
+        if args.keep_route:
+            raise ValueError('--finish removes the verified route and cannot be combined with --keep-route')
+        if args.handoff:
+            raise ValueError('--finish completes a prepared handoff and cannot be combined with --handoff')
         if args.retro_file or args.no_retro:
             raise ValueError('Record the retrospective when preparing the archive handoff')
         closed = broker.request(args.socket, {'op': 'close-finish', **address,
@@ -504,15 +523,17 @@ def close_participant(args):
         result.update({key: closed[key] for key in ('route_removed', 'correspondence_cleanup',
                        'cleanup_error', 'route_error', 'operator_receipt', 'operator_error') if key in closed})
         return result
-    route = next((r for r in broker.request(args.socket,{'op':'routes','project':args.project})
-                  if r['name'] == args.name), None)
-    if route is None:
-        raise ValueError(f'No participant {args.name!r} is registered in project {args.project!r}')
+    route = registered_route(args)
     if args.expect_session and str(uuid.UUID(args.expect_session)) != route['session']:
         raise ValueError('Endpoint does not match --expect-session')
     archive = args.archive
-    if args.handoff and (not archive or args.keep_route or route['transport'] != 'codex'):
-        raise ValueError('--handoff requires a Codex route and --archive and removes the verified route')
+    if args.handoff:
+        if not archive:
+            raise ValueError('--handoff requires --archive')
+        if args.keep_route:
+            raise ValueError('--handoff removes the verified route and cannot be combined with --keep-route')
+        if route['transport'] != 'codex':
+            raise ValueError('--handoff requires a Codex route')
     if 'closing' in route and not args.handoff:
         raise ValueError('Codex route is closing; finish the native archive handoff')
     if archive and 'closing' not in route:
@@ -629,13 +650,8 @@ def with_models(rows, policy, timeout, key='session'):
     return rows
 
 
-def main(argv=None):
-    argv = sys.argv[1:] if argv is None else argv
-    if argv[:1] == ['wt']:  # Own parser, so `wt --help` and leading options reach it.
-        return wt.main(argv[1:],prog='bridge.py wt')
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--socket',default=str(broker.DEFAULT_SOCKET))
-    sub = parser.add_subparsers(dest='cmd',required=True)
+def add_broker_commands(sub):
+    """The broker itself: serve, its retention and usage reads, ping, stop and the launchd service."""
     p = sub.add_parser('serve',help='Run the local broker in the foreground')
     p.add_argument('--max-messages',type=int,default=2048,help='Active-message cap; TTL mode refuses admission when no safely expired body exists')
     retention_mode = p.add_mutually_exclusive_group()
@@ -662,9 +678,12 @@ def main(argv=None):
     p.add_argument('--state-dir')
     p.add_argument('--max-messages',type=int,default=2048)
     p = sub.add_parser('session-usage', help='Read one local session record; starts no turn')
-    p.add_argument('name', nargs='?'); p.add_argument('--project')
-    p.add_argument('--provider', choices=['codex', 'claude', 'agy']); p.add_argument('--id')
-    p.add_argument('--prices', metavar='FILE'); p.add_argument('--json', action='store_true')
+    p.add_argument('name', nargs='?')
+    p.add_argument('--project')
+    p.add_argument('--provider', choices=['codex', 'claude', 'agy'])
+    p.add_argument('--id')
+    p.add_argument('--prices', metavar='FILE')
+    p.add_argument('--json', action='store_true')
     p = sub.add_parser('usage',help='Recorded subscription limits; reads the history file, starts nothing')
     p.add_argument('--provider',choices=['all', *usage.PROVIDERS],default='all')
     p.add_argument('--state-dir',help='Broker state directory (default: socket path with .state suffix)')
@@ -673,7 +692,8 @@ def main(argv=None):
     p.add_argument('--events',action='store_true',help='Reset events, early-reset intervals, the next-reset estimate and the spend/stop-risk horizons')
     p.add_argument('--refresh',action='store_true',help='Force a fresh Antigravity quota read before querying')
     p.add_argument('--seed-announcements',metavar='FILE',help='Merge promo-reset announcements (JSONL: at with UTC offset, note) into the state dir, then exit')
-    sub.add_parser('ping'); sub.add_parser('stop')
+    sub.add_parser('ping')
+    sub.add_parser('stop')
     for cmd in ('install-service','uninstall-service'):
         p = sub.add_parser(cmd,help='Opt-in per-user launchd service management')
         p.add_argument('--state-dir')
@@ -684,13 +704,21 @@ def main(argv=None):
             mode = p.add_mutually_exclusive_group()
             mode.add_argument('--retention-prepare',action='store_true',help='Generate service arguments for non-deleting timestamp warm-up')
             mode.add_argument('--retention-ttl',action='store_true',help='Generate service arguments for opt-in TTL cleanup')
+
+
+def add_session_commands(sub):
+    """Routes and the sessions behind them: register, open, model, close."""
     p = sub.add_parser('register',help='Bind an unused project/name or retry its exact existing identity')
-    p.add_argument('name');p.add_argument('--project',required=True)
+    p.add_argument('name')
+    p.add_argument('--project',required=True)
     p.add_argument('--transport',choices=['realtime','codex','claude','claude-peer','agy'],default='realtime')
-    p.add_argument('--session');p.add_argument('--cwd');p.add_argument('--executable')
+    p.add_argument('--session')
+    p.add_argument('--cwd')
+    p.add_argument('--executable')
     p.add_argument('--discover',action='store_true')
     p.add_argument('--new',action='store_true',help='Open a new Antigravity, Claude Code, or Codex session and register it')
-    p.add_argument('--title');p.add_argument('--model', help=f'New-session model (Codex: flag > AGENT_BRIDGE_CODEX_MODEL > policy defaults.codex > {codex_new.DEFAULT_MODEL})')
+    p.add_argument('--title')
+    p.add_argument('--model', help=f'New-session model (Codex: flag > AGENT_BRIDGE_CODEX_MODEL > policy defaults.codex > {codex_new.DEFAULT_MODEL})')
     p.add_argument('--timeout',type=float,default=180,help='Seconds to wait for desktop session creation')
     p.add_argument('--host',choices=['desktop','ide'],default='desktop',help='Host for --new (claude-peer, agy): desktop app or IDE. Claude desktop needs Enter; Claude IDE, agy desktop and agy IDE do not')
     p.add_argument('--ide',choices=sorted(sessions.CLAUDE_IDES),help=f'IDE for --host ide (default {sessions.DEFAULT_IDE})')
@@ -698,7 +726,9 @@ def main(argv=None):
     p.add_argument('--state-dir',help='Broker state directory holding policy.json (default: socket path with .state suffix)')
     p = sub.add_parser('open',help='Open a new live session (Claude Code, Codex, Antigravity; desktop or IDE)')
     p.add_argument('--provider',choices=['agy','claude','codex'],default='agy')
-    p.add_argument('--cwd',required=True);p.add_argument('--title');p.add_argument('--model', help=f'New-session model (Codex: flag > AGENT_BRIDGE_CODEX_MODEL > policy defaults.codex > {codex_new.DEFAULT_MODEL})')
+    p.add_argument('--cwd',required=True)
+    p.add_argument('--title')
+    p.add_argument('--model', help=f'New-session model (Codex: flag > AGENT_BRIDGE_CODEX_MODEL > policy defaults.codex > {codex_new.DEFAULT_MODEL})')
     p.add_argument('--timeout',type=float,default=180)
     p.add_argument('--host',choices=['desktop','ide'],default='desktop',help='Host (claude, agy): desktop app or IDE. Claude desktop needs Enter; Claude IDE, agy desktop and agy IDE do not')
     p.add_argument('--ide',choices=sorted(sessions.CLAUDE_IDES),help=f'IDE for --host ide (default {sessions.DEFAULT_IDE})')
@@ -707,8 +737,11 @@ def main(argv=None):
     p.add_argument('--project', help='Project for --register')
     p.add_argument('--new', action='store_true', help='Codex: explicitly create despite a saved title/cwd match')
     p = sub.add_parser('model',help="Read a participant's model, or switch it with --set (provider-neutral)")
-    p.add_argument('name');p.add_argument('--project',required=True);p.add_argument('--set',dest='target')
-    p.add_argument('--timeout',type=float,default=30);p.add_argument('--state-dir')
+    p.add_argument('name')
+    p.add_argument('--project',required=True)
+    p.add_argument('--set',dest='target')
+    p.add_argument('--timeout',type=float,default=30)
+    p.add_argument('--state-dir')
     p = sub.add_parser('archive-sweep', help='Review or apply a guarded Codex archive manifest')
     p.add_argument('--cwd-prefix', help='Absolute workspace prefix, matched by path components')
     p.add_argument('--apply', action='store_true', help='Apply a reviewed manifest')
@@ -716,7 +749,8 @@ def main(argv=None):
     p.add_argument('--state-dir', help='Broker routing directory (defaults to the socket .state directory)')
     p.add_argument('--timeout', type=float, default=10, help='Seconds per Codex RPC')
     p = sub.add_parser('close',help="Close a participant's session without deleting it, then remove its route")
-    p.add_argument('name');p.add_argument('--project',required=True)
+    p.add_argument('name')
+    p.add_argument('--project',required=True)
     archive = p.add_mutually_exclusive_group()
     archive.add_argument('--archive',action='store_true',
                          help='Archive the session and clean its unprotected broker correspondence')
@@ -728,51 +762,81 @@ def main(argv=None):
     p.add_argument('--keep-route',action='store_true',help='Close the session but keep the route registered')
     p.add_argument('--timeout',type=float,default=10)
     g = p.add_mutually_exclusive_group()
-    g.add_argument('--retro-file');g.add_argument('--no-retro',metavar='REASON')
+    g.add_argument('--retro-file')
+    g.add_argument('--no-retro',metavar='REASON')
     p.add_argument('--card',default=None)
-    p.add_argument('--tower');p.add_argument('--urgency',choices=['stop','repeat','note'],default='note')
-    p.add_argument('--tags',default='');p.add_argument('--notify');p.add_argument('--store');p.add_argument('--state-dir')
+    p.add_argument('--tower')
+    p.add_argument('--urgency',choices=['stop','repeat','note'],default='note')
+    p.add_argument('--tags',default='')
+    p.add_argument('--notify')
+    p.add_argument('--store')
+    p.add_argument('--state-dir')
     p = sub.add_parser('close-operator', help='Claim an authorized Codex native archive handoff from its enrolled chat')
     p.add_argument('id', metavar='MESSAGE_ID')
+
+
+def add_record_commands(sub):
+    """Owner-private records: retrospectives, run receipts and verified handovers."""
     p = sub.add_parser('retro',help='Append and inspect project retrospectives')
     retro_sub = p.add_subparsers(dest='retro_cmd',required=True)
     for action in ('add','list','tally'):
         r = retro_sub.add_parser(action)
-        r.add_argument('--project',required=True);r.add_argument('--store');r.add_argument('--state-dir')
+        r.add_argument('--project',required=True)
+        r.add_argument('--store')
+        r.add_argument('--state-dir')
         r.add_argument('--json',action='store_true')
         if action == 'add':
             for field in ('card','runner','model','from-file','urgency','tags'):
                 r.add_argument('--'+field,required=True,**({'choices':['stop','repeat','note']} if field=='urgency' else {}))
-            r.add_argument('--tower');r.add_argument('--session',default=os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_CODE_SESSION_ID'))
+            r.add_argument('--tower')
+            r.add_argument('--session',default=os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_CODE_SESSION_ID'))
             r.add_argument('--notify')
         else:
             r.add_argument('--since')
             if action == 'list':
-                r.add_argument('--tag');r.add_argument('--urgency',choices=['stop','repeat','note'])
+                r.add_argument('--tag')
+                r.add_argument('--urgency',choices=['stop','repeat','note'])
     p = sub.add_parser('run',help='Capture a local command in an owner-private run receipt')
-    p.add_argument('--label',required=True);p.add_argument('--cwd');p.add_argument('--state-dir')
+    p.add_argument('--label',required=True)
+    p.add_argument('--cwd')
+    p.add_argument('--state-dir')
     p.add_argument('command',nargs=argparse.REMAINDER)
     p = sub.add_parser('handover',help='Verify receipt-backed rows before one peer message')
     p.add_argument('action',nargs='?',choices=['check'])
-    p.add_argument('--rows',required=True);p.add_argument('--head',required=True);p.add_argument('--state-dir')
-    p.add_argument('--project');p.add_argument('--from',dest='sender');p.add_argument('--to',dest='recipient')
-    p.add_argument('--card');p.add_argument('--note-file')
+    p.add_argument('--rows',required=True)
+    p.add_argument('--head',required=True)
+    p.add_argument('--state-dir')
+    p.add_argument('--project')
+    p.add_argument('--from',dest='sender')
+    p.add_argument('--to',dest='recipient')
+    p.add_argument('--card')
+    p.add_argument('--note-file')
+
+
+def add_lookup_commands(sub):
+    """Reads of sessions, policy, routes and channels, and the two channel writes."""
     p = sub.add_parser('wake',help="Bring an idle-closed claude-peer session back in its own host; prints woken, already-live, unsupported, failed or uncertain")
-    p.add_argument('name');p.add_argument('--project',required=True)
+    p.add_argument('name')
+    p.add_argument('--project',required=True)
     p.add_argument('--timeout',type=float,default=sessions.WAKE_TIMEOUT,help='Seconds to wait for the woken session inbox')
     p = sub.add_parser('title',help="Label a claude-peer route's session with PROJECT/NAME in the resume picker (works on dead sessions)")
-    p.add_argument('name');p.add_argument('--project',required=True)
+    p.add_argument('name')
+    p.add_argument('--project',required=True)
     p.add_argument('--force',action='store_true',help='Replace a title the session already has')
     p = sub.add_parser('policy',help='Show the model policy (defaults, denylist) the bridge enforces; read-only')
     p.add_argument('--state-dir')
     p = sub.add_parser('codex-model',help="Deprecated UUID alias for model NAME --set; changes next-turn settings")
-    p.add_argument('id',metavar='SESSION_ID');p.add_argument('--model',required=True)
+    p.add_argument('id',metavar='SESSION_ID')
+    p.add_argument('--model',required=True)
     p.add_argument('--timeout',type=float,default=10)
     p.add_argument('--state-dir')
     p = sub.add_parser('sessions',help='Discover real CLI sessions without starting a turn')
     p.add_argument('--provider',choices=['all','codex','claude','agy'],default='all')
-    p.add_argument('--cwd');p.add_argument('--search');p.add_argument('--limit',type=int,default=100)
-    p.add_argument('--codex-executable',default='codex');p.add_argument('--claude-executable',default='claude')
+    p.add_argument('--cwd')
+    p.add_argument('--search')
+    p.add_argument('--limit',type=int,default=100)
+    p.add_argument('--codex-executable',default='codex')
+    p.add_argument('--claude-executable',default='claude')
     p.add_argument('--codex-mode',choices=['auto','shared','saved'],default='auto')
     model_options = p.add_mutually_exclusive_group()
     model_options.add_argument('--with-model',action='store_true',help='Read the live model for each discovered session')
@@ -780,26 +844,41 @@ def main(argv=None):
     p.set_defaults(with_model=False)
     p.add_argument('--state-dir')
     p = sub.add_parser('session')
-    p.add_argument('provider',choices=['codex','claude','agy']);p.add_argument('id');p.add_argument('--executable')
+    p.add_argument('provider',choices=['codex','claude','agy'])
+    p.add_argument('id')
+    p.add_argument('--executable')
     p.add_argument('--codex-mode',choices=['auto','shared','saved'],default='auto')
     for cmd in ('routes','channels'):
-        p = sub.add_parser(cmd);p.add_argument('--project',required=True)
+        p = sub.add_parser(cmd)
+        p.add_argument('--project',required=True)
         if cmd == 'routes':
             p.add_argument('--no-model',action='store_true',help='Skip the live model reading')
             p.add_argument('--state-dir')
     p = sub.add_parser('channel-bind')
-    p.add_argument('name');p.add_argument('--project',required=True);p.add_argument('--owner',required=True)
-    p.add_argument('--description',required=True);p.add_argument('--expect-generation',type=int,default=0)
+    p.add_argument('name')
+    p.add_argument('--project',required=True)
+    p.add_argument('--owner',required=True)
+    p.add_argument('--description',required=True)
+    p.add_argument('--expect-generation',type=int,default=0)
     p = sub.add_parser('channel-close')
-    p.add_argument('name');p.add_argument('--project',required=True);p.add_argument('--expect-generation',type=int,required=True)
+    p.add_argument('name')
+    p.add_argument('--project',required=True)
+    p.add_argument('--expect-generation',type=int,required=True)
+
+
+def add_message_commands(sub):
+    """Correspondence: send, ask, reply, the reads and the delivery outcomes."""
     for cmd in ('send','ask'):
         p = sub.add_parser(cmd)
         p.add_argument('--project',required=True)
         g = p.add_mutually_exclusive_group(required=True)
-        g.add_argument('--from',dest='sender');g.add_argument('--from-channel',dest='sender_channel')
+        g.add_argument('--from',dest='sender')
+        g.add_argument('--from-channel',dest='sender_channel')
         g = p.add_mutually_exclusive_group(required=True)
-        g.add_argument('--to',dest='recipient');g.add_argument('--channel')
-        p.add_argument('--file',required=True);p.add_argument('--key',required=True)
+        g.add_argument('--to',dest='recipient')
+        g.add_argument('--channel')
+        p.add_argument('--file',required=True)
+        p.add_argument('--key',required=True)
         g = p.add_mutually_exclusive_group()
         if cmd == 'send':
             g.add_argument('--one-way',action='store_true',help='Explicitly no answer requested')
@@ -807,279 +886,421 @@ def main(argv=None):
         p.add_argument('--state-dir',help=USAGE_STATE_HELP)
         if cmd=='ask':
             p.add_argument('--timeout',type=float,default=60)
-    p = sub.add_parser('reply');p.add_argument('id');p.add_argument('--file',required=True);p.add_argument('--key',required=True)
+    p = sub.add_parser('reply')
+    p.add_argument('id')
+    p.add_argument('--file',required=True)
+    p.add_argument('--key',required=True)
     p.add_argument('--state-dir',help=USAGE_STATE_HELP)
     for cmd in ('watch','inbox'):
-        p = sub.add_parser(cmd);p.add_argument('name',nargs='?');p.add_argument('--project',required=True);p.add_argument('--channel')
+        p = sub.add_parser(cmd)
+        p.add_argument('name',nargs='?')
+        p.add_argument('--project',required=True)
+        p.add_argument('--channel')
         if cmd=='watch':
-            p.add_argument('--after',type=int);p.add_argument('--instance')
+            p.add_argument('--after',type=int)
+            p.add_argument('--instance')
         else:
-            p.add_argument('--session');p.add_argument('--all',action='store_true')
-    p = sub.add_parser('wait');p.add_argument('id');p.add_argument('--timeout',type=float,default=60)
+            p.add_argument('--session')
+            p.add_argument('--all',action='store_true')
+    p = sub.add_parser('wait')
+    p.add_argument('id')
+    p.add_argument('--timeout',type=float,default=60)
     for cmd in ('show','conversation','ack'):
-        p = sub.add_parser(cmd);p.add_argument('id')
+        p = sub.add_parser(cmd)
+        p.add_argument('id')
     p = sub.add_parser('receive-codex', help='Read one dispatched peer message from its addressed Codex thread')
     p.add_argument('id', metavar='MESSAGE_ID')
-    p = sub.add_parser('progress');p.add_argument('id');p.add_argument('--note',required=True)
-    p = sub.add_parser('deliver');p.add_argument('id');p.add_argument('--dry-run',action='store_true');p.add_argument('--timeout',type=float,default=180)
-    p = sub.add_parser('resolve');p.add_argument('id');p.add_argument('--state',choices=['pending','submitted','done'],required=True);p.add_argument('--note',required=True)
+    p = sub.add_parser('progress')
+    p.add_argument('id')
+    p.add_argument('--note',required=True)
+    p = sub.add_parser('deliver')
+    p.add_argument('id')
+    p.add_argument('--dry-run',action='store_true')
+    p.add_argument('--timeout',type=float,default=180)
+    p = sub.add_parser('resolve')
+    p.add_argument('id')
+    p.add_argument('--state',choices=['pending','submitted','done'],required=True)
+    p.add_argument('--note',required=True)
     p = sub.add_parser('wt',add_help=False,help='Agent worktrees: new, list, sweep, adopt (bridge.py wt --help)')
     p.add_argument('wt_args',nargs=argparse.REMAINDER)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--socket',default=str(broker.DEFAULT_SOCKET))
+    sub = parser.add_subparsers(dest='cmd',required=True)
+    add_broker_commands(sub)
+    add_session_commands(sub)
+    add_record_commands(sub)
+    add_lookup_commands(sub)
+    add_message_commands(sub)
+    return parser
+
+
+def run_command(args):
+    return receipts.run(broker_state_dir(args), args.label, args.cwd, args.command)
+
+
+def handover_command(args):
+    checked = receipts.check(broker_state_dir(args), args.rows, args.head)
+    if args.action == 'check':
+        output({'verified': True, 'head': args.head, 'rows': checked})
+        return 0
+    if not all(getattr(args, name) and getattr(args, name).strip()
+               for name in ('project', 'sender', 'recipient', 'card')):
+        raise ValueError('HANDOVER_UNVERIFIED: send requires --project, --from, --to and --card')
+    note = None
+    if args.note_file:
+        with Path(args.note_file).expanduser().open(encoding='utf-8', newline='') as source:
+            note = source.read()
+    body = receipts.message(args.card, args.head, checked, note)
+    # Identical verified content has one durable broker idempotency key. No retry on uncertainty.
+    key_data = json.dumps([args.project, args.sender, args.recipient, body], ensure_ascii=False).encode('utf-8')
+    sent = broker.request(args.socket, {'op': 'send', 'project': args.project,
+        'sender': args.sender, 'recipient': args.recipient, 'body': body,
+        'key': 'handover-' + hashlib.sha256(key_data).hexdigest()})
+    output(push_if_peer(args.socket, sent))
+    return 0
+
+
+def serve_command(args):
+    if args.max_messages<1:
+        raise ValueError('Message limit must be positive')
+    if args.usage_interval and args.usage_interval<usage.MIN_INTERVAL_MINUTES:
+        raise ValueError(f'Usage interval must be 0 (off) or at least {usage.MIN_INTERVAL_MINUTES} minutes')
+    asyncio.run(broker.serve(args.socket,args.max_messages,args.state_dir,
+                             args.usage_interval,args.codex_executable,args.claude_live,
+                             args.codex_failure_interval,
+                             tuple(int(value) for value in args.provider_retry_backoff.split(',')),
+                             args.provider_retry_cap,
+                             args.agy_failure_interval, args.retention_ttl, args.retention_prepare))
+    return 0
+
+
+def retention_command(args):
+    if args.live:
+        output(broker.request(args.socket, {'op': 'retention-plan'}))
+    else:
+        if not 1 <= args.max_messages <= 2048:
+            raise ValueError('TTL active-message limit must be 1..2048')
+        store = broker.message_store.MessageStore(broker_state_dir(args), args.max_messages)
+        output(store.retention_dry_run())
+    return 0
+
+
+def session_usage_command(args):
+    if args.name:
+        if not args.project or args.provider or args.id:
+            raise ValueError('Use NAME --project P or --provider PROVIDER --id ID')
+        route = registered_route(args)
+        provider = {'claude-peer': 'claude', 'claude': 'claude', 'codex': 'codex', 'agy': 'agy'}.get(route['transport'])
+        if provider is None:
+            raise ValueError('Registered transport has no session usage reader')
+        sid = route['session']
+    else:
+        if not args.provider or not args.id or args.project:
+            raise ValueError('Use NAME --project P or --provider PROVIDER --id ID')
+        provider, sid = args.provider, args.id
+    result = session_usage.query(provider, sid, args.prices)
+    if args.json:
+        output(result)
+    else:
+        print(session_usage.format_line(result), flush=True)
+    return 0
+
+
+def usage_command(args):
+    state_dir = args.state_dir or Path(args.socket).expanduser().absolute().with_suffix('.state')
+    if args.seed_announcements:
+        output(usage.seed_announcements(state_dir, args.seed_announcements))
+        return 0
+    if args.refresh and args.provider in ('all', 'agy'):
+        usage.refresh_agy(state_dir)
+    records, summary, moment = usage.query(state_dir, args.since, args.provider)
+    warning = usage.claude_caller_warning(summary, args.provider)
+    if warning and not args.json:
+        print(warning, flush=True)  # First, before any Claude bucket (#125).
+    extra = {} if warning is None else {'warning': warning}
+    if args.events:
+        if args.json:
+            output(dict(**extra, announcements=summary['announcements'],
+                        buckets=[{key: row[key] for key in ('limit_id','slot','resets_at','events','early_reset',
+                                                            'spend_horizon','spend_basis','stop_risk_horizon')}
+                                 for row in summary['buckets']]))
+        else:
+            print(usage.format_events(summary, summary['announcements']), flush=True)
+    elif args.json:
+        cutoff = moment-usage.parse_since(args.since)
+        payload = {k: v for k, v in summary.items() if k != 'summaries'}
+        output(dict(**extra, records=[r for r in records if usage.parse_time(r['observed_at'])>=cutoff],
+                    **payload))
+    else:
+        print(usage.format_summary(summary, moment), flush=True)
+    return 0
+
+
+def service_command(args):
+    fields = dict(socket=args.socket, state_dir=args.state_dir, plist=args.plist,
+                  generate_only=args.generate_only)
+    if args.cmd == 'install-service':
+        fields.update(max_messages=args.max_messages, retention_prepare=args.retention_prepare, retention_ttl=args.retention_ttl)
+    output((service.install if args.cmd == 'install-service' else service.uninstall)(**fields))
+    return 0
+
+
+def open_command(args):
+    if args.provider == 'codex':
+        return open_codex_result(args)
+    if args.register or args.project or args.new:
+        raise ValueError('--register, --project and --new on open apply only to --provider codex')
+    new_session_policy(args, args.provider)
+    result = sessions.open_session(args.provider,args.cwd,args.title,args.model,args.timeout,host=args.host,ide=args.ide)
+    output(result)
+    return 0
+
+
+def retro_output_command(args):
+    result = retro_command(args)
+    if args.json or args.retro_cmd == 'add':
+        output(result)
+    elif args.retro_cmd == 'tally':
+        for row in result:
+            print(f"{row['tag']}\t{row['count']}\t{row['first']}\t{row['last']}\t{', '.join(str(c) for c in row['cards'])}")
+    else:
+        for row in result:
+            print(f"{row['time']} {row['urgency']} {row['card']} {row['runner']} [{','.join(row['tags'])}]\n{row['text'] if row['text'] is not None else row['no_retro']}")
+    return 0
+
+
+def archive_sweep_command(args):
+    if args.apply != (args.manifest is not None):
+        raise ValueError('--apply and --manifest FILE must be supplied together')
+    if not 0 < args.timeout <= 600:
+        raise ValueError('Timeout must be between 0 and 600 seconds')
+    path = codex_archive.sweep_store()
+    directory = broker_state_dir(args).expanduser().resolve()
+    prefix = codex_archive.absolute_path(args.cwd_prefix) if args.cwd_prefix is not None else None
+    if not args.apply:
+        output(codex_archive.plan(path, directory, prefix))
+        return 0
+    with args.manifest.expanduser().open(encoding='utf-8') as source:
+        manifest = json.load(source)
+    result = codex_archive.apply(path, directory, prefix, manifest, args.timeout)
+    output(result)
+    return int(not result['complete'])
+
+
+def close_command(args):
+    result = close_participant(args)
+    output(result)
+    return int(bool(result.get('cleanup_error') or result.get('operator_error') or result.get('archive_incomplete')))
+
+
+def close_operator_command(args):
+    caller = os.environ.get('CODEX_THREAD_ID')
+    if not caller:
+        raise ValueError('Run close-operator from the enrolled Codex Desktop chat')
+    request = broker.request(args.socket, {'op':'close-operator', 'id':str(uuid.UUID(args.id)),
+                              'operator_session':str(uuid.UUID(caller))})
+    target = request['target']
+    output({key: target[key] for key in ('project', 'name', 'session', 'cwd')}
+           | {'close_id': request['close_id']})
+    return 0
+
+
+def receive_codex_command(args):
+    output(receive_codex(args))
+    return 0
+
+
+def wake_command(args):
+    result = wake_participant(args)
+    output(result)
+    return 0 if result['state'] in ('woken','already-live') else 1
+
+
+def title_command(args):
+    route = registered_route(args)
+    if route['transport'] != 'claude-peer':
+        raise models.Unsupported(f"{route['transport']}: titles are set at creation; only claude-peer routes are labelled")
+    found = label_claude(route, force=args.force)
+    output({'name':args.name,'project':args.project,'session':route['session'],**found})
+    return 0 if found['state'] != 'skipped' else 1
+
+
+def policy_command(args):
+    output(models.load_policy(broker_state_dir(args)))
+    return 0
+
+
+def model_command(args):
+    if not 0 < args.timeout <= 3600:
+        raise ValueError('Timeout must be between 0 and 3600 seconds')
+    policy = models.load_policy(broker_state_dir(args))
+    route = registered_route(args)
+    if args.target is None:
+        output({'name':args.name,**models.flag(policy, models.read(route, min(args.timeout, 30)))})
+        return 0
+    output({'name':args.name,**models.switch(route, args.target, policy, args.timeout, ModelRelay(args.socket))})
+    return 0
+
+
+def codex_model_command(args):
+    policy = models.load_policy(broker_state_dir(args))
+    route = {'transport':'codex','session':args.id}
+    output(models.switch(route, args.model, policy, args.timeout))
+    return 0
+
+
+def sessions_command(args):
+    result = sessions.discover(args.provider,args.cwd,args.search,args.limit,args.codex_executable,args.claude_executable,args.codex_mode)
+    if args.with_model:
+        policy = models.load_policy(broker_state_dir(args))
+        for name in ('codex','agy','claude'):
+            if name in result['providers']:
+                with_models(result['providers'][name]['sessions'], policy, 10)
+    output(result)
+    return 1 if result['errors'] else 0
+
+
+def session_command(args):
+    output(sessions.inspect_session(args.provider,args.id,args.executable,args.codex_mode))
+    return 0
+
+
+REQUEST_OPS = {'stop': 'shutdown', 'ask': 'send'}
+NOT_REQUEST_FIELDS = ('cmd', 'socket', 'file', 'discover', 'new', 'title', 'model', 'codex_mode', 'state_dir', 'no_model')
+
+
+def request_fields(args):
+    """The broker request a plain command sends: its own options under its operation name."""
+    fields = {key: value for key, value in vars(args).items()
+              if key not in NOT_REQUEST_FIELDS and not (key == 'timeout' and args.cmd == 'register')}
+    fields['op'] = REQUEST_OPS.get(args.cmd, args.cmd)
+    return fields
+
+
+def message_fields(args):
+    """request_fields for send, ask and reply, with the body read from --file."""
+    fields = request_fields(args)
+    if args.cmd in ('send', 'ask') and (fields.get('one_way') or fields.get('reply_deadline_seconds') is not None):
+        # A distinct operation is rejected before mutation by older brokers,
+        # including when the broker restarts between separate CLI calls.
+        fields['op'] = 'send-with-retention'
+    fields['body'] = sys.stdin.read() if args.file == '-' else Path(args.file).read_text(encoding='utf-8')
+    return fields
+
+
+def require_wait_timeout(args):
+    if not 0 < args.timeout <= 3600:
+        raise ValueError('Timeout must be between 0 and 3600 seconds')
+
+
+def request_command(args):
+    output(broker.request(args.socket, request_fields(args)))
+    return 0
+
+
+def ping_command(args):
+    result = broker.request(args.socket, request_fields(args))
+    result['cli_build'] = broker.build_id()
+    warning = build_skew(args.socket, result)
+    if warning is not None:
+        result['warning'] = warning
+    output(result)
+    return 0
+
+
+def routes_command(args):
+    result = broker.request(args.socket, request_fields(args))
+    if not args.no_model:
+        with_models(result, models.load_policy(broker_state_dir(args)), 5)
+    output(result)
+    return 0
+
+
+def register_command(args):
+    if args.transport == 'codex' and args.new:
+        return open_codex_result(args)
+    if args.new and args.transport in ('agy', 'claude-peer'):
+        validate_new_registration(args)
+        require_free_registration_name(args.socket, args.project, args.name)
+        new_session_policy(args, 'claude' if args.transport == 'claude-peer' else args.transport)
+    observation = registration(args)  # Fills args.session and args.cwd before the request is built.
+    result = broker.request(args.socket, request_fields(args))
+    if observation:
+        result['discovery'] = observation
+    if args.transport == 'claude-peer' and result.get('session'):
+        result['title'] = label_claude(result)
+    output(result)
+    return 0
+
+
+def deliver_command(args):
+    result = deliver(args.socket, args.id, args.timeout, args.dry_run)
+    output(result)
+    return int(result['state'] in ('failed', 'uncertain') or result.get('reason') == ARCHIVED_REASON)
+
+
+def watch_command(args):
+    for event in broker.stream(args.socket, request_fields(args)):
+        output(event)
+    return 0
+
+
+def send_command(args):
+    output(with_usage(args, push_if_peer(args.socket, broker.request(args.socket, message_fields(args)))))
+    return 0
+
+
+def wait_result(args, fields):
+    result = broker.request(args.socket, fields, timeout=args.timeout + 5)
+    output(result)
+    return 2 if result['timed_out'] else 0
+
+
+def ask_command(args):
+    fields = message_fields(args)
+    require_wait_timeout(args)
+    sent = push_if_peer(args.socket, broker.request(args.socket, fields))
+    found = message_usage(args, sent)
+    output({'type': 'sent', 'message': sent} | ({} if found is None else {'usage': found}))
+    return wait_result(args, {'op': 'wait', 'id': sent['id'], 'timeout': args.timeout})
+
+
+def wait_command(args):
+    require_wait_timeout(args)
+    return wait_result(args, request_fields(args))
+
+
+COMMANDS = {
+    'run': run_command, 'handover': handover_command, 'serve': serve_command,
+    'retention': retention_command, 'session-usage': session_usage_command, 'usage': usage_command,
+    'install-service': service_command, 'uninstall-service': service_command,
+    'open': open_command, 'register': register_command,
+    'retro': retro_output_command, 'archive-sweep': archive_sweep_command, 'close': close_command, 'close-operator': close_operator_command,
+    'receive-codex': receive_codex_command, 'wake': wake_command, 'title': title_command,
+    'policy': policy_command, 'model': model_command, 'codex-model': codex_model_command,
+    'sessions': sessions_command, 'session': session_command,
+    'deliver': deliver_command, 'watch': watch_command,
+    'send': send_command, 'reply': send_command, 'ask': ask_command, 'wait': wait_command,
+    'ping': ping_command, 'routes': routes_command,
+    # Plain requests: the parsed options are the broker operation.
+    **{name: request_command for name in ('stop', 'channels', 'channel-bind', 'channel-close', 'inbox',
+                                          'show', 'conversation', 'ack', 'progress', 'resolve')},
+}
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ['wt']:  # Own parser, so `wt --help` and leading options reach it.
+        return wt.main(argv[1:],prog='bridge.py wt')
+    parser = build_parser()
     args = parser.parse_args(argv)
     if args.cmd=='wt':
         return wt.main(args.wt_args,prog='bridge.py wt')
-    observation = None
-    creation_model_source = None
     try:
-        if args.cmd == 'run':
-            return receipts.run(broker_state_dir(args), args.label, args.cwd, args.command)
-        if args.cmd == 'handover':
-            checked = receipts.check(broker_state_dir(args), args.rows, args.head)
-            if args.action == 'check':
-                output({'verified': True, 'head': args.head, 'rows': checked})
-                return 0
-            if not all(getattr(args, name) and getattr(args, name).strip()
-                       for name in ('project', 'sender', 'recipient', 'card')):
-                raise ValueError('HANDOVER_UNVERIFIED: send requires --project, --from, --to and --card')
-            note = None
-            if args.note_file:
-                with Path(args.note_file).expanduser().open(encoding='utf-8', newline='') as source:
-                    note = source.read()
-            body = receipts.message(args.card, args.head, checked, note)
-            # Identical verified content has one durable broker idempotency key. No retry on uncertainty.
-            key_data = json.dumps([args.project, args.sender, args.recipient, body], ensure_ascii=False).encode('utf-8')
-            sent = broker.request(args.socket, {'op': 'send', 'project': args.project,
-                'sender': args.sender, 'recipient': args.recipient, 'body': body,
-                'key': 'handover-' + hashlib.sha256(key_data).hexdigest()})
-            output(push_if_peer(args.socket, sent))
-            return 0
-        if ((args.cmd == 'open' and args.provider == 'codex') or
-                (args.cmd == 'register' and args.transport == 'codex' and args.new)):
-            return open_codex_result(args)
-        if args.cmd == 'open' and (args.register or args.project or args.new):
-            raise ValueError('--register, --project and --new on open apply only to --provider codex')
-        if args.cmd=='serve':
-            if args.max_messages<1:
-                raise ValueError('Message limit must be positive')
-            if args.usage_interval and args.usage_interval<usage.MIN_INTERVAL_MINUTES:
-                raise ValueError(f'Usage interval must be 0 (off) or at least {usage.MIN_INTERVAL_MINUTES} minutes')
-            asyncio.run(broker.serve(args.socket,args.max_messages,args.state_dir,
-                                     args.usage_interval,args.codex_executable,args.claude_live,
-                                     args.codex_failure_interval,
-                                     tuple(int(value) for value in args.provider_retry_backoff.split(',')),
-                                     args.provider_retry_cap,
-                                     args.agy_failure_interval, args.retention_ttl, args.retention_prepare))
-            return 0
-        if args.cmd == 'retention':
-            if args.live:
-                output(broker.request(args.socket, {'op': 'retention-plan'}))
-            else:
-                if not 1 <= args.max_messages <= 2048:
-                    raise ValueError('TTL active-message limit must be 1..2048')
-                store = broker.message_store.MessageStore(broker_state_dir(args), args.max_messages)
-                output(store.retention_dry_run())
-            return 0
-        if args.cmd == 'session-usage':
-            if args.name:
-                if not args.project or args.provider or args.id:
-                    raise ValueError('Use NAME --project P or --provider PROVIDER --id ID')
-                route = registered_route(args)
-                provider = {'claude-peer': 'claude', 'claude': 'claude', 'codex': 'codex', 'agy': 'agy'}.get(route['transport'])
-                if provider is None:
-                    raise ValueError('Registered transport has no session usage reader')
-                sid = route['session']
-            else:
-                if not args.provider or not args.id or args.project:
-                    raise ValueError('Use NAME --project P or --provider PROVIDER --id ID')
-                provider, sid = args.provider, args.id
-            result = session_usage.query(provider, sid, args.prices)
-            if args.json:
-                output(result)
-            else:
-                print(session_usage.format_line(result), flush=True)
-            return 0
-        if args.cmd=='usage':
-            state_dir = args.state_dir or Path(args.socket).expanduser().absolute().with_suffix('.state')
-            if args.seed_announcements:
-                output(usage.seed_announcements(state_dir, args.seed_announcements))
-                return 0
-            if args.refresh and args.provider in ('all', 'agy'):
-                usage.refresh_agy(state_dir)
-            records, summary, moment = usage.query(state_dir, args.since, args.provider)
-            warning = usage.claude_caller_warning(summary, args.provider)
-            if warning and not args.json:
-                print(warning, flush=True)  # First, before any Claude bucket (#125).
-            extra = {} if warning is None else {'warning': warning}
-            if args.events:
-                if args.json:
-                    output(dict(**extra, announcements=summary['announcements'],
-                                buckets=[{key: row[key] for key in ('limit_id','slot','resets_at','events','early_reset',
-                                                                    'spend_horizon','spend_basis','stop_risk_horizon')}
-                                         for row in summary['buckets']]))
-                else:
-                    print(usage.format_events(summary, summary['announcements']), flush=True)
-            elif args.json:
-                cutoff = moment-usage.parse_since(args.since)
-                payload = {k: v for k, v in summary.items() if k != 'summaries'}
-                output(dict(**extra, records=[r for r in records if usage.parse_time(r['observed_at'])>=cutoff],
-                            **payload))
-            else:
-                print(usage.format_summary(summary, moment), flush=True)
-            return 0
-        if args.cmd in ('install-service','uninstall-service'):
-            fields = dict(socket=args.socket, state_dir=args.state_dir, plist=args.plist,
-                          generate_only=args.generate_only)
-            if args.cmd == 'install-service':
-                fields.update(max_messages=args.max_messages, retention_prepare=args.retention_prepare, retention_ttl=args.retention_ttl)
-            output((service.install if args.cmd == 'install-service' else service.uninstall)(**fields))
-            return 0
-        if args.cmd=='open':
-            source = new_session_policy(args, args.provider)
-            result = sessions.open_session(args.provider,args.cwd,args.title,args.model,args.timeout,host=args.host,ide=args.ide)
-            if args.provider == 'codex':
-                result['model_source'] = source
-            output(result)
-            return 0
-        if args.cmd=='retro':
-            result = retro_command(args)
-            if args.json or args.retro_cmd == 'add':
-                output(result)
-            elif args.retro_cmd == 'tally':
-                for row in result:
-                    print(f"{row['tag']}\t{row['count']}\t{row['first']}\t{row['last']}\t{', '.join(str(c) for c in row['cards'])}")
-            else:
-                for row in result:
-                    print(f"{row['time']} {row['urgency']} {row['card']} {row['runner']} [{','.join(row['tags'])}]\n{row['text'] if row['text'] is not None else row['no_retro']}")
-            return 0
-        if args.cmd == 'archive-sweep':
-            if args.apply != (args.manifest is not None):
-                raise ValueError('--apply and --manifest FILE must be supplied together')
-            if not 0 < args.timeout <= 600:
-                raise ValueError('Timeout must be between 0 and 600 seconds')
-            path = codex_archive.sweep_store()
-            directory = broker_state_dir(args).expanduser().resolve()
-            prefix = codex_archive.absolute_path(args.cwd_prefix) if args.cwd_prefix is not None else None
-            if not args.apply:
-                output(codex_archive.plan(path, directory, prefix))
-                return 0
-            with args.manifest.expanduser().open(encoding='utf-8') as source:
-                manifest = json.load(source)
-            result = codex_archive.apply(path, directory, prefix, manifest, args.timeout)
-            output(result)
-            return int(not result['complete'])
-        if args.cmd=='close':
-            result = close_participant(args)
-            output(result)
-            return int(bool(result.get('cleanup_error') or result.get('operator_error') or result.get('archive_incomplete')))
-        if args.cmd=='close-operator':
-            caller = os.environ.get('CODEX_THREAD_ID')
-            if not caller:
-                raise ValueError('Run close-operator from the enrolled Codex Desktop chat')
-            request = broker.request(args.socket, {'op':'close-operator', 'id':str(uuid.UUID(args.id)),
-                                      'operator_session':str(uuid.UUID(caller))})
-            target = request['target']
-            output({key: target[key] for key in ('project', 'name', 'session', 'cwd')}
-                   | {'close_id': request['close_id']})
-            return 0
-        if args.cmd=='receive-codex':
-            output(receive_codex(args))
-            return 0
-        if args.cmd=='wake':
-            result = wake_participant(args)
-            output(result)
-            return 0 if result['state'] in ('woken','already-live') else 1
-        if args.cmd=='title':
-            route = next((r for r in broker.request(args.socket,{'op':'routes','project':args.project})
-                          if r['name'] == args.name), None)
-            if route is None:
-                raise ValueError(f'No participant {args.name!r} is registered in project {args.project!r}')
-            if route['transport'] != 'claude-peer':
-                raise models.Unsupported(f"{route['transport']}: titles are set at creation; only claude-peer routes are labelled")
-            found = label_claude(route, force=args.force)
-            output({'name':args.name,'project':args.project,'session':route['session'],**found})
-            return 0 if found['state'] != 'skipped' else 1
-        if args.cmd=='policy':
-            output(models.load_policy(broker_state_dir(args)))
-            return 0
-        if args.cmd=='model':
-            if not 0 < args.timeout <= 3600:
-                raise ValueError('Timeout must be between 0 and 3600 seconds')
-            policy = models.load_policy(broker_state_dir(args))
-            route = next((r for r in broker.request(args.socket,{'op':'routes','project':args.project})
-                          if r['name'] == args.name), None)
-            if route is None:
-                raise ValueError(f'No participant {args.name!r} is registered in project {args.project!r}')
-            if args.target is None:
-                output({'name':args.name,**models.flag(policy, models.read(route, min(args.timeout, 30)))})
-                return 0
-            output({'name':args.name,**models.switch(route, args.target, policy, args.timeout, ModelRelay(args.socket))})
-            return 0
-        if args.cmd=='codex-model':
-            policy = models.load_policy(broker_state_dir(args))
-            route = {'transport':'codex','session':args.id}
-            output(models.switch(route, args.model, policy, args.timeout))
-            return 0
-        if args.cmd=='sessions':
-            result = sessions.discover(args.provider,args.cwd,args.search,args.limit,args.codex_executable,args.claude_executable,args.codex_mode)
-            if args.with_model:
-                policy = models.load_policy(broker_state_dir(args))
-                for name in ('codex','agy','claude'):
-                    if name in result['providers']:
-                        with_models(result['providers'][name]['sessions'], policy, 10)
-            output(result)
-            return 1 if result['errors'] else 0
-        if args.cmd=='session':
-            output(sessions.inspect_session(args.provider,args.id,args.executable,args.codex_mode))
-            return 0
-        if args.cmd=='register' and args.new and args.transport in ('agy','codex','claude-peer'):
-            validate_new_registration(args)
-            require_free_registration_name(args.socket, args.project, args.name)
-            creation_model_source = new_session_policy(args, 'claude' if args.transport == 'claude-peer' else args.transport)
-        observation = registration(args) if args.cmd=='register' else None
-        if observation and creation_model_source is not None:
-            observation['model_source'] = creation_model_source
-        if args.cmd=='deliver':
-            result = deliver(args.socket,args.id,args.timeout,args.dry_run)
-            output(result)
-            return int(result['state'] in ('failed','uncertain') or result.get('reason') == ARCHIVED_REASON)
-        fields = {k:v for k,v in vars(args).items() if k not in ('cmd','socket','file','discover','new','title','model','codex_mode','state_dir','no_model') and not (k=='timeout' and args.cmd=='register')}
-        fields['op'] = {'stop':'shutdown','ask':'send'}.get(args.cmd,args.cmd)
-        if args.cmd in ('send','ask') and (fields.get('one_way') or fields.get('reply_deadline_seconds') is not None):
-            # A distinct operation is rejected before mutation by older brokers,
-            # including when the broker restarts between separate CLI calls.
-            fields['op'] = 'send-with-retention'
-        if args.cmd in ('send','ask','reply'):
-            fields['body'] = sys.stdin.read() if args.file=='-' else Path(args.file).read_text(encoding='utf-8')
-        if args.cmd in ('wait','ask') and not 0<args.timeout<=3600:
-            raise ValueError('Timeout must be between 0 and 3600 seconds')
-        if args.cmd=='watch':
-            for event in broker.stream(args.socket,fields):
-                output(event)
-            return 0
-        if args.cmd in ('send','reply'):
-            output(with_usage(args, push_if_peer(args.socket,broker.request(args.socket,fields))))
-            return 0
-        if args.cmd=='ask':
-            sent = push_if_peer(args.socket,broker.request(args.socket,fields))
-            found = message_usage(args, sent)
-            output({'type':'sent','message':sent} | ({} if found is None else {'usage': found}))
-            fields = {'op':'wait','id':sent['id'],'timeout':args.timeout}
-        result = broker.request(args.socket,fields,timeout=args.timeout+5 if args.cmd in ('ask','wait') else 10)
-        if args.cmd == 'ping':
-            result['cli_build'] = broker.build_id()
-            warning = build_skew(args.socket, result)
-            if warning is not None:
-                result['warning'] = warning
-        if args.cmd=='routes' and not args.no_model:
-            with_models(result, models.load_policy(broker_state_dir(args)), 5)
-        if observation:
-            result['discovery'] = observation
-        if args.cmd == 'register' and args.transport == 'claude-peer' and result.get('session'):
-            result['title'] = label_claude(result)
-            if args.cmd == 'register' and args.transport == 'codex' and args.new:
-                result['registered'] = True
-        output(result)
-        return 2 if args.cmd in ('ask','wait') and result['timed_out'] else 0
+        return COMMANDS[args.cmd](args)
     except KeyboardInterrupt:
         return 130
     except ClaudeDispatchUnknown as error:
@@ -1115,11 +1336,7 @@ def main(argv=None):
                 'created':error.created,'adopted':error.adopted,'registered':False,'stage':error.stage})
         return 130 if error.cancelled else 1
     except (ValueError,OSError,subprocess.TimeoutExpired,KeyError,TypeError) as error:
-        result = {'error':str(error)}
-        if observation and args.cmd == 'register' and args.transport == 'codex' and args.new:
-            result.update(created=True, adopted=observation.get('adopted',False), session=observation['session']['id'],
-                          registered=False, discovery=observation)
-        output(with_skew(args, result, error))
+        output(with_skew(args, {'error':str(error)}, error))
         return 1
 
 
