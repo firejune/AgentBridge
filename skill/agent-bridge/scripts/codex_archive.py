@@ -140,8 +140,36 @@ def preview_snapshot(path):
         return Snapshot(copy)
 
 
+DESKTOP_HELPER = codex_queue.APP / 'Contents/Resources/cua_node/bin/node_repl'
+
+
+def desktop_helpers(rows):
+    """PIDs among lsof rows that are Desktop's per-thread helpers: the bundled binary run by the queue owner.
+
+    Anything unverified is not exempt: no single Desktop owner, another parent, another binary.
+    """
+    candidates = sorted({pid for pid, command, _ in rows if command == DESKTOP_HELPER.name})
+    if not candidates:
+        return set()
+    read = codex_queue.checked_output
+    try:
+        owner = codex_queue.desktop_queue_owner(codex_queue.default_stores()[1], read)
+        if owner is None:
+            return set()
+        listing = read(['/bin/ps', '-ww', '-o', 'pid=,ppid=,uid=,command=', '-p', ','.join(map(str, candidates))])
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return set()
+    helpers = set()
+    for line in listing.splitlines():
+        fields = line.split(None, 3)
+        if (len(fields) == 4 and fields[1] == owner[0] and fields[2] == str(os.getuid())
+                and fields[3] == str(DESKTOP_HELPER)):
+            helpers.add(int(fields[0]))
+    return helpers
+
+
 class Protections:
-    def __init__(self, directory, prefix=None, close_route=None):
+    def __init__(self, directory, prefix=None, close_route=None, own=None):
         snapshot = route_store.read_snapshot(directory / 'routes.json')
         self.protected = set()
         endpoints, channels = [], []
@@ -153,7 +181,15 @@ class Protections:
         for route in endpoints + [channel['route'] for channel in channels if channel['active']]:
             if route['transport'] == 'codex' and route != close_route:
                 self.protected.add(route['session'])
-        self.holders = {absolute_path(cwd) for _, _, cwd in wt.open_files(skip=(os.getpid(),), cwd_only=True)}
+        rows = wt.open_files(skip=(os.getpid(),), cwd_only=True)
+        # An explicit close names the thread, so the helpers Desktop itself runs in that
+        # thread's folder do not make it "in use" (issue #175). The sweep exempts nothing.
+        # They are identified once, before the archive client starts: that client opens the
+        # queue store too, and Desktop is then no longer its only owner. Later checks reuse the set.
+        if own is None:
+            own = desktop_helpers(rows) if close_route is not None else set()
+        self.own = frozenset(own)
+        self.holders = {absolute_path(cwd) for pid, _, cwd in rows if pid not in self.own}
         self.cutoff = None if close_route is not None else time.time() - MIN_AGE
         self.prefix = prefix
 
@@ -270,6 +306,8 @@ def invoke(binary, timeout, method, sid, before_call=None):
                 client.call(method, {'threadId': sid})
             except sessions.CodexRpcError as rejection:
                 error = {'kind': 'rpc_rejected', 'code': rejection.code if type(rejection.code) is int else None}
+                if (rejection.code, rejection.message) == (-32600, f'thread {sid} already has an active writer'):
+                    error['active_writer'] = True
             except NATIVE_ERRORS:
                 error = {'kind': 'rpc_uncertain'}
     except NATIVE_ERRORS:
@@ -277,6 +315,21 @@ def invoke(binary, timeout, method, sid, before_call=None):
             raise ValueError('Native Codex app-server startup or safety check failed') from None
         error = {**(error or {'kind': 'rpc_uncertain'}), 'shutdown_unconfirmed': True}
     return before, error
+
+
+def archive_saved_state(path, sid, cwd):
+    """Set the archive bit of one exact thread in the saved state; the caller reads it back.
+
+    Desktop holds the writer of every thread it has loaded, so a second app-server cannot archive a
+    session that has just run (issue #175). This is what `close --archive` did before the native call.
+    """
+    codex_preview.require_owned_store(path)
+    try:
+        with closing(sqlite3.connect(path.as_uri() + '?mode=rw', uri=True, timeout=5)) as connection, connection:
+            connection.execute('UPDATE threads SET archived=1, archived_at=? WHERE id=? AND cwd=? AND archived=0',
+                               (int(time.time()), sid, cwd))
+    except sqlite3.Error:
+        raise ValueError('Saved Codex state could not be written') from None
 
 
 def readback(path, before, sid):
@@ -315,7 +368,7 @@ def restore_unlisted(binary, path, timeout, after, late):
     return after, restored, errors, None
 
 
-def archive_group(binary, path, directory, prefix, item, timeout, close_route=None):
+def archive_group(binary, path, directory, prefix, item, timeout, close_route=None, own=None):
     root = item['id']
     expected = {row['id']: row for row in [item, *item['members']]}
     subtrees = {sid: set(row['descendants']) for sid, row in expected.items()}
@@ -331,7 +384,7 @@ def archive_group(binary, path, directory, prefix, item, timeout, close_route=No
         check = {}
 
         def before_call():
-            guard = Protections(directory, prefix, close_route)
+            guard = Protections(directory, prefix, close_route, own)
             before = Snapshot(path)
             if (before.descendants(root) != subtrees[root]
                     or before.descendants(sid) != subtrees[sid]):
@@ -367,6 +420,10 @@ def archive_group(binary, path, directory, prefix, item, timeout, close_route=No
                     continue
                 return receipts, False
             receipt['provider_error'] = error
+            if close_route is not None and (error or {}).get('active_writer'):
+                # Only an explicit close of a named route takes this path; a sweep stays refused.
+                archive_saved_state(path, sid, before.rows[sid]['cwd'])
+                receipt['method'] = 'saved_state'
             after, affected = readback(path, before, sid)
             late = {key for key in affected - subtrees[sid] - {sid} if after.rows[key]['archived']
                     and not before.rows.get(key, {}).get('archived')}
@@ -428,11 +485,12 @@ def close(route, directory, timeout):
     row = snapshot.rows.get(sid)
     if row is None or absolute_path(row['cwd']) != absolute_path(route['cwd']):
         raise ValueError('Codex native thread workspace or identity does not match the route')
-    item = group(snapshot, Protections(directory, close_route=route), sid, 'explicit_close')
+    guard = Protections(directory, close_route=route)
+    item = group(snapshot, guard, sid, 'explicit_close')
     if item['refusals']:
         results, stopped = [{'id': sid, 'status': 'refused', 'refusals': item['refusals']}], False
     else:
-        results, stopped = archive_group(binary, path, directory, None, item, timeout, route)
+        results, stopped = archive_group(binary, path, directory, None, item, timeout, route, guard.own)
     final = next((result for result in results if result['id'] == sid), {})
     archived = final.get('archived') is True or final.get('status') == 'already_archived'
     incomplete = any(result['status'] not in ('archived', 'already_archived') for result in results)

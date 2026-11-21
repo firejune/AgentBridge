@@ -62,6 +62,10 @@ class CodexArchiveTests(unittest.TestCase):
         self.behavior(method, sid)
         return {}  # The response alone carries no completion evidence.
 
+    def bits(self, *sids):
+        with closing(sqlite3.connect(self.db)) as db:
+            return [db.execute('SELECT archived FROM threads WHERE id=?', (sid,)).fetchone()[0] for sid in sids]
+
     def plan(self):
         return archive.plan(self.db, self.routes, self.prefix)
 
@@ -151,6 +155,81 @@ class CodexArchiveTests(unittest.TestCase):
         self.assertEqual(self.calls, [('thread/archive', child), ('thread/archive', root)])
         self.assertEqual((result['closed'], result['count'], result['archive_incomplete']),
                          (True, 2, False))
+
+    def test_close_ignores_desktop_helpers_but_not_other_processes(self):
+        self.cwd.mkdir(parents=True)
+        root = self.add(1)
+        route = self.route(root)
+        helper, uid = str(archive.DESKTOP_HELPER), archive.os.getuid()
+        listing = f'  41 900 {uid} {helper}\n  42 900 {uid} {helper}\n'
+        owner = patch.object(archive.codex_queue, 'desktop_queue_owner', return_value=('900', '899', 'Codex'))
+        stores = patch.object(archive.codex_queue, 'default_stores', return_value=(self.db, self.db))
+        ps = patch.object(archive.codex_queue, 'checked_output', return_value=listing)
+        helpers = [(41, 'node_repl', str(self.cwd)), (42, 'node_repl', str(self.cwd))]
+
+        # The sweep exempts nothing: the same helpers keep the thread out of a manifest.
+        self.holders.return_value = helpers
+        with owner, stores, ps:
+            self.assertEqual({row['reason'] for row in self.plan()['refusals']}, {'running_process_cwd'})
+        self.register(route)
+
+        cases = (('another process beside the helpers', helpers + [(43, 'zsh', str(self.cwd))], listing),
+                 ('a node_repl the Desktop owner did not start', helpers, listing.replace(' 900 ', ' 901 ', 1)),
+                 ('a node_repl that is another binary', helpers, listing.replace(helper, '/usr/local/bin/node_repl', 1)))
+        for label, rows, table in cases:
+            self.holders.return_value = rows
+            with self.subTest(label), owner, stores, patch.object(archive.codex_queue, 'checked_output',
+                                                                   return_value=table):
+                result = archive.close(route, self.routes, 1)
+                self.assertEqual(result['results'][0]['refusals'][0]['reason'], 'running_process_cwd')
+                self.assertEqual(self.calls, [])
+        self.holders.return_value = helpers
+        with stores, ps, patch.object(archive.codex_queue, 'desktop_queue_owner', return_value=None):
+            self.assertFalse(archive.close(route, self.routes, 1)['closed'])
+        self.assertEqual(self.calls, [])
+
+        # While the archive client runs, Desktop is not the store's only owner: the helpers
+        # found before it started are the ones the recheck exempts.
+        with stores, ps, patch.object(archive.codex_queue, 'desktop_queue_owner',
+                                      side_effect=[('900', '899', 'Codex'), None, None]):
+            result = archive.close(route, self.routes, 1)
+        self.assertEqual(self.calls, [('thread/archive', root)])
+        self.assertEqual((result['closed'], result['count']), (True, 1))
+
+    def test_close_archives_threads_whose_writer_desktop_holds(self):
+        def held(method, sid):
+            raise archive.sessions.CodexRpcError(method, {
+                'code': -32600, 'message': f'thread {sid} already has an active writer'})
+
+        self.behavior = held
+        # A sweep gets no fallback: the rejected thread stays unarchived.
+        swept = self.add(5)
+        result = self.apply(self.plan())['results']
+        self.assertEqual((result[0]['status'], 'method' in result[0], self.bits(swept)), ('not_archived', False, [0]))
+
+        self.cwd.mkdir(parents=True)
+        root = self.add(1)
+        leaf = self.add(2, parent=root)
+        route = self.route(root)
+        self.register(route)
+        result = archive.close(route, self.routes, 1)
+        self.assertEqual(self.calls[-2:], [('thread/archive', leaf), ('thread/archive', root)])
+        self.assertEqual((result['closed'], result['count'], result['archive_incomplete']), (True, 2, False))
+        self.assertEqual({row['method'] for row in result['results']}, {'saved_state'})
+        self.assertEqual(self.bits(root, leaf, swept), [1, 1, 0])
+
+        # Any other rejection is still a failed archive.
+        other = self.add(3, cwd=self.root / 'other')
+        (self.root / 'other').mkdir()
+        route = self.route(other, 'second', self.root / 'other')
+        self.register(self.route(root), route)
+
+        def rejected(method, sid):
+            raise archive.sessions.CodexRpcError(method, {'code': -32600, 'message': 'invalid request'})
+
+        self.behavior = rejected
+        self.assertFalse(archive.close(route, self.routes, 1)['closed'])
+        self.assertEqual(self.bits(other), [0])
 
     def test_close_refuses_alias_and_protected_descendant(self):
         root = self.add(1)
