@@ -13,7 +13,7 @@ import uuid
 import codex_preview
 import codex_queue
 
-APP_BUILD = ('26.1117.31558', '29513')
+APP_BUILD = ('26.1117.41037', '29803')
 APP_SIGNATURE = codex_queue.SIGNATURE.replace('identifier "codex"', 'identifier "com.openai.codex"')
 MARKER = 'AB_WAKE_TEST_OK'
 PROMPT = (
