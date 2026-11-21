@@ -545,6 +545,16 @@ class CloseCommandTests(unittest.TestCase):
             self.assertNotIn('retro_recorded', out)
             self.assertEqual([json.loads(line)['id'] for line in records()], [out['retro_id']])
 
+            # A handoff records before it marks the route closing: a closing route cannot send the notification.
+            server.call('register', project='p', name='n', cwd=cwd, transport='codex', session=sid)
+            order = []
+            with mock.patch.object(bridge, 'record_retro', side_effect=lambda *_: order.append('retro') or {'retro_id': 'r'}), \
+                    mock.patch.object(bridge, 'prepare_archive_handoff',
+                                      side_effect=lambda *_: order.append('handoff') or {'status': 'awaiting_native_archive'}):
+                code, out = run(command + ['--handoff'])
+            self.assertEqual((order, out['retro_id'], out['status']), (['retro', 'handoff'], 'r', 'awaiting_native_archive'))
+            server.call('unregister', project='p', name='n')
+
             # A session that closed is not reopened because its retro could not be saved: the gap is named.
             server.call('register', project='p', name='n', cwd=cwd, transport='codex', session=sid)
             with mock.patch.object(bridge, 'close_session', return_value=archived), \

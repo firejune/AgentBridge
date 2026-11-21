@@ -563,9 +563,10 @@ def close_participant(args):
     # Validated and read while the session is still open; written only after the close is confirmed.
     retro = None if 'closing' in route else prepare_retro(args, route)
     if args.handoff:
-        result = prepare_archive_handoff(args, address, route)
-        record_closing_retro(args, retro, result)
-        return result
+        # The handoff marks the route closing, and a closing route cannot send the stop/repeat
+        # notification. So this one path records first; the native archive is confirmed later by --finish.
+        receipt = {} if retro is None else record_retro(args, retro)
+        return {**receipt, **prepare_archive_handoff(args, address, route)}
     result = {**address, 'transport': route['transport'],
               **close_session(route, args.timeout, archive=archive, directory=broker_state_dir(args).expanduser().resolve())}
     if archive and (result.get('archived') is not True or result.get('session') != route['session']):
