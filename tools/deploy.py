@@ -226,6 +226,28 @@ def route_counts(layout):
                 closing=sum('closing' in item for item in routes['endpoints']))
 
 
+def route_identity(endpoint):
+    return tuple(endpoint.get(key) for key in ('project', 'name', 'transport', 'session'))
+
+
+def saved_endpoints(layout):
+    """Each endpoint's identity and saved workspace, read before the restart."""
+    return {route_identity(item): item.get('cwd') for item in read_json(layout.state / 'routes.json')['endpoints']}
+
+
+def route_changes(layout, before):
+    """Endpoints gone after the restart, split by whether the broker was right to drop them.
+
+    The broker does not restore a route whose workspace is unavailable (it logs `routing_drop`
+    with that reason). Such a drop is the route's own state, not damage from the deploy.
+    """
+    after = saved_endpoints(layout)
+    missing = [before[key] for key in before if key not in after]
+    expected = sum(1 for cwd in missing if isinstance(cwd, str) and not Path(cwd).is_dir())
+    return dict(dropped_workspace_missing=expected, dropped_other=len(missing) - expected,
+                added=sum(1 for key in after if key not in before))
+
+
 def check_source(layout, system, sha, live, components, allow_non_ancestor):
     code, dirty = system.git(layout.repo, 'status', '--porcelain')
     if code or dirty:
@@ -419,6 +441,7 @@ def verify(layout, system, live, sha, components, before, result):
     bridge = Path(next(iter(after.pins))) / 'scripts/bridge.py'
     ping = wait_ping(layout, system, bridge)
     states, routes = correspondence_states(layout), route_counts(layout)
+    changes = route_changes(layout, before['endpoints'])
     result.update(
         cli_sha=after.cli, broker_sha=after.broker, facade_sha=after.facade,
         broker_pid=system.pid(layout.broker_label), previous_broker_pid=before['broker_pid'],
@@ -427,8 +450,9 @@ def verify(layout, system, live, sha, components, before, result):
         correspondence=states, correspondence_lost=ping.get('correspondence_lost'),
         endpoint_count=routes['endpoints'], channel_count=routes['channels'],
         subscribers=ping.get('subscribers'), previous_subscribers=live.ping.get('subscribers'),
-        routes_preserved=(routes['endpoints'], routes['channels']) == (before['routes']['endpoints'],
-                                                                      before['routes']['channels']),
+        routes_dropped_workspace_missing=changes['dropped_workspace_missing'],
+        routes_preserved=(changes['dropped_other'] == 0 and changes['added'] == 0
+                          and routes['channels'] == before['routes']['channels']),
         protected_correspondence_preserved=all(states.get(state, 0) >= count for state, count in
                                                before['states'].items() if state in ('pending', 'uncertain')),
         pins=len(after.pins))
@@ -445,7 +469,7 @@ def verify(layout, system, live, sha, components, before, result):
         ('CLI and broker builds differ',
          ping.get('build') is None or ping.get('build') != ping.get('cli_build') or bool(ping.get('warning'))),
         ('correspondence_lost is set', bool(ping.get('correspondence_lost'))),
-        ('route count changed', not result['routes_preserved']),
+        ('routes changed', not result['routes_preserved']),
         ('pending or uncertain correspondence went missing', not result['protected_correspondence_preserved']),
         ('the facade is not ready', 'facade' in components and not result.get('facade_ready')),
     ) if bad]
@@ -478,7 +502,7 @@ def deploy(layout, system, commit, components, dry_run=False, allow_non_ancestor
         return 0
     started = time.monotonic()
     before = dict(broker_pid=system.pid(layout.broker_label), routes=route_counts(layout),
-                  states=correspondence_states(layout))
+                  endpoints=saved_endpoints(layout), states=correspondence_states(layout))
     if {'cli', 'facade'} & set(components):
         release = build_release(layout, system, 'nana', sha)
         if system.cli(release / SKILL / 'scripts/bridge.py', layout.socket, 'ping')[0]:
@@ -504,6 +528,9 @@ def deploy(layout, system, commit, components, dry_run=False, allow_non_ancestor
     write_receipt(folder, result)
     out(f'deployed {sha[:7]}: build {result["build"]}, {result["endpoint_count"]} routes, '
         f'broker pid {result["broker_pid"]}')
+    if result['routes_dropped_workspace_missing']:
+        out(f"warning: the broker dropped {result['routes_dropped_workspace_missing']} route(s) whose workspace "
+            'no longer exists')
     out(f'receipt: {folder / "result.json"}')
     return 0
 
