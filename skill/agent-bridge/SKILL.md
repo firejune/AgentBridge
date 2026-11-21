@@ -201,6 +201,18 @@ A confirmed route/session conflict before broker posting returns `BACKEND_UNAVAI
 - For remote session creation, use `bridge_models_list` with an approved workspace alias and the intended provider. Optionally pass the exact ID as `model` for Codex or Antigravity. Omit `model` for existing defaults. [Session model selection](references/remote-mcp.md#session-model-selection).
 - Remote MCP Events require `events_enabled: true`, `inbox_enabled: true` and `bridge:read`. A matching signed `bridge.inbox.message.created` webhook can wake a supported ChatGPT Work chat on web or Desktop Work with Cloud selected. Read a captured reply with `bridge_operation_get` when the event carries `operation_id`. Read independent mail with the inbox tools and ACK it explicitly. After a gap, list the inbox and query known operations. Notifications have no replay or automatic retry. [Events contract and setup](references/remote-mcp.md#optional-mcp-events).
 
+### Reporting to the remote coordinator
+
+The session connected through the remote MCP facade (the remote coordinator) is not a local session. It does not appear in `sessions` for any provider or in a desktop app's session list; do not look for it there or conclude it is absent.
+
+- **Answering it**: when the work came as a bridge message, `reply` to that message. The reply goes to the address it wrote from.
+- **Reporting unprompted** (a stage finished, or you stopped):
+  1. Find its route for your job: `routes --project P`, then the `realtime` routes with no session whose name has the prefix the owner configured for coordinator routes (`inbox_route_prefixes`) and whose `cwd` is your work folder or one of its parents.
+  2. Send only when exactly one route matches. With none or several, stop and ask the user; never choose by a similar name. A route of another agent working on the same job is not the coordinator.
+  3. Register this session in that project if it has no route there (`register NAME --project P --transport … --session … --discover`), then send once: `send --project P --from NAME --to ROUTE --file report.txt --key UNIQUE --one-way`. Leave out `--one-way` when you need a ruling back; the answer arrives in this session.
+- **Reading the state**: the message is `pending` until the coordinator collects it. Arrival raises an event that wakes it, and its acknowledgement closes the message (`done`), usually within a minute. Still `pending` after several minutes means unread, not lost. Do not resend; check with `show ID`.
+- **What a report carries**: what finished on the first line, artefacts as absolute paths, the base commit, what was and was not done, and what you are waiting for. Under an isolation rule (an independent read-through, for example) leave findings and content out of the message; they stay in the report file.
+
 ## Operational Boundaries
 
 - Restart restores owner-private routing and mail using terminal-eviction guards and reports protected mail above a lowered limit through stderr and `ping.correspondence_over_limit`. See [storage](references/usage.md#correspondence-storage-issue-94). Coordinate with active participants before restarting or stopping a shared broker.

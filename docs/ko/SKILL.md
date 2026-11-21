@@ -195,6 +195,18 @@ python3 "$bridge_cli" usage --events
 - 원격에서 세션을 만들 때 `bridge_models_list`에 승인된 워크스페이스 별칭과 대상 에이전트 종류를 지정한다. Codex나 Antigravity는 반환된 정확한 ID를 `bridge_session_create`의 `model`로 쓸 수 있다. 생략하면 기존 기본값을 사용한다. [세션 모델 선택 계약](../../skill/agent-bridge/references/remote-mcp.md#session-model-selection).
 - 원격 MCP Events에는 `events_enabled: true`, `inbox_enabled: true`, `bridge:read`가 필요하다. 활성 구독과 일치하는 서명된 `bridge.inbox.message.created` 웹훅이 도착하면 웹의 ChatGPT Work 채팅이나 Cloud를 선택한 Desktop Work 채팅이 깨어날 수 있다. 알림에 `operation_id`가 있으면 `bridge_operation_get`으로 기록된 답장을 읽는다. 독립 메시지는 수신함 도구로 읽고 명시적으로 ACK한다. 알림이 누락되면 수신함과 알고 있는 작업 ID를 다시 조회한다. 알림의 재생과 자동 재시도는 지원하지 않는다. [Events 계약과 설정](../../skill/agent-bridge/references/remote-mcp.md#optional-mcp-events)을 참고한다.
 
+### 원격 진행자에게 보고하기
+
+원격 MCP 파사드로 접속한 세션(원격 진행자)은 로컬 세션이 아니다. 어느 공급자의 `sessions` 목록에도, 데스크톱 앱의 세션 목록에도 나오지 않는다. 거기서 찾지 않고, 없다고 판단하지도 않는다.
+
+- **답할 때**: 작업이 브릿지 메시지로 왔다면 그 메시지에 `reply`한다. 답장은 진행자가 보낸 주소로 돌아간다.
+- **먼저 보고할 때**(한 단계가 끝났거나 멈췄을 때):
+  1. 작업에 묶인 진행자 라우트를 찾는다. `routes --project P`에서 세션이 없는 `realtime` 라우트 중, 소유자가 진행자용으로 설정한 접두어(`inbox_route_prefixes`)로 시작하고 `cwd`가 현재 작업 폴더이거나 그 상위 폴더인 것을 고른다.
+  2. 정확히 하나일 때만 보낸다. 없거나 여럿이면 멈추고 사용자에게 묻는다. 이름이 비슷하다는 이유로 고르지 않는다. 같은 작업을 하는 다른 에이전트의 라우트는 진행자가 아니다.
+  3. 이 세션이 그 프로젝트에 라우트가 없으면 등록하고(`register NAME --project P --transport … --session … --discover`), 한 번 보낸다: `send --project P --from NAME --to ROUTE --file report.txt --key UNIQUE --one-way`. 판정을 받아야 하면 `--one-way`를 뺀다. 답은 이 세션으로 들어온다.
+- **상태 읽기**: 진행자가 가져가기 전까지 `pending`이다. 도착하면 이벤트가 진행자를 깨우고, 진행자가 확인하면 메시지가 닫힌다(`done`). 보통 1분 안이다. 몇 분 뒤에도 `pending`이면 아직 읽지 않은 것이지 유실이 아니다. 다시 보내지 않고 `show ID`로 확인한다.
+- **보고에 넣는 것**: 첫 줄에 무엇이 끝났는지, 산출물의 절대 경로, 기준 커밋, 한 일과 하지 않은 일, 기다리는 것. 격리 조건이 걸린 작업(독립 통독 등)이면 발견 내용과 본문은 메시지에 넣지 않고 보고 파일에만 둔다.
+
 ## 실행 경계
 
 - 재시작은 종료 메시지 제거·보호 규칙에 따라 비공개 라우트와 메시지를 복원하며, 낮춘 한도를 넘는 보호 메시지는 유지하고 stderr와 `ping.correspondence_over_limit`에 표시한다. 자세한 규칙은 [저장 계약](../../skill/agent-bridge/references/usage.md#correspondence-storage-issue-94)을 따른다. 활성 참가자와 조율 없이 공유 브로커를 재시작하거나 멈추지 않는다.
