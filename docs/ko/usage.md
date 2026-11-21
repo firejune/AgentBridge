@@ -477,6 +477,10 @@ fork·subagent는 `subagent_history_start_ordinal` 경계 또는 부모 snapshot
 
 `ping`은 `checkpoint_last_save_seconds`, `checkpoint_max_save_seconds`, `checkpoint_bytes`를 반환한다. 각각 마지막 저장 시도 시간, 브로커 시작 이후 최대 시간(실패한 시도 포함, 초), 마지막으로 성공한 `correspondence.json` 페이로드 크기(메타데이터 인덱스 제외, 바이트)다. 저장소가 없으면 각각 `null`, `0.0`, `0`이다. 저장이 1초를 넘으면 `checkpoint_save_slow` JSON 로그 한 줄을 stderr에 남긴다. `event`의 값은 `checkpoint_save_slow`이며, 로그에는 `timestamp`(UTC), `duration_seconds`, `thread_cpu_seconds`, `bytes`(실패 시 마지막 성공 페이로드 크기), `retained_count`, `outcome`(`saved` 또는 `failed`), `stages_seconds`(검증과 직렬화, 인덱스 쓰기, 페이로드 쓰기의 시간)가 포함된다. 시간에는 검증·직렬화·영속 쓰기가 포함되며 변경 상태 준비는 제외한다. 계측은 재시작하면 초기화된다. 저장 중 `ping`은 마지막으로 끝난 저장 시도와 커밋된 메시지 수를 반환한다. watch 이벤트는 해당 저장이 끝난 뒤 공개된다. 상태 변경, inbox 스냅샷 작업, wait 등록은 진행 중인 저장이 끝날 때까지 기다린다. 브로커가 종료되면 이미 시작한 커밋을 마친 뒤 상태 잠금을 해제한다.
 
+`ping`은 진행되지 않는 작업을 읽기 전용으로 요약한 `attention`도 반환한다. `pending_over_hour`(만든 지 한 시간이 넘은 pending 메시지 수), `oldest_pending_seconds`, `dispatching`, `oldest_dispatching_seconds`, `uncertain`이다. 나이는 정수 초이고, 해당 메시지가 없으면 `null`이다. 개수와 나이만 담고 메시지 ID · 본문 · 경로 · 이름은 담지 않는다.
+
+메시지는 `dispatching`에 최대 600초까지만 머문다. 푸시한 명령이 죽거나 결과를 보고하지 않으면 브로커가 그 메시지를 `uncertain`으로 옮기고, 노트 `Dispatch outcome was not reported within 600 s; check the receiving session before resolving`과 `push_failed` 이벤트를 남긴다. 다시 보내지 않고 `pending`으로 되돌리지도 않는다. 원래 푸시가 뒤늦게 보고해도 그 메시지를 확정하지 못한다. 아직 dispatching인 메시지가 있으면 `close --archive`의 거절 문구가 그 메시지의 ID와 dispatching이 이어진 시간을 밝힌다. 한도가 지나면 그 메시지는 uncertain으로 보존되고 close를 더는 막지 않는다.
+
 Codex `open` / `register --new`는 권한 확인에 실패하면 라우트를 등록하지 않는다. 성공·실패 단계와 확인된 `approvalPolicy`, 샌드박스 유형을 stderr 한 줄에 출력한다.
 
 

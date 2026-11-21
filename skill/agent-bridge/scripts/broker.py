@@ -58,6 +58,26 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def seconds_since(stamp, current):
+    """Age of an ISO UTC stamp written by now(), or None when unreadable."""
+    try:
+        parsed = datetime.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return current - parsed.timestamp()
+
+
+def dispatch_age(message, current):
+    started = message.get('dispatch_started_at')
+    if started is None:
+        # Older records may lack the stamp; the event that entered the state has it.
+        started = next((entry.get('at') for entry in reversed(message.get('events') or ())
+                        if entry.get('state') == 'dispatching'), None)
+    return seconds_since(started, current)
+
+
 def identifier(value):
     if not isinstance(value,str) or not re.fullmatch(r'[a-z][a-z0-9_-]*',value):
         raise ValueError('Use a lowercase identifier')
@@ -94,6 +114,15 @@ TTL_CAPACITY_ERROR = ('Active-message limit reached: TTL or protected work preve
 MESSAGE_CAPACITY_ERRORS = frozenset((LEGACY_CAPACITY_ERROR, TTL_CAPACITY_ERROR))
 GUARDED_CLAIM_WINDOW = 10
 CLAIM_RELEASE_NOTE = 'Claude claim response was lost. The claim was released before any peer write.'
+# Legitimate pushes settle in well under a minute and `close --timeout` caps at
+# 600 s. A sender that dies mid-push never reports; past this bound the broker
+# moves the message to `uncertain` by name. It never resends (issue #153).
+DISPATCH_LIMIT = 600
+DISPATCH_CHECK_INTERVAL = 30
+DISPATCH_EXPIRED_NOTE = (f'Dispatch outcome was not reported within {DISPATCH_LIMIT} s; '
+                         'check the receiving session before resolving')
+PENDING_ATTENTION_SECONDS = 3600
+ARCHIVE_BLOCKED_ERROR = 'Archive cleanup blocked by an active delivery, provider continuation or wait'
 
 
 def delivery_destination(route):
@@ -702,7 +731,7 @@ class State:
         protected = selected & (active | uncertain)
         if args.get('check_only') is True:
             if selected & active:
-                raise ValueError('Archive cleanup blocked by an active delivery, provider continuation or wait')
+                raise ValueError(self.archive_blocked(records, selected & active))
             return dict(supported=True, matched=len(selected), retained=len(protected))
         if args.get('archived') is not True:
             raise ValueError('Archive cleanup requires confirmed provider archival')
@@ -721,6 +750,44 @@ class State:
         if protected:
             result['active_retained'] = len(selected & active)
         return result
+
+    @staticmethod
+    def archive_blocked(records, blocking, current=None):
+        # Name what blocks the close so the operator knows whether waiting helps.
+        # The fixed prefix stays first; callers match on it.
+        current = time.time() if current is None else current
+        dispatching = sorted((records[mid] for mid in blocking if records[mid]['state'] == 'dispatching'),
+                             key=lambda m: m['id'])
+        parts = []
+        if dispatching:
+            shown = []
+            for message in dispatching[:3]:
+                age = dispatch_age(message, current)
+                shown.append(f"id {message['id']}" + ('' if age is None else f', {max(0, int(age))} s'))
+            if len(dispatching) > 3:
+                shown.append(f'{len(dispatching) - 3} more')
+            noun = 'delivery' if len(dispatching) == 1 else 'deliveries'
+            verb = 'it becomes' if len(dispatching) == 1 else 'each becomes'
+            parts.append(f"{len(dispatching)} {noun} still dispatching ({'; '.join(shown)}); "
+                         f'{verb} uncertain after {DISPATCH_LIMIT} s')
+        others = len(blocking) - len(dispatching)
+        if others:
+            parts.append(f"{others} {'wait or provider continuation' if others == 1 else 'waits or provider continuations'}")
+        return f"{ARCHIVE_BLOCKED_ERROR}: {', '.join(parts)}"
+
+    def expired_dispatches(self, current):
+        return [mid for mid, message in self.messages.items()
+                if message['state'] == 'dispatching'
+                and (age := dispatch_age(message, current)) is not None and age > DISPATCH_LIMIT]
+
+    def expire_dispatches(self, current=None):
+        # Only `dispatching` moves, and only to `uncertain`: never back to
+        # `pending`, never a resend. A late `finish` then meets a cleared claim.
+        current = time.time() if current is None else current
+        expired = self.expired_dispatches(current)
+        for mid in expired:
+            self.status(self.messages[mid], 'uncertain', DISPATCH_EXPIRED_NOTE, 'push_failed')
+        return {'expired': len(expired)}
 
     def purge_archive_events(self, removed):
         if not removed:
@@ -853,10 +920,14 @@ class State:
         mutations = ('send', 'send-with-retention', 'reply', 'ack', 'progress', 'resolve', 'claim', 'finish',
                      'claim-guarded', 'release-claim', 'note-pending',
                      'inbox_ack', 'inbox_reply', 'provider-failure', 'provider-retry', 'retention-sweep',
-                     'archive-correspondence', 'close-dispatch', 'close-operator')
+                     'archive-correspondence', 'close-dispatch', 'close-operator', 'dispatch-expire')
         archive = args['op'] == 'archive-correspondence'
         if archive and args.get('check_only') is True:
             return self.archive_correspondence(args), None
+        if args['op'] == 'dispatch-expire':
+            args = dict(args, at=time.time())
+            if not self.expired_dispatches(args['at']):
+                return {'expired': 0}, None  # No deep copy or checkpoint write on an idle tick.
         planned = None
         planned_at = None
         if args['op'] == 'retention-sweep':
@@ -997,6 +1068,8 @@ class State:
                         retention_mode='ttl' if self.retention_ttl else 'prepare' if self.retention_prepare else 'legacy')
         if op == 'retention-sweep':
             return {'changed': self.sweep_retention()}
+        if op == 'dispatch-expire':
+            return self.expire_dispatches(args.get('at'))
         if op == 'provider-failure':
             return public_message(self.provider_failure(args['expected_route'], args['source_message_id'], args['failure']))
         if op == 'provider-retry':
@@ -1044,7 +1117,27 @@ class State:
                 'checkpoint_last_save_seconds': self.correspondence.last_save_seconds if self.correspondence else None,
                 'checkpoint_max_save_seconds': self.correspondence.max_save_seconds if self.correspondence else 0.0,
                 'checkpoint_bytes': self.correspondence.checkpoint_bytes if self.correspondence else 0,
-                'max_messages': self.max_messages}
+                'max_messages': self.max_messages, 'attention': self.attention()}
+
+    def attention(self, current=None):
+        # Counts and ages only: no IDs, bodies, routes or names (issue #153).
+        current = time.time() if current is None else current
+        pending, dispatching, uncertain = [], [], 0
+        for message in self.messages.values():
+            if message['state'] == 'pending':
+                pending.append(seconds_since(message.get('created'), current))
+            elif message['state'] == 'dispatching':
+                dispatching.append(dispatch_age(message, current))
+            elif message['state'] == 'uncertain':
+                uncertain += 1
+
+        def oldest(ages):
+            known = [age for age in ages if age is not None]
+            return max(0, int(max(known))) if known else None
+        return {'pending_over_hour': sum(1 for age in pending
+                                         if age is not None and age > PENDING_ATTENTION_SECONDS),
+                'oldest_pending_seconds': oldest(pending), 'dispatching': len(dispatching),
+                'oldest_dispatching_seconds': oldest(dispatching), 'uncertain': uncertain}
 
     def register_route(self, args):
         project, name = identifier(args['project']), identifier(args['name'])
@@ -1546,6 +1639,17 @@ async def retention_loop(state):
             print(json.dumps({'event': 'retention_sweep_failed'}), file=sys.stderr, flush=True)
 
 
+async def dispatch_loop(state, interval=DISPATCH_CHECK_INTERVAL):
+    # Always on: a sender that died mid-push must not block its recipient forever.
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await state.action_async({'op': 'dispatch-expire'})
+        except (ValueError, OSError):
+            # Fixed count-only diagnostic; never reveal routes, bodies or IDs.
+            print(json.dumps({'event': 'dispatch_expire_failed'}), file=sys.stderr, flush=True)
+
+
 async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DEFAULT_INTERVAL_MINUTES,
                 codex_executable='codex', claude_live=True,
                 codex_failure_interval=codex_failures.DEFAULT_INTERVAL,
@@ -1572,6 +1676,7 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
     failure_observer = None
     agy_failure_observer = None
     retention_task = None
+    dispatch_task = None
     stopping = asyncio.Event()
     handlers = set()
     writers = set()
@@ -1588,6 +1693,7 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
                       checkpoint_executor=checkpoint_executor)
         if retention_ttl or retention_prepare:
             retention_task = asyncio.create_task(retention_loop(state))
+        dispatch_task = asyncio.create_task(dispatch_loop(state))
         if codex_failure_interval:
             failure_observer = asyncio.create_task(
                 codex_failures.observe_codex_failures(state, codex_failure_interval, retry_policy))
@@ -1654,7 +1760,8 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
         # Python 3.12.1+ waits for active clients in wait_closed(). Cancel
         # handlers and abort transports first, including stalled readers/writers,
         # then drain any admitted operation before releasing either store lock.
-        active = list(handlers) + [task for task in (failure_observer, agy_failure_observer, retention_task)
+        active = list(handlers) + [task for task in (failure_observer, agy_failure_observer, retention_task,
+                                                             dispatch_task)
                                    if task is not None]
         for writer in list(writers):
             writer.transport.abort()
