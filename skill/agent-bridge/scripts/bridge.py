@@ -32,6 +32,7 @@ from delivery import (
     push_agy, push_codex, push_frame, push_if_peer, reply_command,
 )
 import models
+from new_session_policy import CodexDesktopWakePolicyError
 import sessions
 import service
 import usage
@@ -333,7 +334,8 @@ def open_codex_result(args):
         if title is None and name:
             title = default_title = f'{args.project}/{name}'
         result = sessions.open_session('codex', cwd=args.cwd, title=title, model=args.model,
-            timeout=args.timeout, host=args.host, ide=args.ide, force_new=args.new, allow_queue_wake=True)
+            timeout=args.timeout, host=args.host, ide=args.ide, force_new=args.new, allow_queue_wake=True,
+            queue_wake_workspace_write=getattr(args, 'queue_wake_workspace_write', False))
     except RegistrationConflict as error:
         result.update(error=str(error), route_conflict=error.route)
     except broker.BrokerConnectError:
@@ -348,6 +350,8 @@ def open_codex_result(args):
         cancelled = True
     except sessions.DiscoveryError as error:
         result['error'] = str(error)  # A fixed --host/--ide refusal, before any provider call.
+    except CodexDesktopWakePolicyError as error:
+        result['error'] = str(error)  # Fixed text, with no policy path or contents.
     except (ValueError, OSError, subprocess.TimeoutExpired, KeyError, TypeError):
         # Policy files and transport exceptions can contain local paths or secrets.
         result['error'] = 'Codex open preflight failed; check provider, host and model policy'

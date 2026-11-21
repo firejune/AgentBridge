@@ -1,4 +1,4 @@
-"""Owner-edited model policy and one default chain for new provider sessions.
+"""Owner-edited policy and model defaults for new provider sessions.
 
 Pure policy helpers: this module never contacts a provider or writes policy.
 """
@@ -7,9 +7,16 @@ import os
 from pathlib import Path
 
 POLICY_FILE = 'policy.json'
+CODEX_DESKTOP_WAKE_PERMISSIONS = 'codex_desktop_wake_permissions'
 # Seed from the owner's rule of 2026-10-23; applies only while no policy file exists.
 SEED_DENY = {'codex': ['gpt-6-astra']}
 DEFAULT_MODELS = {'codex': 'gpt-6.2-sol'}
+
+
+class CodexDesktopWakePolicyError(ValueError):
+    def __init__(self):
+        super().__init__(f'In owner policy.json, "{CODEX_DESKTOP_WAKE_PERMISSIONS}" must be omitted '
+                         'or set to "workspace-write"')
 
 
 def load_policy(state_dir):
@@ -36,7 +43,12 @@ def load_policy(state_dir):
     if not isinstance(post, dict) or not all(isinstance(k, str) and isinstance(v, str) and v.strip()
                                              for k, v in post.items()):
         raise ValueError(f'{path}: "command_post" must map a provider to a registered route name')
-    return {'path': str(path), 'exists': True, 'defaults': defaults, 'deny': deny, 'command_post': post}
+    policy = {'path': str(path), 'exists': True, 'defaults': defaults, 'deny': deny, 'command_post': post}
+    if CODEX_DESKTOP_WAKE_PERMISSIONS in data:
+        if data[CODEX_DESKTOP_WAKE_PERMISSIONS] != 'workspace-write':
+            raise CodexDesktopWakePolicyError()
+        policy[CODEX_DESKTOP_WAKE_PERMISSIONS] = data[CODEX_DESKTOP_WAKE_PERMISSIONS]
+    return policy
 
 
 def denied(policy, provider, *names):

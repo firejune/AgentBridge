@@ -295,14 +295,15 @@ def inspect_session(provider, sid, executable=None, codex_mode='auto'):
 
 
 def open_session(provider='agy', cwd=None, title=None, model=None, timeout=180, host='desktop', ide=None,
-                 force_new=False, *, allow_queue_wake=False):
+                 force_new=False, *, allow_queue_wake=False, queue_wake_workspace_write=False):
     if host != 'desktop' and provider not in ('claude', 'agy'):
         raise DiscoveryError(f'--host {host} applies only to Claude Code (claude / claude-peer) and Antigravity (agy)')
     if ide and (host != 'ide' or provider != 'claude'):
         raise DiscoveryError('--ide picks the IDE of a Claude Code session; it needs --provider claude --host ide')
     if provider == 'codex':
         return codex_new.open_codex(cwd=cwd, title=title, model=model, timeout=timeout,
-                                    force_new=force_new, allow_queue_wake=allow_queue_wake)
+                                    force_new=force_new, allow_queue_wake=allow_queue_wake,
+                                    queue_wake_workspace_write=queue_wake_workspace_write)
     if provider == 'claude':
         if not cwd:
             raise DiscoveryError('Provide --cwd when opening a new Claude Code session')

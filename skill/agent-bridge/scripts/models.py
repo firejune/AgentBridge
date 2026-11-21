@@ -16,7 +16,7 @@ import agy_live
 import sessions
 import codex_live
 import codex_new
-from new_session_policy import (POLICY_FILE, SEED_DENY, default_model, denied,
+from new_session_policy import (CODEX_DESKTOP_WAKE_PERMISSIONS, POLICY_FILE, SEED_DENY, default_model, denied,
                                 env_name, load_policy, require_allowed)
 
 PROVIDER = {'codex': 'codex', 'agy': 'agy', 'claude-peer': 'claude', 'claude': 'claude'}
@@ -45,6 +45,7 @@ def new_session_policy(args, provider, state_dir):
     policy = load_policy(state_dir)
     if provider == 'codex':
         args.model, source = codex_new.resolve_model(args.model, policy=policy)
+        args.queue_wake_workspace_write = CODEX_DESKTOP_WAKE_PERMISSIONS in policy
         return source
     model, source = default_model(provider, args.model, policy)
     if provider == 'claude':
