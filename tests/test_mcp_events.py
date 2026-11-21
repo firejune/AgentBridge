@@ -767,6 +767,20 @@ class EventTests(unittest.TestCase):
         self.subscribe()
         self.params['arguments'] = {'agent_session_id': self.adopted_slot('other-x')}
         self.assertEqual(self.rpc('events/subscribe', self.params)['error']['code'], -32602)
+        # The selected adopted route goes away while its subscription lives: that subscription has
+        # nothing to watch, and the unfiltered one keeps picking up new routes.
+        self.running.call('unregister', project='test-project', name='nana-x')
+        self.running.call('register', project='test-project', name='nana-y',
+            cwd=str(Path(self.running.temp.name).resolve()), transport='realtime')
+        deadline = time.monotonic() + 4
+        wanted = {'nana-y'}
+        def watched():
+            return {json.loads(key)['route']['name'] for key, (thread, ready, _) in list(self.service.watchers.items())
+                    if thread.is_alive() and ready.is_set()}
+        while not wanted <= watched() and time.monotonic() < deadline:
+            time.sleep(.02)
+        self.assertLessEqual(wanted, watched())
+        self.assertNotIn('nana-x', watched())
 
     def test_unsubscribe_cleanup_failure_keeps_recoverable_refs(self):
         self.subscribe()
