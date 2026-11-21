@@ -226,6 +226,21 @@ class DesktopWakeRolloutTests(unittest.TestCase):
             'sandboxPolicy': {'type': 'readOnly'}}})
         self.opener.assert_called_once()
 
+    def test_workspace_permissions_are_read_from_the_fresh_rollout(self):
+        def workspace_turn(proof):
+            records = startup_records(prompt=proof)
+            records[2]['payload'].update(workspace_permissions())
+            records = json.loads(json.dumps(records).replace(str(CWD), str(self.cwd)))
+            self.append(records[1:])
+
+        self.desktop_turn = workspace_turn
+        result = codex_wake_open.adopt(self.desktop, self.route, MODEL, timeout=5)
+        self.assertEqual(result, {'model': MODEL, 'turn_id': TURN, 'permission_settings': {
+            'activePermissionProfile': {'id': ':workspace'}, 'approvalPolicy': 'on-request',
+            'sandboxPolicy': {'type': 'workspaceWrite', 'networkAccess': False}}})
+        self.assertEqual(len(self.queued), 1)
+        self.opener.assert_called_once()
+
     def test_a_turn_already_in_the_file_or_carrying_another_nonce_is_not_evidence(self):
         earlier = codex_wake_open.PROMPT + '00000000-0000-4000-8000-000000000999'
         self.append(self.records(earlier)[1:])  # A complete matching-looking turn before the call.
