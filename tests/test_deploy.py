@@ -332,6 +332,38 @@ class RealRunTests(DeployFixture):
                 self.assertEqual([call[0] for call in self.system.calls], ['bootout', 'bootout', 'bootstrap', 'bootstrap'])
                 self.assertEqual(self.lines[-1], f'rollback: {deploy.rollback_command(folder)}')
 
+    def test_a_route_dropped_for_a_missing_workspace_warns_and_any_other_route_change_fails(self):
+        kept = self.layout.state  # A folder that exists.
+        gone = self.layout.runtime / 'removed-worktree'
+
+        def restart_drops(name, cwd):
+            self.setUp()
+            routes = self.layout.state / 'routes.json'
+            saved = {'version': 1, 'channels': [{'name': 'c'}], 'endpoints': [
+                {'project': 'p', 'name': 'stays', 'transport': 'codex', 'session': 's1', 'cwd': str(kept)},
+                {'project': 'p', 'name': name, 'transport': 'agy', 'session': 's2', 'cwd': str(cwd)}]}
+            routes.write_text(json.dumps(saved))
+            launchctl = self.system.launchctl
+
+            def dropping(*args):
+                if args[0] == 'bootstrap':  # The broker rewrites its routing snapshot when it starts.
+                    routes.write_text(json.dumps({**saved, 'endpoints': saved['endpoints'][:1]}))
+                return launchctl(*args)
+
+            self.system.launchctl = dropping
+            code = self.run_deploy()
+            folder, = self.layout.runtime.glob(f'deploy-{NEW[:7]}-*')
+            return code, json.loads((folder / 'result.json').read_text())
+
+        code, result = restart_drops('runner', gone)
+        self.assertEqual((code, result['routes_preserved'], result['routes_dropped_workspace_missing']), (0, True, 1))
+        self.assertIn('warning: the broker dropped 1 route(s) whose workspace no longer exists', self.lines)
+        self.assertFalse(any('runner' in line or str(gone) in line for line in self.lines))
+
+        code, result = restart_drops('runner', kept)
+        self.assertEqual((code, result['routes_preserved'], result['routes_dropped_workspace_missing']), (1, False, 0))
+        self.assertIn('routes changed', result['error'])
+
     def test_a_broker_that_does_not_come_back_stops_before_pins_and_facade_move(self):
         real = self.system.launchctl
 

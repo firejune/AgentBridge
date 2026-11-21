@@ -100,7 +100,7 @@ and prints the rollback command.
 - Pins, plist and profile all name the target commit.
 - `ping` through the new pin answers; `build` equals `cli_build`; there is no warning.
 - `correspondence_lost` is false.
-- The endpoint and channel counts in `routes.json` are unchanged.
+- Every endpoint saved in `routes.json` before the restart is still there, none was added, and the channel count is unchanged. One exception is a warning, not a failure: the broker does not restore a route whose workspace folder no longer exists, so such a route missing after the restart is reported as a count (`routes_dropped_workspace_missing`).
 - No `pending` or `uncertain` message disappeared from `correspondence.json`.
 - The facade's `/readyz` answers (through `nana-runtime/health.url`).
 
