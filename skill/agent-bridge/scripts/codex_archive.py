@@ -154,7 +154,7 @@ class Protections:
             if route['transport'] == 'codex' and route != close_route:
                 self.protected.add(route['session'])
         self.holders = {absolute_path(cwd) for _, _, cwd in wt.open_files(skip=(os.getpid(),), cwd_only=True)}
-        self.cutoff = time.time() - MIN_AGE
+        self.cutoff = None if close_route is not None else time.time() - MIN_AGE
         self.prefix = prefix
 
     def reason(self, row):
@@ -167,7 +167,7 @@ class Protections:
             return 'registered_route'
         if any(holder.is_relative_to(cwd) for holder in self.holders):
             return 'running_process_cwd'
-        if not row['archived'] and row['activity'] > self.cutoff:
+        if self.cutoff is not None and not row['archived'] and row['activity'] > self.cutoff:
             return 'recent_activity'
         return None
 

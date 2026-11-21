@@ -135,6 +135,23 @@ class CodexArchiveTests(unittest.TestCase):
         self.assertEqual(self.calls, [('thread/archive', leaf), ('thread/archive', root)])
         self.assertEqual((result['closed'], result['count'], result['archived_at']), (True, 2, 2))
 
+    def test_close_archives_recent_root_and_child_rejected_by_sweep(self):
+        now = int(archive.time.time())
+        root = self.add(1, age=now - 3)
+        child = self.add(2, parent=root, age=now - 1)
+        manifest = self.plan()
+        self.assertEqual(manifest['candidates'], [])
+        self.assertEqual({row['id']: row['reason'] for row in manifest['refusals']},
+                         {root: 'recent_activity', child: 'recent_activity'})
+        route = self.route(root)
+        self.register(route)
+
+        result = archive.close(route, self.routes, 1)
+
+        self.assertEqual(self.calls, [('thread/archive', child), ('thread/archive', root)])
+        self.assertEqual((result['closed'], result['count'], result['archive_incomplete']),
+                         (True, 2, False))
+
     def test_close_refuses_alias_and_protected_descendant(self):
         root = self.add(1)
         leaf = self.add(2, parent=root)

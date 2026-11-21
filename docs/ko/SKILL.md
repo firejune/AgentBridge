@@ -144,7 +144,7 @@ python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.
 - 내가 소유하거나 소유자 또는 HQ가 종료를 지시한 세션만 닫는다. 일반 `close`는 정확한 Claude CLI 프로세스를 중지하거나, 대기 중인 Antigravity 대화 또는 Codex 라우트를 분리한다. 세션을 보관하려면 `--archive`를 사용한다.
 - 보관이 확인되면 브로커는 별칭을 포함해 정확한 세션의 정리 가능한 서신을 삭제하고, 영향을 받은 수신함 스냅샷을 만료시킨다. 공급자 대화 원문은 유지한다. 일반 종료는 서신을 유지한다. 직접 보관에 `--keep-route`를 사용해도 서신 정리는 수행한다.
 - Codex Desktop의 네이티브 보관은 `close --archive --handoff`로 요청한다. Desktop에서 정확한 대화를 직접 보관하거나 등록된 담당자를 이용하고, `close --finish CLOSE_ID --expect-session UUID`로 완료를 확인한다. [세션 닫기](usage.md#세션-닫기) 참고.
-- Codex 직접 종료(`close --archive`)는 네이티브 앱 서버에서 하위 스레드부터 보관한다. 등록 라우트, 실행 중인 프로세스의 작업 경로, 최근 활동을 확인하고 보관 상태를 다시 읽은 뒤 라우트를 제거한다. `archive-sweep --cwd-prefix /absolute/workspace`로 후보와 거부 사유를 확인하고 비공개 JSON 검토 후 `archive-sweep --apply --manifest FILE`로 적용한다. 되돌리기는 하위 스레드에도 영향을 줄 수 있다. [Codex 일괄 보관](usage.md#codex-일괄-보관).
+- Codex 직접 종료(`close --archive`)는 네이티브 앱 서버에서 하위 스레드부터 보관한다. 등록 라우트와 실행 중인 프로세스의 작업 경로를 확인하고 보관 상태를 다시 읽은 뒤 라우트를 제거한다. `archive-sweep --cwd-prefix /absolute/workspace`로 후보와 거부 사유를 확인하고 비공개 JSON 검토 후 `archive-sweep --apply --manifest FILE`로 적용한다. 되돌리기는 하위 스레드에도 영향을 줄 수 있다. [Codex 일괄 보관](usage.md#codex-일괄-보관).
 
 - 저장된 메타데이터에서 정확한 수신 Codex 대화의 보관이 확인되면 CLI는 Desktop에 연결하기 전에 `state: "failed"`와 `reason: "archived"`를 반환한다. 종료 코드는 1이다.
 - 전달에 필요한 정확한 Desktop 소유자를 찾지 못하면 메시지는 `pending`에 머문다. CLI와 MCP는 조회 이유와 확인된 작업 경로 누락을 보고한다. 브리지는 대화를 자동으로 다시 열거나 메시지를 재전송하지 않는다.
