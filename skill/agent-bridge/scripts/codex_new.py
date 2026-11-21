@@ -19,6 +19,7 @@ import codex_wake_open
 import new_session_policy
 
 FULL_ACCESS_PROFILE = ':danger-full-access'
+WORKSPACE_PROFILE = ':workspace'
 QUEUE_ADOPTION = 'desktop-queue-wake'
 PERMISSION_SETTLE_SECONDS = 2
 PERMISSION_SETTLE_ATTEMPTS = 20
@@ -268,7 +269,8 @@ class _Attempt:
         self.stage, self.sid, self.adopted, self.attempted = 'preflight', None, False, False
 
 
-def create_thread(attempt, result, creator, folder, title, model, queue_wake, remaining):
+def create_thread(attempt, result, creator, folder, title, model, queue_wake, remaining,
+                  *, queue_wake_workspace_write=False):
     """Start one persistent thread and require what the creator itself reports; returns its UUID."""
     import sessions
     params = {'cwd': str(folder), 'ephemeral': False, 'allowProviderModelFallback': False,
@@ -304,20 +306,19 @@ def create_thread(attempt, result, creator, folder, title, model, queue_wake, re
             if (error.code, error.message) != (-32601, 'list_turns is not supported yet'):
                 raise
     if queue_wake:
-        # thread/start applies Full Access to the creator's loaded thread only. Desktop
-        # resumes a queue-woken thread from the settings saved in its rollout, and with
-        # none saved it falls back to workspace-write with on-request approval, where an
-        # unattended turn waits on an approval nobody gives (issue #172). Saving the
-        # settings here is what the wake turn and every later queue turn inherit. It has
-        # to follow the calls above: an update sent before the rollout exists is not saved.
+        # Desktop queue turns inherit settings saved in the rollout. The
+        # creator's loaded settings alone are insufficient (issue #172).
+        # Update after materialization so the settings can be persisted.
+        profile, approval = ((WORKSPACE_PROFILE, 'on-request') if queue_wake_workspace_write
+                             else (FULL_ACCESS_PROFILE, 'never'))
         attempt.stage = 'settings'
         creator.timeout = remaining()
         creator.call('thread/settings/update', {
-            'threadId': sid, 'permissions': FULL_ACCESS_PROFILE, 'approvalPolicy': 'never'})
+            'threadId': sid, 'permissions': profile, 'approvalPolicy': approval})
     return sid
 
 
-def adopt_by_wake(attempt, result, wake, sid, folder, model, timeout):
+def adopt_by_wake(attempt, result, wake, sid, folder, model, timeout, *, queue_wake_workspace_write=False):
     """Wake the exact thread through the Desktop queue and record what that one turn showed."""
     route = {'session': sid, 'cwd': str(folder), 'transport': 'codex'}
     confirmed = codex_wake_open.adopt(wake, route, model, timeout)
@@ -333,18 +334,25 @@ def adopt_by_wake(attempt, result, wake, sid, folder, model, timeout):
     permissions = permission_diagnostics(raw_permissions)
     result.update(permission_settings=permissions,
                   permission_settings_source='Desktop wake turn context')
-    if not has_full_access(permissions):
-        profile = raw_permissions['activePermissionProfile']
-        sandbox = raw_permissions.get('sandboxPolicy')
+    profile = raw_permissions['activePermissionProfile']
+    sandbox = raw_permissions.get('sandboxPolicy')
+    workspace_write = (profile == {'id': WORKSPACE_PROFILE}
+                       and permissions['approvalPolicy'] == 'on-request'
+                       and sandbox == {'type': 'workspaceWrite', 'networkAccess': False}
+                       and sandbox['networkAccess'] is False)
+    if workspace_write:
+        permissions['sandboxPolicy']['networkAccess'] = False
+    if queue_wake_workspace_write:
+        if not workspace_write:
+            raise CreationError('Codex Desktop wake did not confirm the owner policy requirements '
+                                '(:workspace, workspaceWrite with networkAccess false, on-request)')
+    elif not has_full_access(permissions):
         if permissions['approvalPolicy'] != 'on-request':
             raise CreationError('Codex Desktop wake returned unconfirmed permission settings')
         if profile == {'id': ':read-only'} and sandbox == {'type': 'readOnly'}:
             sandbox_name = 'read-only'
-        elif (profile == {'id': ':workspace'}
-              and sandbox == {'type': 'workspaceWrite', 'networkAccess': False}
-              and sandbox['networkAccess'] is False):
+        elif workspace_write:
             sandbox_name = 'workspace-write'
-            permissions['sandboxPolicy']['networkAccess'] = False
         else:
             raise CreationError('Codex Desktop wake returned unconfirmed permission settings')
         result['warning'] = {
@@ -419,7 +427,8 @@ def adopt_by_owner(attempt, result, client, sid, model, deadline, poll):
 
 
 def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_factory=None,
-               owner_factory=None, poll=0.5, policy=None, force_new=False, *, allow_queue_wake=False):
+               owner_factory=None, poll=0.5, policy=None, force_new=False, *,
+               allow_queue_wake=False, queue_wake_workspace_write=False):
     import sessions
     result = open_result()
     attempt = _Attempt()
@@ -489,7 +498,8 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
                     factory = partial(sessions.CodexClient, executable=str(codex_queue.CLI))
                 creator = scope.enter_context(factory(mode='saved', timeout=remaining(), experimental=True))
                 validate_creator(creator)
-            sid = create_thread(attempt, result, creator, folder, title, model, wake is not None, remaining)
+            sid = create_thread(attempt, result, creator, folder, title, model, wake is not None, remaining,
+                                queue_wake_workspace_write=queue_wake_workspace_write)
         # Close the creator before proving persistence and exact Desktop adoption.
         attempt.stage = 'persistence'
         with factory(mode='saved', timeout=remaining()) as reader:
@@ -498,7 +508,8 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
             result['session'] = sessions.codex_row(stored, 'saved')
         attempt.stage = 'adoption'
         if wake is not None:
-            adopt_by_wake(attempt, result, wake, sid, folder, model, remaining(timeout))
+            adopt_by_wake(attempt, result, wake, sid, folder, model, remaining(timeout),
+                          queue_wake_workspace_write=queue_wake_workspace_write)
         elif opener is None:
             open_link(result['url'], remaining())
         else:

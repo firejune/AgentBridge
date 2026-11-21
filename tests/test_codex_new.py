@@ -19,6 +19,7 @@ import broker
 import codex_live
 import codex_new
 import codex_wake_open
+from new_session_policy import CODEX_DESKTOP_WAKE_PERMISSIONS
 import sessions
 from support import RunningBroker
 from test_codex_live import FakeDesktop
@@ -768,7 +769,7 @@ class NewCodexTests(unittest.TestCase):
                     self.assertNotIn(str(endpoint), result['error'])
                     self.assertEqual([call.args[1]['op'] for call in rpc.call_args_list], ['routes'])
 
-    def test_open_registers_queue_wake_with_verified_restricted_settings(self):
+    def test_open_registers_queue_wake_with_default_or_configured_permissions(self):
         self.thread['historyMode'] = 'paginated'
         real_open = codex_new.open_codex
         turn_id = str(uuid.uuid4())
@@ -790,17 +791,27 @@ class NewCodexTests(unittest.TestCase):
             self.assertEqual(model, 'requested-model')
             self.assertTrue(all(client.closed for client in self.instances))
             self.assertGreater(timeout, 0)
+            self.assertEqual([method for method, _, _ in self.calls][-4:],
+                             ['thread/name/set', 'thread/read', 'thread/settings/update', 'thread/read'])
             return {'model': model, 'permission_settings': permissions, 'turn_id': turn_id}
 
         endpoint = codex_live.EndpointUnavailable
-        cases = ((endpoint.MISSING, ':read-only', {'type': 'readOnly'}, 'read-only'),
-                 (endpoint.REFUSED, ':workspace', {'type': 'workspaceWrite', 'networkAccess': False},
-                  'workspace-write'))
-        for reason, profile, sandbox, label in cases:
-            permissions = {'activePermissionProfile': {'id': profile}, 'approvalPolicy': 'on-request',
-                           'sandboxPolicy': sandbox}
+        workspace = {'activePermissionProfile': {'id': ':workspace'}, 'approvalPolicy': 'on-request',
+                     'sandboxPolicy': {'type': 'workspaceWrite', 'networkAccess': False}}
+        read_only = {'activePermissionProfile': {'id': ':read-only'}, 'approvalPolicy': 'on-request',
+                     'sandboxPolicy': {'type': 'readOnly'}}
+        full_access = dict(full_permissions(), activePermissionProfile={'id': ':danger-full-access'})
+        cases = ((False, endpoint.MISSING, read_only, 'read-only'),
+                 (False, endpoint.REFUSED, workspace, 'workspace-write'),
+                 (False, endpoint.MISSING, full_access, None),
+                 (True, endpoint.REFUSED, workspace, None))
+        for configured, reason, permissions, warning_sandbox in cases:
+            if configured:
+                Path(self.root, 'policy.json').write_text(json.dumps({
+                    CODEX_DESKTOP_WAKE_PERMISSIONS: 'workspace-write'}))
             self.calls.clear()
-            with self.subTest(reason=reason, profile=profile), patch.object(codex_new, 'open_codex', side_effect=create), \
+            with self.subTest(configured=configured, permissions=permissions), \
+                    patch.object(codex_new, 'open_codex', side_effect=create), \
                     patch.object(codex_live, 'Client', side_effect=endpoint(endpoint.DEFAULT, reason)) as ipc, \
                     patch.object(codex_wake_open, 'prepare', side_effect=prepare_context) as prepare, \
                     patch.object(codex_wake_open, 'adopt', side_effect=adopt) as wake, \
@@ -824,25 +835,57 @@ class NewCodexTests(unittest.TestCase):
             self.assertEqual(result['wake_turn_id'], turn_id)
             self.assertEqual(result['permission_settings'], permissions)
             self.assertEqual(result['permission_settings_source'], 'Desktop wake turn context')
-            self.assertEqual(result['warning']['code'], 'CODEX_DESKTOP_WAKE_RESTRICTED')
-            # The claim covers the one turn that was read, and says the bridge asked for more.
-            self.assertEqual(result['warning']['message'],
-                             f'The Desktop wake turn ran with {label} sandbox, no network access and on-request '
-                             'approval, not the Full Access the bridge requested. Later turns are not verified.')
+            if warning_sandbox is None:
+                self.assertIsNone(result['warning'])
+            else:
+                self.assertEqual(result['warning']['code'], 'CODEX_DESKTOP_WAKE_RESTRICTED')
+                self.assertEqual(result['warning']['message'],
+                                 f'The Desktop wake turn ran with {warning_sandbox} sandbox, no network access and '
+                                 'on-request approval, not the Full Access the bridge requested. '
+                                 'Later turns are not verified.')
             self.assertEqual(result['model'], 'requested-model')
             self.assertEqual(result['creator_settings']['sandbox']['type'], 'dangerFullAccess')
             self.assertEqual([method for method, _, _ in self.calls].count('thread/start'), 1)
             self.assertEqual([(method, params.get('includeTurns')) for method, params, client in self.calls
                               if client.creator and method in ('thread/name/set', 'thread/read')],
                              [('thread/name/set', None), ('thread/read', True)])
-            # Full Access is saved on the thread once, before the wake (issue #172).
-            methods = [method for method, _, _ in self.calls]
+            # The creator stays on its existing contract. Only the saved update varies.
+            start, = [params for method, params, _ in self.calls if method == 'thread/start']
+            self.assertEqual((start['permissions'], start['approvalPolicy']), (':danger-full-access', 'never'))
             self.assertEqual([params for method, params, _ in self.calls if method == 'thread/settings/update'],
-                             [{'threadId': self.sid, 'permissions': codex_new.FULL_ACCESS_PROFILE,
-                               'approvalPolicy': 'never'}])
-            # After the calls that materialize the rollout; an earlier update is not saved.
-            self.assertEqual(methods.index('thread/settings/update'),
-                             max(i for i, (method, _, client) in enumerate(self.calls) if client.creator))
+                             [{'threadId': self.sid, 'permissions': ':workspace' if configured else ':danger-full-access',
+                               'approvalPolicy': 'on-request' if configured else 'never'}])
+
+    def test_queue_wake_policy_does_not_change_desktop_ipc(self):
+        Path(self.root, 'policy.json').write_text(json.dumps({
+            CODEX_DESKTOP_WAKE_PERMISSIONS: 'workspace-write'}))
+        with ModelDesktop(model='requested-model') as desktop, \
+                patch.object(codex_wake_open, 'prepare') as prepare:
+            code, result = self.cli_open(desktop)
+            update, = [call for call in desktop.calls if call['method'] == 'thread-follower-update-thread-settings']
+        self.assertEqual(code, 0)
+        self.assertEqual(result['adoption_mode'], 'desktop-ipc')
+        self.assertEqual(result['permission_settings'], full_permissions())
+        self.assertEqual(update['params']['threadSettings'], {
+            'permissions': ':danger-full-access', 'approvalPolicy': 'never'})
+        self.assertFalse(any(method == 'thread/settings/update' for method, _, _ in self.calls))
+        prepare.assert_not_called()
+
+    def test_invalid_queue_wake_policy_refuses_before_creation_without_leaking_contents(self):
+        path = Path(self.root, 'policy.json')
+        command = ['open', '--provider', 'codex', '--cwd', self.root, '--state-dir', self.root]
+        for invalid in (None, True, '', 'read-only', ':workspace', 'private-unrecognized-profile'):
+            path.write_text(json.dumps({CODEX_DESKTOP_WAKE_PERMISSIONS: invalid}))
+            with self.subTest(invalid=invalid), patch.object(sessions, 'open_session') as create, \
+                    patch('sys.stdout', new_callable=io.StringIO) as out:
+                self.assertEqual(bridge.main(command), 1)
+                result = json.loads(out.getvalue())
+            create.assert_not_called()
+            self.assertEqual(result['stage'], 'preflight')
+            self.assertFalse(result['created'] or result['registered'] or result['uncertain'])
+            self.assertIn(CODEX_DESKTOP_WAKE_PERMISSIONS, result['error'])
+            self.assertNotIn(str(path), result['error'])
+            self.assertNotIn('private-unrecognized-profile', result['error'])
 
     def test_queue_wake_preflight_refuses_without_creating_or_retrying(self):
         endpoint = codex_live.EndpointUnavailable
@@ -881,19 +924,28 @@ class NewCodexTests(unittest.TestCase):
         def create(**kwargs):
             return real_open(**kwargs, client_factory=self.factory, opener=self.urls.append)
 
-        workspace = dict(permissions, activePermissionProfile={'id': ':workspace'})
+        workspace = dict(permissions, activePermissionProfile={'id': ':workspace'},
+                         sandboxPolicy={'type': 'workspaceWrite', 'networkAccess': False})
         invalid_sandboxes = ({'type': 'workspaceWrite'},
                              {'type': 'workspaceWrite', 'networkAccess': True},
                              {'type': 'workspaceWrite', 'networkAccess': 0},
                              {'type': 'workspaceWrite', 'networkAccess': False, 'extra': True})
-        confirmations = [('model', 'substituted', permissions),
-                         ('permissions', 'requested-model', dict(permissions, activePermissionProfile=None)),
-                         *[('permissions', 'requested-model', dict(workspace, sandboxPolicy=sandbox))
-                           for sandbox in invalid_sandboxes]]
+        invalid = [dict(permissions, activePermissionProfile=None),
+                   *(dict(workspace, sandboxPolicy=sandbox) for sandbox in invalid_sandboxes)]
+        default = [(False, 'model', 'substituted', permissions),
+                   *((False, 'permissions', 'requested-model', observed) for observed in invalid)]
+        configured = [(True, 'permissions', 'requested-model', observed) for observed in (
+            *invalid, permissions, dict(full_permissions(), activePermissionProfile={'id': ':danger-full-access'}),
+            dict(workspace, approvalPolicy='never'),
+            dict(workspace, activePermissionProfile={'id': ':workspace-write'}),
+            dict(workspace, activePermissionProfile={'id': ':workspace', 'extends': None}))]
         endpoint = codex_live.EndpointUnavailable
-        for stage, model, observed in confirmations:
+        for opted_in, stage, model, observed in default + configured:
+            if opted_in:
+                Path(self.root, 'policy.json').write_text(json.dumps({
+                    CODEX_DESKTOP_WAKE_PERMISSIONS: 'workspace-write'}))
             self.calls.clear()
-            with self.subTest(stage=stage), \
+            with self.subTest(opted_in=opted_in, stage=stage, observed=observed), \
                     patch.object(codex_new, 'open_codex', side_effect=create), \
                     patch.object(codex_live, 'Client', side_effect=endpoint(endpoint.DEFAULT, endpoint.MISSING)), \
                     patch.object(codex_wake_open, 'prepare'), \
@@ -907,6 +959,9 @@ class NewCodexTests(unittest.TestCase):
             self.assertEqual(result['session']['id'], self.sid)
             self.assertTrue(result['created'] and result['uncertain'])
             self.assertFalse(result['adopted'] or result['registered'])
+            self.assertIsNone(result['wake_turn_id'])
+            if opted_in:
+                self.assertIn('owner policy requirements', result['error'])
             self.assertEqual([call.args[1]['op'] for call in rpc.call_args_list], ['routes'])
             self.assertEqual([method for method, _, _ in self.calls].count('thread/start'), 1)
             self.assertEqual(self.urls, [])
