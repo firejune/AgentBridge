@@ -197,7 +197,8 @@ class CodexLiveTests(unittest.TestCase):
                 if expected:
                     result = codex_live.deliver(self.route, self.message_id, 'PEER_BODY')
                     self.assertEqual(result['delivery_mode'], 'queue')
-                    queue.assert_called_once_with(self.route, self.route['session'], self.message_id, 10, False)
+                    queue.assert_called_once_with(self.route, self.route['session'], self.message_id, 10, False,
+                                                  close_handoff=False)
                 else:
                     with self.assertRaises(codex_live.EndpointUnavailable):
                         codex_live.deliver(self.route, self.message_id, 'PEER_BODY')

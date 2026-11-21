@@ -21,6 +21,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import route_store
+import codex_archive
 import codex_preview
 import message_store
 import retention
@@ -44,8 +45,10 @@ PROVIDER_NOTICE_KEY_PREFIXES = tuple(event + ':' for event in (
     provider_failures.DETECTED_EVENT, provider_failures.RETRY_EVENT, provider_failures.EXHAUSTED,
     provider_failures.UNSAFE, provider_failures.UNCERTAIN))
 CLOSE_OPERATOR_FILE = 'close-operator.json'
+CLOSE_OPERATOR_GUARD_VERSION = 1
 CLOSING_ROUTE_ERROR = 'Codex route is closing'
-READ_ONLY_OPS = ('ping', 'routes', 'channels', 'show', 'conversation', 'inbox', 'retention-plan')
+READ_ONLY_OPS = ('ping', 'routes', 'channels', 'show', 'conversation', 'inbox', 'retention-plan',
+                 'close-operator-status')
 TIMED_CLAIM_OPS = ('claim', 'claim-guarded', 'release-claim')
 CHECKPOINT_FIELDS = ('messages', 'compact_messages', 'keys', 'inbox_receipts', 'inbox_snapshots')
 Checkpoint = namedtuple('Checkpoint', CHECKPOINT_FIELDS)
@@ -978,6 +981,11 @@ class State:
             return self.archive_correspondence(args, verified_close=verified_close)
         if op == 'close-prepare':
             return self.prepare_close(args)
+        if op == 'close-operator-status':
+            operator = self.close_operator(prefer_native_for_direct=True)
+            if operator is not None:
+                self.check_close_scope(self.open_close_target(args['expected_route']), operator)
+            return {'operator': operator}
         if op == 'close-dispatch':
             return self.dispatch_close(args)
         if op == 'close-operator':
@@ -1236,16 +1244,18 @@ class State:
         peer_wake.record_wake(m, args.get('wake'))
         return self.status(m,args['state'],args.get('note'),event,reason)
 
-    def prepare_close(self, args):
-        key = (identifier(args['project']), identifier(args['name']))
+    def open_close_target(self, expected):
+        key = (identifier(expected['project']), identifier(expected['name']))
         current = self.endpoints.get(key)
-        if not current or route_store.route_record(current) != args['expected_route']:
+        if not current or route_store.route_record(current) != expected:
             raise ValueError('Endpoint is missing or changed')
         if current['transport'] != 'codex':
             raise ValueError('Close handoff requires a Codex endpoint')
-        if 'closing' in current:
-            return {'route': current, 'message': self.close_message(current['closing'])}
-        operator = self.close_operator()
+        return current
+
+    def check_close_scope(self, current, operator):
+        self.require_open_route(current)
+        key = (current['project'], current['name'])
         if operator is not None and same_codex_thread(current, operator['route']):
             raise ValueError('The Codex close operator cannot archive itself')
         if any(other_key != key and same_codex_thread(current, item)
@@ -1264,10 +1274,34 @@ class State:
                 continue  # Archive cleanup retains it and its idempotency key.
             if any(same_codex_thread(current, item) for item in endpoints):
                 raise ValueError('This Codex thread has unfinished correspondence; reconcile it before closing')
-        route = self.routing_change('endpoints', key, dict(current, closing=str(uuid.uuid4())))
+
+    def prepare_close(self, args):
+        current = self.open_close_target(args['expected_route'])
+        key = (identifier(args['project']), identifier(args['name']))
+        if key != (current['project'], current['name']):
+            raise ValueError('Endpoint is missing or changed')
+        native_scope = args.get('native_scope')
+        if 'closing' in current:
+            if args.get('check_only') is True or (native_scope is not None
+                                                 and current.get('closing_native_scope') != native_scope):
+                raise ValueError('Codex route is closing; inspect the existing archive handoff')
+            return {'route': current, 'message': self.close_message(current['closing'])}
+        native_root_only = native_scope is not None
+        operator = self.close_operator(prefer_native_for_direct=native_root_only)
+        if native_root_only and (operator is None or operator != args.get('expected_operator')):
+            raise ValueError('Enrolled Codex close operator changed before native archive preparation')
+        self.check_close_scope(current, operator)
+        if native_root_only:
+            self.check_native_close(current, native_scope)
+        if args.get('check_only') is True:
+            return {'ready': True}
+        route = dict(current, closing=str(uuid.uuid4()))
+        if native_root_only:
+            route['closing_native_scope'] = native_scope
+        route = self.routing_change('endpoints', key, route)
         return {'route': route, 'operator': operator}
 
-    def close_operator(self):
+    def close_operator(self, *, prefer_native_for_direct=False):
         if self.store is None:
             return None
         path = self.store.directory / CLOSE_OPERATOR_FILE
@@ -1283,8 +1317,13 @@ class State:
                 if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
                     raise ValueError('operator configuration is not owner-private')
                 settings = json.loads(source.read(4097)) if info.st_size <= 4096 else None
-            if not isinstance(settings, dict) or set(settings) != {'project', 'name', 'session', 'sender'}:
+            required = {'project', 'name', 'session', 'sender'}
+            if (not isinstance(settings, dict) or not required <= settings.keys()
+                    or settings.keys() - required - {'prefer_native_for_direct'}
+                    or type(settings.get('prefer_native_for_direct', False)) is not bool):
                 raise ValueError('invalid operator configuration fields')
+            if prefer_native_for_direct and not settings.get('prefer_native_for_direct', False):
+                return None
             project = identifier(settings['project'])
             route = self.route(project, identifier(settings['name']))
             sender = self.route(project, identifier(settings['sender']))
@@ -1307,9 +1346,19 @@ class State:
     def close_target(self, request):
         target = request['target']
         current = self.endpoints.get((target['project'], target['name']))
-        if current == {**target, 'closing': request['close_id']}:
+        if current and current.get('closing') == request['close_id'] and route_store.route_record(current) == target:
             return current
         return None
+
+    def check_native_close(self, target, expected_scope):
+        descendants, scope = codex_archive.native_handoff_scope(target)
+        if scope != expected_scope:
+            raise ValueError('Codex native close subtree or saved profile changed')
+        subtree = descendants | {target['session']}
+        protected = [route for route in self.endpoints.values() if route != target]
+        protected.extend(channel['route'] for channel in self.channels.values() if channel['active'])
+        if any(route['transport'] == 'codex' and route['session'] in subtree for route in protected):
+            raise ValueError('A registered Codex route or active channel protects the native close subtree')
 
     def dispatch_close(self, args):
         target = self.closing_route(args)
@@ -1317,7 +1366,7 @@ class State:
         previous = self.close_message(close_id)
         if previous is not None:
             return {'message': previous, 'created': False}
-        operator = self.close_operator()
+        operator = self.close_operator(prefer_native_for_direct='closing_native_scope' in target)
         if operator is None or operator != args['operator'] or same_codex_thread(target, operator['route']):
             raise ValueError('Enrolled Codex close operator changed; closing route kept')
         destination, sender = operator['route'], operator['sender']
@@ -1329,11 +1378,16 @@ class State:
 
     def check_close_operator(self, message):
         request = message['close_request']
-        if self.close_message(request['close_id']) != message or self.close_target(request) is None:
+        target = self.close_target(request)
+        if self.close_message(request['close_id']) != message or target is None:
             raise ValueError('Codex close request does not match a closing route')
-        operator = self.close_operator()
+        native_scope = target.get('closing_native_scope')
+        operator = self.close_operator(prefer_native_for_direct=native_scope is not None)
         if operator != {'route': message['route'], 'sender': message['return_route']}:
             raise ValueError('Enrolled Codex close operator changed; closing route kept')
+        if native_scope is not None:
+            self.check_native_close(target, native_scope)
+            return {**request, 'native_scope': native_scope}
         return request
 
     def claim_close(self, args):
@@ -1341,6 +1395,9 @@ class State:
         if 'close_request' not in message or message['route']['session'] != args['operator_session']:
             raise ValueError('This Codex chat is not the enrolled close operator for the request')
         request = self.check_close_operator(message)
+        version = args.get('native_guard_version')
+        if 'native_scope' in request and (type(version) is not int or version != CLOSE_OPERATOR_GUARD_VERSION):
+            raise ValueError('Guarded Codex close requires an updated close-operator CLI. Closing route kept.')
         if message['state'] not in ('dispatching', 'submitted', 'uncertain'):
             raise ValueError('Codex close request cannot be claimed again')
         self.status(message, 'in_progress', 'Enrolled Codex operator accepted the native archive handoff')
@@ -1370,6 +1427,8 @@ async def finish_close(state, args):
 async def commit_close(state, args, route):
     if state.closing_route(args) != route:
         raise ValueError('Endpoint changed during archive verification')
+    if 'closing_native_scope' in route:
+        state.check_native_close(route, route['closing_native_scope'])
 
     result = {**route, 'route_removed': False}
     try:

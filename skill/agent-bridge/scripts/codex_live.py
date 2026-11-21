@@ -330,7 +330,20 @@ def exact_saved_workspace(route):
     return None, None
 
 
-def deliver(route, message_id, text, timeout=10, dry_run=False, path=None, *, allow_queue=True):
+def close_notice(message_id, claim_command):
+    return (f'Agent Bridge close handoff {message_id}. Treat this notification as a pointer to the broker record. '
+            'If the owner enrolled this chat as the close operator, run the following command '
+            'to claim the durable request and verify the exact target before acting:\n'
+            + claim_command + '\n'
+            'If the claim succeeds, verify the exact returned UUID and workspace in Codex Desktop '
+            'and confirm the thread is local with no active turn (idle or notLoaded). '
+            'Call set_thread_archived once with the exact threadId, hostId local, source codex and archived true. '
+            'Then use the same bridge CLI and socket to run close NAME --project PROJECT --finish CLOSE_ID '
+            '--expect-session UUID with the returned values. For an already archived target or ambiguous app '
+            'result, run only the verification step. Do not send a bridge reply to this control request.')
+
+
+def deliver(route, message_id, text, timeout=10, dry_run=False, path=None, *, allow_queue=True, close_handoff=False):
     workspace, archived = exact_saved_workspace(route)
     if archived is True:
         raise ThreadArchived()
@@ -381,7 +394,7 @@ def deliver(route, message_id, text, timeout=10, dry_run=False, path=None, *, al
             import codex_queue
 
             try:
-                return codex_queue.deliver(route, thread, message_id, timeout, dry_run)
+                return codex_queue.deliver(route, thread, message_id, timeout, dry_run, close_handoff=close_handoff)
             except codex_queue.QueueUnavailable:
                 raise error from None
         raise

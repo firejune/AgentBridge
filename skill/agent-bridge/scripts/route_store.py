@@ -126,6 +126,11 @@ def endpoint_record(item):
                 or str(uuid.UUID(close_id)) != close_id):
             raise ValueError('Invalid Codex close generation')
         result['closing'] = close_id
+    if 'closing_native_scope' in item:
+        scope = item['closing_native_scope']
+        if 'closing' not in result or not isinstance(scope, str) or not re.fullmatch(r'[0-9a-f]{64}', scope):
+            raise ValueError('Invalid Codex native close guard')
+        result['closing_native_scope'] = scope
     return result
 
 
@@ -198,7 +203,7 @@ def read_snapshot(path):
             data = json.load(source)
         except (ValueError, UnicodeError):
             raise ValueError('Invalid routing snapshot; refusing to overwrite it') from None
-    if (not isinstance(data, dict) or data.get('version') not in (1, 2)
+    if (not isinstance(data, dict) or data.get('version') not in (1, 2, 3)
             or not isinstance(data.get('endpoints'), list) or not isinstance(data.get('channels'), list)):
         raise ValueError('Unsupported routing snapshot; refusing to overwrite it')
     return data
@@ -227,6 +232,8 @@ class RouteStore:
     def save(self, endpoints, channels):
         # An older broker must refuse a snapshot containing delivery guards.
         version = 2 if any('closing' in item for item in endpoints.values()) else 1
+        if any('closing_native_scope' in item for item in endpoints.values()):
+            version = 3
         snapshot = dict(version=version,
                         endpoints=[endpoint_record(item) for item in endpoints.values()],
                         channels=[channel_record(item) for item in channels.values()])
@@ -248,10 +255,12 @@ class RouteStore:
             for index, raw in enumerate(items):
                 item = None
                 failed_check = 'invalid routing record'
-                closing = kind == 'endpoint' and isinstance(raw, dict) and 'closing' in raw
+                closing = (kind == 'endpoint' and isinstance(raw, dict)
+                           and ('closing' in raw or 'closing_native_scope' in raw))
                 try:
                     item = normalize(raw)
-                    if closing and data['version'] != 2:
+                    if ((closing and data['version'] < 2)
+                            or ('closing_native_scope' in item and data['version'] < 3)):
                         raise ValueError('Unsupported Codex close snapshot')
                     route = item['route'] if kind == 'channel' else item
                     identity = tuple(route.get(field) for field in ROUTE_FIELDS)

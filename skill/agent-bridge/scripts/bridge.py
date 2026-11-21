@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import agy_live
 import broker
 import codex_archive
+import codex_live
 import codex_preview  # Shared sidebar preview module exposed to CLI callers.
 import codex_new
 # Keep the existing CLI imports of the shared delivery helpers available.
@@ -414,7 +415,7 @@ def open_codex_result(args):
     return 130 if cancelled else (1 if result['error'] else 0)
 
 
-def close_session(route, timeout, archive=False, *, directory=None):
+def close_session(route, timeout, archive=False, *, directory=None, prefer_native=None):
     """Stop or detach one route's session; optionally archive it out of the sidebar."""
     transport, sid = route['transport'], route.get('session')
     if transport == 'claude-peer':
@@ -437,7 +438,7 @@ def close_session(route, timeout, archive=False, *, directory=None):
         return agy_live.close_agy(sid, timeout=timeout)
     if transport == 'codex':
         if archive:
-            return codex_archive.close(route, directory, timeout)
+            return codex_archive.close(route, directory, timeout, prefer_native=prefer_native)
         return {
             'closed': True,
             'method': 'detach',
@@ -552,6 +553,9 @@ def close_participant(args):
         if route['transport'] != 'codex':
             raise ValueError('--handoff requires a Codex route')
     if 'closing' in route and not args.handoff:
+        if archive and not args.keep_route and 'closing_native_scope' in route:
+            pending = prepare_archive_handoff(args, address, route)
+            return {**pending, 'archive_incomplete': not pending['closed']}
         raise ValueError('Codex route is closing; finish the native archive handoff')
     if archive and 'closing' not in route:
         try:
@@ -567,8 +571,33 @@ def close_participant(args):
         # notification. So this one path records first; the native archive is confirmed later by --finish.
         receipt = {} if retro is None else record_retro(args, retro)
         return {**receipt, **prepare_archive_handoff(args, address, route)}
+    directory = broker_state_dir(args).expanduser().resolve()
+    operator = None
+
+    def prefer_native():
+        nonlocal operator
+        operator = preflight_native_close_operator(args, route)
+        return operator is not None
+
+    preflight = prefer_native if archive and not args.keep_route else None
     result = {**address, 'transport': route['transport'],
-              **close_session(route, args.timeout, archive=archive, directory=broker_state_dir(args).expanduser().resolve())}
+              **close_session(route, args.timeout, archive=archive, directory=directory, prefer_native=preflight)}
+    if result.get('status') == 'awaiting_native_archive':
+        scope = result.pop('native_scope')
+        try:
+            prepare_archive_handoff(args, address, route, expected_operator=operator, native_scope=scope,
+                                    check_only=True)
+            if retro is not None:
+                result.update(record_retro(args, retro))
+            result.update(prepare_archive_handoff(args, address, route, expected_operator=operator,
+                                                  native_scope=scope))
+        except (broker.BrokerResponseError, OSError):
+            result.update(status='native_archive_preparation_unconfirmed', route_removed=False,
+                          operator_error='Native archive handoff could not be confirmed; inspect the route')
+        except ValueError as error:
+            result.update(status='native_archive_preparation_refused', route_removed=False, operator_error=str(error))
+        result['archive_incomplete'] = not result['closed']
+        return result
     if archive and (result.get('archived') is not True or result.get('session') != route['session']):
         result.update(correspondence_removed=False, cleanup_error='Provider archival was not confirmed', route_removed=False)
         if retro is not None:
@@ -613,9 +642,41 @@ def close_participant(args):
     return result
 
 
-def prepare_archive_handoff(args, address, route):
-    expected = {key: value for key, value in route.items() if key != 'closing'}
-    prepared = broker.request(args.socket, {'op': 'close-prepare', **address, 'expected_route': expected})
+def preflight_native_close_operator(args, target):
+    try:
+        status = broker.request(args.socket, {'op': 'close-operator-status', 'expected_route': target})
+    except ValueError as error:
+        if str(error) == 'Unknown operation':
+            raise ValueError('The running broker cannot verify the Codex close operator preference; upgrade it') from None
+        raise
+    if not isinstance(status, dict) or 'operator' not in status:
+        raise ValueError('Could not verify the Codex close operator preference')
+    operator = status['operator']
+    if operator is not None:
+        allow_queue = Path(args.socket).expanduser() == broker.DEFAULT_SOCKET
+        try:
+            codex_live.deliver(operator['route'], str(uuid.uuid4()), '', args.timeout, dry_run=True,
+                               allow_queue=allow_queue, close_handoff=True)
+        except codex_live.EndpointUnavailable as error:
+            detail = ' The local Desktop queue could not be verified.' if allow_queue and error.default_absent else ''
+            raise ValueError(f'Enrolled Codex close operator is unavailable. {error}{detail}') from None
+        except codex_live.DeliveryError as error:
+            raise ValueError(f'Enrolled Codex close operator is unavailable. {error}') from None
+    return operator
+
+
+def prepare_archive_handoff(args, address, route, *, expected_operator=None, native_scope=None, check_only=False):
+    expected = {key: value for key, value in route.items() if key not in ('closing', 'closing_native_scope')}
+    request = {'op': 'close-prepare', **address, 'expected_route': expected}
+    if native_scope is not None:
+        request.update(native_scope=native_scope, expected_operator=expected_operator)
+    if check_only:
+        request['check_only'] = True
+    prepared = broker.request(args.socket, request)
+    if check_only:
+        if prepared != {'ready': True}:
+            raise broker.BrokerResponseError('Broker did not confirm native archive preparation checks')
+        return None
     target = prepared['route']
     result = {**address, 'status': 'awaiting_native_archive', 'closed': False, 'route_removed': False,
               'transport': 'codex', 'close_id': target['closing'],
@@ -628,7 +689,10 @@ def prepare_archive_handoff(args, address, route):
                 'operator': prepared['operator']})
             message = dispatch['message']
             if dispatch['created']:
-                message = push_codex(args.socket, message, args.timeout, close_dispatch=True)
+                message = push_codex(args.socket, message, args.timeout, close_dispatch=True,
+                                     guarded_close='closing_native_scope' in target)
+                if 'delivery_path' in message:
+                    result['operator_delivery_path'] = message['delivery_path']
         except PushFailed as error:
             message = error.message
             result['operator_error'] = 'Codex close handoff delivery could not be confirmed'
@@ -641,6 +705,8 @@ def prepare_archive_handoff(args, address, route):
         elif message['state'] == 'done':
             result.update(status='closed', closed=True, archived=True, route_removed=True)
             result.pop('operator_error', None)
+    elif 'closing_native_scope' in target:
+        result.setdefault('operator_error', 'No dispatcher was confirmed for the native archive handoff')
     return result
 
 
@@ -1126,8 +1192,11 @@ def close_operator_command(args):
     if not caller:
         raise ValueError('Run close-operator from the enrolled Codex Desktop chat')
     request = broker.request(args.socket, {'op':'close-operator', 'id':str(uuid.UUID(args.id)),
-                              'operator_session':str(uuid.UUID(caller))})
+                              'operator_session':str(uuid.UUID(caller)),
+                              'native_guard_version':broker.CLOSE_OPERATOR_GUARD_VERSION})
     target = request['target']
+    if 'native_scope' in request:
+        codex_archive.check_native_operator_processes(target, request['native_scope'])
     output({key: target[key] for key in ('project', 'name', 'session', 'cwd')}
            | {'close_id': request['close_id']})
     return 0

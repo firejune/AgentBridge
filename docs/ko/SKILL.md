@@ -144,8 +144,8 @@ python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.
 - `ack`와 `progress`는 수신 확인·진행 보고이며 최종 답변이 아니다. `ask`/`wait`의 종료 코드 2는 대기 시간 초과이므로 요청을 다시 보내지 말고 같은 ID로 `wait`한다.
 - 내가 소유하거나 소유자 또는 HQ가 종료를 지시한 세션만 닫는다. 일반 `close`는 정확한 Claude CLI 프로세스를 중지하거나, 대기 중인 Antigravity 대화 또는 Codex 라우트를 분리한다. 세션을 보관하려면 `--archive`를 사용한다.
 - 보관이 확인되면 브로커는 별칭을 포함해 정확한 세션의 정리 가능한 서신을 삭제하고, 영향을 받은 수신함 스냅샷을 만료시킨다. 공급자 대화 원문은 유지한다. 일반 종료는 서신을 유지한다. 직접 보관에 `--keep-route`를 사용해도 서신 정리는 수행한다.
-- Codex Desktop의 네이티브 보관은 `close --archive --handoff`로 요청한다. Desktop에서 정확한 대화를 직접 보관하거나 등록된 담당자를 이용하고, `close --finish CLOSE_ID --expect-session UUID`로 완료를 확인한다. [세션 닫기](usage.md#세션-닫기) 참고.
-- Codex 직접 종료(`close --archive`)는 네이티브 앱 서버에서 하위 스레드부터 보관한다. 등록 라우트와 실행 중인 프로세스의 작업 경로를 확인하고 보관 상태를 다시 읽은 뒤 라우트를 제거한다. `archive-sweep --cwd-prefix /absolute/workspace`로 후보와 거부 사유를 확인하고 비공개 JSON 검토 후 `archive-sweep --apply --manifest FILE`로 적용한다. 되돌리기는 하위 스레드에도 영향을 줄 수 있다. [Codex 일괄 보관](usage.md#codex-일괄-보관).
+- 기본적으로 Codex 직접 종료(`close --archive`)는 저장된 보관 상태를 확인한다. 이미 열려 있는 Desktop 사이드바에는 대화가 계속 보일 수 있다. Desktop에서 네이티브 보관을 하려면 `close --archive --handoff`를 사용하고, Desktop에서 정확한 대화를 직접 보관하거나 등록된 담당자를 이용한다. 소유자가 `close-operator.json`에 `"prefer_native_for_direct": true`를 설정하면 직접 종료가 검토된 하위 스레드를 먼저 보관하고 루트를 인계한다. 이 설정은 라우트를 제거하는 직접 종료에 적용된다. 이 설정을 적용한 직접 종료에서 기본 Desktop IPC 소켓이 없거나 연결을 거부하면, 기본 로컬 브로커 소켓에서 검증된 Desktop 큐로 등록된 담당자에게 알릴 수 있다. 담당자 대화가 로드되어 있고 새 턴을 시작할 수 있어야 알림을 처리할 수 있다. 명시적 `--handoff`는 IPC 또는 Desktop에서의 수동 보관을 사용한다. 직접 종료의 인계가 대기 중이면 `awaiting_native_archive`와 종료 코드 1을 반환한다. 담당자의 완료 기록이나 `close --finish CLOSE_ID --expect-session UUID`로 완료를 확인한다. [세션 닫기](usage.md#세션-닫기) 참고.
+- Codex 직접 종료(`close --archive`)는 등록 라우트와 실행 중인 프로세스의 작업 경로를 확인하고 하위 스레드부터 보관한다. 저장 상태를 확인하는 경로에서는 보관 비트를 다시 읽은 뒤 라우트를 제거한다. `archive-sweep --cwd-prefix /absolute/workspace`로 후보와 거부 사유를 확인하고 비공개 JSON 검토 후 `archive-sweep --apply --manifest FILE`로 적용한다. 되돌리기는 하위 스레드에도 영향을 줄 수 있다. [Codex 일괄 보관](usage.md#codex-일괄-보관).
 
 - 저장된 메타데이터에서 정확한 수신 Codex 대화의 보관이 확인되면 CLI는 Desktop에 연결하기 전에 `state: "failed"`와 `reason: "archived"`를 반환한다. 종료 코드는 1이다.
 - 전달에 필요한 정확한 Desktop 소유자를 찾지 못하면 메시지는 `pending`에 머문다. CLI와 MCP는 조회 이유와 확인된 작업 경로 누락을 보고한다. 브리지는 대화를 자동으로 다시 열거나 메시지를 재전송하지 않는다.
@@ -250,8 +250,7 @@ Codex `open` / `register --new`는 권한 확인에 실패하면 라우트를 �
 필수다. 누락은 `RETRO_REQUIRED`, 빈 파일은 `RETRO_EMPTY`, 빈 사유는
 `RETRO_REASON_EMPTY`로 공급자 동작과 경로 삭제 전에 거절한다. 타워와 HQ는
 `--no-retro` 사유를 남긴다.
-회고는 공급자 동작 전에 읽고 검증하며, 종료가 확인된 뒤에만 저장한다(`--archive`는
-보관 상태를 다시 읽은 뒤, `--handoff`는 닫는 중인 라우트가 회고 알림을 보낼 수 없어 인계를 준비할 때). 실패한 close는 회고를 저장하지 않고 `retro_recorded: false`를
+회고는 공급자 동작 전에 읽고 검증하며 일반적으로 종료가 확인된 뒤에 저장한다. 저장 상태를 확인하는 보관 경로에서는 상태를 다시 읽고 나서 저장한다. 명시적 또는 설정으로 선택된 네이티브 인계는 닫는 중인 라우트가 회고 알림을 보낼 수 없으므로 인계 준비 전에 저장한다. 그 시점에 이르기 전에 실패한 close는 회고를 저장하지 않고 `retro_recorded: false`를
 반환하며, 나중에 다시 실행하면 한 번만 기록된다. 세션은 닫혔는데 저장이 실패하면
 `retro_error`로 알리고, 그 기록은 `retro add`로 넣는다.
 

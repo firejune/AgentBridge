@@ -126,7 +126,7 @@ Python CLI의 `sessions`는 기본적으로 세션별 모델 조회를 건너뛴
 | --- | --- | --- | --- |
 | **Antigravity (`agy`)** | `language_server` / `agy --hub`(`StartCascade`)로 무인 생성 및 프로젝트·워크트리 환경 자동 연결 | 데스크톱과 동일 (`StartCascade` + 통합 허브 프로젝트·환경 자동 연결) | 기본은 대화 스택 유지(`--archive` 시 `{archived: true}` 보관) 후 라우트 제거 |
 | **Claude (`claude-peer`)** | `claude://code/new`로 첫 메시지를 채운 입력창을 열고 사용자의 Enter 대기 | IDE CLI + `<scheme>://anthropic.claude-code/open`으로 무인 생성 | CLI 프로세스에 `SIGTERM` 전송 후 기본은 대화 스택 유지(`--archive` 시 데스크톱 `isArchived: true` 보관) 및 라우트 제거 |
-| **Codex (`codex`)** | `app-server --stdio`로 저장 스레드 생성 후 IPC 또는 검증된 큐 시작 턴으로 Desktop 인계 | 미지원 | 기본은 사이드바 대화 유지(`--archive` 시 하위 스레드부터 네이티브 보관 및 검증) 후 라우트 제거 |
+| **Codex (`codex`)** | `app-server --stdio`로 저장 스레드 생성 후 IPC 또는 검증된 큐 시작 턴으로 Desktop 인계 | 미지원 | 기본은 사이드바 대화 유지(`--archive` 시 하위 스레드부터 보관하고 저장 상태 확인) 후 라우트 제거 |
 
 ```bash
 # 단독 생성 또는 생성과 동시에 브로커 등록:
@@ -134,7 +134,7 @@ python3 "$bridge_cli" open --provider agy --host ide --cwd /path/to/workspace --
 python3 "$bridge_cli" register codex-worker --project my-app --transport codex \
   --new --cwd /path/to/workspace --title "Worker" --model gpt-6.2-sol
 
-# 작업이 끝난 워커 세션 닫기 및 라우트 해제 (사이드바에서 숨기려면 --archive 추가):
+# 작업이 끝난 워커 세션 닫기 및 라우트 해제 (보관하려면 --archive 추가):
 python3 "$bridge_cli" close agy-worker --project my-app --retro-file /absolute/retro.txt [--archive]
 
 # 유휴로 닫힌 Claude 데스크톱 세션 깨우기 (woken, already-live, unsupported, uncertain 중 하나를 출력):
@@ -143,9 +143,9 @@ python3 "$bridge_cli" wake claude-tower --project my-app [--timeout 30]
 
 보관이 확인되면 브로커는 별칭을 포함해 정확한 세션의 정리 가능한 서신을 삭제하고, 영향을 받은 수신함 스냅샷을 만료시킨다. 공급자 대화 원문은 유지한다. 일반 종료는 서신을 유지한다. 직접 보관에 `--keep-route`를 사용해도 서신 정리는 수행한다. 보관과 요청한 라우트 처리가 확인되면 전달 여부가 불명확한 서신만 남아도 성공으로 처리한다. 해당 서신과 멱등성 키는 유지한다.
 
-Codex Desktop의 네이티브 보관은 `close --archive --handoff`로 요청한다. Desktop에서 정확한 대화를 직접 보관하거나 등록된 담당자를 이용하고, `close --finish CLOSE_ID --expect-session UUID`로 완료를 확인한다. [세션 닫기](usage.md#세션-닫기) 참고.
+기본적으로 Codex 직접 종료(`close --archive`)는 저장된 보관 상태를 확인한다. 이미 열려 있는 Desktop 사이드바에는 대화가 계속 보일 수 있다. Desktop에서 네이티브 보관을 하려면 `close --archive --handoff`를 사용하고, Desktop에서 정확한 대화를 직접 보관하거나 등록된 담당자를 이용한다. 소유자가 `close-operator.json`에 `"prefer_native_for_direct": true`를 설정하면 직접 종료가 검토된 하위 스레드를 먼저 보관하고 루트를 인계한다. 이 설정은 라우트를 제거하는 직접 종료에 적용된다. 이 설정을 적용한 직접 종료에서 기본 Desktop IPC 소켓이 없거나 연결을 거부하면, 기본 로컬 브로커 소켓에서 검증된 Desktop 큐로 등록된 담당자에게 알릴 수 있다. 담당자 대화가 로드되어 있고 새 턴을 시작할 수 있어야 알림을 처리할 수 있다. 명시적 `--handoff`는 IPC 또는 Desktop에서의 수동 보관을 사용한다. 직접 종료의 인계가 대기 중이면 `awaiting_native_archive`와 종료 코드 1을 반환한다. 담당자의 완료 기록이나 `close --finish CLOSE_ID --expect-session UUID`로 완료를 확인한다. [세션 닫기](usage.md#세션-닫기) 참고.
 
-`archive-sweep --cwd-prefix /absolute/workspace`로 Codex 보관 후보와 거부 사유를 읽기 전용으로 확인한다. 비공개 JSON을 검토한 뒤 `archive-sweep --apply --manifest FILE`로 적용한다. 직접 종료와 일괄 보관 모두 네이티브 상태를 다시 읽어 확인한다. 되돌리기는 하위 스레드에도 영향을 줄 수 있다. [Codex 일괄 보관](usage.md#codex-일괄-보관).
+`archive-sweep --cwd-prefix /absolute/workspace`로 Codex 보관 후보와 거부 사유를 읽기 전용으로 확인한다. 비공개 JSON을 검토한 뒤 `archive-sweep --apply --manifest FILE`로 적용한다. 직접 종료의 저장 상태 경로와 일괄 보관은 저장된 보관 비트를 다시 읽어 확인한다. 되돌리기는 하위 스레드에도 영향을 줄 수 있다. [Codex 일괄 보관](usage.md#codex-일괄-보관).
 
 Claude 데스크톱은 세션을 스스로 닫는다. 화면에 안 보이는 세션은 마지막 턴 뒤 900초가 지나면 멈추고, 메모리가 부족하면 가장 오래 쉰 세션을 내린다. 그러면 CLI가 끝나고 레지스트리 기록과 inbox 소켓이 사라진다. 이런 라우트로 `claude-peer` push가 오면 브릿지가 먼저 세션을 깨운다. 데스크톱 메타데이터에서 `cliSessionId`로 찾은 `claude://claude.ai/epitaxy/<local_id>`를 열면, 앱이 같은 세션 ID와 대화 기록을 새 PID로 이어 받는다. 새 inbox 소켓이 뜨면 메시지를 한 번만 push한다. 그때까지 메시지는 `dispatching`이고, 다른 결과면 아무것도 보내지 않은 채 `pending`으로 돌아간다. 브릿지는 스스로 다시 열거나 다시 보내지 않는다. `bridge.py wake NAME --project P`는 같은 단계를 명시적으로 한다. 링크를 열면 앱이 그 세션으로 포커스를 옮기고 앞으로 올 수 있다. 예약 작업 세션(앱이 세션 간 메시징을 끈 채 띄운다)과 IDE 세션은 `unsupported`다.
 
@@ -276,8 +276,7 @@ Codex `open` / `register --new`는 권한 확인에 실패하면 라우트를 �
 필수다. 누락은 `RETRO_REQUIRED`, 빈 파일은 `RETRO_EMPTY`, 빈 사유는
 `RETRO_REASON_EMPTY`로 공급자 동작과 경로 삭제 전에 거절한다. 타워와 HQ는
 `--no-retro` 사유를 남긴다.
-회고는 공급자 동작 전에 읽고 검증하며, 종료가 확인된 뒤에만 저장한다(`--archive`는
-보관 상태를 다시 읽은 뒤, `--handoff`는 닫는 중인 라우트가 회고 알림을 보낼 수 없어 인계를 준비할 때). 실패한 close는 회고를 저장하지 않고 `retro_recorded: false`를
+회고는 공급자 동작 전에 읽고 검증하며 일반적으로 종료가 확인된 뒤에 저장한다. 저장 상태를 확인하는 보관 경로에서는 상태를 다시 읽고 나서 저장한다. 명시적 또는 설정으로 선택된 네이티브 인계는 닫는 중인 라우트가 회고 알림을 보낼 수 없으므로 인계 준비 전에 저장한다. 그 시점에 이르기 전에 실패한 close는 회고를 저장하지 않고 `retro_recorded: false`를
 반환하며, 나중에 다시 실행하면 한 번만 기록된다. 세션은 닫혔는데 저장이 실패하면
 `retro_error`로 알리고, 그 기록은 `retro add`로 넣는다.
 
