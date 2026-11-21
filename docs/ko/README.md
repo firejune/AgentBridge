@@ -32,6 +32,7 @@
 | 상세 CLI 및 프로토콜 레퍼런스 | [skill/agent-bridge/references/usage.md](../../skill/agent-bridge/references/usage.md) | [docs/ko/usage.md](usage.md) |
 | 원격 MCP 명세 | [skill/agent-bridge/references/remote-mcp.md](../../skill/agent-bridge/references/remote-mcp.md) | — |
 | Antigravity IDE 내부 명령어 | — | [docs/ko/antigravity-commands.md](antigravity-commands.md) |
+| launchd 운영 설치 배포 | [docs/DEPLOY.md](../DEPLOY.md) (`tools/deploy.py`) | — |
 
 ## 아키텍처 및 전송 방식
 
