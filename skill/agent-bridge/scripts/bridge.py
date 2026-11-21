@@ -451,7 +451,8 @@ def close_session(route, timeout, archive=False, *, directory=None):
             'note': f'{transport} routes have no provider session to close'}
 
 
-def save_retro(args, route=None):
+def prepare_retro(args, route=None):
+    """Read and validate a retrospective; nothing is written or sent until record_retro."""
     state = broker_state_dir(args)
     path = retros.store_path(state, args.project, args.store)
     text_file = args.retro_file if route is not None else args.from_file
@@ -474,6 +475,11 @@ def save_retro(args, route=None):
         reading = models.read(route, min(args.timeout, 10))
         row['model'] = reading.get('model')
         # Provider diagnostics never belong in the retro ledger.
+    return path, row, target
+
+
+def record_retro(args, prepared):
+    path, row, target = prepared
     retros.append(path, row)
     result = {'retro_id':row['id'], 'store':str(path), 'notification':None}
     if target and row['urgency'] in ('stop', 'repeat'):
@@ -492,9 +498,20 @@ def save_retro(args, route=None):
     return result
 
 
+def record_closing_retro(args, prepared, result):
+    """Write a close's retrospective once the close is confirmed; a failed close writes none (issue #144)."""
+    if prepared is None:
+        return
+    try:
+        result.update(record_retro(args, prepared))
+    except (ValueError, OSError) as error:
+        # The session is already closed. Name the gap; `retro add` can still record it.
+        result.update(retro_recorded=False, retro_error=str(error))
+
+
 def retro_command(args):
     if args.retro_cmd == 'add':
-        return save_retro(args)
+        return record_retro(args, prepare_retro(args))
     found = retros.rows(retros.store_path(broker_state_dir(args), args.project, args.store),
                         args.project, args.since, getattr(args, 'tag', None), getattr(args, 'urgency', None))
     return retros.tally(found) if args.retro_cmd == 'tally' else found
@@ -543,15 +560,23 @@ def close_participant(args):
             if str(error) == 'Unknown operation':
                 raise ValueError('Archive cleanup is unsupported by the running broker; upgrade it before archiving') from None
             raise
-    receipt = {} if 'closing' in route else save_retro(args, route)
+    # Validated and read while the session is still open; written only after the close is confirmed.
+    retro = None if 'closing' in route else prepare_retro(args, route)
     if args.handoff:
+        # The handoff marks the route closing, and a closing route cannot send the stop/repeat
+        # notification. So this one path records first; the native archive is confirmed later by --finish.
+        receipt = {} if retro is None else record_retro(args, retro)
         return {**receipt, **prepare_archive_handoff(args, address, route)}
-    result = {**receipt, **address, 'transport': route['transport'],
+    result = {**address, 'transport': route['transport'],
               **close_session(route, args.timeout, archive=archive, directory=broker_state_dir(args).expanduser().resolve())}
+    if archive and (result.get('archived') is not True or result.get('session') != route['session']):
+        result.update(correspondence_removed=False, cleanup_error='Provider archival was not confirmed', route_removed=False)
+        if retro is not None:
+            result['retro_recorded'] = False
+        return result
+    # Before the route is removed: a stop/repeat retro is sent from the runner's route.
+    record_closing_retro(args, retro, result)
     if archive:
-        if result.get('archived') is not True or result.get('session') != route['session']:
-            result.update(correspondence_removed=False, cleanup_error='Provider archival was not confirmed', route_removed=False)
-            return result
         try:
             cleanup = broker.request(args.socket, {'op':'archive-correspondence', 'expected_route':route, 'archived':True})
             result['correspondence_cleanup'] = cleanup

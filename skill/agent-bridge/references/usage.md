@@ -592,9 +592,12 @@ Codex `open` / `register --new` does not register a route when permission verifi
 `close NAME --project P` requires `--retro-file FILE` or `--no-retro "reason"`.
 Missing retros (`RETRO_REQUIRED`), blank files (`RETRO_EMPTY`) and blank opt-out
 reasons (`RETRO_REASON_EMPTY`) are refused before any provider action or route
-removal. Towers and HQ use an explicit `--no-retro` reason. A retro is saved
-before close, so a later provider refusal can leave a recorded retro; the receipt
-is not evidence that the session closed. Do not blindly repeat failed closes.
+removal. Towers and HQ use an explicit `--no-retro` reason. A retro is read and
+validated before the provider is touched and saved only after the close is
+confirmed (with `--archive`, after the archive reads back; `--handoff` saves it when the handoff is prepared, since a closing route cannot send the retro notification). A close that fails
+saves none and reports `retro_recorded: false`; repeating it later records once.
+If the session closed but the save failed, `retro_error` names it; add the
+record with `retro add`.
 
 ```bash
 python3 "$bridge_cli" retro add --project P --card repo#139 --runner worker \
