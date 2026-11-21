@@ -17,8 +17,8 @@ Releases are plain `git archive` extractions named by the full commit id.
 | Broker | `~/.local/share/agent-bridge/broker-runtime/releases/<commit>/…/bridge.py serve` | `ProgramArguments` of `~/Library/LaunchAgents/com.agent-bridge.broker.<socket hash>.plist` |
 | MCP facade | `…/nana-runtime/releases/<commit>/…/mcp_server.py`, started by the tunnel client | One command line in the tunnel profile (`~/.config/agent-bridge/nana/tunnel.yaml`), run by its own launchd agent |
 
-The tunnel profile also holds a credential. The script rewrites only the release id in it and
-never prints the file.
+The tunnel profile also holds a credential. The script rewrites only the release id in it,
+never prints the file and never copies it.
 
 The broker state (`~/.local/share/agent-bridge/bridge.state`) and the facade state
 (`nana-runtime/state`) are not part of a release and are not moved.
@@ -74,11 +74,15 @@ The three in-flight checks apply only when the broker or the facade moves.
 
 1. Read the live pins, broker plist and tunnel profile; check the source and the refusals above.
 2. Extract the commit into `nana-runtime/releases/<commit>` and `broker-runtime/releases/<commit>`
-   (staged beside the final place, then renamed). The new CLI must be able to ping the broker.
+   (staged beside the final place, then renamed). If a release directory with that id already
+   exists it must match the commit; `__pycache__` folders and `.pyc` files written by an earlier
+   run are ignored in that comparison. The new CLI must be able to ping the broker.
 3. Snapshot into `~/.local/share/agent-bridge/deploy-<commit7>-<random>/`: `routes.json`,
    `correspondence.json`, `correspondence-index.json`, `policy.json`, the broker plist, the
-   facade plist, the tunnel profile, the facade's `events.json` and `ledger.sqlite3`, and
-   `cli-pins.json` (the pin targets before the move). The rollback command is printed here.
+   facade plist, the facade's `events.json` and `ledger.sqlite3`, `cli-pins.json` (the pin
+   targets before the move) and `facade.json` (the release id the tunnel profile named before
+   the move). The tunnel profile itself is not copied, because it holds a credential. The
+   rollback command is printed here.
 4. Stop the facade: `launchctl bootout gui/<uid>/<facade label>`.
 5. Stop the broker: `launchctl bootout gui/<uid>/<broker label>`. The broker handles the
    signal by writing its checkpoint; the script waits until launchd no longer lists the service.
@@ -111,11 +115,14 @@ by its owner.
 ## Rollback
 
 ```bash
+python3 tools/deploy.py --rollback ~/.local/share/agent-bridge/deploy-<commit7>-<random> --dry-run   # prints the steps, changes nothing
 python3 tools/deploy.py --rollback ~/.local/share/agent-bridge/deploy-<commit7>-<random>
 ```
 
-It restores the pins, the broker plist and the tunnel profile from that snapshot and
-restarts the services that changed. It does not restore the state files: the broker keeps
+It restores the pins and the broker plist from that snapshot, rewrites the release id in the
+tunnel profile back to the one in `facade.json` (in place, like the deploy does; the rest of
+the profile is not touched), and restarts the services that changed. It works when the pins
+point at different releases, which is what an interrupted deploy leaves. It does not restore the state files: the broker keeps
 the correspondence it has. The copies in the snapshot folder are for a person to inspect if
 state itself is damaged.
 

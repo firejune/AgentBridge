@@ -237,7 +237,7 @@ class RealRunTests(DeployFixture):
         self.assertNotIn(OLD, profile)
         self.assertIn('api_key: FIXTURE-SECRET', profile)
         folder, = self.layout.runtime.glob(f'deploy-{NEW[:7]}-*')
-        self.assertLessEqual({'cli-pins.json', 'routes.json', 'correspondence.json', 'policy.json', 'tunnel.yaml',
+        self.assertLessEqual({'cli-pins.json', 'routes.json', 'correspondence.json', 'policy.json', 'facade.json',
                               'events.json', self.layout.broker_plist.name, self.facade_plist.name, 'result.json'},
                              {path.name for path in folder.iterdir()})
         self.assertEqual(plistlib.loads((folder / self.layout.broker_plist.name).read_bytes())['ProgramArguments'],
@@ -272,6 +272,47 @@ class RealRunTests(DeployFixture):
         self.assertTrue(self.layout.release('nana', NEW).is_dir(), 'a rollback keeps the new release on disk')
         with self.assertRaisesRegex(deploy.Refusal, 'SNAPSHOT_UNUSABLE'):
             deploy.rollback(self.layout, self.system, self.layout.state, out=self.lines.append)
+
+    def test_the_snapshot_holds_no_copy_of_the_credential(self):
+        self.assertEqual(self.run_deploy(), 0, self.lines)
+        folder, = self.layout.runtime.glob(f'deploy-{NEW[:7]}-*')
+        self.assertNotIn('tunnel.yaml', {path.name for path in folder.iterdir()})
+        for path in folder.iterdir():
+            self.assertNotIn(b'FIXTURE-SECRET', path.read_bytes(), path.name)
+        self.assertEqual(json.loads((folder / 'facade.json').read_text()), {'release': OLD})
+
+    def test_rollback_dry_run_prints_the_steps_and_changes_nothing(self):
+        self.run_deploy()
+        folder, = self.layout.runtime.glob(f'deploy-{NEW[:7]}-*')
+        self.system.calls.clear()
+        before = self.fingerprint()
+        self.assertEqual(deploy.main(['--rollback', str(folder), '--dry-run'], system=self.system, layout=self.layout), 0)
+        self.assertEqual(self.fingerprint(), before)
+        self.assertEqual(self.system.calls, [])
+        self.assertEqual(deploy.rollback(self.layout, self.system, folder, dry_run=True, out=self.lines.append), 0)
+        tail = self.lines[self.lines.index('dry run: nothing was changed') - 8:]
+        steps = [re.match(r' *\d+\. ([a-z ]+):', line)[1] for line in tail[:-1]]
+        self.assertEqual(steps, ['stop facade', 'stop broker', 'restore broker plist', 'start broker', 'restore pins',
+                                 'point facade', 'start facade', 'verify'])
+        self.assertNotIn('FIXTURE-SECRET', '\n'.join(self.lines))
+
+    def test_rollback_restores_pins_that_an_interrupted_deploy_left_mixed(self):
+        self.run_deploy()
+        folder, = self.layout.runtime.glob(f'deploy-{NEW[:7]}-*')
+        deploy.move_pin(self.layout.pins[0], str(self.layout.release('nana', OLD) / deploy.SKILL))
+        self.assertEqual(deploy.rollback(self.layout, self.system, folder, out=self.lines.append), 0)
+        self.assertEqual([os.readlink(pin) for pin in self.layout.pins],
+                         [str(self.layout.release('nana', OLD) / deploy.SKILL)] * 3)
+        self.assertIn(OLD, self.layout.tunnel_profile.read_text())
+
+    def test_an_existing_release_that_has_run_is_still_the_same_release(self):
+        scripts = self.layout.release('nana', NEW) / deploy.SKILL / 'scripts'
+        scripts.mkdir(parents=True)
+        (scripts / 'bridge.py').write_text(f'# {NEW}\n')
+        (scripts / '__pycache__').mkdir()
+        (scripts / '__pycache__/bridge.cpython-312.pyc').write_bytes(b'\x00compiled')
+        (scripts / 'stray.pyc').write_bytes(b'\x00compiled')
+        self.assertEqual(self.run_deploy(), 0, self.lines)
 
     def test_cli_only_deploy_leaves_both_services_alone(self):
         self.assertEqual(self.run_deploy(components=('cli',)), 1, 'old broker and new CLI are different builds')

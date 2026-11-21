@@ -155,12 +155,46 @@ def only_sha(pattern, text, code, what):
     return found.pop()
 
 
-def read_live(layout, components):
+def read_pins(layout):
     pins = {}
     for pin in layout.pins:
         if not pin.is_symlink():
             raise Refusal('PIN_NOT_A_LINK', f'{pin} is not a symbolic link to a release')
         pins[str(pin)] = os.readlink(pin)
+    return pins
+
+
+def read_facade(layout):
+    """The release the tunnel profile names, and the launchd agent that runs the profile."""
+    prefix = re.escape(str(layout.runtime))
+    if not layout.tunnel_profile.is_file():
+        raise Refusal('FACADE_PROFILE_MISSING', 'the tunnel profile is missing')
+    # The profile also holds a credential: read it, never print or copy it.
+    facade = only_sha(rf'{prefix}/nana-runtime/releases/({SHA})/', layout.tunnel_profile.read_text(encoding='utf-8'),
+                      'FACADE_PROFILE_UNREADABLE', 'the tunnel profile')
+    facade_label = facade_plist = None
+    for candidate in sorted(layout.launch_agents.glob('*.plist')):
+        try:
+            with candidate.open('rb') as source:
+                data = plistlib.load(source)
+        except Exception:  # Another program's plist, unreadable or not a plist: not ours to judge.
+            continue
+        if str(layout.tunnel_profile) in map(str, data.get('ProgramArguments') or []):
+            facade_label, facade_plist = data.get('Label'), candidate
+    if facade_label is None:
+        raise Refusal('FACADE_SERVICE_MISSING', 'no launchd plist runs this tunnel profile')
+    return facade, facade_label, facade_plist
+
+
+def point_facade(layout, current, target):
+    """Rewrite the release id in the tunnel profile in place; the rest of the file is kept as it is."""
+    prefix = f'{layout.runtime}/nana-runtime/releases/'
+    text = layout.tunnel_profile.read_text(encoding='utf-8')
+    atomic_bytes(layout.tunnel_profile, text.replace(prefix + current + '/', prefix + target + '/').encode('utf-8'))
+
+
+def read_live(layout, components):
+    pins = read_pins(layout)
     prefix = re.escape(str(layout.runtime))
     targets = set(pins.values())
     pinned = re.fullmatch(rf'{prefix}/nana-runtime/releases/({SHA})/{SKILL}', targets.pop()) if len(targets) == 1 else None
@@ -175,21 +209,7 @@ def read_live(layout, components):
                       '\n'.join(map(str, arguments)), 'BROKER_SERVICE_UNREADABLE', 'the broker plist')
     facade = facade_label = facade_plist = None
     if 'facade' in components:
-        if not layout.tunnel_profile.is_file():
-            raise Refusal('FACADE_PROFILE_MISSING', 'the tunnel profile is missing')
-        # The profile also holds a credential: read it, never print it.
-        facade = only_sha(rf'{prefix}/nana-runtime/releases/({SHA})/', layout.tunnel_profile.read_text(encoding='utf-8'),
-                          'FACADE_PROFILE_UNREADABLE', 'the tunnel profile')
-        for candidate in sorted(layout.launch_agents.glob('*.plist')):
-            try:
-                with candidate.open('rb') as source:
-                    data = plistlib.load(source)
-            except Exception:  # Another program's plist, unreadable or not a plist: not ours to judge.
-                continue
-            if str(layout.tunnel_profile) in map(str, data.get('ProgramArguments') or []):
-                facade_label, facade_plist = data.get('Label'), candidate
-        if facade_label is None:
-            raise Refusal('FACADE_SERVICE_MISSING', 'no launchd plist runs this tunnel profile')
+        facade, facade_label, facade_plist = read_facade(layout)
     return Live(pins, cli, broker, facade, facade_label, facade_plist)
 
 
@@ -255,7 +275,7 @@ def plan_steps(layout, live, sha, components, uid):
         steps.append(('build cli release', f'git archive {sha} -> {layout.release("nana", sha)}'))
     if 'broker' in components:
         steps.append(('build broker release', f'git archive {sha} -> {layout.release("broker", sha)}'))
-    steps.append(('snapshot', f'copy state, plists and pins to {layout.runtime}/deploy-{sha[:7]}-*'))
+    steps.append(('snapshot', f'copy state, plists, pins and the facade release id to {layout.runtime}/deploy-{sha[:7]}-*'))
     if 'facade' in components:
         steps.append(('stop facade', f'launchctl bootout gui/{uid}/{live.facade_label}'))
     if 'broker' in components:
@@ -271,9 +291,14 @@ def plan_steps(layout, live, sha, components, uid):
     return steps
 
 
+def generated(path, root):
+    """Bytecode Python writes beside the sources once a release has run; not part of the commit."""
+    return '__pycache__' in path.relative_to(root).parts or path.suffix == '.pyc'
+
+
 def tree_digest(root):
     digest = hashlib.sha256()
-    for path in sorted(p for p in root.rglob('*') if p.is_file() or p.is_symlink()):
+    for path in sorted(p for p in root.rglob('*') if (p.is_file() or p.is_symlink()) and not generated(p, root)):
         digest.update(str(path.relative_to(root)).encode() + b'\0')
         digest.update(os.readlink(path).encode() if path.is_symlink() else path.read_bytes())
     return digest.hexdigest()
@@ -322,13 +347,16 @@ def snapshot(layout, live, sha, components):
     copies = [(layout.broker_plist, layout.broker_plist.name)]
     copies += [(layout.state / name, name) for name in BROKER_STATE_FILES]
     if 'facade' in components:
-        copies += [(live.facade_plist, live.facade_plist.name), (layout.tunnel_profile, layout.tunnel_profile.name)]
+        # Not the tunnel profile: it holds a credential. Rollback needs only the release id it named.
+        copies += [(live.facade_plist, live.facade_plist.name)]
         copies += [(layout.runtime / 'nana-runtime/state' / name, name) for name in FACADE_STATE_FILES]
     for source, name in copies:
         if source.is_file():
             shutil.copy2(source, folder / name)
             os.chmod(folder / name, 0o600)
     atomic_bytes(folder / 'cli-pins.json', json.dumps(live.pins).encode())
+    if 'facade' in components:
+        atomic_bytes(folder / 'facade.json', json.dumps(dict(release=live.facade)).encode())
     return folder
 
 
@@ -382,9 +410,7 @@ def apply(layout, system, live, sha, components, folder, result):
         for pin in layout.pins:
             move_pin(pin, str(layout.release('nana', sha) / SKILL))
     if 'facade' in components:
-        text = layout.tunnel_profile.read_text(encoding='utf-8')
-        atomic_bytes(layout.tunnel_profile, text.replace(f'{prefix}/nana-runtime/releases/{live.facade}/',
-                                                         f'{prefix}/nana-runtime/releases/{sha}/').encode('utf-8'))
+        point_facade(layout, live.facade, sha)
         start(system, live.facade_label, live.facade_plist, actions, 'start facade')
 
 
@@ -482,29 +508,60 @@ def deploy(layout, system, commit, components, dry_run=False, allow_non_ancestor
     return 0
 
 
-def rollback(layout, system, folder, out=print):
-    """Put back the pins, the broker plist and the tunnel profile a deploy saved. State files stay as they are."""
+def rollback(layout, system, folder, dry_run=False, out=print):
+    """Put back the pins, the broker plist and the facade release id a deploy saved. State files stay as they are.
+
+    The current pins may disagree (an interrupted deploy leaves them so); the services are identified
+    from the broker plist and the tunnel profile, not from the pins.
+    """
     folder = Path(folder)
     saved_plist = folder / layout.broker_plist.name
     pins = read_json(folder / 'cli-pins.json') if (folder / 'cli-pins.json').is_file() else {}
     if set(pins) != {str(pin) for pin in layout.pins} or not saved_plist.is_file():
         raise Refusal('SNAPSHOT_UNUSABLE', f'{folder} does not hold this install\'s pins and broker plist')
-    saved_profile = folder / layout.tunnel_profile.name
-    facade = read_live(layout, COMPONENTS) if saved_profile.is_file() else None
+    saved_facade = read_json(folder / 'facade.json').get('release') if (folder / 'facade.json').is_file() else None
+    if saved_facade is not None and not re.fullmatch(SHA, str(saved_facade)):
+        raise Refusal('SNAPSHOT_UNUSABLE', f'{folder}/facade.json names no release')
+    read_pins(layout)  # Each pin must still be a link; its target does not matter here.
+    facade = read_facade(layout) if saved_facade else None
+    uid = system.uid()
+    plist_changed = not layout.broker_plist.is_file() or layout.broker_plist.read_bytes() != saved_plist.read_bytes()
+    broker_loaded = system.loaded(layout.broker_label)
+    steps = []
+    if facade is not None and system.loaded(facade[1]):
+        steps.append(('stop facade', f'launchctl bootout gui/{uid}/{facade[1]}'))
+    if plist_changed:
+        if broker_loaded:
+            steps.append(('stop broker', f'launchctl bootout gui/{uid}/{layout.broker_label}'))
+        steps.append(('restore broker plist', f'{layout.broker_plist.name} from {folder.name}'))
+    if plist_changed or not broker_loaded:
+        steps.append(('start broker', f'launchctl bootstrap gui/{uid} {layout.broker_plist}'))
+    steps.append(('restore pins', f'{len(pins)} pins from cli-pins.json'))
+    if facade is not None:
+        steps.append(('point facade', f'{layout.tunnel_profile.name}: {facade[0][:7]} -> {saved_facade[:7]}'))
+        steps.append(('start facade', f'launchctl bootstrap gui/{uid} {facade[2]}'))
+    steps.append(('verify', 'ping with the restored CLI'))
+    for number, (name, detail) in enumerate(steps, 1):
+        out(f'{number:>2}. {name}: {detail}')
+    if dry_run:
+        out('dry run: nothing was changed')
+        return 0
     actions = {}
-    if facade is not None and system.loaded(facade.facade_label):
-        stop(system, facade.facade_label, actions, 'stop facade')
-    if layout.broker_plist.read_bytes() != saved_plist.read_bytes():
-        if system.loaded(layout.broker_label):
-            stop(system, layout.broker_label, actions, 'stop broker')
+    names = {name for name, _ in steps}
+    if 'stop facade' in names:
+        stop(system, facade[1], actions, 'stop facade')
+    if 'stop broker' in names:
+        stop(system, layout.broker_label, actions, 'stop broker')
+    if 'restore broker plist' in names:
         atomic_bytes(layout.broker_plist, saved_plist.read_bytes())
-    if not system.loaded(layout.broker_label):
+    if 'start broker' in names:
         start(system, layout.broker_label, layout.broker_plist, actions, 'start broker')
     for pin, target in pins.items():
         move_pin(Path(pin), target)
     if facade is not None:
-        atomic_bytes(layout.tunnel_profile, saved_profile.read_bytes())
-        start(system, facade.facade_label, facade.facade_plist, actions, 'start facade')
+        if facade[0] != saved_facade:
+            point_facade(layout, facade[0], saved_facade)
+        start(system, facade[1], facade[2], actions, 'start facade')
     ping = wait_ping(layout, system, Path(next(iter(pins.values()))) / 'scripts/bridge.py')
     atomic_bytes(folder / 'rollback.json', json.dumps(dict(actions=actions, build=ping.get('build')), indent=2).encode())
     out(f'rolled back from {folder}: broker answers, build {ping.get("build")}')
@@ -518,7 +575,7 @@ def main(argv=None, system=None, layout=None):
     mode.add_argument('--rollback', metavar='SNAPSHOT_DIR', help='Restore the pins and services a deploy saved')
     parser.add_argument('--components', default=','.join(COMPONENTS),
                         help='Comma-separated subset of cli,broker,facade (default: all, so one build runs everywhere)')
-    parser.add_argument('--dry-run', action='store_true', help='Print every step and change nothing')
+    parser.add_argument('--dry-run', action='store_true', help='Print every step and change nothing (also with --rollback)')
     parser.add_argument('--allow-non-ancestor', action='store_true',
                         help='Deploy although a live release carries commits the target lacks')
     args = parser.parse_args(argv)
@@ -526,7 +583,7 @@ def main(argv=None, system=None, layout=None):
     layout = layout or Layout.default(Path(__file__).resolve().parents[1])
     try:
         if args.rollback:
-            return rollback(layout, system, args.rollback)
+            return rollback(layout, system, args.rollback, args.dry_run)
         components = tuple(name for name in COMPONENTS if name in args.components.split(','))
         if not components or set(args.components.split(',')) - set(COMPONENTS):
             raise Refusal('COMPONENTS_UNKNOWN', f'choose from {", ".join(COMPONENTS)}')
