@@ -704,6 +704,84 @@ class EventTests(unittest.TestCase):
             time.sleep(.02)
         self.assertEqual(len(self.applications()), 1)
 
+    def adopted_slot(self, name):
+        return 'ar_' + phase.digest([self.config['principal'], self.config['tunnel_id'],
+                                     'adopted', 'test-project', name])[:32]
+
+    def adopted_mail(self, name='nana-x'):
+        self.sequence += 1
+        return self.running.call('send', project='test-project', sender='writer', recipient=name,
+            body='private adopted body', key='adopted-' + str(self.sequence))
+
+    def test_adopted_route_arrival_emits_one_event_shaped_like_an_owned_one(self):
+        self.config['inbox_route_prefixes'] = {'test-project': ['nana-']}
+        for name in ('nana-x', 'writer'):
+            self.running.call('register', project='test-project', name=name, cwd=self.root, transport='realtime')
+        self.params['arguments'] = {}
+        self.subscribe()
+        self.service.arrival(*self.send())
+        slot = self.adopted_slot('nana-x')
+        entry = self.engine.inbox_routes(self.engine.principal, slot)[0]
+        event = {'type': 'message', 'instance': self.running.instance, 'message': self.adopted_mail()}
+        self.service.arrival(entry, event)
+        self.service.arrival(entry, event)
+        owned, adopted = self.applications()
+        self.assertEqual(owned['data'], {'agent_session_id': self.sid})
+        self.assertEqual(adopted['data'], {'agent_session_id': slot})
+        self.assertEqual(set(adopted), set(owned))
+        self.assertEqual({k: v for k, v in adopted.items() if k not in ('eventId', 'timestamp', 'data')},
+                         {k: v for k, v in owned.items() if k not in ('eventId', 'timestamp', 'data')})
+        self.assertNotIn('private adopted body', json.dumps(self.applications()))
+        self.assertNotIn('acknowledged_at', self.running.call('show', id=event['message']['id']))
+        # An other-prefix route and a session-bound route raise nothing.
+        for name, session in (('other-x', None), ('nana-session', str(uuid.uuid4()))):
+            self.running.call('register', project='test-project', name=name, cwd=self.root,
+                              transport='realtime', session=session)
+            fake = {'slot': self.adopted_slot(name), 'route': {'project': 'test-project', 'name': name,
+                'cwd': self.root, 'transport': 'realtime', 'session': session}}
+            self.service.arrival(fake, {'type': 'message', 'instance': self.running.instance,
+                                        'message': self.adopted_mail(name)})
+        self.assertEqual(len(self.applications()), 2)
+
+    def test_adopted_route_registered_after_subscription_is_watched_without_resubscribing(self):
+        self.config['inbox_route_prefixes'] = {'test-project': ['nana-']}
+        self.running.call('register', project='test-project', name='writer', cwd=self.root, transport='realtime')
+        self.service.close()
+        self.service = events.EventService(self.engine, self.keys, self.callback, start=True)
+        self.engine.events = self.service
+        self.params['arguments'] = {}
+        self.subscribe()
+        self.assertEqual(self.service.health()['watching_routes'], 2)
+        self.running.call('register', project='test-project', name='nana-x',
+            cwd=str(Path(self.running.temp.name).resolve()), transport='realtime')
+        deadline = time.monotonic() + 4
+        while self.service.health()['watching_routes'] != 3 and time.monotonic() < deadline:
+            time.sleep(.02)
+        self.assertEqual(self.service.health()['watching_routes'], 3)
+        self.adopted_mail()
+        while not self.applications() and time.monotonic() < deadline:
+            time.sleep(.02)
+        self.assertEqual([v['data'] for v in self.applications()], [{'agent_session_id': self.adopted_slot('nana-x')}])
+        # A subscription may also select the adopted slot by its id.
+        self.params['arguments'] = {'agent_session_id': self.adopted_slot('nana-x')}
+        self.subscribe()
+        self.params['arguments'] = {'agent_session_id': self.adopted_slot('other-x')}
+        self.assertEqual(self.rpc('events/subscribe', self.params)['error']['code'], -32602)
+        # The selected adopted route goes away while its subscription lives: that subscription has
+        # nothing to watch, and the unfiltered one keeps picking up new routes.
+        self.running.call('unregister', project='test-project', name='nana-x')
+        self.running.call('register', project='test-project', name='nana-y',
+            cwd=str(Path(self.running.temp.name).resolve()), transport='realtime')
+        deadline = time.monotonic() + 4
+        wanted = {'nana-y'}
+        def watched():
+            return {json.loads(key)['route']['name'] for key, (thread, ready, _) in list(self.service.watchers.items())
+                    if thread.is_alive() and ready.is_set()}
+        while not wanted <= watched() and time.monotonic() < deadline:
+            time.sleep(.02)
+        self.assertLessEqual(wanted, watched())
+        self.assertNotIn('nana-x', watched())
+
     def test_unsubscribe_cleanup_failure_keeps_recoverable_refs(self):
         self.subscribe()
         params = copy.deepcopy(self.params)

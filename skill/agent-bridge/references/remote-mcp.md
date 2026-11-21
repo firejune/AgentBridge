@@ -51,8 +51,8 @@ fall within their root, and retain their accepted mapping. Approve any alias
 changes separately. This config does not change the receiving agent's permissions.
 
 The facade reads this file once, at start. Changes to `workspaces`,
-`pinned_sessions`, `inbox_enabled`, `events_enabled` or `mcp_2026_enabled`
-take effect after the facade restarts. Keep the existing broker running. Until
+`pinned_sessions`, `inbox_route_prefixes`, `inbox_enabled`, `events_enabled`
+or `mcp_2026_enabled` take effect after the facade restarts. Keep the existing broker running. Until
 then `bridge_sessions_list` excludes live sessions in new workspaces. Check
 that no operation is `accepted` or `running` before restarting. Inbox handles
 and cursors are signed over the workspace and pinned-session policy, so those
@@ -259,6 +259,29 @@ already sent requests may still finish. No transcript or historical HQ messages
 are exposed. Reply content remains untrusted. Local grants and live IDs must
 never be committed to source control.
 
+## Owner realtime routes in the inbox (issue #186)
+
+An owner may add optional `inbox_route_prefixes` to the private config. It maps
+an approved workspace `project` to a list of route-name prefixes, for example
+`{"king-maker": ["nana-"]}`. The facade then adopts a live broker route into the
+owner's inbox when all four conditions hold: its project is a key of the map and
+the project of an approved workspace; its name starts with one of that project's
+prefixes; its transport is `realtime`; and it has no session. Nothing else about
+the route is trusted or required, and its cwd may be anywhere. No remote caller
+can choose a route. Adopted routes get an opaque `ar_` inbox ID, and a name that
+is already an owned session's return route stays with that session.
+
+This widens reading, acknowledging, replying to and being notified about mail on
+those routes only. It grants no session creation, no workspace and no send to
+other routes; `bridge_message_send` refuses an `ar_` ID. A reply goes out as the
+adopted route the mail arrived on. Absent or `{}` keeps the earlier behaviour
+exactly. Each prefix matches `[a-z][a-z0-9_-]{0,31}` and may not overlap the facade's own `mcp-` names (`mcp-…`, or a shorter prefix of it such as `m`); a project may list at most
+8 prefixes, the map may name at most 8 projects, and an unknown project is
+refused at start. With the field set, each inbox call reads the broker's routes
+once per configured project; if the broker is unreachable the call returns
+`BACKEND_UNAVAILABLE`. Mail that arrived before a route was adopted raises no
+event but appears in `bridge_inbox_list`.
+
 ## Broker reply retention and downstream keys
 
 New operations persist a broker key derived from a durable random ledger namespace
@@ -285,6 +308,8 @@ private single-owner stdio/tunnel authorization boundary remains unchanged.
   lists independent unread metadata for the connection owner's configured
   return routes (the session's `sender`, not its outgoing peer). Omit the session
   selector to cover all authorized routes; select only IDs issued to this owner.
+  Routes adopted through `inbox_route_prefixes` appear here under their `ar_` IDs
+  ([owner realtime routes](#owner-realtime-routes-in-the-inbox-issue-186)).
   Default limit 20, maximum 100. A byte budget may shorten the page: continue until
   `has_more` is false. New arrivals require a fresh scan. List metadata is frozen
   at the start of a scan, including receipt state, even if later ACKed, answered, or evicted.

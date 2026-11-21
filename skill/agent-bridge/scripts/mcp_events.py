@@ -642,11 +642,24 @@ class EventService:
     def ensure_watchers(self, arguments=None):
         selectors = [sub['arguments'].get('agent_session_id') for sub in self.subscriptions.values()
             if sub['expires'] > time.time()]
-        if arguments is not None:
-            selectors.append(arguments.get('agent_session_id'))
+        requested = arguments.get('agent_session_id') if arguments is not None else None
         entries = {}
         for selector in set(selectors):
-            for entry in self.engine.inbox_routes(self.engine.principal, selector):
+            try:
+                found = self.engine.inbox_routes(self.engine.principal, selector)
+            except Exception as error:
+                # An adopted route (ar_) can be unregistered while a subscription still selects it.
+                # That one subscription has nothing to watch; it must not stop the refresh for the
+                # others. The same selector in the request being made now still fails below.
+                if (isinstance(selector, str) and selector.startswith('ar_')
+                        and getattr(error, 'payload', {}).get('code') == 'NOT_FOUND'):
+                    self.note('inbox_route_changed')
+                    continue
+                raise
+            for entry in found:
+                entries[canonical(entry)] = entry
+        if arguments is not None:
+            for entry in self.engine.inbox_routes(self.engine.principal, requested):
                 entries[canonical(entry)] = entry
         actual = {}
         for project in {entry['route']['project'] for entry in entries.values()}:

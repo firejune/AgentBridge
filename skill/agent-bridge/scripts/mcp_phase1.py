@@ -40,6 +40,8 @@ AGENT_TYPES = ('claude', 'agy', 'codex')
 AGENT_TRANSPORTS = {'claude': 'claude-peer', 'agy': 'agy', 'codex': 'codex'}
 TRANSPORT_AGENTS = {'claude-peer': 'claude', 'agy': 'agy', 'codex': 'codex'}
 ACTIVE = ('accepted', 'running', 'unknown')
+MAX_ADOPTED_PROJECTS = 8   # inbox_route_prefixes keys (issue #186).
+MAX_ADOPTED_PREFIXES = 8   # Prefixes per inbox_route_prefixes project.
 # Exact broker wire refusals only. The production E31 embedded broker predates
 # TTL mode, so the facade must not depend on newer broker module constants.
 MESSAGE_CAPACITY_ERRORS = frozenset((
@@ -130,7 +132,8 @@ def load_config(path):
     if not stat.S_ISREG(s.st_mode) or s.st_uid != os.getuid() or stat.S_IMODE(s.st_mode) != 0o600:
         raise ValueError('Phase 1 configuration must be owner-only (0600)')
     config = json.loads(Path(path).read_text())
-    if set(config) - {'pinned_sessions', 'inbox_enabled', 'events_enabled', 'mcp_2026_enabled'} != {'principal','scopes','workspaces','state_dir','tunnel_id','writes_enabled'}:
+    if set(config) - {'pinned_sessions', 'inbox_enabled', 'events_enabled', 'mcp_2026_enabled',
+                      'inbox_route_prefixes'} != {'principal','scopes','workspaces','state_dir','tunnel_id','writes_enabled'}:
         raise ValueError('Unexpected Phase 1 configuration fields')
     if config['writes_enabled'] is not True or not config['principal'] or not config['tunnel_id']:
         raise ValueError('An approved private tunnel owner mapping is required')
@@ -144,7 +147,28 @@ def load_config(path):
         raise ValueError('events_enabled requires inbox_enabled')
     validate_workspaces(config['workspaces'])
     pinned_sessions(config)
+    inbox_route_prefixes(config)
     return config
+
+
+def inbox_route_prefixes(config):
+    """Owner-configured realtime route-name prefixes per approved workspace project."""
+    prefixes = config.get('inbox_route_prefixes', {})
+    if not isinstance(prefixes, dict) or len(prefixes) > MAX_ADOPTED_PROJECTS:
+        raise ValueError('inbox_route_prefixes must map at most 8 approved workspace projects')
+    projects = {w['project'] for w in config['workspaces'].values()}
+    result = {}
+    for project, names in prefixes.items():
+        if project not in projects:
+            raise ValueError('inbox_route_prefixes project must be an approved workspace project')
+        if (not isinstance(names, list) or not names or len(names) > MAX_ADOPTED_PREFIXES
+                or any(not isinstance(n, str) or not re.fullmatch(r'[a-z][a-z0-9_-]{0,31}', n) for n in names)):
+            raise ValueError('inbox_route_prefixes needs 1 to 8 lowercase prefixes per project')
+        if any(n.startswith('mcp-') or 'mcp-'.startswith(n) for n in names):
+            # The facade's own sender routes are named mcp-…; a prefix must not reach them.
+            raise ValueError('inbox_route_prefixes must not overlap the reserved mcp- names')
+        result[project] = tuple(names)
+    return result
 
 
 def validate_workspaces(workspaces):
@@ -1333,15 +1357,63 @@ class Engine:
         except Exception:
             raise Fault('INVALID_ARGUMENT') from None
 
+    def owned_inbox_sessions(self, principal):
+        with self.lock:
+            owned = [json.loads(r[0]) for r in self.db.execute(
+                'SELECT doc FROM owned_sessions WHERE principal=? ORDER BY id', (principal,))]
+        return owned + list(pinned_sessions(self.config).values())
+
+    def adopted_inbox_routes(self, principal, owned):
+        """Live realtime, session-less routes the owner configured by project and name prefix.
+
+        Nothing a caller supplies selects a route. One broker routes read per
+        configured project; an unreachable broker is BACKEND_UNAVAILABLE."""
+        prefixes = inbox_route_prefixes(self.config)
+        if principal != self.principal or not prefixes:
+            return []
+        senders = {(s['workspace']['project'], s['sender']) for s in owned}
+        adopted = []
+        for project in sorted(prefixes):
+            try:
+                rows = self.backend.rpc('routes', project=project)
+            except Exception:
+                raise Fault('BACKEND_UNAVAILABLE') from None
+            if not isinstance(rows, list):
+                raise Fault('BACKEND_UNAVAILABLE')
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                name, cwd = r.get('name'), r.get('cwd')
+                if (r.get('project') != project or not isinstance(name, str)
+                        or not name.startswith(prefixes[project]) or r.get('transport') != 'realtime'
+                        or r.get('session') is not None or not isinstance(cwd, str) or not cwd
+                        or (project, name) in senders):
+                    continue
+                slot = 'ar_' + digest([self.config['principal'], self.config['tunnel_id'],
+                                       'adopted', project, name])[:32]
+                adopted.append({'slot': slot, 'route': {
+                    'project': project, 'name': name, 'cwd': cwd,
+                    'transport': 'realtime', 'session': None}})
+        return adopted
+
     def inbox_routes(self, principal, selector=None):
-        if selector is not None:
+        adopted = None
+        if selector is not None and selector.startswith('ar_'):
+            # Adopted slots are never ledger sessions; never resolve them as one.
+            adopted = [e for e in self.adopted_inbox_routes(principal, self.owned_inbox_sessions(principal))
+                       if e['slot'] == selector]
+            if not adopted:
+                raise Fault('NOT_FOUND')
+            owned = []
+        elif selector is not None:
             owned = [self.session(selector, principal)]
         else:
-            with self.lock:
-                owned = [json.loads(r[0]) for r in self.db.execute(
-                    'SELECT doc FROM owned_sessions WHERE principal=? ORDER BY id', (principal,))]
-            owned += list(pinned_sessions(self.config).values())
+            owned = self.owned_inbox_sessions(principal)
         if len(owned) > 64:
+            raise Fault('CAPACITY_EXCEEDED')
+        if adopted is None:
+            adopted = self.adopted_inbox_routes(principal, owned) if selector is None else []
+        if len(owned) + len(adopted) > 64:
             raise Fault('CAPACITY_EXCEEDED')
         routes = []
         for session in sorted(owned, key=lambda s: s['id']):
@@ -1353,6 +1425,8 @@ class Engine:
             routes.append({'slot': session['id'], 'route': {
                 'project': w['project'], 'name': session['sender'], 'cwd': cwd,
                 'transport': 'realtime', 'session': None}})
+        if adopted:
+            routes = sorted(routes + adopted, key=lambda entry: entry['slot'])
         if selector is not None and not routes:
             raise Fault('NOT_FOUND')
         return routes
