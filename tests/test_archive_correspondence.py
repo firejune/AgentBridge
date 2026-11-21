@@ -261,7 +261,7 @@ class ArchiveCloseCommandTests(unittest.TestCase):
     def run_close(self, *flags):
         out = io.StringIO()
         with patch.object(bridge.broker, 'request', side_effect=self.request), \
-                patch.object(bridge, 'save_retro', return_value={'retro_id':'fixture'}), \
+                patch.object(bridge, 'prepare_retro', return_value=None), \
                 patch.object(bridge, 'close_session', return_value=self.archive_result) as close, \
                 patch('sys.stdout', out):
             code = bridge.main(['close', 'worker', '--project', 'p', '--no-retro', 'fixture', *flags])
@@ -315,7 +315,7 @@ class ArchiveCloseCommandTests(unittest.TestCase):
     def test_provider_archive_failure_never_purges_or_unregisters(self):
         out = io.StringIO()
         with patch.object(bridge.broker, 'request', side_effect=self.request), \
-                patch.object(bridge, 'save_retro', return_value={'retro_id':'fixture'}), \
+                patch.object(bridge, 'prepare_retro', return_value=None), \
                 patch.object(bridge, 'close_session', side_effect=ValueError('Archive failed')) as close, \
                 patch('sys.stdout', out):
             code = bridge.main(['close', 'worker', '--project', 'p', '--archive', '--no-retro', 'fixture'])

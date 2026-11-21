@@ -508,6 +508,52 @@ class CloseCodexTests(unittest.TestCase):
 
 
 class CloseCommandTests(unittest.TestCase):
+    def test_a_failed_close_writes_no_retro_and_a_confirmed_one_writes_it_once(self):
+        with RunningBroker() as server, tempfile.TemporaryDirectory() as cwd:
+            store = Path(cwd) / 'retros.jsonl'
+            sid = str(uuid.uuid4())
+            server.call('register', project='p', name='n', cwd=cwd, transport='codex', session=sid)
+            command = ['--socket', server.path, 'close', 'n', '--project', 'p', '--archive', '--store', str(store),
+                       '--no-retro', 'nothing to report']
+            refused = {'closed': False, 'method': 'archive', 'archived': False, 'session': sid, 'host': 'codex'}
+            archived = {**refused, 'closed': True, 'archived': True}
+
+            def records():
+                return store.read_text().splitlines() if store.exists() else []
+
+            # A refused archive, twice, then a provider error: the route stays and nothing is recorded.
+            with mock.patch.object(bridge, 'close_session', side_effect=[refused, refused, OSError('provider gone')]):
+                for _ in range(2):
+                    code, out = run(command)
+                    self.assertEqual((code, out['archived'], out['route_removed'], out['retro_recorded']),
+                                     (1, False, False, False))
+                    self.assertNotIn('retro_id', out)
+                code, out = run(command)
+                self.assertEqual(code, 1)
+            self.assertEqual(records(), [])
+            self.assertEqual(len(server.call('routes', project='p')), 1)
+
+            # The requirement is still checked before the provider is touched.
+            with mock.patch.object(bridge, 'close_session') as close:
+                code, out = run(command[:-2])
+                self.assertEqual((code, close.called), (1, False))
+                self.assertIn('RETRO_REQUIRED', out['error'])
+
+            with mock.patch.object(bridge, 'close_session', return_value=archived):
+                code, out = run(command)
+            self.assertEqual((code, out['archived'], out['route_removed']), (0, True, True))
+            self.assertNotIn('retro_recorded', out)
+            self.assertEqual([json.loads(line)['id'] for line in records()], [out['retro_id']])
+
+            # A session that closed is not reopened because its retro could not be saved: the gap is named.
+            server.call('register', project='p', name='n', cwd=cwd, transport='codex', session=sid)
+            with mock.patch.object(bridge, 'close_session', return_value=archived), \
+                    mock.patch.object(bridge.retros, 'append', side_effect=OSError('disk full')):
+                code, out = run(command)
+            self.assertEqual((out['archived'], out['route_removed'], out['retro_recorded'], out['retro_error']),
+                             (True, True, False, 'disk full'))
+            self.assertEqual(len(records()), 1)
+
     def test_codex_and_agy_detach_by_default_and_archive_when_requested(self):
         with RunningBroker() as server, tempfile.TemporaryDirectory() as cwd, \
                 FakeAgyServer(cwd, str(uuid.uuid4())) as fake, \

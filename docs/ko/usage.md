@@ -482,8 +482,10 @@ Codex `open` / `register --new`는 권한 확인에 실패하면 라우트를 �
 필수다. 누락은 `RETRO_REQUIRED`, 빈 파일은 `RETRO_EMPTY`, 빈 사유는
 `RETRO_REASON_EMPTY`로 공급자 동작과 경로 삭제 전에 거절한다. 타워와 HQ는
 `--no-retro` 사유를 남긴다.
-회고를 먼저 저장하므로 이후 공급자 종료가 실패해도 기록은 남는다. 기록 영수증이
-종료 성공을 뜻하지 않으며 실패한 close를 무작정 반복하지 않는다.
+회고는 공급자 동작 전에 읽고 검증하며, 종료가 확인된 뒤에만 저장한다(`--archive`는
+보관 상태를 다시 읽은 뒤). 실패한 close는 회고를 저장하지 않고 `retro_recorded: false`를
+반환하며, 나중에 다시 실행하면 한 번만 기록된다. 세션은 닫혔는데 저장이 실패하면
+`retro_error`로 알리고, 그 기록은 `retro add`로 넣는다.
 
 ```bash
 python3 "$bridge_cli" retro add --project P --card repo#139 --runner worker \
