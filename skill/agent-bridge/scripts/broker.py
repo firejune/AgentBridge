@@ -1125,7 +1125,10 @@ class State:
         pending, dispatching, uncertain = [], [], 0
         for message in self.messages.values():
             if message['state'] == 'pending':
-                pending.append(seconds_since(message.get('created'), current))
+                # A pull recipient (realtime) collects its mail itself, so `pending` is its resting
+                # state there; counting it buries the pushes that did not go out.
+                if message['route']['transport'] in retention.PUSH_TRANSPORTS:
+                    pending.append(seconds_since(message.get('created'), current))
             elif message['state'] == 'dispatching':
                 dispatching.append(dispatch_age(message, current))
             elif message['state'] == 'uncertain':

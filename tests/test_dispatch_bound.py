@@ -168,6 +168,12 @@ class DispatchBoundTests(unittest.TestCase):
         self.assertEqual(ping['attention'], {'pending_over_hour': 1, 'oldest_pending_seconds': 3601,
                                              'dispatching': 1, 'oldest_dispatching_seconds': 120,
                                              'uncertain': 1})
+        # Mail waiting for a pull recipient to collect is that route's resting state, not stuck work.
+        self.call('register', project='p', name='puller', cwd=self.temp.name, transport='realtime')
+        waiting = self.send('collect me', 'other', 'puller')
+        self.state.messages[waiting['id']]['created'] = stamp(90000, current)
+        with patch.object(broker.time, 'time', return_value=current):
+            self.assertEqual(self.call('ping')['attention'], ping['attention'])
         self.state.messages[old['id']]['created'] = stamp(3599, current)
         with patch.object(broker.time, 'time', return_value=current):
             self.assertEqual(self.call('ping')['attention']['pending_over_hour'], 0)
