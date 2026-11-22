@@ -1082,7 +1082,7 @@ def handover_command(args):
     sent = broker.request(args.socket, {'op': 'send', 'project': args.project,
         'sender': args.sender, 'recipient': args.recipient, 'body': body,
         'key': 'handover-' + hashlib.sha256(key_data).hexdigest()})
-    output(push_if_peer(args.socket, sent))
+    output(push_if_peer(args.socket, refuse_uncertain_replay(sent)))
     return 0
 
 
@@ -1477,8 +1477,20 @@ def watch_command(args):
     return 0
 
 
+def refuse_uncertain_replay(sent):
+    """A new message is always pending, so an uncertain claude-peer one is a same-key replay (#200).
+
+    Answer like the first call did (exit 1, uncertain), so a caller retrying after a lost response
+    never reads success. Nothing is pushed and nothing waits.
+    """
+    if sent['state'] == 'uncertain' and sent['route']['transport'] == 'claude-peer':
+        raise ClaudeDispatchUnknown('replay', sent['id'])
+    return sent
+
+
 def send_command(args):
-    output(with_usage(args, push_if_peer(args.socket, broker.request(args.socket, message_fields(args)))))
+    sent = refuse_uncertain_replay(broker.request(args.socket, message_fields(args)))
+    output(with_usage(args, push_if_peer(args.socket, sent)))
     return 0
 
 
@@ -1491,7 +1503,7 @@ def wait_result(args, fields):
 def ask_command(args):
     fields = message_fields(args)
     require_wait_timeout(args)
-    sent = push_if_peer(args.socket, broker.request(args.socket, fields))
+    sent = push_if_peer(args.socket, refuse_uncertain_replay(broker.request(args.socket, fields)))
     found = message_usage(args, sent)
     output({'type': 'sent', 'message': sent} | ({} if found is None else {'usage': found}))
     return wait_result(args, {'op': 'wait', 'id': sent['id'], 'timeout': args.timeout})
