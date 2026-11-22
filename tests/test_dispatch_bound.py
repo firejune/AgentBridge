@@ -149,7 +149,7 @@ class DispatchBoundTests(unittest.TestCase):
         waiting = self.send('waiting')
         self.state.waiters[waiting['id']] = 1
         with self.assertRaisesRegex(ValueError, r'blocked by an active delivery, provider continuation or wait: '
-                                                r'1 wait or provider continuation$'):
+                                                rf"1 wait or provider continuation \(IDs: {waiting['id']}\)$"):
             self.call('archive-correspondence', expected_route=self.route, check_only=True)
         self.state.waiters.clear()
 

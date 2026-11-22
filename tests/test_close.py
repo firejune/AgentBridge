@@ -387,12 +387,99 @@ class CloseCodexTests(unittest.TestCase):
         pending = self.server.call('send', project='p', sender='sender', recipient='target', key='one', body='work')
         self.assertIn('unfinished correspondence', self.close('--archive', '--handoff')[1]['error'])
         self.server.call('claim', id=pending['id'])
-        self.assertIn('active delivery', self.close('--archive', '--handoff')[1]['error'])
+        error = self.close('--archive', '--handoff')[1]['error']
+        self.assertIn('active delivery', error)
+        self.assertIn(pending['id'], error)
         self.server.call('finish', id=pending['id'], state='submitted')
         self.server.call('progress', id=pending['id'], note='working')
         self.assertIn('unfinished correspondence', self.close('--archive', '--handoff')[1]['error'])
         self.server.call('resolve', id=pending['id'], state='done', note='reviewed')
         self.assertEqual(self.close('--archive', '--handoff')[0], 0)
+
+    def test_close_finishes_received_one_way_and_reply_but_lists_work_still_open(self):
+        self.server.call('register', project='p', name='peer', cwd=str(self.cwd))
+
+        def send(key, sender='peer', recipient='target', **intent):
+            return self.server.call('send', project='p', sender=sender, recipient=recipient,
+                                    key=key, body='fixture', **intent)['id']
+
+        def finish(mid, state):
+            self.server.call('claim', id=mid)
+            self.server.call('finish', id=mid, state=state)
+
+        received_one_way = send('one-way', one_way=True)
+        report_parent = send('request')
+        received_reply = self.server.call('reply', id=report_parent, key='report', body='fixture')['id']
+        for mid in (received_one_way, received_reply):
+            finish(mid, 'submitted')
+            self.server.call('ack', id=mid)
+
+        received_request = send('read-request')
+        unread_one_way = send('unread', one_way=True)
+        working_one_way = send('working', one_way=True)
+        unread_parent = send('other-request', sender='target', recipient='peer')
+        unread_reply = self.server.call('reply', id=unread_parent, key='unread-report', body='fixture')['id']
+        failed = send('failed')
+        done = send('done')
+        for mid in (received_request, unread_one_way):
+            finish(mid, 'submitted')
+        self.server.call('ack', id=received_request)
+        self.server.call('progress', id=working_one_way)
+        finish(failed, 'failed')
+        self.server.call('resolve', id=done, state='done', note='reviewed')
+
+        blocking = (received_request, unread_one_way, working_one_way, unread_reply)
+        code, receipt = self.close('--archive', '--handoff')
+        self.assertEqual(code, 1)
+        self.assertEqual(receipt['error'],
+                         'This Codex thread has unfinished correspondence; reconcile it before closing '
+                         f"(IDs: {', '.join(sorted(blocking))})")
+        self.assertEqual(self.server.call('show', id=report_parent)['state'], 'answered')
+        for mid in blocking:
+            self.server.call('resolve', id=mid, state='done', note='reviewed')
+        self.assertEqual(self.close('--archive', '--handoff')[0], 0)
+        for mid in (received_one_way, received_reply):
+            self.assertEqual(self.server.call('show', id=mid)['state'], 'received')
+
+    def test_close_finishes_submitted_direct_push_replies_from_its_sender(self):
+        replies = {}
+        for transport in ('claude-peer', 'agy', 'codex', 'realtime'):
+            route = {'session': str(uuid.uuid4())} if transport != 'realtime' else {}
+            self.server.call('register', project='p', name=transport, cwd=str(self.cwd),
+                             transport=transport, **route)
+            parent = self.server.call('send', project='p', sender=transport, recipient='target',
+                                      key=f'ask-{transport}', body='request')
+            reply = self.server.call('reply', id=parent['id'], key=f'reply-{transport}', body='report')
+            replies[transport] = reply['id']
+
+        def submit(mid, **fields):
+            self.server.call('claim', id=mid)
+            self.server.call('finish', id=mid, state='submitted', event='pushed', **fields)
+
+        ordinary = self.server.call('send', project='p', sender='target', recipient='claude-peer',
+                                    key='ordinary', body='work')['id']
+        submit(ordinary)
+        submit(replies['codex'], codex_queue_accepted=True)
+        submit(replies['realtime'])
+        direct = [replies[transport] for transport in ('claude-peer', 'agy')]
+        blocking = [ordinary, replies['codex'], replies['realtime']]
+
+        def check_blocking(ids):
+            code, receipt = self.close('--archive', '--handoff')
+            self.assertEqual(code, 1)
+            self.assertEqual(receipt['error'],
+                             'This Codex thread has unfinished correspondence; reconcile it before closing '
+                             f"(IDs: {', '.join(sorted(ids))})")
+
+        check_blocking(blocking + direct)
+        for mid in direct:
+            submit(mid)
+        check_blocking(blocking)
+        for mid in blocking:
+            self.server.call('resolve', id=mid, state='done', note='reviewed')
+        self.assertEqual(self.close('--archive', '--handoff')[0], 0)
+        for mid in direct:
+            self.assertEqual(self.server.call('show', id=mid)['state'], 'submitted')
 
     def test_close_handoff_retains_uncertain_delivery_after_restart_and_missing_workspace(self):
         self.server.call('register', project='p', name='sender', cwd=str(self.home))

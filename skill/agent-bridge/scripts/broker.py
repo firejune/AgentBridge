@@ -810,18 +810,17 @@ class State:
         parts = []
         if dispatching:
             shown = []
-            for message in dispatching[:3]:
+            for message in dispatching:
                 age = dispatch_age(message, current)
                 shown.append(f"id {message['id']}" + ('' if age is None else f', {max(0, int(age))} s'))
-            if len(dispatching) > 3:
-                shown.append(f'{len(dispatching) - 3} more')
             noun = 'delivery' if len(dispatching) == 1 else 'deliveries'
             verb = 'it becomes' if len(dispatching) == 1 else 'each becomes'
             parts.append(f"{len(dispatching)} {noun} still dispatching ({'; '.join(shown)}); "
                          f'{verb} uncertain after {DISPATCH_LIMIT} s')
-        others = len(blocking) - len(dispatching)
+        others = sorted(blocking - {message['id'] for message in dispatching})
         if others:
-            parts.append(f"{others} {'wait or provider continuation' if others == 1 else 'waits or provider continuations'}")
+            noun = 'wait or provider continuation' if len(others) == 1 else 'waits or provider continuations'
+            parts.append(f"{len(others)} {noun} (IDs: {', '.join(others)})")
         return f"{ARCHIVE_BLOCKED_ERROR}: {', '.join(parts)}"
 
     def expired_dispatches(self, current):
@@ -1444,14 +1443,27 @@ class State:
                for channel in self.channels.values()):
             raise ValueError('Close or hand off active channels before closing this Codex thread')
         self.archive_correspondence({'expected_route': current, 'check_only': True})
+        blocking = []
         for message in self.messages.values():
-            if message['state'] in TERMINAL_STATES:
+            state = message['state']
+            if state in TERMINAL_STATES:
                 continue
-            endpoints = (message['route'], message['return_route'])
-            if message['state'] == 'uncertain' and any(same_archive_endpoint(current, item) for item in endpoints):
+            is_reply = message['reply_to'] is not None
+            if state == 'received' and (message.get('one_way') or is_reply):
+                continue
+            recipient, sender = message['route'], message['return_route']
+            # These transports submit the reply body to the live session itself.
+            if (state == 'submitted' and is_reply and recipient['transport'] in ('claude-peer', 'agy')
+                    and same_archive_endpoint(current, sender)):
+                continue
+            endpoints = (recipient, sender)
+            if state == 'uncertain' and any(same_archive_endpoint(current, item) for item in endpoints):
                 continue  # Archive cleanup retains it and its idempotency key.
             if any(same_codex_thread(current, item) for item in endpoints):
-                raise ValueError('This Codex thread has unfinished correspondence; reconcile it before closing')
+                blocking.append(message['id'])
+        if blocking:
+            raise ValueError('This Codex thread has unfinished correspondence; reconcile it before closing '
+                             f"(IDs: {', '.join(sorted(blocking))})")
 
     def prepare_close(self, args, *, self_archive=False):
         current = self.open_close_target(args['expected_route'])
