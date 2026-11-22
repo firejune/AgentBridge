@@ -115,6 +115,9 @@ class CloseHandoffQueueTests(unittest.TestCase):
         self.server.call('register', project='ops', name='operator', cwd=self.cwd,
                          transport='codex', session=self.operator)
         self.server.call('register', project='ops', name='requester', cwd=self.cwd, transport='realtime')
+        wake = patch.object(codex_wake_open, 'request_queued_wake')
+        self.wake = wake.start()
+        self.addCleanup(wake.stop)
         config = Path(self.server.state_dir) / 'close-operator.json'
         config.write_text(json.dumps({'project': 'ops', 'name': 'operator', 'session': self.operator,
                                       'sender': 'requester', 'prefer_native_for_direct': True}), encoding='utf-8')
@@ -177,8 +180,11 @@ class CloseHandoffQueueTests(unittest.TestCase):
         with patch.object(codex_queue, 'enqueue', side_effect=enqueue) as submit:
             code, receipt = self.handoff()
             self.assertEqual((code, receipt['operator_delivery']), (1, 'in_progress'))
+            self.assertIs(receipt['wake_requested'], True)
             self.assertEqual(self.handoff()[1]['operator_message_id'], receipt['operator_message_id'])
         submit.assert_called_once()
+        self.wake.assert_called_once()
+        self.assertEqual(self.wake.call_args.args[0], self.operator)
         self.assertEqual(self.server.call('show', id=receipt['operator_message_id'])['state'], 'in_progress')
 
     def test_early_claim_confirms_handoff_when_queue_receipt_is_lost(self):
@@ -189,6 +195,7 @@ class CloseHandoffQueueTests(unittest.TestCase):
         with patch.object(codex_queue, 'enqueue', side_effect=enqueue) as submit:
             code, receipt = self.handoff()
         submit.assert_called_once()
+        self.wake.assert_not_called()
         self.assertEqual((code, receipt['operator_delivery']), (1, 'in_progress'))
         self.assertNotIn('operator_error', receipt)
 

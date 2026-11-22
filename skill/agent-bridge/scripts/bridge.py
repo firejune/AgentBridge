@@ -762,6 +762,7 @@ def prepare_archive_handoff(args, address, route, *, expected_operator=None, nat
                                      guarded_close='closing_native_scope' in target)
                 if 'delivery_path' in message:
                     result['operator_delivery_path'] = message['delivery_path']
+                result.update({key: message[key] for key in ('wake_requested', 'wake_reason') if key in message})
         except PushFailed as error:
             message = error.message
             result['operator_error'] = 'Codex close handoff delivery could not be confirmed'

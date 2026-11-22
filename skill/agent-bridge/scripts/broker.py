@@ -1315,6 +1315,8 @@ class State:
         state = {'ack':'received','progress':'in_progress'}.get(op,args.get('state'))
         if op=='resolve' and (state not in ('pending','submitted','done') or not args.get('note','').strip()):
             raise ValueError('Recovery requires a supported state and explanation')
+        if op == 'resolve' and state == 'pending' and m.get('codex_queue_accepted'):
+            raise ValueError('Codex Desktop already accepted this notification; it cannot be redelivered')
         if state not in TERMINAL_STATES:
             self.require_open_route(m['route'])
             self.require_open_route(m['return_route'])
@@ -1378,6 +1380,8 @@ class State:
         return m
 
     def finish_delivery(self, m, args):
+        if args.get('codex_queue_accepted') is True:
+            return self.finish_codex_queue(m, args)
         if m['state'] not in ('dispatching', 'pending', 'uncertain'):
             return m
         if args.get('expect_dispatch_claim') != m.get('dispatch_claim'):
@@ -1399,6 +1403,24 @@ class State:
         # Keep the normalized wake outcome on the message before it is published (#121).
         peer_wake.record_wake(m, args.get('wake'))
         return self.status(m,args['state'],args.get('note'),event,reason)
+
+    def finish_codex_queue(self, m, args):
+        if m['route']['transport'] != 'codex' or args.get('state') != 'submitted':
+            raise ValueError('Queue acceptance requires a submitted Codex notification')
+        if m.get('codex_queue_accepted'):
+            return m
+        if m['state'] == 'dispatching':
+            if m.get('dispatch_claim') is not None:
+                raise ValueError('Delivery claim changed. Inspect the current state.')
+            m['codex_queue_accepted'] = True
+            self.status(m, 'submitted', args.get('note'), 'pushed')
+        elif m['state'] in ('received', 'in_progress', 'answered', 'done'):
+            # A close operator can claim and finish before the queue CLI returns.
+            m['codex_queue_accepted'] = True
+        else:
+            return m
+        # The one-shot permission is returned only after the checkpoint commits.
+        return {**m, 'queue_wake_reserved': self.correspondence is not None}
 
     def open_close_target(self, expected):
         key = (identifier(expected['project']), identifier(expected['name']))

@@ -15,6 +15,7 @@ import bridge
 import broker
 import codex_live
 import codex_queue
+import codex_wake_open
 import delivery
 from support import RunningBroker
 from test_agy_live import CSRF, FakeAgyServer
@@ -29,6 +30,9 @@ class DeliveryMatrixTests(unittest.TestCase):
         contexts = ExitStack()
         self.addCleanup(contexts.close)
         self.server = contexts.enter_context(RunningBroker())
+        contexts.enter_context(patch.dict(os.environ, {'CODEX_HOME': self.server.temp.name}))
+        self.verify_build = contexts.enter_context(patch.object(codex_wake_open, '_verify_app_build'))
+        self.open_wake = contexts.enter_context(patch.object(codex_wake_open, '_open_wake_url'))
         contexts.enter_context(patch.object(codex_live, 'exact_saved_workspace', return_value=(None, None)))
         self.thread = str(uuid.uuid4())
         self.register_routes()
@@ -234,9 +238,18 @@ class DeliveryMatrixTests(unittest.TestCase):
         message = self.post('codex')
         queued_id = uuid.uuid4()
         receipt = f'Queued message {queued_id} for thread {self.thread}.\n'
+
+        def open_wake(thread, timeout):
+            self.assertEqual(thread, self.thread)
+            self.assertGreater(timeout, 0)
+            self.assertEqual(self.show(message)['state'], 'submitted')
+
+        self.open_wake.side_effect = open_wake
         (code, result), queue = self.queue_delivery(message, receipt=receipt)
         self.assertEqual(code, 0, result)
         self.assertEqual(result['delivery_path'], codex_queue.DELIVERY_PATH)
+        self.assertIs(result['wake_requested'], True)
+        self.open_wake.assert_called_once()
         queue.assert_called_once()
         notification = queue.call_args.args[0][-1]
         self.assertIn(message['id'], notification)
@@ -248,17 +261,44 @@ class DeliveryMatrixTests(unittest.TestCase):
         self.assertIs(shown['read_by_recipient'], False)
         self.assertEqual(shown['events'], record['events'])
 
+        self.restart()
+        with self.assertRaisesRegex(ValueError, 'already accepted'):
+            self.server.call('resolve', id=message['id'], state='pending', note='fixture resolution')
+        self.assertEqual(self.cli('deliver', message['id']),
+                         (1, {'error': 'Only pending messages may be delivered'}))
+        self.open_wake.assert_called_once()
+
+    def test_unconfirmed_queue_receipt_never_opens_wake(self):
         malformed = self.post('codex', key='malformed')
-        (code, result), queue = self.queue_delivery(malformed, receipt=receipt.replace('.\n', '!\n'))
+        receipt = f'Queued message {uuid.uuid4()} for thread {self.thread}!\n'
+        (code, result), queue = self.queue_delivery(malformed, receipt=receipt)
         self.assertEqual(code, 1, result)
         queue.assert_called_once()
         self.assert_record(malformed, 'uncertain', codex_queue.UNKNOWN)
+        self.open_wake.assert_not_called()
+
+    def test_queue_acceptance_survives_wake_refusal_and_opener_failure(self):
+        unsupported = 'This Codex Desktop build has not been verified for queue wake'
+        opener_failed = 'The Codex Desktop wake request could not be confirmed'
+        self.open_wake.side_effect = OSError('private opener diagnostics')
+        for reason in (unsupported, opener_failed):
+            with self.subTest(reason=reason):
+                self.verify_build.side_effect = codex_wake_open.WakeError(reason) if reason == unsupported else None
+                message = self.post('codex', key=reason)
+                receipt = f'Queued message {uuid.uuid4()} for thread {self.thread}.\n'
+                (code, result), queue = self.queue_delivery(message, receipt=receipt)
+                self.assertEqual((code, result['state'], result['wake_requested'], result['wake_reason']),
+                                 (0, 'submitted', False, reason))
+                self.assertEqual(self.show(message)['state'], 'submitted')
+                queue.assert_called_once()
+                self.assertEqual(self.open_wake.call_count, int(reason == opener_failed))
 
     def test_queue_refusal_drops_private_reason_current_behavior(self):
         message = self.post('codex')
         (code, result), queue = self.queue_delivery(message, refusal=ValueError('fixture private queue check'))
         self.assertEqual(code, 1, result)
         queue.assert_not_called()
+        self.open_wake.assert_not_called()
         record = self.assert_record(message, 'pending', result['error'], 'push_failed')
         self.assertNotIn('fixture private queue check', json.dumps(record))
         self.assertEqual(result['error'], codex_live.EndpointUnavailable(

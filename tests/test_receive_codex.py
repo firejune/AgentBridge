@@ -240,11 +240,12 @@ class ReceiveCodexTests(unittest.TestCase):
                 self.assertEqual(checkpoint.read_bytes(), before)
                 return str(uuid.uuid4())
 
-            with patch.dict('os.environ', {'CODEX_THREAD_ID': self.thread}), \
+            with patch.dict('os.environ', {'CODEX_THREAD_ID': self.thread, 'CODEX_HOME': server.temp.name}), \
                     patch.object(bridge.broker, 'DEFAULT_SOCKET', Path(server.path)), \
                     patch.object(codex_live, 'exact_saved_workspace', return_value=(None, None)), \
                     patch.object(codex_live, 'Client') as client, \
                     patch.object(codex_queue, 'check_route'), \
+                    patch('codex_wake_open.request_queued_wake'), \
                     patch.object(codex_queue, 'enqueue', side_effect=enqueue) as queued:
                 client.return_value.mutation_sent = False
                 client.return_value.__enter__.side_effect = endpoint(endpoint.DEFAULT, endpoint.MISSING)
