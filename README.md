@@ -126,7 +126,7 @@ The Python CLI lists sessions without per-session model reads by default. Add `s
 | --- | --- | --- | --- |
 | **Antigravity (`agy`)** | Autonomous via `language_server` / `agy --hub` (`StartCascade`), auto-linked to project & worktree environment | Identical to Desktop (`StartCascade` + project/environment association on unified hub) | Keeps conversation in active stack by default (`--archive` sets `{archived: true}`) and unregisters route |
 | **Claude (`claude-peer`)** | Opens `claude://code/new` composer prefilled with `--title`; waits for user Enter | Autonomous via IDE CLI + `<scheme>://anthropic.claude-code/open` | Sends `SIGTERM` to CLI process; keeps in sidebar by default (`--archive` sets Desktop `isArchived: true`) and unregisters route |
-| **Codex (`codex`)** | Saved thread via `app-server --stdio`, then Desktop adoption over IPC or a verified queued startup turn | N/A | Keeps thread in active sidebar by default (`--archive` checks descendants first and verifies saved archive state) and unregisters route |
+| **Codex (`codex`)** | Saved thread via `app-server --stdio`, then Desktop adoption over IPC or a verified queued startup turn | N/A | Keeps thread in active sidebar by default (`--archive` checks descendants first, queues a native self-archive, and verifies the archived rollout) and unregisters route |
 
 ```bash
 # Open without registering, or open + register in one command:
@@ -143,7 +143,20 @@ python3 "$bridge_cli" wake claude-tower --project my-app [--timeout 30]
 
 After archive is confirmed, the broker removes eligible retained correspondence for the exact session, including aliases, and expires inbox snapshots affected by removal. Provider transcripts remain available. Ordinary close preserves correspondence. Direct archive with `--keep-route` still cleans correspondence. Confirmed archive and the requested route operation succeed when only uncertain correspondence remains, and the broker keeps those records and their idempotency keys.
 
-By default, direct Codex `close --archive` verifies the saved archive state. An already open Desktop sidebar may still show the chat. For a native Desktop archive, use `close --archive --handoff` and archive the exact thread in Desktop or use an enrolled operator. The owner can set `"prefer_native_for_direct": true` in `close-operator.json` to make direct `close --archive` hand off the root after archiving its reviewed descendants. This preference applies when the route will be removed. For direct closes that select this preference, the default local broker socket can notify the enrolled operator through the verified Desktop queue if the default Desktop IPC socket is missing or refuses the connection. The operator chat must be loaded and eligible to start a turn. Explicit `--handoff` uses IPC or manual archive in Desktop. A pending direct-close handoff reports `awaiting_native_archive` and exits 1. Use the operator receipt or `close --finish CLOSE_ID --expect-session UUID` to verify completion. [Closing a session](skill/agent-bridge/references/usage.md#closing-a-session).
+By default, direct Codex `close --archive` queues one fixed self-archive entry for the exact thread. The thread archives itself with the native Desktop tool, and the sidebar entry disappears without a restart. The route is removed only after Agent Bridge reads back the archive bit and the rollout under `archived_sessions`. Agent Bridge only reads Codex state and never writes it. The result's `archive_path` says what happened:
+
+- `self_archive`: archived and verified, route removed.
+- `not_archived`: nothing was submitted. The route stays registered, and `reason` says why.
+- `pending_self_archive`: exit 1, with a `close_id`. The thread may still be finishing a turn. Run `close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID` later. Do not run `close --archive` again.
+
+When close is refused:
+
+- `unfinished correspondence`: read the open reports from that thread, then mark each with `resolve ID --state done --note "..."`.
+- `running_process_cwd`: a process other than the Desktop `node_repl` helpers has its CWD in the workspace. Find it with `lsof`, and ask its owner before stopping it.
+- The queue is unavailable (`not_archived`): check `lsof -t -- ~/.codex/queue_1.sqlite`. More than one owner usually means a thread started its own `codex app-server` through CUA (#210). Stop that process only with the owner's approval.
+- A thread whose archive bit is set while its rollout is still in `sessions/` cannot be closed through Agent Bridge yet. The queue refuses it as archived. Leave it and report it.
+
+`--handoff` and an enrolled operator remain available for owners who set them up. [Closing a session](skill/agent-bridge/references/usage.md#closing-a-session).
 
 Use `archive-sweep --cwd-prefix /absolute/workspace` to preview Codex archive candidates and refusals. Apply only with `archive-sweep --apply --manifest FILE` after reviewing the private JSON. Codex close verifies the native archive (archive bit and rollout under `archived_sessions`) and never writes Codex state; the sweep verifies archive bits. Undo can also affect descendants. [Codex archive sweep](skill/agent-bridge/references/usage.md#codex-archive-sweep).
 
