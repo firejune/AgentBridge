@@ -327,6 +327,8 @@ class CloseCodexTests(unittest.TestCase):
         return {}
 
     def direct_archive(self, behavior, *flags):
+        Path(self.server.state_dir, 'policy.json').write_text(
+            json.dumps({'codex_self_archive': False}), encoding='utf-8')
         with mock.patch.object(codex_archive, 'executable', return_value=self.executable), \
                 mock.patch.object(codex_preview, 'state_path', return_value=self.db), \
                 mock.patch.object(codex_archive.wt, 'open_files', return_value=[]), \
@@ -680,8 +682,10 @@ class CloseCodexTests(unittest.TestCase):
         client.assert_not_called()
         deliver.assert_not_called()
 
-    def test_existing_operator_config_keeps_default_direct_archive(self):
+    def test_existing_operator_without_preference_respects_direct_archive_policy(self):
         self.enroll()
+        Path(self.server.state_dir, 'policy.json').write_text(
+            json.dumps({'codex_self_archive': False}), encoding='utf-8')
         self.assertEqual(self.server.call('close-operator-status'), {'operator': None})
         with mock.patch.object(codex_archive, 'executable', return_value=self.executable), \
                 mock.patch.object(codex_preview, 'state_path', return_value=self.db), \
@@ -852,6 +856,8 @@ class CloseCommandTests(unittest.TestCase):
                 conn.execute('CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)')
             os.chmod(state_db, 0o600)
             server.call('register', project='p', name='n-arch', cwd=cwd, transport='codex', session=codex_sid)
+            Path(server.state_dir, 'policy.json').write_text(
+                json.dumps({'codex_self_archive': False}), encoding='utf-8')
             def archive(method, params):
                 self.assertEqual((method, params), ('thread/archive', {'threadId': codex_sid}))
                 rollout.rename(archived_rollout)  # Codex moves the rollout when it archives natively.

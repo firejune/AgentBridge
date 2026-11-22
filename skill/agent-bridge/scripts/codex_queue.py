@@ -100,16 +100,33 @@ def check_route(route):
         raise ValueError('no unique local Desktop queue owner')
 
 
-def deliver(route, thread, message_id, timeout, dry_run, *, close_handoff=False):
+def check_available(route):
     try:
-        mid = str(uuid.UUID(message_id))
-        if mid != message_id or str(uuid.UUID(route['session'])) != thread:
-            raise ValueError('invalid exact identity')
         check_route(route)
     except ThreadArchived:
         raise
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError, KeyError, TypeError):
         raise QueueUnavailable() from None
+
+
+def enqueue_self_archive(route, timeout):
+    thread = route['session']
+    if str(uuid.UUID(thread)) != thread:
+        raise ValueError('invalid exact identity')
+    prompt = ('Archive this Codex Desktop thread now. Call the Codex app set_thread_archived tool '
+              f'with threadId "{thread}", hostId "local", source "codex", and archived true. '
+              'Take no other action.')
+    return enqueue(thread, prompt, timeout)
+
+
+def deliver(route, thread, message_id, timeout, dry_run, *, close_handoff=False):
+    try:
+        mid = str(uuid.UUID(message_id))
+        if mid != message_id or str(uuid.UUID(route['session'])) != thread:
+            raise ValueError('invalid exact identity')
+    except (ValueError, KeyError, TypeError):
+        raise QueueUnavailable() from None
+    check_available(route)
     receipt = dict(session=thread, transport='codex', delivery_mode='queue',
                    delivery_path=DELIVERY_PATH, input_role='notification')
     if dry_run:

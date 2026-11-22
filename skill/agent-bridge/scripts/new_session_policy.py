@@ -8,6 +8,7 @@ from pathlib import Path
 
 POLICY_FILE = 'policy.json'
 CODEX_DESKTOP_WAKE_PERMISSIONS = 'codex_desktop_wake_permissions'
+CODEX_SELF_ARCHIVE = 'codex_self_archive'
 # Seed from the owner's rule of 2026-10-23; applies only while no policy file exists.
 SEED_DENY = {'codex': ['gpt-6-astra']}
 DEFAULT_MODELS = {'codex': 'gpt-6.2-sol'}
@@ -48,6 +49,10 @@ def load_policy(state_dir):
         if data[CODEX_DESKTOP_WAKE_PERMISSIONS] != 'workspace-write':
             raise CodexDesktopWakePolicyError()
         policy[CODEX_DESKTOP_WAKE_PERMISSIONS] = data[CODEX_DESKTOP_WAKE_PERMISSIONS]
+    if CODEX_SELF_ARCHIVE in data:
+        if type(data[CODEX_SELF_ARCHIVE]) is not bool:
+            raise ValueError(f'In owner policy.json, "{CODEX_SELF_ARCHIVE}" must be a boolean')
+        policy[CODEX_SELF_ARCHIVE] = data[CODEX_SELF_ARCHIVE]
     return policy
 
 
