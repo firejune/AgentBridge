@@ -197,7 +197,9 @@ class RealMcpDeliveryTests(unittest.TestCase):
                 patch.object(phase.delivery.codex_live.Client, 'connect', side_effect=default_missing), \
                 patch.object(phase.delivery.codex_live, 'exact_saved_workspace', return_value=(None, None)), \
                 patch('codex_queue.check_route'), \
-                patch('codex_queue.enqueue', return_value='queued-item-1') as enqueue, \
+                patch('codex_queue.enqueue', return_value=str(uuid.uuid4())) as enqueue, \
+                patch('codex_wake_open.request_queued_wake'), \
+                patch.dict(os.environ, {'CODEX_HOME': self.root}), \
                 patch('sys.stdin', io.StringIO('CLI queues offline codex')), \
                 patch('sys.stdout', out_codex):
             code_codex = bridge.main(['--socket', self.running.path, 'send', '--project', self.project,

@@ -130,6 +130,11 @@ def message_record(raw):
                 or result['route']['transport'] != 'codex'):
             raise ValueError('Invalid delivery reason')
         result['reason'] = ARCHIVED_REASON
+    if 'codex_queue_accepted' in raw:
+        if (raw['codex_queue_accepted'] is not True or result['route']['transport'] != 'codex'
+                or result['state'] not in ('submitted', 'received', 'in_progress', 'answered', 'done')):
+            raise ValueError('Invalid Codex queue acceptance')
+        result['codex_queue_accepted'] = True
     if 'close_request' in raw:
         request = raw['close_request']
         close_id = request['close_id']

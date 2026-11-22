@@ -14,6 +14,7 @@ import uuid
 import agy_live
 import broker
 import codex_live
+import codex_wake_open
 from message_store import ARCHIVED_REASON
 import sessions
 
@@ -420,8 +421,8 @@ def push_if_peer(path, m):
     return m
 
 
-def settle_submission(rpc, note):
-    result = rpc('finish', state='submitted', event='pushed', note=note)
+def settle_submission(rpc, note, **fields):
+    result = rpc('finish', state='submitted', event='pushed', note=note, **fields)
     # A finish after dispatch expiry or broker restart can return the current
     # record without committing the requested transition.
     if result['state'] not in DELIVERED:
@@ -443,6 +444,7 @@ def push_codex(path, m, timeout=10, dry_run=False, *, close_dispatch=False, guar
             raise ValueError('Only pending messages may be delivered')
         rpc('claim', **({'close_id': close_request['close_id']} if close_request else {}))
     allow_queue = Path(path).expanduser() == broker.DEFAULT_SOCKET and (close_request is None or guarded_close)
+    deadline = time.monotonic() + timeout
     try:
         receipt = codex_live.deliver(
             m['route'], m['id'], peer_text(m, path, escape_peer=False), timeout, dry_run=dry_run,
@@ -470,8 +472,17 @@ def push_codex(path, m, timeout=10, dry_run=False, *, close_dispatch=False, guar
     if dry_run:
         return dict(state=m['state'], **receipt)
     if receipt['delivery_mode'] == 'queue':
-        result = settle_submission(rpc, 'Codex Desktop queue accepted the Agent Bridge notification')
-        return {**result, 'delivery_path': receipt['delivery_path']}
+        result = settle_submission(rpc, 'Codex Desktop queue accepted the Agent Bridge notification',
+                                   codex_queue_accepted=bool(receipt.get('queued_id')))
+        reserved = result.pop('queue_wake_reserved', False)
+        result['delivery_path'] = receipt['delivery_path']
+        if not reserved:
+            return {**result, **broker.wake_not_requested('The broker did not confirm a new queue wake reservation')}
+        try:
+            codex_wake_open.request_queued_wake(m['route']['session'], deadline - time.monotonic())
+        except codex_wake_open.WakeError as error:
+            return {**result, **broker.wake_not_requested(str(error))}
+        return {**result, 'wake_requested': True}
     result = settle_submission(rpc, f"Codex {receipt['delivery_mode']} tool output accepted by turn {receipt['turn_id']}")
     # Agent Bridge never writes Codex state, so no sidebar metadata follows acceptance (#212).
     return result
