@@ -396,7 +396,7 @@ class InboxIntegrationTests(unittest.TestCase):
 
     def test_correlated_reply_excluded_even_before_backend_id_saved(self):
         parent = self.running.call('send', project='test-project', sender=self.owned[0]['sender'],
-            recipient=self.owned[0]['route'], body='question', key='parent')
+            recipient=self.owned[0]['route'], body='question', key='parent', mcp_operation_send=True)
         reply = self.running.call('reply', id=parent['id'], body='correlated', key='reply')
         # Even a valid owner-signed guessed handle cannot expose correlated text.
         routes = self.engine.inbox_routes(self.engine.principal, self.sid)
@@ -674,6 +674,36 @@ class InboxAtomicBoundsTests(unittest.TestCase):
         self.assertEqual(json.dumps(self.state.messages, sort_keys=True), original)
         self.assertEqual(self.state.inbox_snapshots, {})
         self.assertEqual(self.state.inbox_receipts, {})
+
+    def test_reply_classification_with_evicted_or_unknown_parent(self):
+        parent = self.state.action(dict(op='send', project='test', sender='receive',
+            recipient='sender', body='ordinary local mail', key='local-parent'))
+        reply = self.state.action(dict(op='reply', id=parent['id'], body='independent', key='local-reply'))
+        for index in range(3):
+            self.send('mail-' + str(index))
+        self.assertNotIn(parent['id'], self.state.messages)
+        self.assertEqual(self.rpc('inbox_get', id=reply['id'])['body'], 'independent')
+        self.assertIn(reply['id'], [item['id'] for item in self.rpc('inbox_list')['messages']])
+
+        # A pre-upgrade record with the same missing parent has no saved proof.
+        del reply['independent_reply']
+        with self.assertRaisesRegex(ValueError, '^NOT_FOUND$'):
+            self.rpc('inbox_get', id=reply['id'])
+        self.assertNotIn(reply['id'], [item['id'] for item in self.rpc('inbox_list')['messages']])
+        with self.assertRaisesRegex(ValueError, 'Unknown message'):
+            self.state.action(dict(op='reply', id=parent['id'], body='new reply', key='missing-parent'))
+
+    def test_unmarked_legacy_operation_parent_remains_operation_only(self):
+        sender = 'mcp-' + 'a' * 32
+        self.state.action(dict(op='register', project='test', name=sender, cwd='/tmp', transport='realtime'))
+        parent = self.state.action(dict(op='send', project='test', sender=sender,
+            recipient='sender', body='legacy operation', key='legacy-key'))
+        del parent['mcp_operation_send']
+        reply = self.state.action(dict(op='reply', id=parent['id'], body='correlated', key='legacy-reply'))
+        routes = [{'slot': 'legacy-slot', 'route': self.state.route('test', name=sender)}]
+        self.assertEqual(self.rpc('inbox_list', routes=routes)['messages'], [])
+        with self.assertRaisesRegex(ValueError, '^NOT_FOUND$'):
+            self.rpc('inbox_get', id=reply['id'], routes=routes)
 
 
 

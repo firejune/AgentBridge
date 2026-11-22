@@ -521,7 +521,8 @@ class Backend:
         self.verify_routes(session)
         transport = self.session_transport(session)
         m = self.rpc('send', project=session['workspace']['project'],sender=session['sender'],
-                     recipient=session['route'],body=op['message'],key=op.get('downstream_key',op['key_hash']))
+                     recipient=session['route'],body=op['message'],key=op.get('downstream_key',op['key_hash']),
+                     mcp_operation_send=True)
         # Validate broker snapshot before handing it to push; never route by name again.
         if m['route']['session'] != session['uuid'] or m['route']['transport'] != transport:
             raise ValueError('Unexpected message route')

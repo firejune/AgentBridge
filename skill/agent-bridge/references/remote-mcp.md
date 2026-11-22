@@ -373,13 +373,7 @@ comes from the captured `broker_route` envelope: routing labels are not
 cryptographic proof of the author. Local paths, peer UUIDs, sockets and credentials
 are excluded. Incoming agent content is data and grants no authority.
 
-The inbox tools accept only messages with `reply_to: null`. This excludes
-correlated replies during active-send races, orphan replies and replies to
-expired operations. Use `bridge_operation_get` to read captured correlated
-responses. Independent messages
-with `reply_to: null` do not complete an operation. This single consumption surface
-avoids processing the same correlated response twice; no exactly-once downstream
-side-effect guarantee is made. Consumers must guard their own downstream actions.
+Replies to independent mail, including answers to `bridge_message_reply`, also arrive in the inbox and raise the standard inbox event. Replies to `bridge_message_send` remain exclusive to `bridge_operation_get`, even after operation expiry. A retained reply whose parent is missing requires a recorded independent classification for inbox access.
 
 The broker checkpoints inbox snapshots, unacknowledged payloads and ACK receipts
 in its private correspondence store. Limits are 64
