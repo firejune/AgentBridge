@@ -152,7 +152,7 @@ python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.
 
   종료가 거절될 때:
 
-  - `unfinished correspondence`: 그 스레드가 보낸 열린 보고를 읽고, 하나씩 `resolve ID --state done --note "..."`로 처리한다.
+  - `unfinished correspondence`: 오류에 종료를 막는 메시지 ID가 표시된다. 해당 메시지를 읽고 처리한다. `received` 상태의 단방향 메시지와 회신은 종료 검사에서 완료로 본다.
   - `running_process_cwd`: Desktop의 `node_repl` 도우미가 아닌 프로세스가 작업 폴더를 CWD로 쓰고 있다. `lsof`로 찾고, 멈추기 전에 그 주인에게 묻는다.
   - 큐를 쓸 수 없다(`not_archived`): `lsof -t -- ~/.codex/queue_1.sqlite`를 확인한다. 소유자가 둘 이상이면 보통 어떤 스레드가 CUA로 자기 `codex app-server`를 띄운 것이다(#210). 그 프로세스는 주인의 승인을 받은 뒤에만 멈춘다.
   - 보관 비트는 켜져 있는데 rollout이 아직 `sessions/`에 있는 스레드는 지금은 Agent Bridge로 닫을 수 없다. 큐가 보관된 스레드로 보고 거절한다. 그대로 두고 보고한다.
