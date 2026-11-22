@@ -348,7 +348,9 @@ private single-owner stdio/tunnel authorization boundary remains unchanged.
   can return `DELIVERY_UNKNOWN`. To reconcile while the original handle
   and broker idempotency record are retained, pass the same key and exact
   text. If the broker already recorded the reply, the tool returns its
-  current delivery state with `replayed: true` and never reattempts the push.
+  current delivery state with `replayed: true`. A recorded reply that is
+  still `pending` was never written, so the replay pushes it once. Any
+  other state, including `uncertain`, is never pushed again.
   If the first call never reached broker admission, a subsequent call can
   admit the original reply. There are no automatic retries. Deduplication
   only lasts while the broker retains the reply's idempotency record.
