@@ -216,8 +216,12 @@ class CloseHandoffQueueTests(unittest.TestCase):
     def test_explicit_handoff_does_not_gain_desktop_queue_dispatch(self):
         with patch.object(codex_queue, 'enqueue') as submit:
             code, receipt = self.handoff('--handoff')
-        self.assertEqual((code, receipt['operator_delivery']), (1, 'pending'))
-        self.assertEqual(self.server.call('show', id=receipt['operator_message_id'])['state'], 'pending')
+        # Without IPC an explicit handoff cannot reach the operator, so it is refused before the
+        # route is reserved instead of stranding it (#196).
+        self.assertEqual(code, 1)
+        self.assertIn('Enrolled Codex close operator is unavailable', receipt['error'])
+        route, = self.server.call('routes', project='work')
+        self.assertNotIn('closing', route)
         submit.assert_not_called()
 
     def test_late_process_keeps_guarded_close_and_withholds_target_from_operator(self):
