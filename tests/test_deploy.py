@@ -126,8 +126,11 @@ class DeployFixture(unittest.TestCase):
         self.system = FakeSystem(self.layout)
         self.lines = []
 
-    def write_state(self, states, closing):
+    def write_state(self, states, closing, close_state='submitted'):
         messages = [{'id': f'{state}-{n}', 'state': state} for state, count in states for n in range(count)]
+        if closing:  # The operator request of the handoff, unless close_state is None (manual handoff).
+            messages += [] if close_state is None else [
+                {'id': 'close', 'state': close_state, 'close_request': {'close_id': 'x'}}]
         (self.layout.state / 'correspondence.json').write_text(json.dumps({'version': 1, 'messages': messages}))
         endpoints = [{'name': f'r{n}', **({'closing': 'x'} if n < closing else {})} for n in range(5)]
         (self.layout.state / 'routes.json').write_text(json.dumps(
@@ -208,6 +211,20 @@ class DryRunAndRefusalTests(DeployFixture):
         with self.assertRaisesRegex(deploy.Refusal, r'LIVE_NOT_IN_TARGET: the live broker release ccccccc carries 3 commit'):
             self.run_deploy(dry_run=True)
         self.assertEqual(self.run_deploy(dry_run=True, allow_non_ancestor=True), 0)
+
+    def test_a_stranded_close_handoff_does_not_hold_a_broker_deploy(self):
+        for close_state in ('failed', 'pending', None):
+            with self.subTest(close_state=close_state):
+                self.write_state([('pending', 1)], closing=1, close_state=close_state)
+                self.assertEqual(deploy.check_quiet(self.layout, self.system, deploy.read_live(self.layout, deploy.COMPONENTS),
+                                                    deploy.COMPONENTS)['stranded_closing'], 1)
+        for close_state in deploy.ACTIVE_CLOSE_STATES:
+            with self.subTest(close_state=close_state):
+                self.write_state([('pending', 1)], closing=1, close_state=close_state)
+                # A dispatching request is also a delivery in flight, refused first under that name.
+                with self.assertRaisesRegex(deploy.Refusal, 'CLOSE_HANDOFF_OPEN|DELIVERIES_IN_FLIGHT'):
+                    deploy.check_quiet(self.layout, self.system, deploy.read_live(self.layout, deploy.COMPONENTS),
+                                       deploy.COMPONENTS)
 
     def test_a_quiet_check_is_not_needed_to_move_only_the_cli(self):
         self.write_state([('dispatching', 1)], closing=1)

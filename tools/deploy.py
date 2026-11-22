@@ -220,10 +220,21 @@ def correspondence_states(layout):
     return counts
 
 
+# A close handoff whose operator request may still move. A reservation with no request (manual
+# handoff) or a failed or undelivered one is stranded: it survives a restart and waits for
+# `close --finish`, so it does not hold a deploy (#196).
+ACTIVE_CLOSE_STATES = ('dispatching', 'submitted', 'in_progress', 'uncertain')
+
+
 def route_counts(layout):
     routes = read_json(layout.state / 'routes.json')
+    requests = {message['close_request'].get('close_id'): message['state']
+                for message in read_json(layout.state / 'correspondence.json')['messages']
+                if isinstance(message.get('close_request'), dict)}
+    closing = [item['closing'] for item in routes['endpoints'] if 'closing' in item]
+    active = sum(requests.get(close_id) in ACTIVE_CLOSE_STATES for close_id in closing)
     return dict(endpoints=len(routes['endpoints']), channels=len(routes['channels']),
-                closing=sum('closing' in item for item in routes['endpoints']))
+                closing=active, stranded_closing=len(closing) - active)
 
 
 def route_identity(endpoint):
@@ -281,13 +292,14 @@ def check_quiet(layout, system, live, components):
         raise Refusal('DELIVERIES_IN_FLIGHT', f'{states["dispatching"]} message(s) are dispatching')
     if routes['closing']:
         raise Refusal('CLOSE_HANDOFF_OPEN', f'{routes["closing"]} route(s) are mid close handoff')
+    stranded = routes['stranded_closing']
     code, plan = system.cli(bridge, layout.socket, 'retention', '--live')
     waits = plan.get('active_waits') if isinstance(plan, dict) else None
     if code or waits is None:
         raise Refusal('BROKER_UNREACHABLE', 'the running broker did not report its active waits')
     if waits:
         raise Refusal('WAITS_ACTIVE', f'{waits} caller(s) are waiting on a reply through this broker')
-    return dict(dispatching=0, closing=0, waits=0)
+    return dict(dispatching=0, closing=0, waits=0, stranded_closing=stranded)
 
 
 def plan_steps(layout, live, sha, components, uid):
