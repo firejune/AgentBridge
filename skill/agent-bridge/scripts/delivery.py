@@ -14,6 +14,7 @@ import uuid
 import agy_live
 import broker
 import codex_live
+import codex_queue
 import codex_wake_open
 from message_store import ARCHIVED_REASON
 import sessions
@@ -53,6 +54,10 @@ class PushFailed(ValueError):
     def __init__(self, reason, message):
         super().__init__(reason)
         self.message = message
+
+
+class QueueOwnerPushFailed(PushFailed):
+    """The Desktop queue guard refused this dispatch before submission."""
 
 
 class ClaudeDispatchUnknown(ValueError):
@@ -463,7 +468,8 @@ def push_codex(path, m, timeout=10, dry_run=False, *, close_dispatch=False, guar
         # The enrolled operator can claim or finish before the queue CLI returns.
         if close_request is not None and message['state'] in ('in_progress', 'done'):
             return message
-        raise PushFailed(str(error), message) from None
+        refusal = QueueOwnerPushFailed if isinstance(error, codex_queue.QueueOwnerUnavailable) else PushFailed
+        raise refusal(str(error), message) from None
     except BaseException:
         # Cancellation may arrive after the owner accepted the output.
         if not dry_run:

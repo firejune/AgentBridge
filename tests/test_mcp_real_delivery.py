@@ -13,6 +13,7 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skill/agent-bridge/scripts'))
 import bridge
 import broker
+import codex_queue
 import mcp_phase1 as phase
 import mcp_server
 import sessions
@@ -116,6 +117,38 @@ class RealMcpDeliveryTests(unittest.TestCase):
         out = self.call(name, **args)
         self.assertTrue(out['ok'], out)
         return out['data']
+
+    def test_queue_conflict_reaches_cli_and_mcp_without_enqueue_or_durable_process_data(self):
+        endpoint = phase.codex_live.EndpointUnavailable(
+            phase.codex_live.EndpointUnavailable.DEFAULT, phase.codex_live.EndpointUnavailable.MISSING)
+        refusal = codex_queue.QueueOwnerUnavailable('Queue holders: pid 4242, pid 4243.')
+        args = dict(agent_session_id=self.codex_pin['id'], message='fixture')
+        live = {'id': self.codex_sid, 'cwd': self.root, 'status': 'idle'}
+        with (patch.object(broker, 'DEFAULT_SOCKET', Path(self.running.path)),
+              patch.object(phase.codex_live.Client, 'connect', side_effect=endpoint),
+              patch.object(phase.codex_live, 'exact_saved_workspace', return_value=(None, None)),
+              patch.object(codex_queue, 'owner_refusal', return_value=refusal),
+              patch.object(codex_queue, 'check_route', side_effect=refusal),
+              patch.object(codex_queue, 'enqueue') as enqueue):
+            with patch.object(sessions, 'resolve_codex_peer', side_effect=ValueError):
+                refused = self.call('bridge_message_send', **args, idempotency_key='conflict-mcp-offline')
+            self.assertEqual(refused['error']['message'], str(refusal))
+            self.assertEqual(self.engine.rows(), [])
+            with patch.object(sessions, 'resolve_codex_peer', return_value=live):
+                accepted = self.data('bridge_message_send', **args, idempotency_key='conflict-mcp-online')
+                self.engine.tick()
+            operation = self.data('bridge_operation_get', operation_id=accepted['operation_id'])
+            self.assertEqual(operation['backend_message_state'], 'pending')
+            self.assertEqual(operation['failure']['message'], str(refusal))
+            stored = self.engine.operation(accepted['operation_id'], 'test-owner')
+            self.assertEqual(stored['failure']['message'], refusal.SUMMARY)
+            with patch('sys.stdin', io.StringIO('fixture')), patch('sys.stdout', io.StringIO()) as out:
+                code = bridge.main(['--socket', self.running.path, 'send', '--project', self.project,
+                                    '--from', self.codex_pin['sender'], '--to', 'codex-worker',
+                                    '--key', 'conflict-cli', '--file', '-'])
+            enqueue.assert_not_called()
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out.getvalue())['error'], str(refusal))
 
     def test_idle_closed_claude_and_offline_codex_refused_before_post_current_behavior(self):
         # 1a. Idle-closed Claude session: dead pid in registry + desktop metadata ready to wake.

@@ -13,6 +13,7 @@ from codex_live import DeliveryError, ThreadArchived, close_notice
 APP = Path('/Applications/ChatGPT.app')
 CLI_BUNDLE = APP / 'Contents/Resources/codex-cli/CodexCLI.app'
 CLI = CLI_BUNDLE / 'Contents/MacOS/codex'
+NODE_REPL = APP / 'Contents/Resources/cua_node/bin/node_repl'
 SIGNATURE = 'anchor apple generic and certificate leaf[subject.OU] = "2DC432GLL2" and identifier "codex"'
 DELIVERY_PATH = 'codex-desktop-queue'
 UNAVAILABLE = 'Codex Desktop notification queue could not be verified. Message was not delivered.'
@@ -34,34 +35,134 @@ def notice(message_id):
 
 
 class QueueUnavailable(DeliveryError):
-    def __init__(self):
-        super().__init__(UNAVAILABLE)
+    def __init__(self, reason=UNAVAILABLE):
+        super().__init__(reason)
+
+
+class QueueOwnerUnavailable(QueueUnavailable):
+    SUMMARY = 'No unique local Desktop queue owner.'
+
+    def __init__(self, detail):
+        super().__init__(f'{self.SUMMARY} {detail}')
 
 
 def checked_output(args, timeout=2):
     return subprocess.run(args, check=True, capture_output=True, text=True, timeout=timeout).stdout
 
 
-def desktop_queue_owner(queue, read=checked_output):
+def desktop_helper(path):
+    return (path.startswith(str(APP / 'Contents/Frameworks/Codex Framework.framework/Versions') + '/')
+            and path.endswith('/Helpers/Codex (Aperitif).app/Contents/MacOS/Codex (Aperitif)'))
+
+
+def process_rows(read, pids, columns):
+    try:
+        return read(['/bin/ps', '-ww', '-p', ','.join(pids), '-o', columns]).splitlines()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+
+
+def app_server_args(command):
+    try:
+        args = shlex.split(command)
+    except ValueError:
+        return None
+    if not args or (args[0] != 'codex' and os.path.normpath(args[0]) != str(CLI)):
+        return None
+    args = args[1:]
+    while len(args) >= 2 and args[0] in ('-c', '--config'):
+        args = args[2:]
+    return args[1:] if args[:1] == ['app-server'] else None
+
+
+def queue_holder_detail(pids, read):
+    if not pids:
+        return 'No process holds the queue store.'
+    holders = {}
+    for line in process_rows(read, pids, 'pid=,uid=,ppid=,etime=,command='):
+        fields = line.split(None, 4)
+        if len(fields) == 5 and fields[0] in pids and re.fullmatch(r'[0-9]+', fields[2]):
+            holders[fields[0]] = fields[1:]
+    executables = {}
+    process_ids = sorted(set(holders) | {row[1] for row in holders.values() if row[0] == str(os.getuid())})
+    if process_ids:
+        for line in process_rows(read, process_ids, 'pid=,uid=,comm='):
+            fields = line.split(None, 2)
+            if len(fields) == 3 and fields[0] in process_ids and fields[1] == str(os.getuid()):
+                executables[fields[0]] = fields[2]
+    details = []
+    cua = False
+    for pid in pids:
+        uid, parent, elapsed, command = holders.get(pid, ('', 'unknown', '', ''))
+        role = 'unverified'
+        args = app_server_args(command)
+        if uid == str(os.getuid()) and executables.get(pid) == str(CLI) and args is not None:
+            role = 'bundled app-server'
+            if desktop_helper(executables.get(parent, '')) and not any(
+                    arg == '--listen' or arg.startswith('--listen=') for arg in args):
+                role = 'Desktop app-server'
+            elif executables.get(parent) == str(NODE_REPL) and args in (
+                    ['--listen', 'stdio://'], ['--listen=stdio://']):
+                role = 'bundled node_repl app-server (CUA)'
+                cua = True
+        age = elapsed if re.fullmatch(r'(?:[0-9]{1,10}-)?(?:[0-9]{2}:)?[0-9]{2}:[0-9]{2}',
+                                     elapsed) else 'unknown'
+        details.append(f'pid {pid} ({role}, parent pid {parent}, elapsed {age})')
+    detail = 'Queue holders: ' + ', '.join(details) + '.'
+    if cua and len(pids) > 1:
+        detail += (' A bundled node_repl app-server (CUA) is a known cause of this conflict. '
+                   'Stopping that server restores delivery once the Desktop app-server is the only holder. '
+                   'Stop it only with the owner\'s approval.')
+    return detail
+
+
+def desktop_queue_owner(queue, read=checked_output, *, explain=False):
     # Multiple owners could load the same persistent UUID. Refuse competing
     # processes instead of allowing an enqueue to choose the runtime.
-    pids = read(['/usr/sbin/lsof', '-t', '--', str(queue)]).split()
-    if len(set(pids)) != 1 or not pids[0].isascii() or not pids[0].isdecimal():
+    try:
+        pids = set(read(['/usr/sbin/lsof', '-t', '--', str(queue)]).split())
+    except subprocess.CalledProcessError as error:
+        # lsof returns 1 with empty output when no process holds an existing file.
+        if not explain:
+            raise
+        if error.returncode != 1 or error.stdout or error.stderr:
+            raise QueueOwnerUnavailable('The queue holder list could not be read.') from None
+        pids = set()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        if not explain:
+            raise
+        raise QueueOwnerUnavailable('The queue holder list could not be read.') from None
+    if any(not re.fullmatch(r'[1-9][0-9]{0,9}', pid) for pid in pids):
+        if explain:
+            raise QueueOwnerUnavailable('The queue holder list could not be verified.')
         return None
-    process = read(['/bin/ps', '-ww', '-p', pids[0], '-o', 'uid=,ppid=,command='])
+    if len(pids) == 1:
+        pid = next(iter(pids))
+        try:
+            owner = desktop_process_owner(pid, read)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            if not explain:
+                raise
+        else:
+            if owner is not None:
+                return owner
+    if explain:
+        raise QueueOwnerUnavailable(queue_holder_detail(sorted(pids, key=int), read))
+    return None
+
+
+def desktop_process_owner(pid, read):
+    process = read(['/bin/ps', '-ww', '-p', pid, '-o', 'uid=,ppid=,command='])
     uid, parent, command = process.strip().split(None, 2)
     args = shlex.split(command)
-    if uid != str(os.getuid()) or not parent.isdecimal() or not args:
-        return None
-    if args[0] != str(CLI) or 'app-server' not in args or any(
-            arg == '--listen' or arg.startswith('--listen=') for arg in args):
+    if (uid != str(os.getuid()) or not re.fullmatch(r'[0-9]+', parent)
+            or not args or args[0] != str(CLI) or 'app-server' not in args
+            or any(arg == '--listen' or arg.startswith('--listen=') for arg in args)):
         return None
     parent_line = read(['/bin/ps', '-ww', '-p', parent, '-o', 'uid=,comm='])
     parent_uid, owner = parent_line.strip().split(None, 1)
-    if (parent_uid == str(os.getuid())
-            and owner.startswith(str(APP / 'Contents/Frameworks/Codex Framework.framework/Versions') + '/')
-            and owner.endswith('/Helpers/Codex (Aperitif).app/Contents/MacOS/Codex (Aperitif)')):
-        return pids[0], parent, owner
+    if parent_uid == str(os.getuid()) and desktop_helper(owner):
+        return pid, parent, owner
     return None
 
 
@@ -72,6 +173,19 @@ def default_stores():
         raise ValueError('non-default Desktop configuration')
     home = Path.home() / '.codex'
     return home / codex_preview.STATE_FILE, home / 'queue_1.sqlite'
+
+
+def owner_refusal():
+    """Read-only diagnosis for a caller that already reached a blocked queue path."""
+    try:
+        _, queue = default_stores()
+        codex_preview.require_owned_store(queue)
+        desktop_queue_owner(queue, checked_output, explain=True)
+    except QueueOwnerUnavailable as error:
+        return error
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    return None
 
 
 def verify_signature(bundle=CLI_BUNDLE, requirement=SIGNATURE, timeout=2):
@@ -96,14 +210,14 @@ def check_route(route):
     if not saved.is_dir():
         raise ValueError('workspace missing')
     codex_preview.require_owned_store(queue)
-    if desktop_queue_owner(queue, checked_output) is None:
-        raise ValueError('no unique local Desktop queue owner')
+    if desktop_queue_owner(queue, checked_output, explain=True) is None:
+        raise QueueOwnerUnavailable('The queue holder could not be verified.')
 
 
 def check_available(route):
     try:
         check_route(route)
-    except ThreadArchived:
+    except (ThreadArchived, QueueOwnerUnavailable):
         raise
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError, KeyError, TypeError):
         raise QueueUnavailable() from None

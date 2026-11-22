@@ -24,6 +24,7 @@ import uuid
 
 import broker
 import codex_live
+import codex_queue
 import delivery
 import models
 import sessions
@@ -364,6 +365,20 @@ class Backend:
         except (ValueError, OSError):
             return 'unavailable'
 
+    def queue_owner_refusal(self, session):
+        if (self.session_transport(session) != 'codex' or Path(self.path).expanduser() != broker.DEFAULT_SOCKET
+                or os.getenv('AGENT_BRIDGE_CODEX_URL')):
+            return None
+        client = codex_live.Client(timeout=0.5)
+        try:
+            client.connect()
+        except codex_live.EndpointUnavailable as error:
+            if error.default_absent:
+                return codex_queue.owner_refusal()
+        finally:
+            client.close()
+        return None
+
     def discover(self, config):
         workspaces = config['workspaces']
         candidates = {}
@@ -617,6 +632,7 @@ class Engine:
         self.observe_retry_limit, self.observe_retry_base = OBSERVE_RETRY_LIMIT, OBSERVE_RETRY_BASE
         self.reply_watch_fast, self.reply_watch_slow = REPLY_WATCH_FAST, REPLY_WATCH_SLOW
         self.observe_at, self.watch_at = {}, {}  # Volatile schedules; a restart only reads sooner.
+        self.queue_refusals = {}  # Volatile process diagnostics for operation responses.
         self.events = None
         self.recover()
         if config.get('events_enabled', False):
@@ -862,11 +878,13 @@ class Engine:
                 if not creating:
                     target = dict(session, transport=destination['transport'],
                                   agent_type=TRANSPORT_AGENTS[destination['transport']], explicit_type=True)
-                    if (not (session.get('registered') or session.get('discovered'))
-                            or self.backend.availability(target) not in ('ready', 'busy')):
+                    if not (session.get('registered') or session.get('discovered')):
                         raise ValueError('Unavailable dedicated session')
+                    self.require_send_availability(target)
             except RouteBindingRefusal:
                 raise Fault('BACKEND_UNAVAILABLE', ROUTE_CHANGED_MESSAGE) from None
+            except codex_queue.QueueOwnerUnavailable as error:
+                raise Fault('BACKEND_UNAVAILABLE', str(error)) from None
             except Exception:
                 raise Fault('BACKEND_UNAVAILABLE') from None
             if not creating and session.get('discovered'):
@@ -913,6 +931,22 @@ class Engine:
             fields['error'] = error
         self.update(op,status='unknown' if unknown else 'failed',failure=failure,result=None,
                     closed_epoch=time.time(),**fields)
+
+    def require_send_availability(self, session):
+        if self.backend.availability(session) in ('ready', 'busy'):
+            return
+        diagnose = getattr(self.backend, 'queue_owner_refusal', None)
+        refusal = diagnose(session) if diagnose else None
+        if refusal is not None:
+            raise refusal
+        raise Fault('BACKEND_UNAVAILABLE')
+
+    def fail_queue_owner(self, op, error):
+        with self.lock:
+            self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=codex_queue.QueueOwnerUnavailable.SUMMARY)
+            if len(self.queue_refusals) >= 64:
+                del self.queue_refusals[next(iter(self.queue_refusals))]
+            self.queue_refusals[op['operation_id']] = str(error)
 
     def recover(self):
         for op in self.rows():
@@ -978,10 +1012,12 @@ class Engine:
                     earlier.append(other)
                 if self.blocked(earlier, destination, queued=True):
                     return  # Still unattempted: never write past an ambiguous intent.
-                if self.backend.availability(session) not in ('ready','busy'):
-                    raise Fault('BACKEND_UNAVAILABLE')
+                self.require_send_availability(session)
         except RouteBindingRefusal:
             self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=ROUTE_CHANGED_MESSAGE)
+            return
+        except codex_queue.QueueOwnerUnavailable as error:
+            self.fail_queue_owner(op, error)
             return
         except Exception:
             self.fail(op,'BACKEND_UNAVAILABLE',unknown=False)
@@ -1046,6 +1082,9 @@ class Engine:
                 # A recorded pre-send failure is definite; uncertain stays blocked.
                 m = e.message
                 self.update(op,backend_message_state=m['state'])
+                if isinstance(e, delivery.QueueOwnerPushFailed) and m['state'] == 'pending':
+                    self.fail_queue_owner(op, e)
+                    return
                 detail = delivery.codex_prewrite_detail(m)
                 if detail is not None or m['state'] == 'pending':
                     self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=detail)
@@ -1319,6 +1358,10 @@ class Engine:
             time.sleep(min(.02,max(0,deadline-time.monotonic())))
         output = {k:op[k] for k in ('operation_id','kind','status','accepted_at','updated_at','agent_session_id',
                                    'message_request_id','backend_message_state','result','failure')}
+        with self.lock:
+            detail = self.queue_refusals.get(op['operation_id'])
+        if detail and output['failure']:
+            output['failure']['message'] = detail
         if 'cursor' in args and not (op['status']=='succeeded' and op['kind']=='message_send'):
             raise Fault('INVALID_ARGUMENT')
         if op['status']=='succeeded' and op['kind']=='message_send':
@@ -1477,6 +1520,7 @@ class Engine:
     def inbox_reply(self, args, principal, routes, handle):
         result = self.inbox_rpc('inbox_reply', principal, routes, handle['e'], id=handle['o'],
             body=args['message'], key=args['idempotency_key'])
+        detail = None
         try:
             message, replayed = result['message'], result['replayed']
             if (type(replayed) is not bool or message['state'] not in STATES
@@ -1491,6 +1535,8 @@ class Engine:
                     message = self.backend.push_inbox_reply(message)
                 except delivery.PushFailed as error:
                     message = error.message
+                    if isinstance(error, delivery.QueueOwnerPushFailed) and message['state'] == 'pending':
+                        detail = str(error)
                 except Exception:
                     # Fixed text only: never ids, routes or bodies (the facade's stderr is its log).
                     print(json.dumps({'event': 'inbox_reply_push_failed'}), file=sys.stderr, flush=True)
@@ -1500,7 +1546,10 @@ class Engine:
                 raise ValueError()
         except Exception:
             raise Fault('DELIVERY_UNKNOWN') from None
-        return {'message_id': args['message_id'], 'delivery_state': state, 'replayed': replayed}
+        receipt = {'message_id': args['message_id'], 'delivery_state': state, 'replayed': replayed}
+        if detail:
+            receipt['reason'] = detail
+        return receipt
 
     def inbox(self, name, args, principal):
         if name == 'bridge_inbox_list':

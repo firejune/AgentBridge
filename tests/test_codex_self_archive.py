@@ -163,6 +163,14 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result['wake_requested'], False)
         self.assertEqual(result['wake_reason'], 'No queue entry was accepted')
 
+    async def test_queue_holder_conflict_is_returned_as_the_not_archived_reason(self):
+        conflict = codex_queue.QueueOwnerUnavailable('Queue holders: pid 42, pid 43.')
+        self.available.side_effect = conflict
+        result = await broker.start_self_archive(self.state, self.args)
+        self.assert_refused_keeps_open_route(result, f'{conflict} No self-archive entry was submitted.')
+        self.enqueue.assert_not_called()
+        self.opener.assert_not_called()
+
     async def test_subtree_recheck_error_releases_route_and_staged_retro(self):
         retro = self.prepare_stop_retro()
         reason = 'Codex native close has an unarchived descendant'
@@ -382,6 +390,24 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SelfArchiveSelectionTests(unittest.TestCase):
+    def test_cli_close_reports_queue_conflict_when_workspace_scan_refuses_first(self):
+        conflict = codex_queue.QueueOwnerUnavailable('Queue holders: pid 42, pid 43.')
+        with RunningBroker() as server:
+            sid = str(uuid.uuid4())
+            server.call('register', name='target', project='p', transport='codex',
+                        session=sid, cwd=server.temp.name)
+            refused = {'session': sid, 'archived': False, 'closed': False, 'count': 0,
+                       'results': [{'id': sid, 'status': 'refused',
+                                    'refusals': [{'id': sid, 'reason': 'running_process_cwd'}]}]}
+            with (mock.patch.object(bridge, 'close_session', return_value=refused),
+                  mock.patch.object(codex_queue, 'owner_refusal', return_value=conflict)):
+                code, result = run(['--socket', server.path, 'close', 'target', '--project', 'p',
+                                    '--state-dir', server.state_dir, '--archive', '--no-retro', 'fixture'])
+            self.assertEqual((code, result['status'], result['route_removed']), (1, 'not_archived', False))
+            self.assertEqual(result['reason'], f'{conflict} No Desktop queue entry was submitted.')
+            self.assertEqual(result['results'], refused['results'])
+            self.assertEqual(len(server.call('routes', project='p')), 1)
+
     def test_policy_off_skips_queue_and_uses_direct_native_archive(self):
         with RunningBroker() as server:
             sid = str(uuid.uuid4())

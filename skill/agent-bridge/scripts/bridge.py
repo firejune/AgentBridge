@@ -615,13 +615,29 @@ def close_participant(args):
         return self_archive
 
     preflight = prefer_native if archive and not args.keep_route else None
-    result = {**address, 'transport': route['transport'],
-              **close_session(route, args.timeout, archive=archive, directory=directory, prefer_native=preflight)}
+    try:
+        result = {**address, 'transport': route['transport'],
+                  **close_session(route, args.timeout, archive=archive, directory=directory, prefer_native=preflight)}
+    except codex_queue.QueueOwnerUnavailable as error:
+        return queue_archive_refusal({**address, 'transport': 'codex', 'session': route['session']}, error)
+    if preflight and route['transport'] == 'codex' and any(
+            refusal['reason'] == 'running_process_cwd'
+            for row in result.get('results', ()) for refusal in row.get('refusals', ())):
+        if load_policy(directory).get(CODEX_SELF_ARCHIVE, True):
+            error = codex_queue.owner_refusal()
+            if error is not None:
+                return queue_archive_refusal(result, error)
     if result.get('status') == 'awaiting_native_archive':
         scope = result.pop('native_scope')
         if self_archive:
             # The process scan exempts the calling CLI's PID.
-            codex_archive.check_native_operator_processes(route, scope)
+            try:
+                codex_archive.check_native_operator_processes(route, scope)
+            except ValueError:
+                error = codex_queue.owner_refusal()
+                if error is not None:
+                    return queue_archive_refusal(result, error)
+                raise
             path, row, target = retro
             closed = broker.request(args.socket, {'op': 'close-self-archive', **address, 'expected_route': route,
                                                   'native_scope': scope, 'timeout': args.timeout,
@@ -691,6 +707,14 @@ def close_participant(args):
     return result
 
 
+def queue_archive_refusal(result, error):
+    reason = f'{error} No Desktop queue entry was submitted.'
+    return {**result, 'status': 'not_archived', 'archive_path': 'not_archived',
+            'archived': False, 'closed': False, 'archive_incomplete': True, 'route_removed': False,
+            'retro_recorded': False, 'reason': reason, 'note': reason,
+            **broker.wake_not_requested('No queue entry was accepted')}
+
+
 def self_archive_result(args, address, closed):
     path = closed['archive_path']
     archived = path == 'self_archive'
@@ -729,6 +753,8 @@ def preflight_native_close_operator(args, target, *, explicit=False):
         except codex_live.EndpointUnavailable as error:
             detail = ' The local Desktop queue could not be verified.' if allow_queue and error.default_absent else ''
             raise ValueError(f'Enrolled Codex close operator is unavailable. {error}{detail}') from None
+        except codex_queue.QueueOwnerUnavailable:
+            raise
         except codex_live.DeliveryError as error:
             raise ValueError(f'Enrolled Codex close operator is unavailable. {error}') from None
     return operator
