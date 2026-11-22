@@ -178,7 +178,7 @@ python3 "$bridge_cli" policy                                   # Show active def
 ```
 
 - **Antigravity (`agy`)**: Reads the latest generator's `plannerConfig`. Switching while idle runs one invocation preserving existing planner settings (`knowledgeConfig`, etc.).
-- **Codex (`codex`)**: Reads and updates the exact Desktop owner's next-turn model settings (`thread-follower-update-thread-settings`) without interrupting an active turn.
+- **Codex (`codex`)**: Reads and updates the exact Desktop owner's next-turn model settings (`thread-follower-update-thread-settings`) without interrupting an active turn. With the default local IPC socket missing or unserved, readback reports the last recorded model from the registered Desktop rollout and names that source.
 - **Claude (`claude-peer`)**: Reads the latest assistant model from the transcript. Desktop switching relays `set_session_model` through a configured `command_post` route in `policy.json`; IDE switching is `unsupported` (use the IDE picker).
 
 ### 3. Subscription Usage & Risk Monitoring (`usage`)

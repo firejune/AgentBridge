@@ -1,4 +1,5 @@
 """Adopt one newly persisted local Codex thread with the proven Desktop wake flow."""
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 import math
@@ -100,19 +101,19 @@ def _uuid(value):
         return False
 
 
-def _saved_rollout(desktop, route):
+def _saved_rollout(state, route):
     if (route.get('transport') != 'codex' or not _uuid(route['session'])
             or route.get('executable') not in (None, 'codex', str(codex_queue.CLI))):
         raise WakeError(TARGET_ERROR)
     registered = Path(route['cwd'])
     cwd, archived, recorded_path = codex_preview._saved_thread_row(
-        route, include_rollout=True, path=desktop.state)
+        route, include_rollout=True, path=state)
     if (archived or not registered.is_absolute() or not Path(cwd).is_absolute()
             or not isinstance(recorded_path, str)):
         raise WakeError(TARGET_ERROR)
     cwd = Path(cwd).resolve(strict=True)
     path = Path(recorded_path)
-    sessions = desktop.state.parent / 'sessions'
+    sessions = state.parent / 'sessions'
     if (not cwd.is_dir() or cwd != registered.resolve(strict=True) or not path.is_absolute()
             or path.resolve(strict=True) != path or not path.is_relative_to(sessions)
             or not path.name.startswith('rollout-') or not path.name.endswith('-' + route['session'] + '.jsonl')):
@@ -179,7 +180,7 @@ class _Attestation:
             if (self.turn is None or self.permissions is not None or payload.get('turn_id') != self.turn
                     or payload.get('cwd') != str(self.cwd)):
                 raise WakeError(EVIDENCE_ERROR)
-            if payload.get('model') != self.model:
+            if _turn_model(payload) != self.model:
                 raise WakeError('The Codex Desktop wake turn used a different model')
             self.permissions = _permissions(payload, self.cwd)
         elif event in ('model_reroute', 'error', 'turn_aborted'):
@@ -222,6 +223,62 @@ def _identity(info):
     return info.st_dev, info.st_ino
 
 
+def _turn_model(context):
+    model = context.get('model')
+    return model if isinstance(model, str) and model.strip() and model.isprintable() else None
+
+
+@contextmanager
+def _open_rollout(path, thread, cwd):
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    with os.fdopen(os.open(path, flags), 'rb') as source:
+        initial = os.fstat(source.fileno())
+        if (not stat.S_ISREG(initial.st_mode) or initial.st_uid != os.getuid()
+                or initial.st_mode & 0o022 or _identity(path.lstat()) != _identity(initial)):
+            raise WakeError(TARGET_ERROR)
+        line = source.readline(MAX_LINE + 1)
+        if not line.endswith(b'\n') or len(line) > MAX_LINE:
+            raise WakeError(TARGET_ERROR)
+        metadata = _record(line)
+        if (metadata.get('type') != 'session_meta' or not isinstance(metadata.get('payload'), dict)
+                or metadata['payload'].get('id') != thread or metadata['payload'].get('cwd') != str(cwd)):
+            raise WakeError(TARGET_ERROR)
+        yield source, initial
+
+
+def read_saved_model(route):
+    """Read the newest complete model context from the registered Desktop rollout."""
+    try:
+        state, _ = codex_queue.default_stores()
+        cwd, path = _saved_rollout(state, route)
+        with _open_rollout(path, route['session'], cwd) as (source, initial):
+            start = max(source.tell(), initial.st_size - MAX_TAIL)
+            source.seek(start - 1)
+            data = source.read(initial.st_size - start + 1)
+            observed = path.lstat()
+            if (len(data) != initial.st_size - start + 1 or _identity(observed) != _identity(initial)
+                    or observed.st_size < initial.st_size):
+                raise WakeError(EVIDENCE_ERROR)
+        # The prefix may begin inside a record. The last fragment may still be written.
+        for line in reversed(data.split(b'\n')[1:-1]):
+            if len(line) > MAX_LINE:
+                raise WakeError(EVIDENCE_ERROR)
+            record = _record(line)
+            if record.get('type') != 'turn_context':
+                continue
+            context = record.get('payload')
+            if (not isinstance(context, dict) or context.get('cwd') != str(cwd)
+                    or not _uuid(context.get('turn_id'))):
+                raise WakeError(EVIDENCE_ERROR)
+            model = _turn_model(context)
+            if model is not None:
+                return model
+            break
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError):
+        raise WakeError('The registered Codex Desktop rollout could not be read') from None
+    raise WakeError('No model recorded in the bounded Codex Desktop rollout')
+
+
 def _tail(source, path, initial, parser, remaining):
     while True:
         remaining()
@@ -245,21 +302,10 @@ def adopt(preflight, route, expected_model, timeout):
     """Queue one nonce-bound message and require fresh, exact Desktop turn evidence."""
     remaining = budget(timeout)
     try:
-        cwd, path = _saved_rollout(preflight, route)
+        cwd, path = _saved_rollout(preflight.state, route)
         thread = route['session']
-        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-        with os.fdopen(os.open(path, flags), 'rb') as source:
-            initial = os.fstat(source.fileno())
-            if (not stat.S_ISREG(initial.st_mode) or initial.st_uid != os.getuid()
-                    or initial.st_mode & 0o022 or _identity(path.lstat()) != _identity(initial)
-                    or initial.st_size < 1 or initial.st_size > MAX_TAIL):
-                raise WakeError(TARGET_ERROR)
-            line = source.readline(MAX_LINE + 1)
-            if not line.endswith(b'\n') or len(line) > MAX_LINE:
-                raise WakeError(TARGET_ERROR)
-            metadata = _record(line)
-            if (metadata.get('type') != 'session_meta' or not isinstance(metadata.get('payload'), dict)
-                    or metadata['payload'].get('id') != thread or metadata['payload'].get('cwd') != str(cwd)):
+        with _open_rollout(path, thread, cwd) as (source, initial):
+            if initial.st_size > MAX_TAIL:
                 raise WakeError(TARGET_ERROR)
             source.seek(initial.st_size - 1)
             if source.read(1) != b'\n' or os.fstat(source.fileno()).st_size != initial.st_size:
@@ -272,7 +318,8 @@ def adopt(preflight, route, expected_model, timeout):
                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                            timeout=remaining(), check=True)
             result = _tail(source, path, initial, _Attestation(thread, cwd, expected_model, proof), remaining)
-            if _owner(preflight.queue, remaining) != preflight.owner or _saved_rollout(preflight, route) != (cwd, path):
+            if (_owner(preflight.queue, remaining) != preflight.owner
+                    or _saved_rollout(preflight.state, route) != (cwd, path)):
                 raise WakeError(CONTEXT_ERROR)
             remaining()
             return result

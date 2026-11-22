@@ -16,6 +16,7 @@ import agy_live
 import sessions
 import codex_live
 import codex_new
+import codex_wake_open
 from new_session_policy import (CODEX_DESKTOP_WAKE_PERMISSIONS, POLICY_FILE, SEED_DENY, default_model, denied,
                                 env_name, load_policy, require_allowed)
 
@@ -208,9 +209,16 @@ def explicit_session_model(workspace, agent_type, state_dir, requested):
 def codex_read(route, timeout):
     """Read the exact owner's resumed settings, including before a first turn."""
     sid = str(uuid.UUID(str(route['session'])))
-    with codex_live.Client(timeout=timeout) as client:
-        owner = client.owner(sid)
-        settings = codex_new.owner_settings(client, sid, owner)
+    try:
+        with codex_live.Client(timeout=timeout) as client:
+            owner = client.owner(sid)
+            settings = codex_new.owner_settings(client, sid, owner)
+    except codex_live.EndpointUnavailable as error:
+        if not error.default_absent:
+            raise
+        model = codex_wake_open.read_saved_model(route)
+        return {'session': sid, 'model': model,
+                'source': 'Desktop rollout turn_context (last recorded turn)'}
     return {'session': sid, 'model': settings['model'],
             'source': 'Desktop owner resumed model settings (next turn)'}
 

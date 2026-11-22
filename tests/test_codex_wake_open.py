@@ -216,6 +216,29 @@ class DesktopWakeRolloutTests(unittest.TestCase):
     def desktop_turn(self, proof):
         self.append(self.records(proof)[1:])
 
+    def test_saved_model_uses_newest_complete_context_without_waking(self):
+        self.append(self.records(PROMPT)[1:])
+        self.append(self.records(PROMPT, turn=UNRELATED_TURN, model='another-model')[1:])
+        with self.log.open('ab') as source:
+            source.write(b'{"type":"turn_context"')
+        with patch.object(codex_wake_open.codex_queue, 'default_stores',
+                          return_value=(self.desktop.state, self.desktop.queue)):
+            self.assertEqual(codex_wake_open.read_saved_model(self.route), 'another-model')
+        self.assertEqual(self.queued, [])
+        self.opener.assert_not_called()
+
+    def test_saved_model_refuses_an_empty_or_mismatched_rollout(self):
+        with patch.object(codex_wake_open.codex_queue, 'default_stores',
+                          return_value=(self.desktop.state, self.desktop.queue)):
+            with self.assertRaisesRegex(codex_wake_open.WakeError, 'No model recorded'):
+                codex_wake_open.read_saved_model(self.route)
+            records = self.records(PROMPT)
+            records[0]['payload']['id'] = UNRELATED_TURN
+            self.log.write_text('')
+            self.append(records)
+            with self.assertRaisesRegex(codex_wake_open.WakeError, 'could not be read'):
+                codex_wake_open.read_saved_model(self.route)
+
     def test_the_queued_turn_written_after_the_call_is_the_evidence(self):
         result = codex_wake_open.adopt(self.desktop, self.route, MODEL, timeout=5)
         (thread, proof), = self.queued
