@@ -10,6 +10,7 @@ import fcntl
 import hashlib
 import hmac
 import json
+import sys
 import os
 from pathlib import Path
 import re
@@ -1480,11 +1481,19 @@ class Engine:
             if (type(replayed) is not bool or message['state'] not in STATES
                     or message['reply_to'] != handle['o']):
                 raise ValueError()
-            if not replayed:
+            # A replay pushes too while the reply is still pending (#198): a pending message was
+            # never written (a possible write settles as dispatching or uncertain), and the broker
+            # claim admits one writer. Without this, a first call that failed before its push
+            # leaves the reply stranded, since the caller's retry comes back replayed.
+            if not replayed or message['state'] == 'pending':
                 try:
                     message = self.backend.push_inbox_reply(message)
                 except delivery.PushFailed as error:
                     message = error.message
+                except Exception:
+                    # Fixed text only: never ids, routes or bodies (the facade's stderr is its log).
+                    print(json.dumps({'event': 'inbox_reply_push_failed'}), file=sys.stderr, flush=True)
+                    raise
             state = message['state']
             if state not in STATES:
                 raise ValueError()

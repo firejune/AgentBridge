@@ -4,6 +4,7 @@ Checklist: defaults/scopes; immutable Unicode/list paging; receipt reconciliatio
 facade reconstruction; broker loss; route races; correlation exclusion; bounds.
 """
 import hashlib
+import io
 import json
 from pathlib import Path
 import socket
@@ -235,7 +236,7 @@ class InboxIntegrationTests(unittest.TestCase):
             push.assert_not_called()
         self.assertEqual(self.running.call('show', id=parent['id'])['state'], 'pending')
 
-    def test_reply_lost_post_response_never_pushes_even_on_replay(self):
+    def test_reply_lost_post_response_pushes_the_pending_reply_on_replay(self):
         args = self.reply_args(self.send('lost post'))
         rpc = self.engine.backend.rpc
 
@@ -252,21 +253,41 @@ class InboxIntegrationTests(unittest.TestCase):
             self.assertNotIn('private response detail', json.dumps(unknown))
             push.assert_not_called()
         self.restart_facade()
-        with patch.object(self.engine.backend, 'push_inbox_reply') as push:
-            replay = self.data('bridge_message_reply', **args)
-            self.assertEqual(replay['delivery_state'], 'pending')
-            self.assertTrue(replay['replayed'])
-            push.assert_not_called()
+        def delivered(message):
+            self.running.call('claim', id=message['id'])
+            return self.running.call('finish', id=message['id'], state='submitted')
 
-    def test_reply_unexpected_push_failure_stays_unknown_and_does_not_resend(self):
+        with patch.object(self.engine.backend, 'push_inbox_reply', side_effect=delivered) as push:
+            # The reply was created but never written, so the retry delivers it (#198).
+            replay = self.data('bridge_message_reply', **args)
+            self.assertEqual((replay['delivery_state'], replay['replayed']), ('submitted', True))
+            push.assert_called_once()
+            again = self.data('bridge_message_reply', **args)
+            self.assertEqual(again, replay)
+            push.assert_called_once()  # Delivered: a later replay does not push again.
+
+    def test_reply_unexpected_push_failure_is_logged_and_a_pending_retry_pushes(self):
         args = self.reply_args(self.send('unexpected push'))
+        stderr = io.StringIO()
         with patch.object(self.engine.backend, 'push_inbox_reply',
-                side_effect=OSError('private push detail')) as push:
+                side_effect=OSError('private push detail')) as push, patch.object(sys, 'stderr', stderr):
             unknown = self.call('bridge_message_reply', **args)
             self.assertEqual(unknown['error']['code'], 'DELIVERY_UNKNOWN')
             self.assertNotIn('private push detail', json.dumps(unknown))
-            self.assertTrue(self.data('bridge_message_reply', **args)['replayed'])
-            push.assert_called_once()
+            self.assertEqual(push.call_count, 1)
+        self.assertEqual(stderr.getvalue(), '{"event": "inbox_reply_push_failed"}\n')
+        self.assertNotIn('private push detail', stderr.getvalue())
+        # Nothing was written, so the message is still pending and the retry pushes it once.
+        pushed = []
+
+        def delivered(message):
+            pushed.append(message['state'])
+            self.running.call('claim', id=message['id'])
+            return self.running.call('finish', id=message['id'], state='submitted')
+
+        with patch.object(self.engine.backend, 'push_inbox_reply', side_effect=delivered):
+            retry = self.data('bridge_message_reply', **args)
+        self.assertEqual((retry['delivery_state'], retry['replayed'], pushed), ('submitted', True, ['pending']))
 
     def test_reply_push_uses_recorded_state_without_diagnostics_or_resend(self):
         args = self.reply_args(self.send('uncertain push'))
