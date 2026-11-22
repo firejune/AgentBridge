@@ -134,6 +134,18 @@ def saved_thread(route):
     return cwd, bool(archived)
 
 
+def verify_saved_archive(route):
+    """Require the saved archive bit of the exact thread in the exact workspace (#196 release)."""
+    try:
+        cwd, archived = _saved_thread_row(route)
+        if not Path(cwd).is_absolute() or Path(cwd).resolve() != Path(route['cwd']).resolve():
+            raise ValueError('workspace differs')
+        if not archived:
+            raise ValueError('archive not recorded')
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, TimeoutExpired):
+        raise ValueError('Saved Codex archive could not be verified; closing route kept') from None
+
+
 def verify_archive(route):
     """Require the native archive bit and the exact owned rollout in the archive."""
     try:
