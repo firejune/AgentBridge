@@ -138,6 +138,34 @@ def endpoint_record(item):
     return result
 
 
+CLAUDE_NOT_LIVE_RETAINED = 'Claude session not live; saved Desktop session retained for wake'
+
+
+def saved_claude_desktop_session(route, cwd):
+    """Keep a route to an idle-closed Claude Desktop session so a push can wake it (#115, #120).
+
+    Claude Desktop closes hidden sessions after an idle timeout and under memory pressure; the CLI
+    exits but the Desktop session metadata stays. Drop the route only when that session is gone
+    (no metadata for this exact session id, archived, or another workspace). Never wakes anything.
+    """
+    sid = route['session']
+    if any(record['sessionId'] == sid for record in sessions.claude_live_records(sessions.claude_sessions_dir())):
+        # Running but unreachable (no inbox, other protocol): a wake cannot restart it.
+        raise ValueError('Peer socket unavailable')
+    desktop = sessions.find_claude_desktop_session(sid)
+    if desktop is None:
+        raise RouteCheckError('Claude session not live and no saved Desktop session')
+    if desktop['archived']:
+        raise RouteCheckError('Claude Desktop session archived')
+    try:
+        desktop_cwd = Path(desktop['cwd']).resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        raise RouteCheckError('session workspace differs') from None
+    if desktop_cwd != cwd:
+        raise RouteCheckError('session workspace differs')
+    return CLAUDE_NOT_LIVE_RETAINED
+
+
 def verify_route(route):
     """Verify identity, not Codex liveness; return a reason for an unverified retain."""
     try:
@@ -180,7 +208,10 @@ def verify_route(route):
             raise RouteCheckError('session workspace differs')
         return
     if transport == 'claude-peer':
-        target = sessions.resolve_claude_peer(route['session'])
+        try:
+            target = sessions.resolve_claude_peer(route['session'])
+        except sessions.DiscoveryError:
+            return saved_claude_desktop_session(route, cwd)
         info = Path(target['socket']).stat()
         if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
             raise ValueError('Peer socket unavailable')
