@@ -3,6 +3,7 @@ from contextlib import closing
 import json
 import os
 from pathlib import Path
+import plistlib
 import sqlite3
 import tempfile
 import unittest
@@ -14,6 +15,7 @@ import broker
 import codex_archive
 import codex_preview
 import codex_queue
+import codex_wake_open
 import retros
 import route_store
 from support import RunningBroker
@@ -53,7 +55,15 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.patch(codex_archive, 'sweep_store', return_value=self.db)
         self.patch(codex_preview, 'state_path', return_value=self.db)
         self.available = self.patch(codex_queue, 'check_available')
-        self.enqueue = self.patch(codex_queue, 'enqueue')
+        self.queue_id = str(uuid.uuid4())
+        self.enqueue = self.patch(codex_queue, 'enqueue', return_value=self.queue_id)
+        self.app = root / 'Test.app'
+        self.plist = self.app / 'Contents' / 'Info.plist'
+        self.plist.parent.mkdir(parents=True)
+        self.write_app_build(*codex_wake_open.APP_BUILD)
+        self.patch(codex_queue, 'APP', new=self.app)
+        self.patch(codex_queue, 'verify_signature')
+        self.opener = self.patch(codex_wake_open, '_open_wake_url')
         self.args = {**self.address, 'expected_route': self.route, 'timeout': 1,
                      'native_scope': codex_archive.native_handoff_scope(self.route)[1]}
         self.state.action({'op': 'register', 'project': 'p', 'name': 'caller', 'cwd': str(self.cwd)})
@@ -65,6 +75,11 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         patcher = mock.patch.object(target, field, **kwargs)
         self.addCleanup(patcher.stop)
         return patcher.start()
+
+    def write_app_build(self, version, build):
+        self.plist.write_bytes(plistlib.dumps({
+            'CFBundleShortVersionString': version, 'CFBundleVersion': build,
+        }))
 
     def record_archive_bit(self, rollout):
         with closing(sqlite3.connect(self.db)) as db, db:
@@ -110,6 +125,8 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list((self.store.directory / 'pending-close-retros').iterdir()), [])
 
     async def test_exact_entry_archives_and_releases_only_after_readback(self):
+        calls = []
+
         def submit(thread, prompt, timeout):
             self.assertEqual(thread, self.sid)
             self.assertEqual(prompt, 'Archive this Codex Desktop thread now. Call the Codex app '
@@ -117,12 +134,20 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
                              'source "codex", and archived true. Take no other action.')
             self.assertTrue(self.state.endpoints[('p', 'target')]['closing_self_archive'])
             self.assertEqual(self.state.messages[self.mid]['state'], 'done')
+            calls.append(('enqueue', thread))
+            return self.queue_id
+
+        def open_wake(thread, timeout):
+            calls.append(('wake', thread))
             self.record_native_archive()
 
         self.enqueue.side_effect = submit
+        self.opener.side_effect = open_wake
         result = await broker.start_self_archive(self.state, self.args)
         self.assert_closed(result, 'self_archive', 'Queued self-archive verified')
-        self.enqueue.assert_called_once()
+        self.assertEqual(calls, [('enqueue', self.sid), ('wake', self.sid)])
+        self.assertIs(result['wake_requested'], True)
+        self.assertNotIn('wake_reason', result)
 
     async def test_definite_submit_refusal_reopens_route_without_touching_codex(self):
         self.enqueue.side_effect = codex_queue.QueueUnavailable()
@@ -134,6 +159,9 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.rollout.exists())
         self.assert_retro_discarded(retro)
         self.enqueue.assert_called_once()
+        self.opener.assert_not_called()
+        self.assertIs(result['wake_requested'], False)
+        self.assertEqual(result['wake_reason'], 'No queue entry was accepted')
 
     async def test_subtree_recheck_error_releases_route_and_staged_retro(self):
         retro = self.prepare_stop_retro()
@@ -175,11 +203,42 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         result = await broker.start_self_archive(self.state, self.args)
         self.assert_closed(result, 'self_archive', 'Thread already natively archived; archive verified')
         self.enqueue.assert_not_called()
+        self.opener.assert_not_called()
+        self.assertIs(result['wake_requested'], False)
+
+    async def test_unsupported_build_keeps_accepted_entry_and_archive_readback(self):
+        self.write_app_build('99.0.1', '1')
+
+        def submit(*_):
+            self.record_native_archive()
+            return self.queue_id
+
+        self.enqueue.side_effect = submit
+        result = await broker.start_self_archive(self.state, self.args)
+        self.assert_closed(result, 'self_archive', 'Queued self-archive verified')
+        self.enqueue.assert_called_once()
+        self.opener.assert_not_called()
+        self.assertIs(result['wake_requested'], False)
+        self.assertIn('build has not been verified', result['wake_reason'])
+
+    async def test_opener_failure_keeps_close_pending_without_a_second_open(self):
+        self.opener.side_effect = OSError('fixture opener failure')
+        result = await broker.start_self_archive(self.state, {**self.args, 'timeout': 0.15})
+        self.assertEqual(result['archive_path'], 'pending_self_archive')
+        self.assertIs(result['wake_requested'], False)
+        self.assertIn('could not be confirmed', result['wake_reason'])
+        self.record_native_archive()
+        finished = await broker.finish_close(self.state, self.finish_args(result))
+        self.assert_closed(finished, 'self_archive', 'Queued self-archive verified')
+        self.assertIs(finished['wake_requested'], False)
+        self.enqueue.assert_called_once()
+        self.opener.assert_called_once()
 
     async def test_timeout_keeps_durable_guard_and_finish_only_verifies(self):
         retro = self.prepare_stop_retro()
         result = await broker.start_self_archive(self.state, {**self.args, 'timeout': 0.15, 'retro': retro})
         self.assertEqual(result['archive_path'], 'pending_self_archive')
+        self.assertIs(result['wake_requested'], True)
         self.assertFalse(result['route_removed'])
         self.assertEqual(self.archive_events(), [
             ('pending_self_archive', 'Codex self-archive is not yet verified; verify with --finish')])
@@ -212,6 +271,9 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(restored.messages), {finished['notification']['id']})
         self.assertEqual(finished['notification'], incomplete['notification'])
         self.enqueue.assert_called_once()
+        self.opener.assert_called_once()
+        self.assertIs(finished['wake_requested'], False)
+        self.assertEqual(finished['wake_reason'], 'Finish only verifies the native archive')
 
     async def test_uncertain_acceptance_keeps_guard_without_fallback(self):
         self.enqueue.side_effect = broker.DeliveryError('ambiguous queue receipt', uncertain=True)
@@ -222,6 +284,9 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.state.endpoints[('p', 'target')]['closing'], result['closing'])
         self.assertEqual(self.state.messages[self.mid]['state'], 'done')
         self.enqueue.assert_called_once()
+        self.opener.assert_not_called()
+        self.assertIs(result['wake_requested'], False)
+        self.assertEqual(result['wake_reason'], 'Queue acceptance is uncertain')
 
     async def test_unfinished_correspondence_still_blocks_reservation(self):
         notice = self.state.action({'op': 'send', 'project': 'p', 'sender': 'target',
@@ -282,6 +347,7 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
                 os.chdir(previous_cwd)
             scan.assert_called_once()
             self.assertEqual((code, result['archive_path'], result['route_removed']), (0, 'self_archive', True))
+            self.assertIs(result['wake_requested'], True)
             retry_code, _ = await asyncio.to_thread(
                 run, ['--socket', str(self.cwd.parent / 'fixture.sock'), 'close', 'target', '--project', 'p',
                       '--finish', result['close_id'], '--expect-session', self.sid])

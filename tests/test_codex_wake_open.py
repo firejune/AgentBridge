@@ -248,6 +248,9 @@ class DesktopWakeRolloutTests(unittest.TestCase):
             'activePermissionProfile': {'id': ':read-only'}, 'approvalPolicy': 'on-request',
             'sandboxPolicy': {'type': 'readOnly'}}})
         self.opener.assert_called_once()
+        self.assertEqual(self.opener.call_args.args[0],
+                         ['/usr/bin/open', '-a', str(codex_wake_open.codex_queue.APP),
+                          f'codex://threads/wake/{THREAD}'])
 
     def test_workspace_permissions_are_read_from_the_fresh_rollout(self):
         def workspace_turn(proof):

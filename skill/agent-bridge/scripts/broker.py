@@ -25,6 +25,7 @@ import retros
 import codex_archive
 import codex_preview
 import codex_queue
+import codex_wake_open
 from codex_live import DeliveryError, ThreadArchived
 from new_session_policy import CODEX_SELF_ARCHIVE, load_policy
 import message_store
@@ -1586,8 +1587,9 @@ async def finish_close(state, args):
         # Agent Bridge never writes Codex state (#212); an older CLI may still send the flag.
         raise ValueError(SAVED_STATE_REMOVED)
     if route.get('closing_self_archive'):
-        return await verify_self_archive(state, args, route, time.monotonic() + timeout,
-                                         'self_archive', 'Queued self-archive verified')
+        result = await verify_self_archive(state, args, route, time.monotonic() + timeout,
+                                           'self_archive', 'Queued self-archive verified')
+        return {**result, **wake_not_requested('Finish only verifies the native archive')}
     try:
         await asyncio.wait_for(asyncio.to_thread(codex_preview.verify_archive, route), timeout)
     except asyncio.TimeoutError:
@@ -1622,17 +1624,31 @@ async def start_self_archive(state, args):
         except (ValueError, asyncio.TimeoutError):
             return await state.serialized(refuse_self_archive, state, finish, route,
                                           'Existing archive bit has no verified native archive')
-        return await commit_self_archive(state, finish, route, 'self_archive',
-                                         'Thread already natively archived; archive verified')
+        result = await commit_self_archive(state, finish, route, 'self_archive',
+                                           'Thread already natively archived; archive verified')
+        return {**result, **wake_not_requested('Thread was already natively archived')}
     except ValueError as error:
         if isinstance(error, DeliveryError) and error.uncertain:
             note = 'Queue acceptance is uncertain; verify with --finish'
             state.close_archive_event(route, 'pending_self_archive', note)
-            return {**route, 'archive_path': 'pending_self_archive', 'route_removed': False, 'note': note}
+            return {**route, 'archive_path': 'pending_self_archive', 'route_removed': False, 'note': note,
+                    **wake_not_requested('Queue acceptance is uncertain')}
         # The queue adapter marks failures after launch uncertain. A definite refusal is safe to release.
         return await state.serialized(refuse_self_archive, state, finish, route, str(error))
-    return await verify_self_archive(state, finish, route, deadline,
-                                     'self_archive', 'Queued self-archive verified')
+    try:
+        await asyncio.to_thread(codex_wake_open.request_queued_wake, route['session'],
+                                deadline - time.monotonic())
+    except codex_wake_open.WakeError as error:
+        wake = wake_not_requested(str(error))
+    else:
+        wake = {'wake_requested': True}
+    result = await verify_self_archive(state, finish, route, deadline,
+                                       'self_archive', 'Queued self-archive verified')
+    return {**result, **wake}
+
+
+def wake_not_requested(reason):
+    return {'wake_requested': False, 'wake_reason': reason}
 
 
 def queue_self_archive(route, deadline):
@@ -1652,7 +1668,7 @@ async def refuse_self_archive(state, args, route, reason):
     reopened = route_store.route_record(route)
     state.routing_change('endpoints', (route['project'], route['name']), reopened)
     result = {**route, 'route_removed': False, 'archive_path': 'not_archived',
-              'reason': reason, 'note': reason}
+              'reason': reason, 'note': reason, **wake_not_requested('No queue entry was accepted')}
     remove_close_retro(state, route, result)
     state.close_archive_event(route, 'not_archived', reason)
     return result

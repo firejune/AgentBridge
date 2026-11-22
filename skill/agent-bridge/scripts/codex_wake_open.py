@@ -69,18 +69,29 @@ def _owner(queue, remaining):
     return owner
 
 
+def _verify_app_build(remaining):
+    app = codex_queue.APP
+    with (app / 'Contents/Info.plist').open('rb') as source:
+        metadata = plistlib.load(source)
+    if (not isinstance(metadata, dict)
+            or (metadata.get('CFBundleShortVersionString'), metadata.get('CFBundleVersion')) != APP_BUILD):
+        raise WakeError('This Codex Desktop build has not been verified for queue wake')
+    codex_queue.verify_signature(app, APP_SIGNATURE, min(5, remaining()))
+
+
+def _open_wake_url(thread, timeout):
+    subprocess.run(['/usr/bin/open', '-a', str(codex_queue.APP), f'codex://threads/wake/{thread}'],
+                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   timeout=timeout, check=True)
+
+
 def prepare(timeout=10):
     """Validate the sole supported local app and default owner/store before creation."""
     remaining = budget(timeout)
     try:
         state, queue = codex_queue.default_stores()
-        app = codex_queue.APP
-        with (app / 'Contents/Info.plist').open('rb') as source:
-            metadata = plistlib.load(source)
-        if (metadata.get('CFBundleShortVersionString'), metadata.get('CFBundleVersion')) != APP_BUILD:
-            raise WakeError('This Codex Desktop build has not been verified for queue wake')
-        for bundle, signature in ((app, APP_SIGNATURE), (codex_queue.CLI_BUNDLE, codex_queue.SIGNATURE)):
-            codex_queue.verify_signature(bundle, signature, min(5, remaining()))
+        _verify_app_build(remaining)
+        codex_queue.verify_signature(codex_queue.CLI_BUNDLE, codex_queue.SIGNATURE, min(5, remaining()))
         # The existing public config reader has a bounded independent budget.
         if remaining() < codex_preview.CONFIG_TIMEOUT or codex_preview.state_path(str(codex_queue.CLI)) != state:
             raise WakeError(CONTEXT_ERROR)
@@ -99,6 +110,23 @@ def _uuid(value):
         return str(uuid.UUID(value)) == value
     except ValueError:
         return False
+
+
+def request_queued_wake(thread, timeout):
+    """Request one Desktop wake for an exact thread after queue acceptance."""
+    if not _uuid(thread):
+        raise WakeError('Invalid Codex Desktop wake thread identity')
+    remaining = budget(timeout)
+    try:
+        _verify_app_build(remaining)
+    except WakeError:
+        raise
+    except (OSError, ValueError, subprocess.SubprocessError):
+        raise WakeError('The signed Codex Desktop build could not be verified for queue wake') from None
+    try:
+        _open_wake_url(thread, remaining())
+    except (OSError, subprocess.SubprocessError):
+        raise WakeError('The Codex Desktop wake request could not be confirmed') from None
 
 
 def _saved_rollout(state, route):
@@ -314,9 +342,7 @@ def adopt(preflight, route, expected_model, timeout):
                 raise WakeError(CONTEXT_ERROR)
             proof = PROMPT + str(uuid.uuid4())
             codex_queue.enqueue(thread, proof, remaining())
-            subprocess.run(['/usr/bin/open', '-a', str(codex_queue.APP), f'codex://threads/wake/{thread}'],
-                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=remaining(), check=True)
+            _open_wake_url(thread, remaining())
             result = _tail(source, path, initial, _Attestation(thread, cwd, expected_model, proof), remaining)
             if (_owner(preflight.queue, remaining) != preflight.owner
                     or _saved_rollout(preflight.state, route) != (cwd, path)):
