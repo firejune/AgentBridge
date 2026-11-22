@@ -47,13 +47,27 @@ def record(project, card, runner, model, session, text=None, reason=None, tower=
                 text=text, no_retro=reason)
 
 
-def append(path, row):
+def notification_body(row, target):
+    if not target or row['urgency'] not in ('stop', 'repeat'):
+        return None
+    excerpt = '\n'.join((row['text'] or row['no_retro']).splitlines()[:5])[:1000]
+    return (f"Retro {row['urgency']}: card={row['card']} runner={row['runner']} "
+            f"tags={','.join(row['tags'])}\n{excerpt}")
+
+
+def append(path, row, *, once=False):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     data = (json.dumps(row, ensure_ascii=False) + '\n').encode('utf-8')
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    access = os.O_RDWR if once else os.O_WRONLY
+    fd = os.open(path, access | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         os.fchmod(fd, 0o600)
+        if once:
+            with os.fdopen(fd, 'r', encoding='utf-8', closefd=False) as source:
+                for line in source:
+                    if line.strip() and json.loads(line)['id'] == row['id']:
+                        return
         view = memoryview(data)
         while view:
             size = os.write(fd, view)

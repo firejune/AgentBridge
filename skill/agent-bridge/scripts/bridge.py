@@ -34,7 +34,7 @@ from delivery import (
     push_agy, push_codex, push_frame, push_if_peer, reply_command,
 )
 import models
-from new_session_policy import CodexDesktopWakePolicyError
+from new_session_policy import CODEX_SELF_ARCHIVE, CodexDesktopWakePolicyError, load_policy
 import sessions
 import service
 import usage
@@ -501,20 +501,25 @@ def record_retro(args, prepared):
     path, row, target = prepared
     retros.append(path, row)
     result = {'retro_id':row['id'], 'store':str(path), 'notification':None}
-    if target and row['urgency'] in ('stop', 'repeat'):
-        excerpt = '\n'.join((row['text'] or row['no_retro']).splitlines()[:5])[:1000]
-        body = (f"Retro {row['urgency']}: card={row['card']} runner={row['runner']} "
-                f"tags={','.join(row['tags'])}\n{excerpt}")
+    body = retros.notification_body(row, target)
+    if body is not None:
         try:
             sent = broker.request(args.socket, {'op':'send', 'project':args.project,
                        'sender':row['runner'], 'recipient':target, 'body':body, 'key':'retro-'+row['id']})
-            result['notification'] = {'id':sent['id'], 'state':sent['state']}
-            sent = push_if_peer(args.socket, sent)
-            result['notification']['state'] = sent['state']
+            push_retro_notification(args, result, sent)
         except (ValueError, OSError) as error:
             # Saved already: expose the receipt and never retry a possibly dispatched message.
             result['notification'] = {**(result['notification'] or {}), 'error':str(error), 'retry':False}
     return result
+
+
+def push_retro_notification(args, result, sent):
+    result['notification'] = {'id': sent['id'], 'state': sent['state']}
+    try:
+        pushed = push_if_peer(args.socket, sent)
+        result['notification']['state'] = pushed['state']
+    except (ValueError, OSError) as error:
+        result['notification'].update(error=str(error), retry=False)
 
 
 def record_closing_retro(args, prepared, result):
@@ -554,6 +559,8 @@ def close_participant(args):
         request = {'op': 'close-finish', **address, 'close_id': str(uuid.UUID(args.finish)),
                    'session': str(uuid.UUID(args.expect_session)), 'timeout': args.timeout}
         closed = broker.request(args.socket, request, timeout=args.timeout + 5)
+        if 'archive_path' in closed:
+            return self_archive_result(args, address, closed)
         result = {**address, 'transport': 'codex', 'method': 'archive', 'archived': True, 'resumable': True,
                   'status': 'closed' if closed['route_removed'] else 'archive_verified',
                   'closed': True, 'session': closed['session'], 'close_id': closed['closing']}
@@ -564,6 +571,8 @@ def close_participant(args):
     if args.expect_session and str(uuid.UUID(args.expect_session)) != route['session']:
         raise ValueError('Endpoint does not match --expect-session')
     archive = args.archive
+    if route.get('closing_self_archive'):
+        raise ValueError('Codex self-archive is already reserved; inspect the route and use --finish')
     if args.handoff:
         if not archive:
             raise ValueError('--handoff requires --archive')
@@ -595,17 +604,34 @@ def close_participant(args):
         return {**receipt, **prepare_archive_handoff(args, address, route)}
     directory = broker_state_dir(args).expanduser().resolve()
     operator = None
+    self_archive = False
 
     def prefer_native():
-        nonlocal operator
+        nonlocal operator, self_archive
         operator = preflight_native_close_operator(args, route)
-        return operator is not None
+        if operator is not None:
+            return True
+        self_archive = load_policy(directory).get(CODEX_SELF_ARCHIVE, True)
+        return self_archive
 
     preflight = prefer_native if archive and not args.keep_route else None
     result = {**address, 'transport': route['transport'],
               **close_session(route, args.timeout, archive=archive, directory=directory, prefer_native=preflight)}
     if result.get('status') == 'awaiting_native_archive':
         scope = result.pop('native_scope')
+        if self_archive:
+            # The process scan exempts the calling CLI's PID.
+            codex_archive.check_native_operator_processes(route, scope)
+            path, row, target = retro
+            closed = broker.request(args.socket, {'op': 'close-self-archive', **address, 'expected_route': route,
+                                                  'native_scope': scope, 'timeout': args.timeout,
+                                                  'retro': {'store': str(path.absolute()), 'row': row, 'target': target}},
+                                    timeout=args.timeout + 10)
+            finished = self_archive_result(args, address, closed)
+            result['results'][-1].update(status='archived' if finished['archived'] else finished['status'],
+                                         archived=finished['archived'], method=finished['archive_path'])
+            return {**result, **finished,
+                    'count': result['count'] + int(finished['archived'])}
         try:
             prepare_archive_handoff(args, address, route, expected_operator=operator, native_scope=scope,
                                     check_only=True)
@@ -629,7 +655,8 @@ def close_participant(args):
     record_closing_retro(args, retro, result)
     if archive:
         try:
-            cleanup = broker.request(args.socket, {'op':'archive-correspondence', 'expected_route':route, 'archived':True})
+            cleanup = broker.request(args.socket, {'op':'archive-correspondence', 'expected_route':route,
+                                                   'archived':True})
             result['correspondence_cleanup'] = cleanup
             if not cleanup['complete'] and cleanup.get('active_retained') != 0:
                 result['cleanup_error'] = 'Archive confirmed; protected correspondence remains (active or uncertain delivery/wait)'
@@ -661,6 +688,22 @@ def close_participant(args):
         result['route_note'] = (('The running broker lacks guarded archive route removal; upgrade it before removing the route'
                                  if archive else 'The running broker predates route removal; restart it to pick up this version')
                                 if str(error) == 'Unknown operation' else str(error))
+    return result
+
+
+def self_archive_result(args, address, closed):
+    path = closed['archive_path']
+    archived = path == 'self_archive'
+    status = ('closed' if closed['route_removed'] else 'archive_verified') if archived else path
+    result = {**address, 'transport': 'codex', 'host': 'codex', 'method': 'archive',
+              'archive_path': path, 'archived': archived, 'closed': archived, 'resumable': True,
+              'archive_incomplete': not archived, 'status': status, 'note': closed['note'],
+              'session': closed['session'], 'close_id': closed['closing']}
+    result.update({key: closed[key] for key in ('route_removed', 'correspondence_cleanup',
+                   'cleanup_error', 'route_error', 'retro_id', 'store', 'retro_recorded',
+                   'retro_error', 'notification', 'reason') if key in closed})
+    if 'retro_message' in closed:
+        push_retro_notification(args, result, closed['retro_message'])
     return result
 
 

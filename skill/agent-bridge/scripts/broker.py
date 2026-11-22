@@ -21,8 +21,12 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import route_store
+import retros
 import codex_archive
 import codex_preview
+import codex_queue
+from codex_live import DeliveryError, ThreadArchived
+from new_session_policy import CODEX_SELF_ARCHIVE, load_policy
 import message_store
 import retention
 import usage
@@ -403,6 +407,8 @@ class State:
         return deepcopy(item)
 
     def matches(self, sub, event):
+        if event['type'] == 'close_archive':
+            return route_key(event['route']) == sub['route']
         m = event['message']
         destinations = [m['route']]
         if event['type'] == 'status':
@@ -414,8 +420,15 @@ class State:
         if self.pending_publications is not None:
             self.pending_publications.append((deepcopy(m), kind))
             return
+        self.emit({'type':kind,'message':deepcopy(m)})
+
+    def close_archive_event(self, route, path, note):
+        self.emit({'type': 'close_archive', 'route': route_store.route_record(route),
+                   'archive_path': path, 'note': note})
+
+    def emit(self, event):
         self.sequence += 1
-        event = {'seq':self.sequence,'instance':self.instance,'type':kind,'message':deepcopy(m)}
+        event.update(seq=self.sequence, instance=self.instance)
         self.events.append(event)
         for sub in self.subscribers:
             if sub['overflow']:
@@ -462,7 +475,7 @@ class State:
             self.answers[m['id']].set()
         return m
 
-    def post(self, args, reply_to=None, *, close_request=None, inbox_reply=False):
+    def post(self, args, reply_to=None, *, close_request=None, inbox_reply=False, closing_origin=None):
         body, key = args['body'], args['key']
         if not isinstance(body,str) or not body.strip() or len(body.encode()) > 32768:
             raise ValueError('Message must contain 1–32768 UTF-8 bytes')
@@ -503,7 +516,8 @@ class State:
             conversation = parent['conversation']
         else:
             destination = self.route(args['project'],args.get('recipient'),args.get('channel'))
-            origin = self.route(args['project'],args.get('sender'),args.get('sender_channel'))
+            origin = (route_store.route_record(closing_origin) if closing_origin is not None
+                      else self.route(args['project'],args.get('sender'),args.get('sender_channel')))
             if route_key(destination)==route_key(origin):
                 raise ValueError('Sender and recipient addresses must differ')
             conversation = str(uuid.uuid4())
@@ -738,6 +752,9 @@ class State:
         if args.get('archived') is not True:
             raise ValueError('Archive cleanup requires confirmed provider archival')
 
+        if verified_close:
+            selected.discard(args.get('close_retro_id'))
+            protected &= selected
         removed = selected - protected
         for mid in removed:
             self.messages.pop(mid, None)
@@ -922,7 +939,8 @@ class State:
         mutations = ('send', 'send-with-retention', 'reply', 'ack', 'progress', 'resolve', 'claim', 'finish',
                      'claim-guarded', 'release-claim', 'note-pending',
                      'inbox_ack', 'inbox_reply', 'provider-failure', 'provider-retry', 'retention-sweep',
-                     'archive-correspondence', 'close-dispatch', 'close-operator', 'dispatch-expire')
+                     'archive-correspondence', 'close-dispatch', 'close-operator', 'close-retro-notify',
+                     'dispatch-expire')
         archive = args['op'] == 'archive-correspondence'
         if archive and args.get('check_only') is True:
             return self.archive_correspondence(args), None
@@ -1054,6 +1072,11 @@ class State:
             return self.archive_correspondence(args, verified_close=verified_close)
         if op == 'close-prepare':
             return self.prepare_close(args)
+        if op == 'close-retro-notify' and verified_close:
+            route = self.closing_route(args)
+            if not route.get('closing_self_archive'):
+                raise ValueError('Retrospective notification requires a verified self-archive')
+            return public_message(self.post(args, closing_origin=route))
         if op == 'close-operator-status':
             explicit = args.get('explicit', False)
             if type(explicit) is not bool:
@@ -1378,20 +1401,24 @@ class State:
             if any(same_codex_thread(current, item) for item in endpoints):
                 raise ValueError('This Codex thread has unfinished correspondence; reconcile it before closing')
 
-    def prepare_close(self, args):
+    def prepare_close(self, args, *, self_archive=False):
         current = self.open_close_target(args['expected_route'])
         key = (identifier(args['project']), identifier(args['name']))
         if key != (current['project'], current['name']):
             raise ValueError('Endpoint is missing or changed')
         native_scope = args.get('native_scope')
         if 'closing' in current:
+            if self_archive or current.get('closing_self_archive'):
+                raise ValueError('Codex self-archive is already reserved; inspect the route and use --finish')
             if args.get('check_only') is True or (native_scope is not None
                                                  and current.get('closing_native_scope') != native_scope):
                 raise ValueError('Codex route is closing; inspect the existing archive handoff')
             return {'route': current, 'message': self.close_message(current['closing'])}
         native_root_only = native_scope is not None
-        operator = self.close_operator(prefer_native_for_direct=native_root_only)
-        if native_root_only and (operator is None or operator != args.get('expected_operator')):
+        operator = None if self_archive else self.close_operator(prefer_native_for_direct=native_root_only)
+        if self_archive and not native_root_only:
+            raise ValueError('Codex self-archive requires a reviewed subtree')
+        if native_root_only and not self_archive and (operator is None or operator != args.get('expected_operator')):
             raise ValueError('Enrolled Codex close operator changed before native archive preparation')
         self.check_close_scope(current, operator)
         if native_root_only:
@@ -1401,6 +1428,10 @@ class State:
         route = dict(current, closing=str(uuid.uuid4()))
         if native_root_only:
             route['closing_native_scope'] = native_scope
+        if self_archive:
+            route['closing_self_archive'] = True
+            if 'retro' in args:
+                stage_close_retro(self, route, args['retro'])
         route = self.routing_change('endpoints', key, route)
         return {'route': route, 'operator': operator}
 
@@ -1465,6 +1496,8 @@ class State:
 
     def dispatch_close(self, args):
         target = self.closing_route(args)
+        if target.get('closing_self_archive'):
+            raise ValueError('Codex self-archive does not use a close operator')
         close_id = target['closing']
         previous = self.close_message(close_id)
         if previous is not None:
@@ -1523,11 +1556,157 @@ async def finish_close(state, args):
     if 'saved_state' in args:
         # Agent Bridge never writes Codex state (#212); an older CLI may still send the flag.
         raise ValueError(SAVED_STATE_REMOVED)
+    if route.get('closing_self_archive'):
+        return await verify_self_archive(state, args, route, time.monotonic() + timeout,
+                                         'self_archive', 'Queued self-archive verified')
     try:
         await asyncio.wait_for(asyncio.to_thread(codex_preview.verify_archive, route), timeout)
     except asyncio.TimeoutError:
         raise ValueError('Codex archive verification timed out; closing route kept') from None
     return await state.serialized(commit_close, state, args, route)
+
+
+async def start_self_archive(state, args):
+    timeout = args.get('timeout', 10)
+    if not 0 < timeout <= 600:
+        raise ValueError('Timeout must be between 0 and 600 seconds')
+    deadline = time.monotonic() + timeout
+
+    async def reserve():
+        # Reuse the same durable delivery guard and subtree checks as native handoffs.
+        if state.store is None or not load_policy(state.store.directory).get(CODEX_SELF_ARCHIVE, True):
+            raise ValueError('Codex self-archive requires an enabled owner policy and persistent routing')
+        return state.prepare_close(args, self_archive=True)['route']
+
+    route = await state.serialized(reserve)
+    finish = {'project': route['project'], 'name': route['name'],
+              'session': route['session'], 'close_id': route['closing']}
+    try:
+        await asyncio.to_thread(queue_self_archive, route, deadline)
+    except codex_queue.QueueUnavailable:
+        return await state.serialized(refuse_self_archive, state, finish, route,
+                                      'Desktop queue unavailable; no self-archive entry was submitted')
+    except ThreadArchived:
+        try:
+            await asyncio.wait_for(asyncio.to_thread(verify_self_archive_readback, route),
+                                   max(0, deadline - time.monotonic()))
+        except (ValueError, asyncio.TimeoutError):
+            return await state.serialized(refuse_self_archive, state, finish, route,
+                                          'Existing archive bit has no verified native archive')
+        return await commit_self_archive(state, finish, route, 'self_archive',
+                                         'Thread already natively archived; archive verified')
+    except ValueError as error:
+        if isinstance(error, DeliveryError) and error.uncertain:
+            note = 'Queue acceptance is uncertain; verify with --finish'
+            state.close_archive_event(route, 'pending_self_archive', note)
+            return {**route, 'archive_path': 'pending_self_archive', 'route_removed': False, 'note': note}
+        # The queue adapter marks failures after launch uncertain. A definite refusal is safe to release.
+        return await state.serialized(refuse_self_archive, state, finish, route, str(error))
+    return await verify_self_archive(state, finish, route, deadline,
+                                     'self_archive', 'Queued self-archive verified')
+
+
+def queue_self_archive(route, deadline):
+    codex_queue.check_available(route)
+    _, scope = codex_archive.native_handoff_scope(route)
+    if scope != route['closing_native_scope']:
+        raise ValueError('Codex native close subtree or saved profile changed before queue submission')
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ValueError('Codex self-archive deadline expired before queue submission')
+    codex_queue.enqueue_self_archive(route, remaining)
+
+
+async def refuse_self_archive(state, args, route, reason):
+    if state.closing_route(args) != route:
+        raise ValueError('Endpoint changed during archive refusal')
+    reopened = route_store.route_record(route)
+    state.routing_change('endpoints', (route['project'], route['name']), reopened)
+    result = {**route, 'route_removed': False, 'archive_path': 'not_archived',
+              'reason': reason, 'note': reason}
+    remove_close_retro(state, route, result)
+    state.close_archive_event(route, 'not_archived', reason)
+    return result
+
+
+def verify_self_archive_readback(route):
+    codex_preview.verify_archive(route, path=codex_archive.sweep_store())
+
+
+async def verify_self_archive(state, args, route, deadline, path, note):
+    while True:
+        remaining = deadline - time.monotonic()
+        try:
+            await asyncio.wait_for(asyncio.to_thread(verify_self_archive_readback, route),
+                                   max(0, remaining))
+        except (ValueError, asyncio.TimeoutError):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                note = 'Codex self-archive is not yet verified; verify with --finish'
+                state.close_archive_event(route, 'pending_self_archive', note)
+                return {**route, 'archive_path': 'pending_self_archive', 'route_removed': False, 'note': note}
+            await asyncio.sleep(min(0.25, remaining))
+        else:
+            return await commit_self_archive(state, args, route, path, note)
+
+
+async def commit_self_archive(state, args, route, path, note):
+    result = await state.serialized(commit_close, state, args, route)
+    state.close_archive_event(route, path, note)
+    return {**result, 'archive_path': path, 'note': note}
+
+
+def close_retro_path(state, route):
+    return state.store.directory / 'pending-close-retros' / (route['closing'] + '.json')
+
+
+def remove_close_retro(state, route, result):
+    try:
+        close_retro_path(state, route).unlink(missing_ok=True)
+    except OSError as error:
+        result['retro_error'] = str(error)
+
+
+def stage_close_retro(state, route, prepared):
+    row = prepared['row']
+    if ((row['project'], row['runner'], row['session']) != (route['project'], route['name'], route['session'])
+            or str(uuid.UUID(row['id'])) != row['id'] or not Path(prepared['store']).is_absolute()):
+        raise ValueError('Retrospective does not match the closing route')
+    path = close_retro_path(state, route)
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    route_store.atomic_write(path, wire(prepared), prefix='.retro-')
+
+
+async def record_self_archive_retro(state, route, result):
+    pending = close_retro_path(state, route)
+    try:
+        fd = os.open(pending, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, 'rb') as source:
+            prepared = json.loads(source.read(MAX_FRAME))
+        row = prepared['row']
+        store = Path(prepared['store'])
+        await asyncio.to_thread(retros.append, store, row, once=True)
+    except FileNotFoundError as error:
+        if error.filename == str(pending):
+            return None  # Reservations created by older clients have no staged retrospective.
+        result.update(retro_recorded=False, retro_error=str(error))
+        return None
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        result.update(retro_recorded=False, retro_error=str(error))
+        return None
+    result.update(retro_id=row['id'], store=str(store), notification=None)
+    target = prepared['target']
+    body = retros.notification_body(row, target)
+    if body is None:
+        return None
+    try:
+        return await state.commit_action(
+            {'op': 'close-retro-notify', 'close_id': route['closing'], 'session': route['session'],
+             'project': route['project'], 'name': route['name'], 'sender': route['name'],
+             'recipient': target, 'body': body, 'key': 'retro-' + row['id']}, verified_close=True)
+    except (OSError, ValueError) as error:
+        result['notification'] = {'error': str(error), 'retry': False}
+        return None
 
 
 async def commit_close(state, args, route):
@@ -1537,9 +1716,15 @@ async def commit_close(state, args, route):
         state.check_native_close(route, route['closing_native_scope'])
 
     result = {**route, 'route_removed': False}
+    self_archive = route.get('closing_self_archive')
+    retro_message = await record_self_archive_retro(state, route, result) if self_archive else None
+    if retro_message is not None:
+        result['notification'] = {key: retro_message[key] for key in ('id', 'state')}
+    cleanup_args = {'op': 'archive-correspondence', 'expected_route': route, 'archived': True}
+    if retro_message is not None:
+        cleanup_args['close_retro_id'] = retro_message['id']
     try:
-        cleanup = await state.commit_action(
-            {'op': 'archive-correspondence', 'expected_route': route, 'archived': True}, verified_close=True)
+        cleanup = await state.commit_action(cleanup_args, verified_close=True)
     except (ValueError, OSError) as error:
         return {**result, 'cleanup_error': str(error),
                 'correspondence_cleanup': {'confirmed': False, 'state': 'rejected'}}
@@ -1555,6 +1740,10 @@ async def commit_close(state, args, route):
         result.setdefault('cleanup_error', 'Archive confirmed; route removal was not confirmed')
         return result
     result['route_removed'] = True
+    if self_archive:
+        remove_close_retro(state, route, result)
+        if retro_message is not None:
+            result['retro_message'] = retro_message
     if message is not None:
         try:
             await state.commit_action({'op': 'resolve', 'id': message['id'], 'state': 'done',
@@ -1742,6 +1931,9 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
                     stopping.set()
                 elif op=='close-finish':
                     result = await finish_close(state, args)
+                    await write(writer,{'result':result,'instance':state.instance})
+                elif op=='close-self-archive':
+                    result = await start_self_archive(state, args)
                     await write(writer,{'result':result,'instance':state.instance})
                 else:
                     result = await state.action_async(args)
