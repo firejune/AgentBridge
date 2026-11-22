@@ -102,7 +102,7 @@ class CodexDesktopCanary(unittest.TestCase):
         except (OSError, ValueError):
             self.fail(f'{pin}: could not read the Desktop app.asar')
         if not templates:
-            self.skipTest(f'{pin}: no identifiable throw template in the installed app.asar')
+            self.fail(f'{pin}: no identifiable throw template in the installed app.asar')
         self.assertEqual(len(templates), 1, f'{pin}: bundled idle error templates disagree')
         prefix, suffix = (part.decode('utf-8') for part in templates.pop())
         thread, message, turn = (str(uuid.uuid4()) for _ in range(3))
