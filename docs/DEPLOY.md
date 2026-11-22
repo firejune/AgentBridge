@@ -48,6 +48,16 @@ python3 tools/deploy.py --commit <commit>
 Exit codes: `0` deployed and verified, `1` a step or a check failed after changes began,
 `2` refused before anything changed.
 
+After a Codex Desktop update, run this read-only canary from the repo root with
+Desktop running on macOS and using its default queue and state stores:
+
+```bash
+AGENT_BRIDGE_LIVE_CANARY=1 PYTHONPATH=skill/agent-bridge/scripts:tests python3 -m unittest -v test_live_vendor_canary
+```
+
+The canary checks the installed build, queue owner, saved-thread schema and
+bundled response templates without launching the Codex CLI or sending a message.
+
 ## Refusals (nothing is changed)
 
 | Code | Meaning |
