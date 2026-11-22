@@ -549,16 +549,21 @@ def close_participant(args):
             raise ValueError('--finish completes a prepared handoff and cannot be combined with --handoff')
         if args.retro_file or args.no_retro:
             raise ValueError('Record the retrospective when preparing the archive handoff')
-        closed = broker.request(args.socket, {'op': 'close-finish', **address,
-                                'close_id': str(uuid.UUID(args.finish)),
-                                'session': str(uuid.UUID(args.expect_session)),
-                                'timeout': args.timeout}, timeout=args.timeout + 5)
+        request = {'op': 'close-finish', **address, 'close_id': str(uuid.UUID(args.finish)),
+                   'session': str(uuid.UUID(args.expect_session)), 'timeout': args.timeout}
+        if args.saved_state:
+            request['saved_state'] = True  # The broker archives the exact thread in saved state (#196).
+        closed = broker.request(args.socket, request, timeout=args.timeout + 5)
         result = {**address, 'transport': 'codex', 'method': 'archive', 'archived': True, 'resumable': True,
                   'status': 'closed' if closed['route_removed'] else 'archive_verified',
                   'closed': True, 'session': closed['session'], 'close_id': closed['closing']}
         result.update({key: closed[key] for key in ('route_removed', 'correspondence_cleanup',
                        'cleanup_error', 'route_error', 'operator_receipt', 'operator_error') if key in closed})
+        if args.saved_state:
+            result['archive_path'] = 'saved_state'
         return result
+    if args.saved_state:
+        raise ValueError('--saved-state releases a prepared handoff and requires --finish')
     route = registered_route(args)
     if args.expect_session and str(uuid.UUID(args.expect_session)) != route['session']:
         raise ValueError('Endpoint does not match --expect-session')
@@ -587,6 +592,9 @@ def close_participant(args):
     if args.handoff:
         # The handoff marks the route closing, and a closing route cannot send the stop/repeat
         # notification. So this one path records first; the native archive is confirmed later by --finish.
+        if 'closing' not in route:
+            # Check the operator before the route is reserved; a dead operator strands it (#196).
+            preflight_native_close_operator(args, route, explicit=True)
         receipt = {} if retro is None else record_retro(args, retro)
         return {**receipt, **prepare_archive_handoff(args, address, route)}
     directory = broker_state_dir(args).expanduser().resolve()
@@ -660,9 +668,12 @@ def close_participant(args):
     return result
 
 
-def preflight_native_close_operator(args, target):
+def preflight_native_close_operator(args, target, *, explicit=False):
+    request = {'op': 'close-operator-status', 'expected_route': target}
+    if explicit:
+        request['explicit'] = True  # Any enrollment dispatches an explicit handoff.
     try:
-        status = broker.request(args.socket, {'op': 'close-operator-status', 'expected_route': target})
+        status = broker.request(args.socket, request)
     except ValueError as error:
         if str(error) == 'Unknown operation':
             raise ValueError('The running broker cannot verify the Codex close operator preference; upgrade it') from None
@@ -671,7 +682,8 @@ def preflight_native_close_operator(args, target):
         raise ValueError('Could not verify the Codex close operator preference')
     operator = status['operator']
     if operator is not None:
-        allow_queue = Path(args.socket).expanduser() == broker.DEFAULT_SOCKET
+        # Explicit handoffs dispatch over IPC only; direct ones may use the verified queue.
+        allow_queue = not explicit and Path(args.socket).expanduser() == broker.DEFAULT_SOCKET
         try:
             codex_live.deliver(operator['route'], str(uuid.uuid4()), '', args.timeout, dry_run=True,
                                allow_queue=allow_queue, close_handoff=True)
@@ -868,6 +880,8 @@ def add_session_commands(sub):
     archive.add_argument('--finish',metavar='CLOSE_ID',help='Verify the native Codex archive and remove the prepared route')
     p.add_argument('--handoff',action='store_true',help='Prepare a native Codex archive handoff with --archive')
     p.add_argument('--expect-session',metavar='UUID',help='Match the exact session (required with --finish)')
+    p.add_argument('--saved-state',action='store_true',
+                   help='With --finish: archive the exact thread in saved state and release the reservation')
     p.add_argument('--keep-route',action='store_true',help='Close the session but keep the route registered')
     p.add_argument('--timeout',type=float,default=10)
     g = p.add_mutually_exclusive_group()
@@ -1385,6 +1399,34 @@ def codex_delivery_health(budget=CODEX_HEALTH_SECONDS):
         return {'path': 'unavailable', 'reason': 'health check failed'}
 
 
+def close_operator_health(args, budget=CODEX_HEALTH_SECONDS):
+    """Whether an enrolled Codex close operator could take a handoff now (#196). Never raises.
+
+    `none` when nobody is enrolled. A dry-run delivery checks the operator chat exists, is not
+    archived and has a delivery path; the reason is a fixed string, never an id or path.
+    """
+    try:
+        status = broker.request(args.socket, {'op': 'close-operator-status', 'explicit': True})
+    except ValueError as error:
+        reason = 'broker cannot report it' if str(error) == 'Unknown operation' else 'enrollment invalid'
+        return {'state': 'unavailable', 'reason': reason}
+    except Exception:
+        return {'state': 'unavailable', 'reason': 'health check failed'}
+    operator = status.get('operator') if isinstance(status, dict) else None
+    if operator is None:
+        return {'state': 'none', 'reason': None}
+    try:
+        codex_live.deliver(operator['route'], str(uuid.uuid4()), '', budget, dry_run=True,
+                           allow_queue=Path(args.socket).expanduser() == broker.DEFAULT_SOCKET, close_handoff=True)
+    except codex_live.ThreadArchived:
+        return {'state': 'unavailable', 'reason': 'operator chat is archived'}
+    except codex_live.EndpointUnavailable:
+        return {'state': 'unavailable', 'reason': 'no Codex delivery path'}
+    except Exception:
+        return {'state': 'unavailable', 'reason': 'operator chat cannot be reached'}
+    return {'state': 'ok', 'reason': None}
+
+
 def ping_command(args):
     result = broker.request(args.socket, request_fields(args))
     result['cli_build'] = broker.build_id()
@@ -1393,6 +1435,7 @@ def ping_command(args):
         result['warning'] = warning
     if sys.platform == 'darwin':
         result['codex_delivery'] = codex_delivery_health()
+        result['close_operator'] = close_operator_health(args)
     output(result)
     return 0
 

@@ -1053,8 +1053,12 @@ class State:
         if op == 'close-prepare':
             return self.prepare_close(args)
         if op == 'close-operator-status':
-            operator = self.close_operator(prefer_native_for_direct=True)
-            if operator is not None:
+            explicit = args.get('explicit', False)
+            if type(explicit) is not bool:
+                raise ValueError('explicit must be a boolean')
+            operator = self.close_operator(prefer_native_for_direct=not explicit)
+            # Without a target this only reads the enrollment (ping's health line, #196).
+            if operator is not None and 'expected_route' in args:
                 self.check_close_scope(self.open_close_target(args['expected_route']), operator)
             return {'operator': operator}
         if op == 'close-dispatch':
@@ -1117,7 +1121,8 @@ class State:
                 'checkpoint_last_save_seconds': self.correspondence.last_save_seconds if self.correspondence else None,
                 'checkpoint_max_save_seconds': self.correspondence.max_save_seconds if self.correspondence else 0.0,
                 'checkpoint_bytes': self.correspondence.checkpoint_bytes if self.correspondence else 0,
-                'max_messages': self.max_messages, 'attention': self.attention()}
+                'max_messages': self.max_messages, 'attention': self.attention(),
+                'closing_routes': sum('closing' in route for route in self.endpoints.values())}
 
     def attention(self, current=None):
         # Counts and ages only: no IDs, bodies, routes or names (issue #153).
@@ -1508,13 +1513,40 @@ class State:
         return current
 
 
+def refuse_claimed_release(state, route):
+    message = state.close_message(route['closing'])
+    if message is not None and message['state'] == 'in_progress':
+        raise ValueError('The close operator has claimed this archive; wait for it or finish natively')
+
+
+def release_saved_state(route):
+    """Archive the exact reserved thread in saved state, as a direct close does, and read it back.
+
+    Releases a native handoff the operator never took (#196). No native call, no rollout move:
+    Desktop shows the change when it next reads its saved state.
+    """
+    try:
+        path = codex_preview.state_path(route.get('executable'))
+        codex_archive.archive_saved_state(path, route['session'], route['cwd'])
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, codex_preview.TimeoutExpired):
+        raise ValueError('Saved Codex archive could not be written; closing route kept') from None
+    codex_preview.verify_saved_archive(route)
+
+
 async def finish_close(state, args):
     route = state.closing_route(args)
     timeout = args.get('timeout', 10)
     if not 0 < timeout <= 600:
         raise ValueError('Timeout must be between 0 and 600 seconds')
+    saved_state = args.get('saved_state', False)
+    if type(saved_state) is not bool:
+        raise ValueError('saved_state must be a boolean')
+    if saved_state:
+        # Release a reservation the operator never took (#196). A claimed request is the operator's.
+        refuse_claimed_release(state, route)
+    verify = release_saved_state if saved_state else codex_preview.verify_archive
     try:
-        await asyncio.wait_for(asyncio.to_thread(codex_preview.verify_archive, route), timeout)
+        await asyncio.wait_for(asyncio.to_thread(verify, route), timeout)
     except asyncio.TimeoutError:
         raise ValueError('Codex archive verification timed out; closing route kept') from None
     return await state.serialized(commit_close, state, args, route)
@@ -1523,6 +1555,8 @@ async def finish_close(state, args):
 async def commit_close(state, args, route):
     if state.closing_route(args) != route:
         raise ValueError('Endpoint changed during archive verification')
+    if args.get('saved_state'):
+        refuse_claimed_release(state, route)  # A claim can land while the saved state is written.
     if 'closing_native_scope' in route:
         state.check_native_close(route, route['closing_native_scope'])
 
@@ -1538,6 +1572,9 @@ async def commit_close(state, args, route):
         result['cleanup_error'] = 'Archive confirmed; active correspondence remains'
 
     message = state.close_message(route['closing'])
+    if args.get('saved_state') and message is not None and message['state'] in TERMINAL_STATES:
+        message = None  # A failed dispatch stays as recorded; the release does not rewrite it.
+        result['operator_receipt'] = 'unchanged'
     try:
         state.routing_remove('endpoints', (route['project'], route['name']))
     except (ValueError, OSError) as error:
@@ -1547,8 +1584,9 @@ async def commit_close(state, args, route):
     result['route_removed'] = True
     if message is not None:
         try:
-            await state.commit_action({'op': 'resolve', 'id': message['id'], 'state': 'done',
-                                       'note': 'Native Codex archive verified and route removed'})
+            note = ('Saved Codex archive verified and route released' if args.get('saved_state')
+                    else 'Native Codex archive verified and route removed')
+            await state.commit_action({'op': 'resolve', 'id': message['id'], 'state': 'done', 'note': note})
             result['operator_receipt'] = 'done'
         except (OSError, ValueError):
             result['operator_receipt'] = 'needs_reconciliation'

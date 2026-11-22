@@ -23,6 +23,19 @@ from test_agy_live import CSRF, FakeAgyServer
 from test_peer import FakeClaude
 
 
+def dispatch_raises(error):
+    """A deliver stub: the operator preflight's dry run passes, the real dispatch raises."""
+    def deliver(*args, dry_run=False, **kwargs):
+        if dry_run:
+            return {'sent': False}
+        raise error
+    return deliver
+
+
+def dispatches(deliver):
+    return sum(not call.kwargs.get('dry_run', False) for call in deliver.call_args_list)
+
+
 def run(argv):
     out = io.StringIO()
     with mock.patch('sys.stdout', out):
@@ -397,6 +410,85 @@ class CloseCodexTests(unittest.TestCase):
                          {k: v for k, v in before.items() if k != 'note'})
         self.assertEqual(self.server.call('send', **fields)['id'], mid)
 
+    def test_saved_state_release_frees_a_handoff_no_operator_took(self):
+        self.assertEqual(self.close('--archive', '--saved-state'),
+                         (1, {'error': '--saved-state releases a prepared handoff and requires --finish'}))
+        code, prepared = self.close('--archive', '--handoff')
+        self.assertEqual((code, prepared['status']), (0, 'awaiting_native_archive'))
+        release = ('--finish', prepared['close_id'], '--expect-session', self.sid, '--saved-state')
+        code, result = self.close('--finish', str(uuid.uuid4()), '--expect-session', self.sid, '--saved-state')
+        self.assertEqual(code, 1)
+        self.assertEqual(self.archive_flags()[self.sid], 0)  # A wrong generation writes nothing.
+        code, result = self.close(*release)
+        self.assertEqual((code, result['closed'], result['route_removed'], result['archive_path']),
+                         (0, True, True, 'saved_state'))
+        self.assertEqual(self.archive_flags()[self.sid], 1)
+        self.assertEqual(self.server.call('routes', project='p'), [])
+        self.assertTrue(self.rollout.is_file())  # No native rollout move.
+
+    def test_saved_state_release_waits_for_an_operator_that_claimed(self):
+        self.enroll()
+        with mock.patch.object(codex_live, 'deliver', return_value={'delivery_mode': 'idle', 'turn_id': 'test'}):
+            code, prepared = self.close('--archive', '--handoff')
+        self.assertEqual(code, 0)
+        self.server.call('close-operator', id=prepared['operator_message_id'], operator_session=self.operator_sid)
+        code, result = self.close('--finish', prepared['close_id'], '--expect-session', self.sid, '--saved-state')
+        self.assertEqual(code, 1)
+        self.assertIn('claimed', result['error'])
+        self.assertEqual(self.archive_flags()[self.sid], 0)
+        self.assertEqual(self.server.call('routes', project='p')[0]['closing'], prepared['close_id'])
+
+    def test_a_claim_during_the_saved_state_write_keeps_the_route(self):
+        # The claim check runs again inside the serialized commit: a claim that lands while the
+        # saved state is written keeps the route and the operator's request (#196).
+        import asyncio
+        import broker
+        route = {'project': 'p', 'name': 'target', 'session': self.sid, 'closing': 'c'}
+        claimed = {'state': 'in_progress'}
+        state = mock.Mock(closing_route=mock.Mock(return_value=route), close_message=mock.Mock(return_value=claimed))
+        with self.assertRaisesRegex(ValueError, 'claimed'):
+            asyncio.run(broker.commit_close(state, {'saved_state': True}, route))
+        state.routing_remove.assert_not_called()
+        state.commit_action.assert_not_called()
+
+    def test_saved_state_release_keeps_a_failed_dispatch_record(self):
+        self.enroll()
+        # The operator was reachable at preflight and archived before the dispatch.
+        with mock.patch.object(codex_live, 'deliver', side_effect=dispatch_raises(codex_live.ThreadArchived())):
+            code, prepared = self.close('--archive', '--handoff')
+        mid = prepared['operator_message_id']
+        self.assertEqual(self.server.call('show', id=mid)['state'], 'failed')
+        code, result = self.close('--finish', prepared['close_id'], '--expect-session', self.sid, '--saved-state')
+        self.assertEqual((code, result['route_removed'], result['operator_receipt']), (0, True, 'unchanged'))
+        self.assertEqual(self.server.call('show', id=mid)['state'], 'failed')
+
+    def test_explicit_handoff_refuses_an_unavailable_operator_before_reserving(self):
+        self.enroll()
+        with mock.patch.object(codex_live, 'deliver', side_effect=codex_live.ThreadArchived()) as deliver:
+            code, result = self.close('--archive', '--handoff')
+        self.assertEqual(code, 1)
+        self.assertIn('Enrolled Codex close operator is unavailable', result['error'])
+        self.assertTrue(deliver.call_args.kwargs['dry_run'])
+        self.assertFalse(deliver.call_args.kwargs['allow_queue'])  # Explicit handoffs dispatch over IPC.
+        route, = [row for row in self.server.call('routes', project='p') if row['name'] == 'target']
+        self.assertNotIn('closing', route)
+
+    def test_ping_reports_operator_health_and_closing_routes(self):
+        ping = lambda: run(['--socket', self.server.path, 'ping'])[1]
+        with mock.patch.object(sys, 'platform', 'darwin'), \
+                mock.patch.object(bridge, 'codex_delivery_health', return_value={'path': 'ipc', 'reason': None}):
+            self.assertEqual(ping()['close_operator'], {'state': 'none', 'reason': None})
+            self.enroll(prefer_native=False)
+            with mock.patch.object(codex_live, 'deliver', side_effect=codex_live.ThreadArchived()):
+                self.assertEqual(ping()['close_operator'],
+                                 {'state': 'unavailable', 'reason': 'operator chat is archived'})
+            with mock.patch.object(codex_live, 'deliver', return_value={'sent': False}):
+                result = ping()
+                self.assertEqual(result['close_operator'], {'state': 'ok', 'reason': None})
+                self.assertEqual(result['closing_routes'], 0)
+                self.close('--archive', '--handoff')
+                self.assertEqual(ping()['closing_routes'], 1)
+
     def test_finish_reports_operator_receipt_failure_after_archive(self):
         close_id = str(uuid.uuid4())
         args = ['close', 'target', '--project', 'p', '--finish', close_id, '--expect-session', self.sid]
@@ -459,7 +551,8 @@ class CloseCodexTests(unittest.TestCase):
             self.assertEqual(status, 0)
             self.assertEqual(recovered, {k: v for k, v in prepared.items()
                                          if k not in ('retro_id', 'store', 'notification')})
-            deliver.assert_called_once()
+            # One preflight dry run, then exactly one dispatch however often the handoff is repeated.
+            self.assertEqual([call.kwargs.get('dry_run', False) for call in deliver.call_args_list], [True, False])
         with self.assertRaisesRegex(ValueError, 'reserved'):
             self.server.call('send', project='ops', sender='trigger', recipient='archive',
                              key='agent-bridge-close:' + prepared['close_id'], body='spoof')
@@ -609,13 +702,14 @@ class CloseCodexTests(unittest.TestCase):
 
     def test_ambiguous_delivery_keeps_route_and_is_never_resent(self):
         self.enroll()
-        with mock.patch.object(codex_live, 'deliver', side_effect=codex_live.DeliveryError('unknown', True)) as deliver:
+        with mock.patch.object(codex_live, 'deliver',
+                               side_effect=dispatch_raises(codex_live.DeliveryError('unknown', True))) as deliver:
             code, prepared = self.close('--archive', '--handoff')
             self.assertEqual((code, prepared['operator_delivery'], prepared['route_removed']),
                              (1, 'uncertain', False))
             self.server.restart()
             self.assertEqual(self.close('--archive', '--handoff')[1]['operator_delivery'], 'uncertain')
-            deliver.assert_called_once()
+            self.assertEqual(dispatches(deliver), 1)
         with self.assertRaisesRegex(ValueError, 'Only pending'):
             self.server.call('claim', id=prepared['operator_message_id'])
         self.assertEqual(self.server.call('routes', project='p')[0]['closing'], prepared['close_id'])
@@ -633,7 +727,7 @@ class CloseCodexTests(unittest.TestCase):
                              session=str(uuid.uuid4()))
             self.assertEqual(self.operator(prepared['operator_message_id'], self.operator_sid)[0], 1)
             self.assertEqual(self.close('--archive', '--handoff')[1]['operator_message_id'], prepared['operator_message_id'])
-            deliver.assert_called_once()
+            self.assertEqual(dispatches(deliver), 1)
 
     def test_enrolled_operator_cannot_be_its_own_close_target(self):
         self.enroll(self.sid)
