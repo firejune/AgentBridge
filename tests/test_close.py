@@ -441,6 +441,46 @@ class CloseCodexTests(unittest.TestCase):
         for mid in (received_one_way, received_reply):
             self.assertEqual(self.server.call('show', id=mid)['state'], 'received')
 
+    def test_close_finishes_submitted_direct_push_replies_from_its_sender(self):
+        replies = {}
+        for transport in ('claude-peer', 'agy', 'codex', 'realtime'):
+            route = {'session': str(uuid.uuid4())} if transport != 'realtime' else {}
+            self.server.call('register', project='p', name=transport, cwd=str(self.cwd),
+                             transport=transport, **route)
+            parent = self.server.call('send', project='p', sender=transport, recipient='target',
+                                      key=f'ask-{transport}', body='request')
+            reply = self.server.call('reply', id=parent['id'], key=f'reply-{transport}', body='report')
+            replies[transport] = reply['id']
+
+        def submit(mid, **fields):
+            self.server.call('claim', id=mid)
+            self.server.call('finish', id=mid, state='submitted', event='pushed', **fields)
+
+        ordinary = self.server.call('send', project='p', sender='target', recipient='claude-peer',
+                                    key='ordinary', body='work')['id']
+        submit(ordinary)
+        submit(replies['codex'], codex_queue_accepted=True)
+        submit(replies['realtime'])
+        direct = [replies[transport] for transport in ('claude-peer', 'agy')]
+        blocking = [ordinary, replies['codex'], replies['realtime']]
+
+        def check_blocking(ids):
+            code, receipt = self.close('--archive', '--handoff')
+            self.assertEqual(code, 1)
+            self.assertEqual(receipt['error'],
+                             'This Codex thread has unfinished correspondence; reconcile it before closing '
+                             f"(IDs: {', '.join(sorted(ids))})")
+
+        check_blocking(blocking + direct)
+        for mid in direct:
+            submit(mid)
+        check_blocking(blocking)
+        for mid in blocking:
+            self.server.call('resolve', id=mid, state='done', note='reviewed')
+        self.assertEqual(self.close('--archive', '--handoff')[0], 0)
+        for mid in direct:
+            self.assertEqual(self.server.call('show', id=mid)['state'], 'submitted')
+
     def test_close_handoff_retains_uncertain_delivery_after_restart_and_missing_workspace(self):
         self.server.call('register', project='p', name='sender', cwd=str(self.home))
         fields = dict(project='p', sender='sender', recipient='target', key='old', body='work')

@@ -151,7 +151,7 @@ By default, direct Codex `close --archive` queues one fixed self-archive entry f
 
 When close is refused:
 
-- `unfinished correspondence`: the error lists the blocking message IDs. Read and reconcile those messages. A one-way message or reply in `received` already qualifies as finished for close.
+- `unfinished correspondence`: the error lists the blocking message IDs. Read and reconcile those messages. A one-way message or reply in `received` already qualifies as finished for close. A `submitted` reply sent directly to a live `claude-peer` or `agy` session also qualifies when closing the sender.
 - `running_process_cwd`: a process other than the Desktop `node_repl` helpers has its CWD in the workspace. Find it with `lsof`, and ask its owner before stopping it.
 - The queue is unavailable (`not_archived`): check `lsof -t -- ~/.codex/queue_1.sqlite`. More than one owner usually means a thread started its own `codex app-server` through CUA (#210). Stop that process only with the owner's approval.
 - A thread whose archive bit is set while its rollout is still in `sessions/` cannot be closed through Agent Bridge yet. The queue refuses it as archived. Leave it and report it.

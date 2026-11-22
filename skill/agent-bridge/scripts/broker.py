@@ -1448,9 +1448,15 @@ class State:
             state = message['state']
             if state in TERMINAL_STATES:
                 continue
-            if state == 'received' and (message.get('one_way') or message['reply_to'] is not None):
+            is_reply = message['reply_to'] is not None
+            if state == 'received' and (message.get('one_way') or is_reply):
                 continue
-            endpoints = (message['route'], message['return_route'])
+            recipient, sender = message['route'], message['return_route']
+            # These transports submit the reply body to the live session itself.
+            if (state == 'submitted' and is_reply and recipient['transport'] in ('claude-peer', 'agy')
+                    and same_archive_endpoint(current, sender)):
+                continue
+            endpoints = (recipient, sender)
             if state == 'uncertain' and any(same_archive_endpoint(current, item) for item in endpoints):
                 continue  # Archive cleanup retains it and its idempotency key.
             if any(same_codex_thread(current, item) for item in endpoints):
