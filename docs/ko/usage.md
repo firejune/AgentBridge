@@ -298,7 +298,7 @@ python3 "$bridge_cli" channel-bind modal-view --project my-app --owner codex-age
   - Codex Desktop 26.1117은 IPC 소켓을 제공하지 않는 것으로 관찰됐다(이슈 #156). 그 빌드에서는 모든 Codex 전달과 `open`이 큐 경로를 탄다. 기본 IPC 소켓이 없거나 연결을 거부하고, 서명된 앱 번들 Codex CLI와 확인된 단일 로컬 Desktop 소유자가 기본 큐 저장소를 공유하며, 기본 로컬 브로커 소켓을 사용할 때 이 경로를 사용한다. Desktop 큐 경로는 브릿지 메시지 UUID만 담은 고정 알림을 큐에 넣는다. 알림에는 동료 본문이 없다. 모든 동료 봉투와 같은 범위 문장(동료 서신이고 새 사용자 지시가 아니며 기존 사용자 승인 범위 안에서 처리), 조회 명령, 그 UUID만 담는다. Desktop 소유자와 같은 큐 저장소를 사용하며 `--resume`을 쓰지 않는다. 로드된 대화는 턴을 시작할 수 있을 때 알림을 가져간다. 로드되지 않았거나 중단된 대화는 알림을 큐에 남겨 둘 수 있다. 큐 접수(`delivery_path: "codex-desktop-queue"`)만으로 대화가 깨어났거나 본문을 읽었다고 판정하지 않는다. 결과가 모호한 쓰기는 자동 재시도하지 않는다.
   - 수신 Codex 대화에서 `python3 "$bridge_cli" receive-codex MESSAGE_ID`를 실행한다. 정확한 브로커 ID, 메시지에 고정된 Codex 목적지, 환경의 `CODEX_THREAD_ID`를 대조해 메시지 ID·발신자·동료 출처와 `text`를 반환한다. `text`는 직접 전달이 대화에 넘기는 것과 같은 봉투·본문·회신 명령(또는 단방향 안내)이다. 이미 전달을 시도했고 보관 중인 서신을 읽고 `received`로 표시한다(다음 항목). 브로커는 큐 알림을 제출하기 전에 전달을 맡긴 `dispatching` 메시지를 정확한 수신 Codex 스레드에서 읽을 수 있게 한다. `receive-codex`는 `submitted`를 기다리거나, 지연을 넣거나, 재시도하지 않고 즉시 읽는다. 이 명령은 소켓 접근 거부, 그 밖의 연결 실패, 사용할 수 없는 브로커 응답, 잘못된 입력, 수신 서신을 읽을 수 없는 이유(아직 전달 전, 이미 완료, 보관됨, 본문 만료, 종료 인계)를 구분한다. 알 수 없는 메시지 ID와 다른 스레드로 보낸 메시지는 같은 불일치 오류를 반환한다. 권한이 제한된 Desktop 자동 턴은 알림을 받았어도 로컬 Unix 소켓에 연결하지 못할 수 있다. 네이티브 종료 인계는 별도의 제어 요청을 사용한다. 등록된 담당자 대화에서 `close-operator`로 요청을 받는다.
   - Codex 경로에서 `submitted`는 Desktop 큐가 알림을 접수했다는 뜻일 뿐, 턴이 실행됐다는 뜻이 아니다. `receive-codex`가 수신 대화에서 `text`를 반환할 때 최선 노력으로 `ack`를 한 번 보내 메시지를 `received`로 바꾸며, 결과의 `marked_received`가 그 성공 여부를 알려 준다. 표시가 거부되거나 실패해도(아직 `dispatching`·`uncertain`, 이미 완료, 종료 중인 경로, 구버전 브로커) 조회는 실패하지 않는다. 이미 `received`나 `in_progress`인 메시지에는 다시 `ack`를 보내지 않는다. `show ID`는 Codex 경로의 메시지에 CLI가 계산한 `read_by_recipient`를 덧붙인다. `submitted`이면 `false`, `received` 이후면 `true`다. `submitted`에 머문 메시지는 큐가 접수했지만 대화가 읽지 않은 것이다. 이 표시는 보존 기한을 바꾸지 않는다. Codex 메시지의 `delivered_at`은 이미 `submitted`에서 기록된다.
-  - 첫 과제가 `submitted`로 수락된 뒤 비어 있는 네이티브 사이드바 `preview`를 `state_5.sqlite`에 한 번 초기화한다(잠금 대기 100ms 제한; 미리보기 실패가 전달 성공을 뒤집거나 재전송을 유발하지 않음).
+  - Agent Bridge는 Codex의 `state_5.sqlite`를 읽기 전용으로만 열고 쓰지 않는다(#212). 수락된 과제가 네이티브 사이드바 `preview`를 초기화하지 않으며, 전달 결과에 `preview` 항목이 없다.
 - **Antigravity (`agy`)**:
   - 로컬 `language_server` / `agy --hub`의 ConnectRPC로 정확한 `conversationId`와 워크스페이스를 검증한다.
   - `SendAgentMessage`로 `<SYSTEM_MESSAGE>`(`MESSAGE_PRIORITY_HIGH`)를 주입해 `running` 턴이면 작업을 끊지 않고 다음 스텝에 합류시키고, `idle`이거나 백그라운드 명령/서브에이전트 대기 중이면 빈 `SendUserCascadeMessage`(`MESSAGE_DELIVERY_STRATEGY_NEXT_INVOCATION`)를 이어 호출해 즉시 깨운다.
@@ -357,11 +357,11 @@ python3 "$bridge_cli" archive-sweep --apply --manifest archive-manifest.json
 
 일괄 적용은 작업 경로가 사라졌거나 보관된 생성 조상이 있는 미보관 스레드를 후보로 삼는다. 이 후보에 속한 검토된 하위 스레드는 작업 경로가 남아 있어도 대상이 될 수 있다. Codex 직접 종료(`close --archive`)도 지정한 루트와 기록된 하위 스레드에 같은 작업 경로 예외를 적용한다. 라우트 보호에서 제외되는 라우트는 정확한 종료 대상뿐이다. 다른 등록 라우트, 활성 채널 바인딩, 스레드 작업 공간 안에 현재 작업 경로를 둔 프로세스는 보관을 막는다. 일괄 보관은 미보관 스레드의 마지막 활동이 24시간 미만이면 거부한다. 직접 종료에서는 지정한 루트와 기록된 하위 스레드에 활동 시각 제한을 적용하지 않는다. 하위 스레드가 보호 대상이거나 접두사 밖이거나 검토 목록에 없으면 후보를 거부한다. 일괄 보관은 브로커 라우트와 서신을 유지한다.
 
-직접 종료와 일괄 보관은 검토된 하위 집합을 말단부터 처리하고 보호 조건과 하위 집합을 다시 확인한다. 저장 모드 경로에서는 번들 Codex 앱 서버의 `thread/archive`를 호출한다. 완료 여부와 `count`는 보관 비트를 다시 읽어 판정한다. RPC 거부나 응답 불확실성은 `provider_error`에 별도로 담는다. 일부가 `not_archived`면 종료 코드는 1이며 독립 후보는 계속 처리할 수 있다. 실패한 하위 스레드의 조상은 연쇄 보관으로 재시도하지 않도록 건너뛴다. 직접 종료는 루트 보관 비트가 확인된 뒤 기존 서신·라우트 검사를 거쳐 일치하는 라우트를 제거한다.
+직접 종료와 일괄 보관은 검토된 하위 집합을 말단부터 처리하고 보호 조건과 하위 집합을 다시 확인한다. 저장 모드 경로에서는 번들 Codex 앱 서버의 `thread/archive`를 호출한다. `count`는 보관 비트를 다시 읽어 판정한다. 라우트의 스레드는 `verify_archive`가 네이티브 보관(보관 비트와 `archived_sessions` 아래의 정확한 rollout)을 확인해야만 종료로 본다. 보관 비트만 있고 rollout이 `sessions/`에 남아 있으면 `not_archived`(`reason: "rollout_not_archived"`)로 알리고 라우트를 유지한다. RPC 거부나 응답 불확실성은 `provider_error`에 별도로 담는다. 일부가 `not_archived`면 종료 코드는 1이며 독립 후보는 계속 처리할 수 있다. 실패한 하위 스레드의 조상은 연쇄 보관으로 재시도하지 않도록 건너뛴다. 직접 종료는 루트의 네이티브 보관이 확인된 뒤 기존 서신·라우트 검사를 거쳐 일치하는 라우트를 제거한다.
 
-직접 종료(`close --archive`)는 Codex Desktop이 그 스레드 폴더에서 직접 실행하는 보조 프로세스(검증된 Desktop 앱 서버가 띄운 번들 `node_repl`)를 사용 중으로 세지 않는다. 그 밖의 프로세스가 있으면 그대로 거부하며, 일괄 보관은 예외를 두지 않는다. Desktop은 불러온 스레드의 쓰기 권한을 쥐고 있어서 네이티브 호출이 그런 스레드를 거부한다(`already has an active writer`). 직접 종료에서 저장 상태를 확인하는 경로에서는 CLI가 해당 스레드의 보관 비트를 저장 상태에 직접 기록하고 다시 읽으며, 결과에 `method: "saved_state"`가 표시된다. 저장된 보관 비트를 확인한 결과이므로 이미 열려 있는 Desktop 사이드바에는 대화가 계속 보일 수 있다. 일괄 보관에서는 거부가 `not_archived`로 남는다.
+직접 종료(`close --archive`)는 Codex Desktop이 그 스레드 폴더에서 직접 실행하는 보조 프로세스(검증된 Desktop 앱 서버가 띄운 번들 `node_repl`)를 사용 중으로 세지 않는다. 그 밖의 프로세스가 있으면 그대로 거부하며, 일괄 보관은 예외를 두지 않는다. Desktop은 불러온 스레드의 쓰기 권한을 쥐고 있어서 네이티브 호출이 그런 스레드를 거부한다(`already has an active writer`). Agent Bridge는 Codex 상태(`state_5.sqlite`)에 쓰지 않으므로 보관 비트를 직접 기록하는 대체 경로가 없다(#212). 결과는 `status: "not_archived"`, `reason: "desktop_holds_thread"`로 남고 종료는 보관되지 않음으로 보고되며 라우트는 유지된다. 이 경우 Codex에서 네이티브로 보관한다. 일괄 보관에서도 거부가 `not_archived`로 남는다.
 
-보호 조건 확인과 네이티브 보관은 별도 동작이다. 마지막 확인 뒤에 라우트, 프로세스 작업 경로, 활동, 하위 관계가 바뀔 수 있다. 검토 목록 밖 스레드가 새로 보관되면 해당 하위 스레드 UUID로 즉시 `thread/unarchive`를 호출해 결과를 다시 읽는다. `restored_unlisted`는 복구를 확인한 목록이다. 복구 실패, 다른 스레드의 보관 비트 변경, 상태 확인 불가를 감지하면 추가 보관을 중단하고 종료 코드 1을 반환한다. 자동 재시도는 없다. 확인된 보관에는 같은 Codex 프로필에서 실행할 `undo` 명령을 출력한다. 네이티브 보관 해제는 이미 보관되어 있거나 이후 보관된 하위 스레드에도 연쇄 적용될 수 있으며 일부만 처리될 수도 있다. 따라서 출력된 ID만 해제하거나 앞선 상태를 모두 복원한다고 보장할 수 없다. 실행 전에 현재 하위 집합을 검토한다. 일괄 보관과 직접 종료의 저장 상태 경로에서는 저장된 보관 비트를 확인한다. Desktop 종료 인계는 보관된 원문 파일까지 확인한다.
+보호 조건 확인과 네이티브 보관은 별도 동작이다. 마지막 확인 뒤에 라우트, 프로세스 작업 경로, 활동, 하위 관계가 바뀔 수 있다. 검토 목록 밖 스레드가 새로 보관되면 해당 하위 스레드 UUID로 즉시 `thread/unarchive`를 호출해 결과를 다시 읽는다. `restored_unlisted`는 복구를 확인한 목록이다. 복구 실패, 다른 스레드의 보관 비트 변경, 상태 확인 불가를 감지하면 추가 보관을 중단하고 종료 코드 1을 반환한다. 자동 재시도는 없다. 확인된 보관에는 같은 Codex 프로필에서 실행할 `undo` 명령을 출력한다. 네이티브 보관 해제는 이미 보관되어 있거나 이후 보관된 하위 스레드에도 연쇄 적용될 수 있으며 일부만 처리될 수도 있다. 따라서 출력된 ID만 해제하거나 앞선 상태를 모두 복원한다고 보장할 수 없다. 실행 전에 현재 하위 집합을 검토한다. 일괄 보관은 저장된 보관 비트를 확인한다. Codex 종료는 직접 종료든 Desktop 인계든 보관된 원문 파일까지 확인한다.
 
 ### Codex 네이티브 보관 인계
 
@@ -377,13 +377,13 @@ python3 "$bridge_cli" archive-sweep --apply --manifest archive-manifest.json
 {"project":"ops","name":"archive","session":"OPERATOR_UUID","sender":"trigger"}
 ```
 
-등록 정보에 선택 항목인 불리언 `"prefer_native_for_direct": true`를 설정하면 Codex 직접 종료(`close --archive`)에서 루트를 Desktop 네이티브 보관으로 인계한다. 기본값은 `false`다. 이 항목을 생략하거나 `--keep-route`를 지정하면 기존 저장 상태 경로를 사용한다. 설정을 켜면 기존 보호 조건과 하위 집합을 검사하고 말단부터 처리한다. 검토된 하위 스레드의 보관을 확인한 뒤 정확한 루트만 인계한다. 네이티브 인계를 선택한 루트는 해당 경로에서만 처리한다. CLI는 실패 시 루트의 보관 비트를 데이터베이스에 직접 기록하는 방식으로 전환하지 않는다.
+등록 정보에 선택 항목인 불리언 `"prefer_native_for_direct": true`를 설정하면 Codex 직접 종료(`close --archive`)에서 루트를 Desktop 네이티브 보관으로 인계한다. 기본값은 `false`다. 이 항목을 생략하거나 `--keep-route`를 지정하면 직접 네이티브 보관 경로를 사용한다. 설정을 켜면 기존 보호 조건과 하위 집합을 검사하고 말단부터 처리한다. 검토된 하위 스레드의 보관을 확인한 뒤 정확한 루트만 인계한다. 네이티브 인계를 선택한 루트는 해당 경로에서만 처리한다. Agent Bridge는 어느 경로에서도 보관 비트를 Codex 상태에 직접 기록하지 않는다.
 
 새 인계는 등록된 담당자에게 대상과 종료 식별자가 고정된 제어 요청을 한 건 만들고 `operator_message_id`와 `operator_delivery`를 반환한다. `prefer_native_for_direct`를 켠 상태에서 직접 종료가 보호 조건을 검사한 뒤 인계를 선택하면, 기본 Desktop IPC 소켓이 없거나 연결을 거부할 때 기본 로컬 브로커 소켓에서 검증된 Desktop 알림 큐를 사용할 수 있다. 명시적 `--handoff`는 IPC로 담당자에게 알린다. 수동 인계는 Desktop에서 정확한 대화를 보관한 뒤 `--finish`를 실행한다. 일반 Codex 알림과 같은 로컬 소유자, 서명된 번들 CLI, 기본 큐 저장소를 확인한다. 로컬 Desktop 앱 서버 프로세스가 두 개여서 단일 소유자를 확정할 수 없으면 큐 전달을 거부한다. 고정 알림은 `close-operator MESSAGE_ID`를 안내하며 브리지 메시지 UUID만 담는다. 일반 서신은 `receive-codex`로 읽는다. 등록된 담당자 대화가 로드되어 있고 새 턴을 시작할 수 있어야 알림을 처리할 수 있다. 제어 요청을 받으려면 로컬 브로커 소켓에도 접근할 수 있어야 한다.
 
 큐 접수는 알림 제출을 확인한다. 직접 종료의 인계가 대기 중이면 `status: "awaiting_native_archive"`와 종료 코드 1을 반환한다. 반환된 담당자 메시지 ID로 `wait MESSAGE_ID --timeout 60`을 실행하거나, 원래 라우트와 반환된 식별자를 사용해 `close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID`로 완료를 확인한다. 전달이 실패하거나 중단되면 수동 확인을 위해 종료 대기 라우트가 남는다. 전달 결과가 불명확하면 자동으로 재전송하지 않는다.
 
-담당자 채팅이 보관됐거나 전달이 실패해서 인계를 받을 담당자가 없으면 `close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID --saved-state`로 라우트를 푼다. 브로커가 직접 종료와 같은 방식으로 해당 스레드를 저장 상태에서 보관하고 다시 읽어 확인한 뒤, 정리 가능한 서신을 지우고 라우트를 제거한다. rollout 파일은 옮기지 않으므로 Desktop 사이드바에는 Desktop이 저장 상태를 다시 읽을 때 반영된다. 담당자가 요청을 가져간 상태라면 거부한다. 실패한 전달 기록은 그대로 둔다(`operator_receipt: unchanged`). 명시적 `--handoff`는 라우트를 예약하기 전에 등록된 담당자를 확인하고, IPC로 닿지 않으면 거부한다.
+담당자 채팅이 보관됐거나 전달이 실패해서 인계를 받을 담당자가 없으면 Codex에서 스레드를 네이티브로 보관한 뒤 `close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID`를 실행한다. 이 명령은 네이티브 보관을 확인한 뒤 라우트를 제거한다. 외부에서 Codex 상태에 보관 비트를 기록하던 `--saved-state` 해제는 제거됐다(#212). Codex가 실제로 보관한 적이 없어 `codex unarchive`와 Codex 큐가 그 스레드를 거부했기 때문이다. 이제 `--finish --saved-state`는 그 사유와 함께 종료 코드 1로 끝난다. 명시적 `--handoff`는 라우트를 예약하기 전에 등록된 담당자를 확인하고, IPC로 닿지 않으면 거부한다.
 
 등록된 채팅에서 전달받은 `close-operator MESSAGE_ID`를 실행한다. 이 명령은 등록 정보, 호출자 대화, 종료 대상과 세대를 대조한다. 대상이 대기 중인지 확인한 뒤 보관하고, 반환받은 식별자로 finish를 실행한다. 라우트 제거를 확인한 뒤 `operator_receipt: needs_reconciliation`과 종료 코드 1이 표시되면 완료 기록을 수동으로 남겨야 한다. 보관과 라우트 상태를 확인한 뒤 제어 요청을 완료로 처리한다.
 
@@ -495,7 +495,7 @@ Codex `open` / `register --new`는 권한 확인에 실패하면 라우트를 �
 필수다. 누락은 `RETRO_REQUIRED`, 빈 파일은 `RETRO_EMPTY`, 빈 사유는
 `RETRO_REASON_EMPTY`로 공급자 동작과 경로 삭제 전에 거절한다. 타워와 HQ는
 `--no-retro` 사유를 남긴다.
-회고는 공급자 동작 전에 읽고 검증하며 일반적으로 종료가 확인된 뒤에 저장한다. 저장 상태를 확인하는 보관 경로에서는 상태를 다시 읽고 나서 저장한다. 명시적 또는 설정으로 선택된 네이티브 인계는 닫는 중인 라우트가 회고 알림을 보낼 수 없으므로 인계 준비 전에 저장한다. 그 시점에 이르기 전에 실패한 close는 회고를 저장하지 않고 `retro_recorded: false`를
+회고는 공급자 동작 전에 읽고 검증하며 일반적으로 종료가 확인된 뒤에 저장한다. 직접 보관은 네이티브 보관을 확인한 뒤 저장한다. 명시적 또는 설정으로 선택된 네이티브 인계는 닫는 중인 라우트가 회고 알림을 보낼 수 없으므로 인계 준비 전에 저장한다. 그 시점에 이르기 전에 실패한 close는 회고를 저장하지 않고 `retro_recorded: false`를
 반환하며, 나중에 다시 실행하면 한 번만 기록된다. 세션은 닫혔는데 저장이 실패하면
 `retro_error`로 알리고, 그 기록은 `retro add`로 넣는다.
 

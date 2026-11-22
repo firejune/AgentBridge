@@ -448,11 +448,9 @@ class RealMcpDeliveryTests(unittest.TestCase):
 
     def test_successful_send_and_reply_through_real_push_asserting_broker_final_states(self):
         fake = self.fake_claude()
-        missing_store = Path(self.root) / 'missing.sqlite'
         codex_row = {'provider': 'codex', 'id': self.codex_sid, 'cwd': self.root, 'status': 'idle'}
         with FakeDesktop('idle') as desktop, \
                 patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': self.root, 'AGENT_BRIDGE_CODEX_IPC': desktop.path}), \
-                patch.object(phase.delivery.codex_preview, 'state_path', return_value=missing_store), \
                 patch.object(sessions, 'resolve_codex_peer', return_value=codex_row):
             # 1. Outbound MCP send to Claude peer + correlated reply retirement.
             sent_claude = self.data('bridge_message_send',

@@ -105,6 +105,8 @@ def same_codex_thread(left, right):
 
 
 TERMINAL_STATES = frozenset(('done', 'answered', 'failed'))
+SAVED_STATE_REMOVED = ('The saved-state release was removed (#212): Agent Bridge never writes Codex state. '
+                       'Archive the thread natively in Codex, then run close --finish.')
 UNKNOWN_MESSAGE_ERROR = 'Unknown message; broker may have restarted'
 REGISTER_CONFLICT_ERROR = 'Route name is already in use; use a different name'
 LEGACY_CAPACITY_ERROR = ('In-memory message limit reached: no evictable terminal messages; '
@@ -1513,40 +1515,16 @@ class State:
         return current
 
 
-def refuse_claimed_release(state, route):
-    message = state.close_message(route['closing'])
-    if message is not None and message['state'] == 'in_progress':
-        raise ValueError('The close operator has claimed this archive; wait for it or finish natively')
-
-
-def release_saved_state(route):
-    """Archive the exact reserved thread in saved state, as a direct close does, and read it back.
-
-    Releases a native handoff the operator never took (#196). No native call, no rollout move:
-    Desktop shows the change when it next reads its saved state.
-    """
-    try:
-        path = codex_preview.state_path(route.get('executable'))
-        codex_archive.archive_saved_state(path, route['session'], route['cwd'])
-    except (OSError, RuntimeError, ValueError, KeyError, TypeError, codex_preview.TimeoutExpired):
-        raise ValueError('Saved Codex archive could not be written; closing route kept') from None
-    codex_preview.verify_saved_archive(route)
-
-
 async def finish_close(state, args):
     route = state.closing_route(args)
     timeout = args.get('timeout', 10)
     if not 0 < timeout <= 600:
         raise ValueError('Timeout must be between 0 and 600 seconds')
-    saved_state = args.get('saved_state', False)
-    if type(saved_state) is not bool:
-        raise ValueError('saved_state must be a boolean')
-    if saved_state:
-        # Release a reservation the operator never took (#196). A claimed request is the operator's.
-        refuse_claimed_release(state, route)
-    verify = release_saved_state if saved_state else codex_preview.verify_archive
+    if 'saved_state' in args:
+        # Agent Bridge never writes Codex state (#212); an older CLI may still send the flag.
+        raise ValueError(SAVED_STATE_REMOVED)
     try:
-        await asyncio.wait_for(asyncio.to_thread(verify, route), timeout)
+        await asyncio.wait_for(asyncio.to_thread(codex_preview.verify_archive, route), timeout)
     except asyncio.TimeoutError:
         raise ValueError('Codex archive verification timed out; closing route kept') from None
     return await state.serialized(commit_close, state, args, route)
@@ -1555,8 +1533,6 @@ async def finish_close(state, args):
 async def commit_close(state, args, route):
     if state.closing_route(args) != route:
         raise ValueError('Endpoint changed during archive verification')
-    if args.get('saved_state'):
-        refuse_claimed_release(state, route)  # A claim can land while the saved state is written.
     if 'closing_native_scope' in route:
         state.check_native_close(route, route['closing_native_scope'])
 
@@ -1572,9 +1548,6 @@ async def commit_close(state, args, route):
         result['cleanup_error'] = 'Archive confirmed; active correspondence remains'
 
     message = state.close_message(route['closing'])
-    if args.get('saved_state') and message is not None and message['state'] in TERMINAL_STATES:
-        message = None  # A failed dispatch stays as recorded; the release does not rewrite it.
-        result['operator_receipt'] = 'unchanged'
     try:
         state.routing_remove('endpoints', (route['project'], route['name']))
     except (ValueError, OSError) as error:
@@ -1584,9 +1557,8 @@ async def commit_close(state, args, route):
     result['route_removed'] = True
     if message is not None:
         try:
-            note = ('Saved Codex archive verified and route released' if args.get('saved_state')
-                    else 'Native Codex archive verified and route removed')
-            await state.commit_action({'op': 'resolve', 'id': message['id'], 'state': 'done', 'note': note})
+            await state.commit_action({'op': 'resolve', 'id': message['id'], 'state': 'done',
+                                       'note': 'Native Codex archive verified and route removed'})
             result['operator_receipt'] = 'done'
         except (OSError, ValueError):
             result['operator_receipt'] = 'needs_reconciliation'

@@ -22,7 +22,12 @@ class CodexArchiveTests(unittest.TestCase):
         self.cwd = self.prefix / 'gone'
         self.calls = []
         self.execute('CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, cwd TEXT, '
-                     'updated_at INTEGER, archived INTEGER, archived_at INTEGER)')
+                     'updated_at INTEGER, archived INTEGER, archived_at INTEGER, rollout_path TEXT)')
+        # Codex keeps a thread's rollout in sessions/ and moves it to archived_sessions/ when it archives.
+        self.sessions, self.archived = self.root / 'sessions', self.root / 'archived_sessions'
+        self.sessions.mkdir()
+        self.archived.mkdir()
+        self.enter_context(patch.dict(archive.os.environ, {'CODEX_HOME': str(self.root)}))
         self.execute('CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)')
         self.enter_context(patch.object(archive, 'executable', return_value='/fixture/codex'))
         self.enter_context(patch.object(archive.codex_preview, 'state_path', return_value=self.db))
@@ -45,16 +50,27 @@ class CodexArchiveTests(unittest.TestCase):
 
     def add(self, n, *, parent=None, cwd=None, age=1, bit=0):
         sid = str(uuid.UUID(int=n))
-        self.execute('INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?)',
-                     (sid, f'title {n}', str(cwd or self.cwd), age, bit, 2 if bit else None))
+        rollout = (self.archived if bit else self.sessions) / f'{sid}.jsonl'
+        rollout.write_text('transcript', encoding='utf-8')
+        self.execute('INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?)',
+                     (sid, f'title {n}', str(cwd or self.cwd), age, bit, 2 if bit else None, str(rollout)))
         if parent:
             self.execute('INSERT INTO thread_spawn_edges VALUES (?, ?)', (parent, sid))
         return sid
 
     def set_bit(self, method, sid):
+        # A native archive sets the bit and moves the rollout; an unarchive moves it back.
         bit = int(method == 'thread/archive')
-        self.execute('UPDATE threads SET archived=?, archived_at=? WHERE id=?',
-                     (bit, 2 if bit else None, sid))
+        source, target = (self.sessions, self.archived) if bit else (self.archived, self.sessions)
+        rollout = target / f'{sid}.jsonl'
+        if (source / rollout.name).exists():
+            (source / rollout.name).rename(rollout)
+        self.execute('UPDATE threads SET archived=?, archived_at=?, rollout_path=? WHERE id=?',
+                     (bit, 2 if bit else None, str(rollout), sid))
+
+    def set_bit_only(self, sid):
+        # What Agent Bridge used to write from outside: the bit without a native archive (#212).
+        self.execute('UPDATE threads SET archived=1, archived_at=2 WHERE id=?', (sid,))
 
     def rpc(self, method, params):
         sid = params['threadId']
@@ -196,7 +212,7 @@ class CodexArchiveTests(unittest.TestCase):
         self.assertEqual(self.calls, [('thread/archive', root)])
         self.assertEqual((result['closed'], result['count']), (True, 1))
 
-    def test_close_archives_threads_whose_writer_desktop_holds(self):
+    def test_close_never_writes_codex_state_when_desktop_holds_the_writer(self):
         def held(method, sid):
             raise archive.sessions.CodexRpcError(method, {
                 'code': -32600, 'message': f'thread {sid} already has an active writer'})
@@ -205,18 +221,23 @@ class CodexArchiveTests(unittest.TestCase):
         # A sweep gets no fallback: the rejected thread stays unarchived.
         swept = self.add(5)
         result = self.apply(self.plan())['results']
-        self.assertEqual((result[0]['status'], 'method' in result[0], self.bits(swept)), ('not_archived', False, [0]))
+        self.assertEqual((result[0]['status'], self.bits(swept)), ('not_archived', [0]))
 
         self.cwd.mkdir(parents=True)
         root = self.add(1)
-        leaf = self.add(2, parent=root)
         route = self.route(root)
         self.register(route)
+        before = self.db.read_bytes()
         result = archive.close(route, self.routes, 1)
-        self.assertEqual(self.calls[-2:], [('thread/archive', leaf), ('thread/archive', root)])
-        self.assertEqual((result['closed'], result['count'], result['archive_incomplete']), (True, 2, False))
-        self.assertEqual({row['method'] for row in result['results']}, {'saved_state'})
-        self.assertEqual(self.bits(root, leaf, swept), [1, 1, 0])
+        self.assertEqual(self.calls[-1], ('thread/archive', root))
+        self.assertEqual((result['closed'], result['archived'], result['archive_incomplete']), (False, False, True))
+        receipt, = result['results']
+        self.assertEqual((receipt['status'], receipt['reason']), ('not_archived', 'desktop_holds_thread'))
+        self.assertNotIn('method', receipt)
+        self.assertIn('Desktop holds this thread', result['note'])
+        self.assertEqual(self.db.read_bytes(), before)  # Agent Bridge wrote nothing to Codex state (#212).
+        self.assertEqual(self.bits(root, swept), [0, 0])
+        self.assertTrue((self.sessions / f'{root}.jsonl').is_file())
 
         # Any other rejection is still a failed archive.
         other = self.add(3, cwd=self.root / 'other')
@@ -230,6 +251,27 @@ class CodexArchiveTests(unittest.TestCase):
         self.behavior = rejected
         self.assertFalse(archive.close(route, self.routes, 1)['closed'])
         self.assertEqual(self.bits(other), [0])
+
+    def test_close_reports_a_bit_only_archive_as_not_closed(self):
+        # The bit is set but the rollout is still in sessions/: Codex never archived the thread (#212).
+        self.cwd.mkdir(parents=True)
+        for label, behavior, preset in (('native call sets only the bit', lambda method, sid: self.set_bit_only(sid), False),
+                                        ('thread already half-archived', None, True)):
+            with self.subTest(label):
+                self.calls.clear()
+                sid = self.add(10 if preset else 11)
+                if preset:
+                    self.set_bit_only(sid)
+                self.behavior = behavior or self.set_bit
+                route = self.route(sid)
+                self.register(route)
+                result = archive.close(route, self.routes, 1)
+                self.assertEqual((result['closed'], result['archived'], result['archive_incomplete']),
+                                 (False, False, True))
+                self.assertEqual((result['results'][-1]['status'], result['results'][-1]['reason']),
+                                 ('not_archived', 'rollout_not_archived'))
+                self.assertTrue((self.sessions / f'{sid}.jsonl').is_file())
+                self.register()
 
     def test_close_refuses_alias_and_protected_descendant(self):
         root = self.add(1)
@@ -387,8 +429,8 @@ class CodexArchiveTests(unittest.TestCase):
         with closing(sqlite3.connect(self.db)) as writer:
             writer.execute('PRAGMA journal_mode=WAL')
             sid = str(uuid.UUID(int=1))
-            writer.execute('INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?)',
-                           (sid, 'WAL fixture', str(self.cwd), 1, 0, None))
+            writer.execute('INSERT INTO threads (id, title, cwd, updated_at, archived, archived_at) '
+                           'VALUES (?, ?, ?, ?, ?, ?)', (sid, 'WAL fixture', str(self.cwd), 1, 0, None))
             writer.commit()
             wal = self.db.with_name(self.db.name + '-wal')
             self.assertGreater(wal.stat().st_size, 0)

@@ -317,10 +317,22 @@ class CloseCodexTests(unittest.TestCase):
             db.execute('DELETE FROM threads WHERE id=?', (sid,))
 
     def saved_archive(self, method, params):
+        # A native archive: the bit, and for the route's thread the rollout moved to archived_sessions.
         self.assertEqual(method, 'thread/archive')
+        if params['threadId'] == self.sid:
+            self.rollout.rename(self.archive)
+            self.record_archive(self.archive)
         with closing(sqlite3.connect(self.db)) as db, db:
             db.execute('UPDATE threads SET archived=1, archived_at=2 WHERE id=?', (params['threadId'],))
         return {}
+
+    def direct_archive(self, behavior, *flags):
+        with mock.patch.object(codex_archive, 'executable', return_value=self.executable), \
+                mock.patch.object(codex_preview, 'state_path', return_value=self.db), \
+                mock.patch.object(codex_archive.wt, 'open_files', return_value=[]), \
+                mock.patch.object(sessions, 'CodexClient') as client:
+            client.return_value.__enter__.return_value.call.side_effect = behavior
+            return self.close('--archive', '--state-dir', self.server.state_dir, *flags)
 
     def operator(self, mid, session):
         with mock.patch.dict(os.environ, {'CODEX_THREAD_ID': session}):
@@ -410,57 +422,55 @@ class CloseCodexTests(unittest.TestCase):
                          {k: v for k, v in before.items() if k != 'note'})
         self.assertEqual(self.server.call('send', **fields)['id'], mid)
 
-    def test_saved_state_release_frees_a_handoff_no_operator_took(self):
-        self.assertEqual(self.close('--archive', '--saved-state'),
-                         (1, {'error': '--saved-state releases a prepared handoff and requires --finish'}))
+    def test_saved_state_release_is_removed_and_writes_nothing(self):
+        # Agent Bridge never writes Codex state (#212): the flag only reports that it is gone.
         code, prepared = self.close('--archive', '--handoff')
         self.assertEqual((code, prepared['status']), (0, 'awaiting_native_archive'))
-        release = ('--finish', prepared['close_id'], '--expect-session', self.sid, '--saved-state')
-        code, result = self.close('--finish', str(uuid.uuid4()), '--expect-session', self.sid, '--saved-state')
+        before = self.db.read_bytes()
+        for flags in (('--finish', prepared['close_id'], '--expect-session', self.sid, '--saved-state'),
+                      ('--archive', '--saved-state')):
+            with self.subTest(flags=flags):
+                code, result = self.close(*flags)
+                self.assertEqual(code, 1)
+                self.assertIn('saved-state release was removed (#212)', result['error'])
+                self.assertIn('natively', result['error'])
+        # An older CLI that still sends the field is refused by the broker too.
+        with self.assertRaisesRegex(ValueError, 'removed \\(#212\\)'):
+            self.server.call('close-finish', project='p', name='target', close_id=prepared['close_id'],
+                             session=self.sid, timeout=5, saved_state=True)
+        self.assertEqual(self.db.read_bytes(), before)
+        self.assertTrue(self.rollout.is_file())
+        route, = self.server.call('routes', project='p')
+        self.assertEqual(route['closing'], prepared['close_id'])
+
+    def test_direct_close_keeps_the_route_when_desktop_holds_the_thread(self):
+        def held(method, params):
+            raise sessions.CodexRpcError(method, {
+                'code': -32600, 'message': f"thread {params['threadId']} already has an active writer"})
+
+        before = self.db.read_bytes()
+        code, result = self.direct_archive(held)
         self.assertEqual(code, 1)
-        self.assertEqual(self.archive_flags()[self.sid], 0)  # A wrong generation writes nothing.
-        code, result = self.close(*release)
-        self.assertEqual((code, result['closed'], result['route_removed'], result['archive_path']),
-                         (0, True, True, 'saved_state'))
-        self.assertEqual(self.archive_flags()[self.sid], 1)
-        self.assertEqual(self.server.call('routes', project='p'), [])
-        self.assertTrue(self.rollout.is_file())  # No native rollout move.
+        self.assertEqual((result['closed'], result['archived'], result['route_removed']), (False, False, False))
+        self.assertEqual((result['results'][0]['status'], result['results'][0]['reason']),
+                         ('not_archived', 'desktop_holds_thread'))
+        self.assertEqual(self.db.read_bytes(), before)  # No write to Codex state.
+        self.assertTrue(self.rollout.is_file())
+        route, = self.server.call('routes', project='p')
+        self.assertEqual(route['session'], self.sid)
 
-    def test_saved_state_release_waits_for_an_operator_that_claimed(self):
-        self.enroll()
-        with mock.patch.object(codex_live, 'deliver', return_value={'delivery_mode': 'idle', 'turn_id': 'test'}):
-            code, prepared = self.close('--archive', '--handoff')
-        self.assertEqual(code, 0)
-        self.server.call('close-operator', id=prepared['operator_message_id'], operator_session=self.operator_sid)
-        code, result = self.close('--finish', prepared['close_id'], '--expect-session', self.sid, '--saved-state')
+    def test_direct_close_reports_a_bit_only_archive_as_not_closed(self):
+        def bit_only(method, params):
+            with closing(sqlite3.connect(self.db)) as db, db:
+                db.execute('UPDATE threads SET archived=1, archived_at=2 WHERE id=?', (params['threadId'],))
+            return {}
+
+        code, result = self.direct_archive(bit_only)
         self.assertEqual(code, 1)
-        self.assertIn('claimed', result['error'])
-        self.assertEqual(self.archive_flags()[self.sid], 0)
-        self.assertEqual(self.server.call('routes', project='p')[0]['closing'], prepared['close_id'])
-
-    def test_a_claim_during_the_saved_state_write_keeps_the_route(self):
-        # The claim check runs again inside the serialized commit: a claim that lands while the
-        # saved state is written keeps the route and the operator's request (#196).
-        import asyncio
-        import broker
-        route = {'project': 'p', 'name': 'target', 'session': self.sid, 'closing': 'c'}
-        claimed = {'state': 'in_progress'}
-        state = mock.Mock(closing_route=mock.Mock(return_value=route), close_message=mock.Mock(return_value=claimed))
-        with self.assertRaisesRegex(ValueError, 'claimed'):
-            asyncio.run(broker.commit_close(state, {'saved_state': True}, route))
-        state.routing_remove.assert_not_called()
-        state.commit_action.assert_not_called()
-
-    def test_saved_state_release_keeps_a_failed_dispatch_record(self):
-        self.enroll()
-        # The operator was reachable at preflight and archived before the dispatch.
-        with mock.patch.object(codex_live, 'deliver', side_effect=dispatch_raises(codex_live.ThreadArchived())):
-            code, prepared = self.close('--archive', '--handoff')
-        mid = prepared['operator_message_id']
-        self.assertEqual(self.server.call('show', id=mid)['state'], 'failed')
-        code, result = self.close('--finish', prepared['close_id'], '--expect-session', self.sid, '--saved-state')
-        self.assertEqual((code, result['route_removed'], result['operator_receipt']), (0, True, 'unchanged'))
-        self.assertEqual(self.server.call('show', id=mid)['state'], 'failed')
+        self.assertEqual((result['closed'], result['archived'], result['route_removed']), (False, False, False))
+        self.assertEqual(result['results'][0]['reason'], 'rollout_not_archived')
+        self.assertTrue(self.rollout.is_file())
+        self.assertEqual(len(self.server.call('routes', project='p')), 1)
 
     def test_explicit_handoff_refuses_an_unavailable_operator_before_reserving(self):
         self.enroll()
@@ -831,19 +841,27 @@ class CloseCommandTests(unittest.TestCase):
 
             state_db = Path(cwd) / 'state_5.sqlite'
             os.chmod(cwd, 0o700)
+            rollout = Path(cwd) / 'sessions' / f'{codex_sid}.jsonl'
+            archived_rollout = Path(cwd) / 'archived_sessions' / rollout.name
+            rollout.parent.mkdir()
+            archived_rollout.parent.mkdir()
+            rollout.write_text('transcript', encoding='utf-8')
             with closing(sqlite3.connect(state_db)) as conn, conn:
-                conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, archived INTEGER NOT NULL DEFAULT 0, archived_at INTEGER, title TEXT, updated_at INTEGER)")
-                conn.execute("INSERT INTO threads VALUES (?, ?, 0, NULL, 'fixture', 1)", (codex_sid, cwd))
+                conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, archived INTEGER NOT NULL DEFAULT 0, archived_at INTEGER, title TEXT, updated_at INTEGER, rollout_path TEXT)")
+                conn.execute("INSERT INTO threads VALUES (?, ?, 0, NULL, 'fixture', 1, ?)", (codex_sid, cwd, str(rollout)))
                 conn.execute('CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)')
             os.chmod(state_db, 0o600)
             server.call('register', project='p', name='n-arch', cwd=cwd, transport='codex', session=codex_sid)
             def archive(method, params):
                 self.assertEqual((method, params), ('thread/archive', {'threadId': codex_sid}))
+                rollout.rename(archived_rollout)  # Codex moves the rollout when it archives natively.
                 with closing(sqlite3.connect(state_db)) as conn, conn:
-                    conn.execute('UPDATE threads SET archived=1, archived_at=2 WHERE id=?', (codex_sid,))
+                    conn.execute('UPDATE threads SET archived=1, archived_at=2, rollout_path=? WHERE id=?',
+                                 (str(archived_rollout), codex_sid))
                 return {}
 
             with mock.patch.object(codex_preview, 'state_path', return_value=state_db), \
+                    mock.patch.dict(os.environ, {'CODEX_HOME': cwd}), \
                     mock.patch.object(codex_archive, 'executable', return_value='/fixture/codex'), \
                     mock.patch.object(codex_archive.wt, 'open_files', return_value=[]), \
                     mock.patch.object(sessions, 'CodexClient') as native:

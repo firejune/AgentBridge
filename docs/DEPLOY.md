@@ -73,7 +73,7 @@ bundled response templates without launching the Codex CLI or sending a message.
 | `BROKER_UNREACHABLE` | The running broker did not answer `ping` or `retention --live`. |
 | `CORRESPONDENCE_LOST` | The broker already reports lost correspondence. |
 | `DELIVERIES_IN_FLIGHT` | A message is `dispatching`. Stopping now would leave it uncertain. |
-| `CLOSE_HANDOFF_OPEN` | A route is mid close handoff and its operator request may still move (`dispatching`, `submitted`, `in_progress` or `uncertain`). A stranded reservation, with no request or a failed or undelivered one, survives the restart and does not block; release it with `close --finish ... --saved-state`. |
+| `CLOSE_HANDOFF_OPEN` | A route is mid close handoff and its operator request may still move (`dispatching`, `submitted`, `in_progress` or `uncertain`). A stranded reservation, with no request or a failed or undelivered one, survives the restart and does not block; archive the thread natively in Codex, then release it with `close --finish ...` (the `--saved-state` release was removed in #212). |
 | `WAITS_ACTIVE` | A caller is blocked in `ask` or `wait`; a restart would cut it off. |
 | `RELEASE_MISMATCH` | A release directory with this id exists and differs from the commit. |
 | `RELEASE_UNUSABLE` | The new CLI could not ping the running broker. |

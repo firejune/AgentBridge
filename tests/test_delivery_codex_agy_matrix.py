@@ -163,15 +163,13 @@ class DeliveryMatrixTests(unittest.TestCase):
                     self.restart()
                     return receipt
 
-                with patch.object(provider, 'deliver', side_effect=restart_during_write) as send, \
-                        patch.object(delivery.codex_preview, 'initialize', return_value={}) as preview:
+                with patch.object(provider, 'deliver', side_effect=restart_during_write) as send:
                     code, result = self.cli('send', '--project', 'demo', '--from', 'sender', '--to', transport,
                                             '--key', mode, '--file', '-', stdin='Fixture body')
                 send.assert_called_once()
                 record = self.show(message)
                 self.server.call('resolve', id=message['id'], state='done', note='fixture reconciled')
                 self.assertEqual(code, 1, result)
-                preview.assert_not_called()
                 self.assertEqual(result['message']['state'], 'uncertain')
                 self.assertEqual(result['message']['id'], message['id'])
                 self.assertIs(result['push_failed'], True)
@@ -285,8 +283,7 @@ class DeliveryMatrixTests(unittest.TestCase):
 
     def test_exact_idle_rejection_starts_only_the_pinned_thread(self):
         message = self.post('codex')
-        with FakeDesktop('idle') as desktop, patch.dict(os.environ, {'AGENT_BRIDGE_CODEX_IPC': desktop.path}), \
-                patch.object(delivery.codex_preview, 'initialize', return_value={}):
+        with FakeDesktop('idle') as desktop, patch.dict(os.environ, {'AGENT_BRIDGE_CODEX_IPC': desktop.path}):
             code, result = self.cli('deliver', message['id'])
         self.assertEqual(code, 0, result)
         self.assert_record(message, 'submitted', 'Codex idle tool output accepted by turn idle-turn', 'pushed')
@@ -303,8 +300,7 @@ class DeliveryMatrixTests(unittest.TestCase):
         with FakeDesktop() as desktop, FakeAgyServer(self.server.temp.name, self.thread) as agy:
             agy_env['AGENT_BRIDGE_AGY_URL'] = agy.url
             agy.trajectories[self.thread]['status'] = 'CASCADE_RUN_STATUS_IDLE'
-            with patch.dict(os.environ, {**agy_env, 'AGENT_BRIDGE_CODEX_IPC': desktop.path}), \
-                    patch.object(delivery.codex_preview, 'initialize', return_value={}):
+            with patch.dict(os.environ, {**agy_env, 'AGENT_BRIDGE_CODEX_IPC': desktop.path}):
                 for transport in ('codex', 'agy'):
                     with self.subTest(transport=transport):
                         args = ('send', '--project', 'demo', '--from', 'sender', '--to', transport)

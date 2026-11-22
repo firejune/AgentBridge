@@ -20,7 +20,7 @@ import agy_live
 import broker
 import codex_archive
 import codex_live
-import codex_preview  # Shared sidebar preview module exposed to CLI callers.
+import codex_preview  # Read-only Codex state helpers.
 import codex_new
 import codex_queue
 # Keep the existing CLI imports of the shared delivery helpers available.
@@ -540,6 +540,8 @@ def close_participant(args):
     if not 0 < args.timeout <= 600:
         raise ValueError('Timeout must be between 0 and 600 seconds')
     address = {'name': args.name, 'project': args.project}
+    if args.saved_state:
+        raise ValueError(broker.SAVED_STATE_REMOVED)
     if args.finish:
         if not args.expect_session:
             raise ValueError('--finish requires --expect-session')
@@ -551,19 +553,13 @@ def close_participant(args):
             raise ValueError('Record the retrospective when preparing the archive handoff')
         request = {'op': 'close-finish', **address, 'close_id': str(uuid.UUID(args.finish)),
                    'session': str(uuid.UUID(args.expect_session)), 'timeout': args.timeout}
-        if args.saved_state:
-            request['saved_state'] = True  # The broker archives the exact thread in saved state (#196).
         closed = broker.request(args.socket, request, timeout=args.timeout + 5)
         result = {**address, 'transport': 'codex', 'method': 'archive', 'archived': True, 'resumable': True,
                   'status': 'closed' if closed['route_removed'] else 'archive_verified',
                   'closed': True, 'session': closed['session'], 'close_id': closed['closing']}
         result.update({key: closed[key] for key in ('route_removed', 'correspondence_cleanup',
                        'cleanup_error', 'route_error', 'operator_receipt', 'operator_error') if key in closed})
-        if args.saved_state:
-            result['archive_path'] = 'saved_state'
         return result
-    if args.saved_state:
-        raise ValueError('--saved-state releases a prepared handoff and requires --finish')
     route = registered_route(args)
     if args.expect_session and str(uuid.UUID(args.expect_session)) != route['session']:
         raise ValueError('Endpoint does not match --expect-session')
@@ -881,7 +877,7 @@ def add_session_commands(sub):
     p.add_argument('--handoff',action='store_true',help='Prepare a native Codex archive handoff with --archive')
     p.add_argument('--expect-session',metavar='UUID',help='Match the exact session (required with --finish)')
     p.add_argument('--saved-state',action='store_true',
-                   help='With --finish: archive the exact thread in saved state and release the reservation')
+                   help='Removed (#212): Agent Bridge never writes Codex state; the flag only reports that')
     p.add_argument('--keep-route',action='store_true',help='Close the session but keep the route registered')
     p.add_argument('--timeout',type=float,default=10)
     g = p.add_mutually_exclusive_group()

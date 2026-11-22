@@ -1,110 +1,45 @@
-from contextlib import closing
 import os
 from pathlib import Path
-import sqlite3
+import re
 import sys
 import tempfile
-import threading
 import unittest
 from unittest.mock import MagicMock, patch
-import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skill/agent-bridge/scripts'))
 import codex_preview
 
 
-class PreviewTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix='ab-preview-')
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        self.path = self.root / 'state_5.sqlite'
-        self.route = {'session': str(uuid.uuid4()), 'cwd': str(self.root)}
-        with closing(sqlite3.connect(self.path)) as c, c:
-            c.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, preview TEXT NOT NULL DEFAULT '', cwd TEXT, first_user_message TEXT, title TEXT, originator TEXT)")
-            c.execute('INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?)',
-                      (self.route['session'], '', str(self.root), '', 'Original title', 'agent_bridge'))
-        self.resolver = patch.object(codex_preview, 'state_path', return_value=self.path)
-        self.resolver.start()
-        self.addCleanup(self.resolver.stop)
+SCRIPTS = Path(__file__).resolve().parents[1] / 'skill/agent-bridge/scripts'
+CODEX_STATE = re.compile(r'state_path|state_5|STATE_FILE')
+WRITABLE = re.compile(r'mode=rw')
+CONNECT = re.compile(r'sqlite3\.connect\(')
 
-    def row(self):
-        with closing(sqlite3.connect(self.path)) as c, c:
-            return c.execute('SELECT * FROM threads').fetchone()
 
-    def test_first_task_sets_list_eligible_preview_without_human_identity(self):
-        before = self.row()
-        text = '한글 첫 과제 🌉\nQuotes " SQL ? ; <task> 그대로'
-        self.assertEqual(codex_preview.initialize(self.route, text), {'status': 'initialized'})
-        self.assertEqual(self.row(), (before[0], text, *before[2:]))
-        with closing(sqlite3.connect(self.path)) as c, c:
-            self.assertEqual(c.execute("SELECT id FROM threads WHERE preview <> ''").fetchall(),
-                             [(self.route['session'],)])
-        self.assertEqual(codex_preview.initialize(self.route, 'second task'), {'status': 'preserved'})
-        self.assertEqual(self.row()[1], text)
+def writable_codex_state(source):
+    """Lines that could open Codex state writable: Agent Bridge never writes it (#212)."""
+    if not CODEX_STATE.search(source):
+        return []
+    return [(number, line.strip()) for number, line in enumerate(source.splitlines(), 1)
+            if WRITABLE.search(line) or (CONNECT.search(line) and 'mode=ro' not in line)]
 
-    def test_native_timestamp_triggers_do_not_block_preview(self):
-        with closing(sqlite3.connect(self.path)) as c, c:
-            c.execute('ALTER TABLE threads ADD COLUMN updated_at INTEGER DEFAULT 0')
-            c.execute('ALTER TABLE threads ADD COLUMN updated_at_ms INTEGER')
-            c.execute("""CREATE TRIGGER threads_updated_at_ms_after_update
-                AFTER UPDATE OF updated_at ON threads
-                WHEN NEW.updated_at != OLD.updated_at
-                 AND NEW.updated_at_ms IS OLD.updated_at_ms
-                BEGIN UPDATE threads SET updated_at_ms = NEW.updated_at * 1000 WHERE id = NEW.id; END""")
-            c.execute("""CREATE TRIGGER threads_updated_at_ms_after_insert
-                AFTER INSERT ON threads WHEN NEW.updated_at_ms IS NULL
-                BEGIN UPDATE threads SET updated_at_ms = NEW.updated_at * 1000 WHERE id = NEW.id; END""")
-        before=self.row()
-        self.assertEqual(codex_preview.initialize(self.route,'task'), {'status':'initialized'})
-        self.assertEqual(self.row(),(before[0],'task',*before[2:]))
 
-    def test_existing_native_preview_is_preserved(self):
-        with closing(sqlite3.connect(self.path)) as c, c:
-            c.execute('UPDATE threads SET preview=?, first_user_message=?', ('human preview', 'human message'))
-        before = self.row()
-        self.assertEqual(codex_preview.initialize(self.route, 'task'), {'status': 'preserved'})
-        self.assertEqual(self.row(), before)
+class CodexStateReadOnlyGuard(unittest.TestCase):
+    def test_no_script_opens_codex_state_writable(self):
+        found = {path.name: rows for path in sorted(SCRIPTS.glob('*.py'))
+                 if (rows := writable_codex_state(path.read_text(encoding='utf-8')))}
+        self.assertEqual(found, {})
 
-    def test_missing_store_never_created(self):
-        self.path.unlink()
-        self.assertEqual(codex_preview.initialize(self.route, 'task')['status'], 'unavailable')
-        self.assertFalse(self.path.exists())
+    def test_guard_catches_a_writable_open(self):
+        planted = ("path = state_path(binary)\n"
+                   "sqlite3.connect(path.as_uri() + '?mode=rw', uri=True)\n"
+                   "sqlite3.connect(path)\n"
+                   "sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)\n")
+        self.assertEqual([number for number, _ in writable_codex_state(planted)], [2, 3])
+        self.assertEqual(writable_codex_state("sqlite3.connect(ledger)\n"), [])
 
-    def test_locked_missing_row_schema_and_trigger_fail_closed(self):
-        with closing(sqlite3.connect(self.path)) as c, c:
-            c.execute('BEGIN EXCLUSIVE')
-            self.assertEqual(codex_preview.initialize(self.route, 'task')['status'], 'unavailable')
-        self.assertEqual(self.row()[1], '')
-        self.assertEqual(codex_preview.initialize({**self.route, 'session':str(uuid.uuid4())}, 'task')['status'], 'unavailable')
-        self.assertEqual(codex_preview.initialize({**self.route, 'cwd':'/wrong'}, 'task')['status'], 'unavailable')
-        with closing(sqlite3.connect(self.path)) as c, c:
-            c.execute('CREATE TRIGGER extra AFTER UPDATE ON threads BEGIN UPDATE threads SET first_user_message=NEW.preview; END')
-        self.assertEqual(codex_preview.initialize(self.route, 'task')['status'], 'unavailable')
-        self.assertEqual(self.row()[1:2], ('',))
-        with closing(sqlite3.connect(self.path)) as c, c:
-            c.execute('DROP TABLE threads')
-            c.execute('CREATE TABLE threads (id TEXT PRIMARY KEY, preview BLOB, cwd TEXT, first_user_message TEXT)')
-        self.assertEqual(codex_preview.initialize(self.route, 'task')['status'], 'unavailable')
-
-    def test_simultaneous_tasks_fill_only_once(self):
-        barrier = threading.Barrier(2)
-        results=[]
-        def initialize(text):
-            barrier.wait()
-            results.append(codex_preview.initialize(self.route, text))
-        threads=[threading.Thread(target=initialize,args=(text,)) for text in ('one', 'two')]
-        for t in threads: t.start()
-        for t in threads: t.join(2)
-        self.assertTrue(all(not t.is_alive() for t in threads))
-        self.assertEqual(sorted(r['status'] for r in results), ['initialized','preserved'])
-        self.assertIn(self.row()[1], ('one','two'))
-
-    def test_config_failures_are_sanitized(self):
-        with patch.object(codex_preview, 'state_path', side_effect=ValueError('SECRET_TASK')):
-            result=codex_preview.initialize(self.route,'SECRET_TASK')
-        self.assertEqual(result['status'],'unavailable')
-        self.assertNotIn('SECRET_TASK',str(result))
+    def test_the_preview_writer_is_gone(self):
+        self.assertFalse(hasattr(codex_preview, 'initialize'))
 
 
 class StatePathTests(unittest.TestCase):

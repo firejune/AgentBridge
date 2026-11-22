@@ -1213,10 +1213,8 @@ assert 'bridge' not in sys.modules
             }
             engine = phase.Engine(config, phase.Backend(running.path), start=False)
             try:
-                missing_store = Path(cwd) / 'missing.sqlite'
                 row = {'id': sid, 'cwd': cwd, 'status': 'idle'}
                 with patch.dict(os.environ, {'AGENT_BRIDGE_CODEX_IPC': desktop.path}), \
-                        patch.object(phase.delivery.codex_preview, 'state_path', return_value=missing_store), \
                         patch.object(phase.sessions, 'resolve_codex_peer', return_value=row):
                     output = io.StringIO()
                     with patch.object(sys, 'stdin', io.StringIO('CLI fixture')), redirect_stdout(output):
