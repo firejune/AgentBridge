@@ -154,7 +154,7 @@ python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.
 
   - `self_archive`: archived and verified, route removed.
   - `not_archived`: nothing was submitted. The route stays registered, and `reason` says why.
-  - `pending_self_archive`: exit 1, with a `close_id`. The thread may still be finishing a turn. Run `close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID` later. Do not run `close --archive` again.
+  - `pending_self_archive`: exit 1, with a `close_id`. The thread may still be finishing a turn. After a Codex Desktop restart, a thread nobody has opened yet does not take its queued entry until it is opened in Desktop (#221). Run `close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID` later. Do not run `close --archive` again.
 
   When close is refused:
 

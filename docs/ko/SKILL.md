@@ -148,7 +148,7 @@ python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.
 
   - `self_archive`: 보관과 확인이 끝났고 라우트를 지웠다.
   - `not_archived`: 아무것도 제출하지 않았다. 라우트는 그대로이고, 이유는 `reason`에 있다.
-  - `pending_self_archive`: 종료 코드 1과 `close_id`를 준다. 스레드가 아직 턴을 끝내는 중일 수 있다. 나중에 `close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID`를 실행한다. `close --archive`를 다시 실행하지 않는다.
+  - `pending_self_archive`: 종료 코드 1과 `close_id`를 준다. 스레드가 아직 턴을 끝내는 중일 수 있다. Codex Desktop을 재시작한 뒤 아직 아무도 열지 않은 스레드는 Desktop에서 열어야 큐 항목을 집어 간다(#221). 나중에 `close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID`를 실행한다. `close --archive`를 다시 실행하지 않는다.
 
   종료가 거절될 때:
 
