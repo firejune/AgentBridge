@@ -620,6 +620,8 @@ def close_participant(args):
     if result.get('status') == 'awaiting_native_archive':
         scope = result.pop('native_scope')
         if self_archive:
+            # The process scan exempts the calling CLI's PID.
+            codex_archive.check_native_operator_processes(route, scope)
             path, row, target = retro
             closed = broker.request(args.socket, {'op': 'close-self-archive', **address, 'expected_route': route,
                                                   'native_scope': scope, 'timeout': args.timeout,

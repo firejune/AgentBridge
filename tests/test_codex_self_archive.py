@@ -52,7 +52,6 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
                                         'cwd': str(self.cwd), 'session': self.sid})
         self.patch(codex_archive, 'sweep_store', return_value=self.db)
         self.patch(codex_preview, 'state_path', return_value=self.db)
-        self.patch(codex_archive, 'process_cwds', return_value=(set(), []))
         self.available = self.patch(codex_queue, 'check_available')
         self.enqueue = self.patch(codex_queue, 'enqueue')
         self.args = {**self.address, 'expected_route': self.route, 'timeout': 1,
@@ -106,6 +105,10 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(broker.State(store=self.store).route('p', 'target'), self.route)
         self.assertEqual(self.state.messages[self.mid]['state'], 'done')
 
+    def assert_retro_discarded(self, retro):
+        self.assertFalse(Path(retro['store']).exists())
+        self.assertEqual(list((self.store.directory / 'pending-close-retros').iterdir()), [])
+
     async def test_exact_entry_archives_and_releases_only_after_readback(self):
         def submit(thread, prompt, timeout):
             self.assertEqual(thread, self.sid)
@@ -129,9 +132,33 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assert_refused_keeps_open_route(result, 'Desktop queue unavailable; no self-archive entry was submitted')
         self.assertEqual(self.db.read_bytes(), before)
         self.assertTrue(self.rollout.exists())
-        self.assertFalse(Path(retro['store']).exists())
-        self.assertEqual(list((self.store.directory / 'pending-close-retros').iterdir()), [])
+        self.assert_retro_discarded(retro)
         self.enqueue.assert_called_once()
+
+    async def test_subtree_recheck_error_releases_route_and_staged_retro(self):
+        retro = self.prepare_stop_retro()
+        reason = 'Codex native close has an unarchived descendant'
+        with mock.patch.object(codex_archive, 'native_handoff_scope',
+                               side_effect=[(set(), self.args['native_scope']), ValueError(reason)]):
+            result = await broker.start_self_archive(self.state, {**self.args, 'retro': retro})
+        self.assert_refused_keeps_open_route(result, reason)
+        self.assert_retro_discarded(retro)
+        self.enqueue.assert_not_called()
+
+    async def test_deadline_before_submission_releases_route_and_staged_retro(self):
+        retro = self.prepare_stop_retro()
+        with mock.patch.object(broker, 'time', wraps=broker.time) as clock:
+            clock.monotonic.return_value = 10
+
+            def expire_after_preflight(route):
+                self.assertTrue(route['closing_self_archive'])
+                clock.monotonic.return_value = 12
+
+            self.available.side_effect = expire_after_preflight
+            result = await broker.start_self_archive(self.state, {**self.args, 'retro': retro})
+        self.assert_refused_keeps_open_route(result, 'Codex self-archive deadline expired before queue submission')
+        self.assert_retro_discarded(retro)
+        self.enqueue.assert_not_called()
 
     async def test_existing_archive_bit_without_native_rollout_is_refused(self):
         self.record_archive_bit(self.rollout)
@@ -206,9 +233,11 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.archive_events(), [])
         self.enqueue.assert_not_called()
 
-    async def test_close_archive_records_and_notifies_stop_retro_once_after_verification(self):
+    async def test_close_from_target_workspace_records_stop_retro_once_after_verification(self):
         store = self.cwd.parent / 'retros.jsonl'
         loop = asyncio.get_running_loop()
+        caller_cwd = self.cwd / 'nested'
+        caller_cwd.mkdir()
 
         def request(path, args, timeout=10):
             async def dispatch():
@@ -230,13 +259,28 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(set(self.state.messages), {self.mid})
             self.record_native_archive()
 
+        def scan_cwds(*, skip, cwd_only):
+            self.assertTrue(cwd_only)
+            self.assertEqual(Path.cwd(), caller_cwd)
+            self.assertEqual(skip, (os.getpid(),))
+            self.assertEqual(self.state.endpoints[('p', 'target')], self.route)
+            rows = [(os.getpid(), 'bridge', str(caller_cwd))]
+            return [row for row in rows if row[0] not in skip]
+
         self.enqueue.side_effect = enqueue
         with mock.patch.object(bridge.broker, 'request', side_effect=request), \
-                mock.patch.object(bridge, 'close_session', side_effect=close_session):
-            code, result = await asyncio.to_thread(
-                run, ['--socket', str(self.cwd.parent / 'fixture.sock'), 'close', 'target', '--project', 'p',
-                      '--state-dir', str(self.store.directory), '--archive', '--no-retro', 'fixture',
-                      '--urgency', 'stop', '--notify', 'caller', '--store', str(store)])
+                mock.patch.object(bridge, 'close_session', side_effect=close_session), \
+                mock.patch.object(codex_archive.wt, 'open_files', side_effect=scan_cwds) as scan:
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(caller_cwd)
+                code, result = await asyncio.to_thread(
+                    run, ['--socket', str(self.cwd.parent / 'fixture.sock'), 'close', 'target', '--project', 'p',
+                          '--state-dir', str(self.store.directory), '--archive', '--no-retro', 'fixture',
+                          '--urgency', 'stop', '--notify', 'caller', '--store', str(store)])
+            finally:
+                os.chdir(previous_cwd)
+            scan.assert_called_once()
             self.assertEqual((code, result['archive_path'], result['route_removed']), (0, 'self_archive', True))
             retry_code, _ = await asyncio.to_thread(
                 run, ['--socket', str(self.cwd.parent / 'fixture.sock'), 'close', 'target', '--project', 'p',

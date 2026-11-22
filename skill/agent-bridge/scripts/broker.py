@@ -1595,22 +1595,25 @@ async def start_self_archive(state, args):
                                           'Existing archive bit has no verified native archive')
         return await commit_self_archive(state, finish, route, 'self_archive',
                                          'Thread already natively archived; archive verified')
-    except DeliveryError as error:
-        if not error.uncertain:
-            raise
-        note = 'Queue acceptance is uncertain; verify with --finish'
-        state.close_archive_event(route, 'pending_self_archive', note)
-        return {**route, 'archive_path': 'pending_self_archive', 'route_removed': False, 'note': note}
+    except ValueError as error:
+        if isinstance(error, DeliveryError) and error.uncertain:
+            note = 'Queue acceptance is uncertain; verify with --finish'
+            state.close_archive_event(route, 'pending_self_archive', note)
+            return {**route, 'archive_path': 'pending_self_archive', 'route_removed': False, 'note': note}
+        # The queue adapter marks failures after launch uncertain. A definite refusal is safe to release.
+        return await state.serialized(refuse_self_archive, state, finish, route, str(error))
     return await verify_self_archive(state, finish, route, deadline,
                                      'self_archive', 'Queued self-archive verified')
 
 
 def queue_self_archive(route, deadline):
     codex_queue.check_available(route)
-    codex_archive.check_native_operator_processes(route, route['closing_native_scope'])
+    _, scope = codex_archive.native_handoff_scope(route)
+    if scope != route['closing_native_scope']:
+        raise ValueError('Codex native close subtree or saved profile changed before queue submission')
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise ValueError('Codex self-archive deadline expired before queue submission; closing route kept')
+        raise ValueError('Codex self-archive deadline expired before queue submission')
     codex_queue.enqueue_self_archive(route, remaining)
 
 
