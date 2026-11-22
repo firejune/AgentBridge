@@ -657,7 +657,8 @@ class PersistenceTests(unittest.TestCase):
         self.state.action(dict(op='register', project='demo', name='beta', cwd=str(self.root)))
         send = dict(op='send', project='demo', sender='alpha', recipient='beta', body='question')
         parent = self.state.action(dict(send, key='first-parent'))
-        foreign = self.state.action(dict(send, sender='beta', recipient='alpha', key='foreign'))
+        foreign = self.state.action(dict(send, sender='beta', recipient='alpha', key='foreign',
+                                         mcp_operation_send=True))
         correlated = self.state.action(dict(op='reply', id=foreign['id'], body='existing', key='existing'))
         notice = self.state.provider_notice(
             parent['return_route'], parent['route'], 'notice',

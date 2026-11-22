@@ -100,6 +100,14 @@ def message_record(raw):
             raise ValueError('Invalid message identity')
     if result['reply_to'] is not None:
         uuid.UUID(result['reply_to'])
+    if 'mcp_operation_send' in raw:
+        if type(raw['mcp_operation_send']) is not bool or result['reply_to'] is not None:
+            raise ValueError('Invalid MCP operation send')
+        result['mcp_operation_send'] = raw['mcp_operation_send']
+    if 'independent_reply' in raw:
+        if raw['independent_reply'] is not True or result['reply_to'] is None:
+            raise ValueError('Invalid independent reply')
+        result['independent_reply'] = True
     if result['state'] not in STATES:
         raise ValueError('Invalid message state')
     compact = raw.get('body_expired') is True

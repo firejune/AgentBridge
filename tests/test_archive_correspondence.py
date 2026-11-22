@@ -50,6 +50,8 @@ class ArchiveCorrespondenceTests(unittest.TestCase):
         self.call('register', project='q', name='peer', session=str(uuid.uuid4()), cwd=self.temp.name, transport='codex')
         alias = self.call('send', project='q', sender='peer', recipient='alias', body='alias', key='alias')
         survivor = self.send('keep', 'other', 'third')
+        # Model an older reply whose original parent can be archived separately.
+        del survivor['mcp_operation_send']
         survivor['reply_to'] = outgoing['id']
         survivor['note'] = 'preserve other-session annotation'
         expected = deepcopy(survivor)

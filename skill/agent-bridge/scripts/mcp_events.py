@@ -417,10 +417,14 @@ class EventService:
             error_code=failure.get('code') if isinstance(failure, dict) else None,
             negotiated_protocol=result.get('protocolVersion') if isinstance(result, dict) else None)
 
+    @staticmethod
+    def correlated_reply(message):
+        return message.get('reply_to') is not None and message.get('independent_reply') is not True
+
     def observed_message(self, event):
         message = event.get('message')
         self.audit.write('broker_message_observed', correlated=
-            isinstance(message, dict) and message.get('reply_to') is not None)
+            isinstance(message, dict) and self.correlated_reply(message))
 
     def request_begin(self, method):
         if method not in EVENT_METHODS:
@@ -722,7 +726,7 @@ class EventService:
                             ready.set()
                         elif event.get('type') == 'message':
                             self.observed_message(event)
-                            if event['message'].get('reply_to') is not None:
+                            if self.correlated_reply(event['message']):
                                 event = self.reply_metadata(event)
                             try:
                                 self.pending.put_nowait((entry, event))
@@ -798,7 +802,7 @@ class EventService:
             return
         if broker.route_key(message.get('route', {})) != broker.route_key(entry['route']):
             return
-        if message.get('reply_to') is not None:
+        if self.correlated_reply(message):
             key = (event['instance'], message['id'])
             self.remember_reply(self.reply_arrivals, key, (copy.deepcopy(entry), self.reply_metadata(event)))
             self.reply_notification(key)

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import queue
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -113,7 +114,8 @@ class EventTests(unittest.TestCase):
                 'message': 'private parent request', 'idempotency_key': 'correlated-operation-' + str(self.sequence)})['data']
         op = self.engine.operation(accepted['operation_id'], self.engine.principal)
         parent = self.running.call('send', project='test-project', sender=session['sender'],
-            recipient=session['route'], body='private parent request', key='correlated-parent-' + str(self.sequence))
+            recipient=session['route'], body='private parent request', key='correlated-parent-' + str(self.sequence),
+            mcp_operation_send=True)
         self.engine.update(op, status='running', stage='observing', instance=self.running.instance,
             backend_id=parent['id'] if save_backend else None)
         reply = self.running.call('reply', id=parent['id'], body=body, key='correlated-reply-' + str(self.sequence))
@@ -396,6 +398,57 @@ class EventTests(unittest.TestCase):
         self.assertEqual(self.applications()[0]['data'], {'agent_session_id': self.sid, 'operation_id': op['operation_id']})
         self.assertEqual(self.engine.get({'operation_id': op['operation_id']}, self.engine.principal)['result']['text'], 'private correlated answer')
         self.assertNotIn('acknowledged_at', self.running.call('show', id=reply['id']))
+
+    def test_local_reply_to_inbox_reply_is_independent_mail(self):
+        def call(tool, **args):
+            result = self.engine.call(tool, args)
+            self.assertIn('data', result, result)
+            return result['data']
+
+        _, initial_event = self.send()
+        initial_id = call('bridge_inbox_list')['messages'][0]['message_id']
+        call('bridge_message_reply', message_id=initial_id, message='coordinator reply',
+             idempotency_key='first-inbox-reply')
+        chain = self.running.call('conversation', id=initial_event['message']['id'])
+        self.assertEqual(len(chain), 2)
+
+        self.service.close()
+        self.service = events.EventService(self.engine, self.keys, self.callback, start=True)
+        self.engine.events = self.service
+        self.subscribe()
+        script = Path(events.__file__).with_name('bridge.py')
+        result = subprocess.run([sys.executable, str(script), '--socket', self.running.path,
+            'reply', chain[1]['id'], '--key', 'local-reply', '--file', '-'],
+            input='answer back to the coordinator', text=True, capture_output=True, timeout=10,
+            env=dict(os.environ, CODEX_HOME=self.root + '/codex'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        local_reply = json.loads(result.stdout)
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline and not self.applications():
+            time.sleep(.02)
+        self.assertEqual(len(self.applications()), 1)
+        entry = self.engine.inbox_routes(self.engine.principal, self.sid)[0]
+        self.service.arrival(entry, {'type': 'message', 'instance': self.running.instance,
+                                    'message': local_reply})
+        values = self.applications()
+        self.assertEqual(len(values), 1)
+        self.assertEqual(values[0]['name'], events.NAME)
+        self.assertEqual(values[0]['data'], {'agent_session_id': self.sid})
+        self.assertNotIn(local_reply['id'], json.dumps(values))
+
+        self.running.restart()
+        messages = call('bridge_inbox_list')['messages']
+        self.assertEqual(len(messages), 1)
+        handle = messages[0]['message_id']
+        self.assertEqual(call('bridge_message_get', message_id=handle)['body'],
+                         'answer back to the coordinator')
+        self.assertTrue(call('bridge_message_ack', message_id=handle)['acknowledged'])
+        self.assertEqual(call('bridge_inbox_list')['messages'], [])
+        call('bridge_message_reply', message_id=handle, message='coordinator follow-up',
+             idempotency_key='second-inbox-reply')
+        follow_up = self.running.call('conversation', id=local_reply['id'])[-1]
+        self.assertEqual((follow_up['reply_to'], follow_up['body']),
+                         (local_reply['id'], 'coordinator follow-up'))
 
     def test_postcommit_hook_does_not_wait_for_event_delivery_lock(self):
         op, parent, reply, _, _ = self.correlated()
@@ -1156,7 +1209,7 @@ class EventTests(unittest.TestCase):
         self.send()
         session = self.owned[0]
         parent = self.running.call('send', project='test-project', sender=session['sender'],
-            recipient=session['route'], body='private parent body', key='audit-parent')
+            recipient=session['route'], body='private parent body', key='audit-parent', mcp_operation_send=True)
         self.running.call('reply', id=parent['id'], project='test-project', body='private reply body', key='audit-reply')
         deadline = time.monotonic() + 4
         while time.monotonic() < deadline:

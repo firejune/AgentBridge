@@ -45,6 +45,7 @@ INBOX_PAGE_BYTES = 128 * 1024
 INBOX_MAX_RECEIPTS = 8192
 CLOSE_KEY_PREFIX = 'agent-bridge-close:'
 INBOX_REPLY_KEY_PREFIX = 'agent-bridge-inbox-reply:'
+LEGACY_MCP_SENDER = re.compile(r'mcp-(?:[0-9a-f]{16}|[0-9a-f]{32})')
 PROVIDER_NOTICE_KEY_PREFIXES = tuple(event + ':' for event in (
     provider_failures.DETECTED_EVENT, provider_failures.RETRY_EVENT, provider_failures.EXHAUSTED,
     provider_failures.UNSAFE, provider_failures.UNCERTAIN))
@@ -475,6 +476,28 @@ class State:
             self.answers[m['id']].set()
         return m
 
+    @staticmethod
+    def independent_reply_parent(parent):
+        if parent is None:
+            return False
+        if parent['reply_to'] is not None:
+            return True  # An MCP send operation always posts a root message.
+        if 'mcp_operation_send' in parent:
+            return not parent['mcp_operation_send']
+        # Older checkpoints have no operation marker. Keep roots from legacy
+        # facade return routes operation-only, even if the operation expired.
+        origin = parent['return_route']
+        return not (origin['transport'] == 'realtime' and origin.get('session') is None
+                    and LEGACY_MCP_SENDER.fullmatch(origin['name']))
+
+    def independent_inbox_message(self, message):
+        if 'close_request' in message:
+            return False
+        parent_id = message['reply_to']
+        return (parent_id is None or message.get('independent_reply') is True
+                or self.independent_reply_parent(
+                    self.messages.get(parent_id) or self.compact_messages.get(parent_id)))
+
     def post(self, args, reply_to=None, *, close_request=None, inbox_reply=False, closing_origin=None):
         body, key = args['body'], args['key']
         if not isinstance(body,str) or not body.strip() or len(body.encode()) > 32768:
@@ -495,6 +518,9 @@ class State:
             raise ValueError('Reply deadline must be positive and at most 604800 seconds')
         if one_way and (deadline is not None or reply_to):
             raise ValueError('One-way intent cannot include a reply deadline or be a reply')
+        mcp_operation_send = args.get('mcp_operation_send', False)
+        if type(mcp_operation_send) is not bool or (mcp_operation_send and reply_to):
+            raise ValueError('Invalid MCP operation send')
         if one_way:
             intent['one_way'] = True
         if deadline is not None:
@@ -531,6 +557,11 @@ class State:
              'state':'pending','created':now(),'events':[],'note':None}
         if close_request is not None:
             m['close_request'] = close_request
+        if reply_to:
+            if self.independent_reply_parent(parent):
+                m['independent_reply'] = True
+        else:
+            m['mcp_operation_send'] = mcp_operation_send
         if one_way:
             m['one_way'] = True
         if deadline is not None:
@@ -604,10 +635,8 @@ class State:
                 items = []
                 for message in self.messages.values():
                     slot = selected.get(route_key(message['route']))
-                    # Correlated replies are ALWAYS operation-only, even before an
-                    # operation has saved its backend ID or observed its first reply.
-                    if (slot is not None and message['reply_to'] is None
-                            and 'close_request' not in message and message['state'] not in TERMINAL_STATES):
+                    if (slot is not None and message['state'] not in TERMINAL_STATES
+                            and self.independent_inbox_message(message)):
                         items.append(self.inbox_metadata(message, slot))
                 items.sort(key=lambda m: (m['created_at'], m['id']))
                 size = len(json.dumps(items, ensure_ascii=False).encode())
@@ -644,7 +673,7 @@ class State:
         if message is None:
             raise ValueError('MESSAGE_UNAVAILABLE')
         slot = selected.get(route_key(message['route']))
-        if slot is None or message['reply_to'] is not None or 'close_request' in message:
+        if slot is None or not self.independent_inbox_message(message):
             raise ValueError('NOT_FOUND')
         if message.get('body_expired'):
             raise ValueError('MESSAGE_BODY_EXPIRED')
