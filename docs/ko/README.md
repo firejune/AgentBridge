@@ -143,7 +143,20 @@ python3 "$bridge_cli" wake claude-tower --project my-app [--timeout 30]
 
 보관이 확인되면 브로커는 별칭을 포함해 정확한 세션의 정리 가능한 서신을 삭제하고, 영향을 받은 수신함 스냅샷을 만료시킨다. 공급자 대화 원문은 유지한다. 일반 종료는 서신을 유지한다. 직접 보관에 `--keep-route`를 사용해도 서신 정리는 수행한다. 보관과 요청한 라우트 처리가 확인되면 전달 여부가 불명확한 서신만 남아도 성공으로 처리한다. 해당 서신과 멱등성 키는 유지한다.
 
-기본적으로 Codex 직접 종료(`close --archive`)는 저장된 보관 상태를 확인한다. 이미 열려 있는 Desktop 사이드바에는 대화가 계속 보일 수 있다. Desktop에서 네이티브 보관을 하려면 `close --archive --handoff`를 사용하고, Desktop에서 정확한 대화를 직접 보관하거나 등록된 담당자를 이용한다. 소유자가 `close-operator.json`에 `"prefer_native_for_direct": true`를 설정하면 직접 종료가 검토된 하위 스레드를 먼저 보관하고 루트를 인계한다. 이 설정은 라우트를 제거하는 직접 종료에 적용된다. 이 설정을 적용한 직접 종료에서 기본 Desktop IPC 소켓이 없거나 연결을 거부하면, 기본 로컬 브로커 소켓에서 검증된 Desktop 큐로 등록된 담당자에게 알릴 수 있다. 담당자 대화가 로드되어 있고 새 턴을 시작할 수 있어야 알림을 처리할 수 있다. 명시적 `--handoff`는 IPC 또는 Desktop에서의 수동 보관을 사용한다. 직접 종료의 인계가 대기 중이면 `awaiting_native_archive`와 종료 코드 1을 반환한다. 담당자의 완료 기록이나 `close --finish CLOSE_ID --expect-session UUID`로 완료를 확인한다. [세션 닫기](usage.md#세션-닫기) 참고.
+기본적으로 Codex 직접 종료(`close --archive`)는 그 스레드에 고정된 자기 보관 항목 하나를 큐에 넣는다. 스레드가 Desktop의 네이티브 도구로 스스로를 보관하고, 사이드바에서도 재시작 없이 사라진다. 라우트는 Agent Bridge가 보관 비트와 `archived_sessions` 아래의 rollout을 다시 읽어 확인한 뒤에만 지운다. Agent Bridge는 Codex 상태를 읽기만 하고 절대 쓰지 않는다. 결과의 `archive_path`가 무슨 일이 있었는지 알려 준다.
+
+- `self_archive`: 보관과 확인이 끝났고 라우트를 지웠다.
+- `not_archived`: 아무것도 제출하지 않았다. 라우트는 그대로이고, 이유는 `reason`에 있다.
+- `pending_self_archive`: 종료 코드 1과 `close_id`를 준다. 스레드가 아직 턴을 끝내는 중일 수 있다. 나중에 `close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID`를 실행한다. `close --archive`를 다시 실행하지 않는다.
+
+종료가 거절될 때:
+
+- `unfinished correspondence`: 그 스레드가 보낸 열린 보고를 읽고, 하나씩 `resolve ID --state done --note "..."`로 처리한다.
+- `running_process_cwd`: Desktop의 `node_repl` 도우미가 아닌 프로세스가 작업 폴더를 CWD로 쓰고 있다. `lsof`로 찾고, 멈추기 전에 그 주인에게 묻는다.
+- 큐를 쓸 수 없다(`not_archived`): `lsof -t -- ~/.codex/queue_1.sqlite`를 확인한다. 소유자가 둘 이상이면 보통 어떤 스레드가 CUA로 자기 `codex app-server`를 띄운 것이다(#210). 그 프로세스는 주인의 승인을 받은 뒤에만 멈춘다.
+- 보관 비트는 켜져 있는데 rollout이 아직 `sessions/`에 있는 스레드는 지금은 Agent Bridge로 닫을 수 없다. 큐가 보관된 스레드로 보고 거절한다. 그대로 두고 보고한다.
+
+`--handoff`와 등록된 담당자는 그것을 설정한 소유자에게 계속 열려 있다. [세션 닫기](usage.md#세션-닫기) 참고.
 
 `archive-sweep --cwd-prefix /absolute/workspace`로 Codex 보관 후보와 거부 사유를 읽기 전용으로 확인한다. 비공개 JSON을 검토한 뒤 `archive-sweep --apply --manifest FILE`로 적용한다. Codex 종료는 네이티브 보관(보관 비트와 `archived_sessions`로 옮겨진 rollout)을 확인하며 Codex 상태에 쓰지 않는다. 일괄 보관은 보관 비트를 다시 읽어 확인한다. 되돌리기는 하위 스레드에도 영향을 줄 수 있다. [Codex 일괄 보관](usage.md#codex-일괄-보관).
 
