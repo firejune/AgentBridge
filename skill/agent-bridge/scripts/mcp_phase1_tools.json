@@ -2805,6 +2805,10 @@
                   },
                   "replayed": {
                     "type": "boolean"
+                  },
+                  "reason": {
+                    "type": "string",
+                    "description": "Current Desktop queue owner refusal when a Codex reply stays pending."
                   }
                 },
                 "required": [

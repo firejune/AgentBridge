@@ -304,6 +304,17 @@ class InboxIntegrationTests(unittest.TestCase):
             self.assertEqual(self.data('bridge_message_reply', **args), dict(first, replayed=True))
             push.assert_called_once()
 
+    def test_pending_codex_reply_includes_queue_owner_refusal(self):
+        args = self.reply_args(self.send('fixture'))
+        detail = 'No unique local Desktop queue owner. Queue holders: pid 4242, pid 4243.'
+
+        def refuse(message):
+            raise phase.delivery.QueueOwnerPushFailed(detail, message)
+
+        with patch.object(self.engine.backend, 'push_inbox_reply', side_effect=refuse):
+            result = self.data('bridge_message_reply', **args)
+        self.assertEqual((result['delivery_state'], result['reason']), ('pending', detail))
+
     def test_independent_without_send_operation_and_no_implicit_ack(self):
         message = self.send('not a grant of authority')
         before = self.running.call('show', id=message['id'])

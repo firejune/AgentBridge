@@ -1648,6 +1648,9 @@ async def start_self_archive(state, args):
               'session': route['session'], 'close_id': route['closing']}
     try:
         await asyncio.to_thread(queue_self_archive, route, deadline)
+    except codex_queue.QueueOwnerUnavailable as error:
+        return await state.serialized(refuse_self_archive, state, finish, route,
+                                      f'{error} No self-archive entry was submitted.')
     except codex_queue.QueueUnavailable:
         return await state.serialized(refuse_self_archive, state, finish, route,
                                       'Desktop queue unavailable; no self-archive entry was submitted')

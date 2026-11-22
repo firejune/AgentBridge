@@ -29,6 +29,7 @@ UID = str(os.getuid())
 HELPER = (str(codex_queue.APP) + '/Contents/Frameworks/Codex Framework.framework/Versions/158.0/'
           'Helpers/Codex (Aperitif).app/Contents/MacOS/Codex (Aperitif)')
 SERVER = f'{codex_queue.CLI} app-server --analytics-default-enabled'
+CUA_SERVER = f'{codex_queue.CLI} app-server --listen stdio://'
 OVERRIDES = ('CODEX_HOME', 'CODEX_SQLITE_HOME', 'CODEX_EXEC_SERVER_URL', 'AGENT_BRIDGE_CODEX_IPC')
 
 
@@ -67,6 +68,42 @@ class QueueOwnerTests(unittest.TestCase):
         for name, read in cases.items():
             with self.subTest(case=name):
                 self.assertIsNone(codex_queue.desktop_queue_owner('queue', read))
+
+    def test_conflict_lists_unique_holders_with_verified_roles_and_elapsed_time(self):
+        def read(argv):
+            if argv[0].endswith('lsof'):
+                return '4244\n4243\n4242\n4243\n'
+            if argv[-1].endswith('command='):
+                self.assertEqual(argv[3], '4242,4243,4244')
+                wrapper_exec = codex_queue.CLI_BUNDLE.parent / 'bin/..' / codex_queue.CLI.relative_to(
+                    codex_queue.CLI_BUNDLE.parent)
+                return (f'4242 {UID} 77 02:03:04 {codex_queue.CLI} -c key=value app-server\n'
+                        f'4243 {UID} 78 01:05 {wrapper_exec} app-server --listen stdio://\n'
+                        f'4244 {UID} 79 01:06 {CUA_SERVER} PRIVATE_ARGUMENT\n')
+            return (f'77 {UID} {HELPER}\n78 {UID} {codex_queue.NODE_REPL}\n'
+                    f'79 {UID} /tmp/node_repl\n4242 {UID} {codex_queue.CLI}\n'
+                    f'4243 {UID} {codex_queue.CLI}\n4244 {UID} /tmp/codex\n')
+        with self.assertRaises(codex_queue.QueueOwnerUnavailable) as raised:
+            codex_queue.desktop_queue_owner('queue', read, explain=True)
+        detail = str(raised.exception)
+        self.assertIn('pid 4242 (Desktop app-server, parent pid 77, elapsed 02:03:04)', detail)
+        self.assertIn('pid 4243 (bundled node_repl app-server (CUA), parent pid 78, elapsed 01:05)', detail)
+        self.assertIn('pid 4244 (unverified, parent pid 79, elapsed 01:06)', detail)
+        self.assertEqual(detail.count('pid 4243'), 1)
+        self.assertIn("Stop it only with the owner's approval.", detail)
+        for private in (str(codex_queue.CLI), str(codex_queue.NODE_REPL), 'PRIVATE_ARGUMENT'):
+            self.assertNotIn(private, detail)
+
+    def test_refusal_retains_pids_when_processes_exit_and_handles_zero_holders(self):
+        def disappeared(argv):
+            if argv[0].endswith('lsof'):
+                return '4242\n4243\n'
+            raise subprocess.CalledProcessError(1, argv)
+        with self.assertRaisesRegex(codex_queue.QueueOwnerUnavailable,
+                                    r'pid 4243 \(unverified, parent pid unknown, elapsed unknown\)'):
+            codex_queue.desktop_queue_owner('queue', disappeared, explain=True)
+        with self.assertRaisesRegex(codex_queue.QueueOwnerUnavailable, 'No process holds the queue store'):
+            codex_queue.desktop_queue_owner('queue', processes(''), explain=True)
 
 
 class QueueNoticeTests(unittest.TestCase):
@@ -292,7 +329,7 @@ class DefaultDesktopFixture(unittest.TestCase):
                 (codex_queue, 'checked_output', checked),
                 (codex_preview, 'state_path', lambda executable: self.state),
                 (codex_preview, 'require_owned_store', self.owned.append),
-                (codex_queue, 'desktop_queue_owner', lambda queue, read=None: ('4242', '77', HELPER))):
+                (codex_queue, 'desktop_queue_owner', lambda queue, read=None, **kwargs: ('4242', '77', HELPER))):
             patcher = patch.object(target, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -336,8 +373,8 @@ class QueueRouteTests(DefaultDesktopFixture):
         with self.assertRaises(ThreadArchived):
             codex_queue.check_route(self.route)
         self.saved = (str(self.cwd), 0)
-        with patch.object(codex_queue, 'desktop_queue_owner', lambda queue, read=None: None):
-            with self.assertRaisesRegex(ValueError, 'no unique local Desktop queue owner'):
+        with patch.object(codex_queue, 'desktop_queue_owner', return_value=None):
+            with self.assertRaisesRegex(ValueError, 'No unique local Desktop queue owner'):
                 codex_queue.check_route(self.route)
 
 
