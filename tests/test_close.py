@@ -438,6 +438,19 @@ class CloseCodexTests(unittest.TestCase):
         self.assertEqual(self.archive_flags()[self.sid], 0)
         self.assertEqual(self.server.call('routes', project='p')[0]['closing'], prepared['close_id'])
 
+    def test_a_claim_during_the_saved_state_write_keeps_the_route(self):
+        # The claim check runs again inside the serialized commit: a claim that lands while the
+        # saved state is written keeps the route and the operator's request (#196).
+        import asyncio
+        import broker
+        route = {'project': 'p', 'name': 'target', 'session': self.sid, 'closing': 'c'}
+        claimed = {'state': 'in_progress'}
+        state = mock.Mock(closing_route=mock.Mock(return_value=route), close_message=mock.Mock(return_value=claimed))
+        with self.assertRaisesRegex(ValueError, 'claimed'):
+            asyncio.run(broker.commit_close(state, {'saved_state': True}, route))
+        state.routing_remove.assert_not_called()
+        state.commit_action.assert_not_called()
+
     def test_saved_state_release_keeps_a_failed_dispatch_record(self):
         self.enroll()
         # The operator was reachable at preflight and archived before the dispatch.

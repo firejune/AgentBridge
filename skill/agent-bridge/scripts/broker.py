@@ -1513,6 +1513,12 @@ class State:
         return current
 
 
+def refuse_claimed_release(state, route):
+    message = state.close_message(route['closing'])
+    if message is not None and message['state'] == 'in_progress':
+        raise ValueError('The close operator has claimed this archive; wait for it or finish natively')
+
+
 def release_saved_state(route):
     """Archive the exact reserved thread in saved state, as a direct close does, and read it back.
 
@@ -1537,9 +1543,7 @@ async def finish_close(state, args):
         raise ValueError('saved_state must be a boolean')
     if saved_state:
         # Release a reservation the operator never took (#196). A claimed request is the operator's.
-        message = state.close_message(route['closing'])
-        if message is not None and message['state'] == 'in_progress':
-            raise ValueError('The close operator has claimed this archive; wait for it or finish natively')
+        refuse_claimed_release(state, route)
     verify = release_saved_state if saved_state else codex_preview.verify_archive
     try:
         await asyncio.wait_for(asyncio.to_thread(verify, route), timeout)
@@ -1551,6 +1555,8 @@ async def finish_close(state, args):
 async def commit_close(state, args, route):
     if state.closing_route(args) != route:
         raise ValueError('Endpoint changed during archive verification')
+    if args.get('saved_state'):
+        refuse_claimed_release(state, route)  # A claim can land while the saved state is written.
     if 'closing_native_scope' in route:
         state.check_native_close(route, route['closing_native_scope'])
 
