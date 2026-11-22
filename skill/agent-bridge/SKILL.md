@@ -167,7 +167,7 @@ python3 "$bridge_cli" policy                                    # Show enforced 
 
 - **Policy**: Stored in `<state-dir>/policy.json` (e.g., `{"defaults": {"agy": "gemini-4-argon-medium"}, "deny": {"codex": ["gpt-6-astra"]}}`). Only a human edits `policy.json`. While absent, the seed denylist `{"codex": ["gpt-6-astra"]}` applies.
 - **Antigravity (`agy`)**: Reads the last generator's `plannerConfig`. Switching is accepted while idle, preserves existing planner fields, and runs **one real turn on the new model** (2–8 generators, 10–90 s; reports `generators_spent` and `busy_after`). Do not resend if `busy_after: true`; wait for idle.
-- **Codex (`codex`)**: Reads and updates the exact Desktop owner's **next-turn model settings** (`thread-follower-update-thread-settings`) without interrupting an active turn.
+- **Codex (`codex`)**: Reads and updates the exact Desktop owner's **next-turn model settings** (`thread-follower-update-thread-settings`) without interrupting an active turn. If the default local IPC socket is missing or unserved, readback names the registered Desktop rollout as its source and reports the last recorded turn model.
 - **Claude (`claude-peer`)**: Reads the newest assistant message in the transcript. Desktop switching relays `set_session_model` through a `command_post` route configured in `policy.json` (`{"command_post": {"claude": "<route>"}}`); the switch result (`applies: next turn`) is authoritative even while transcript reads still show the previous turn's model. VS Code / IDE model switching is `unsupported (STOP)`.
 
 ## Checking Usage Limits

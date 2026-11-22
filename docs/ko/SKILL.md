@@ -161,7 +161,7 @@ python3 "$bridge_cli" policy                                    # 적용 중인 
 
 - **정책**: `<state-dir>/policy.json`(예: `{"defaults": {"agy": "gemini-4-argon-medium"}, "deny": {"codex": ["gpt-6-astra"]}}`)에 저장하며 사람만 수정한다. 파일이 없을 때는 시드 거부 목록 `{"codex": ["gpt-6-astra"]}`가 적용된다.
 - **Antigravity (`agy`)**: 마지막 generator의 `plannerConfig`를 읽는다. 전환은 대기 중일 때만 허용되며, 기존 플래너 설정을 유지한 채 `requestedModel`만 바꿔 **새 모델로 실제 턴 1회**를 실행한다(실측 generator 2–8개, 10–90초; `generators_spent`·`busy_after` 보고). `busy_after: true`면 전환은 완료된 것이므로 다시 보내지 말고 대기 상태가 될 때까지 기다린다.
-- **Codex (`codex`)**: 정확한 데스크톱 소유자의 **다음 턴 모델 설정**을 읽고 `thread-follower-update-thread-settings`로 전환 후 재조회로 검증한다. 진행 중인 턴은 끊지 않는다.
+- **Codex (`codex`)**: 정확한 데스크톱 소유자의 **다음 턴 모델 설정**을 읽고 `thread-follower-update-thread-settings`로 전환 후 재조회로 검증한다. 진행 중인 턴은 끊지 않는다. 기본 로컬 IPC 소켓이 없거나 수신 서버가 없으면 등록된 데스크톱 롤아웃의 마지막 모델과 출처를 표시한다.
 - **Claude (`claude-peer`)**: 대화 기록의 최신 assistant 메시지에서 모델을 읽는다. 데스크톱 세션 전환은 `policy.json`에 지정된 `command_post` 세션(`{"command_post": {"claude": "<경로>"}}`)을 통해 `set_session_model`을 중계하며, 전환 응답(`applies: next turn`)이 확정 결과다(한 턴이 돌기 전까지 기록 조회에 이전 모델이 보여도 재전환하지 않는다). VS Code / IDE 세션 전환은 `unsupported (STOP)`다.
 
 ## 사용량 확인

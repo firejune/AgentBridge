@@ -187,6 +187,7 @@ class CodexModelsTest(unittest.TestCase):
                 patch.object(bridge.broker, 'request', side_effect=broker_request):
             code, out = self.cli('model', 'worker', '--project', 'demo')
             self.assertEqual((code, out['name'], out['model'], out['denied']), (0, 'worker', ASTRA, True))
+            self.assertEqual(out['source'], 'Desktop owner resumed model settings (next turn)')
             code, out = self.cli('routes', '--project', 'demo')
             self.assertEqual((code, out[0]['model']['model'], out[0]['model']['denied']), (0, ASTRA, True))
             desktop.model = SOL
@@ -197,6 +198,28 @@ class CodexModelsTest(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertNotIn('model', out[0])
             self.assertEqual(len(desktop.calls), count)
+
+    def test_cli_model_uses_saved_readback_only_for_absent_default_ipc(self):
+        unavailable = models.codex_live.EndpointUnavailable
+        for endpoint, reason, fallback in (
+                (unavailable.DEFAULT, unavailable.MISSING, True),
+                (unavailable.DEFAULT, unavailable.REFUSED, True),
+                (unavailable.DEFAULT, unavailable.UNSAFE, False),
+                (unavailable.CONFIGURED, unavailable.REFUSED, False)):
+            failure = unavailable(endpoint, reason)
+            with self.subTest(endpoint=endpoint, reason=reason), \
+                    patch.object(bridge.broker, 'request', return_value=[self.route]), \
+                    patch.object(models.codex_live, 'Client', side_effect=failure), \
+                    patch.object(models.codex_wake_open, 'read_saved_model', return_value=ASTRA) as saved:
+                code, out = self.cli('model', 'worker', '--project', 'demo')
+                self.assertEqual(code, 0)
+                if fallback:
+                    saved.assert_called_once_with(self.route)
+                    self.assertEqual((out['model'], out['source'], out['denied']),
+                                     (ASTRA, 'Desktop rollout turn_context (last recorded turn)', True))
+                else:
+                    saved.assert_not_called()
+                    self.assertEqual((out['model'], out['reason']), ('unknown', str(failure)))
 
     def test_cli_switch_keeps_uncertainty_and_denial_before_dispatch(self):
         with patch.object(bridge.broker, 'request', return_value=[self.route]), \
