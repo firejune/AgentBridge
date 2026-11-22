@@ -14,7 +14,6 @@ import uuid
 import agy_live
 import broker
 import codex_live
-import codex_preview
 from message_store import ARCHIVED_REASON
 import sessions
 
@@ -474,15 +473,7 @@ def push_codex(path, m, timeout=10, dry_run=False, *, close_dispatch=False, guar
         result = settle_submission(rpc, 'Codex Desktop queue accepted the Agent Bridge notification')
         return {**result, 'delivery_path': receipt['delivery_path']}
     result = settle_submission(rpc, f"Codex {receipt['delivery_mode']} tool output accepted by turn {receipt['turn_id']}")
-    if close_request is not None:
-        return result
-    # Delivery is already terminally accepted before optional sidebar metadata.
-    # Keep warnings out of correspondence state and never replay a task for them.
-    try:
-        result['preview'] = codex_preview.initialize(m['route'], m['body'])
-    except Exception:
-        # Optional metadata must never obscure known delivery acceptance.
-        result['preview'] = codex_preview.unavailable('metadata initialization failed; delivery remains accepted')
+    # Agent Bridge never writes Codex state, so no sidebar metadata follows acceptance (#212).
     return result
 
 

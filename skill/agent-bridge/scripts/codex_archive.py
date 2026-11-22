@@ -321,21 +321,6 @@ def invoke(binary, timeout, method, sid, before_call=None):
     return before, error
 
 
-def archive_saved_state(path, sid, cwd):
-    """Set the archive bit of one exact thread in the saved state; the caller reads it back.
-
-    Desktop holds the writer of every thread it has loaded, so a second app-server cannot archive a
-    session that has just run (issue #175). This is what `close --archive` did before the native call.
-    """
-    codex_preview.require_owned_store(path)
-    try:
-        with closing(sqlite3.connect(path.as_uri() + '?mode=rw', uri=True, timeout=5)) as connection, connection:
-            connection.execute('UPDATE threads SET archived=1, archived_at=? WHERE id=? AND cwd=? AND archived=0',
-                               (int(time.time()), sid, cwd))
-    except sqlite3.Error:
-        raise ValueError('Saved Codex state could not be written') from None
-
-
 def readback(path, before, sid):
     after = Snapshot(path)
     affected = before.descendants(sid) | after.descendants(sid) | {sid}
@@ -480,9 +465,9 @@ def archive_group(binary, path, directory, prefix, item, timeout, close_route=No
                 return receipts, False
             receipt['provider_error'] = error
             if close_route is not None and (error or {}).get('active_writer'):
-                # Only an explicit close of a named route takes this path; a sweep stays refused.
-                archive_saved_state(path, sid, before.rows[sid]['cwd'])
-                receipt['method'] = 'saved_state'
+                # Desktop holds the thread's writer. Agent Bridge never writes Codex state (#212):
+                # the thread stays open and the route is kept until Codex archives it natively.
+                receipt['reason'] = 'desktop_holds_thread'
             after, affected = readback(path, before, sid)
             late = {key for key in affected - subtrees[sid] - {sid} if after.rows[key]['archived']
                     and not before.rows.get(key, {}).get('archived')}
@@ -556,10 +541,22 @@ def close(route, directory, timeout, *, prefer_native=None):
                                          defer_native_root=defer_native_root)
     final = next((result for result in results if result['id'] == sid), {})
     archived = final.get('archived') is True or final.get('status') == 'already_archived'
+    note = 'Native Codex archive verified: archive bit and rollout under archived_sessions.'
+    if archived:
+        # The bit alone is not an archive: Codex moves the rollout when it archives natively (#212).
+        try:
+            codex_preview.verify_archive(route, path=path)
+        except ValueError:
+            archived = False
+            final['status'] = 'not_archived'
+            final['reason'] = 'rollout_not_archived'
+            note = 'Codex archive not verified: the rollout is not under archived_sessions. Closing route kept.'
+    elif final.get('reason') == 'desktop_holds_thread':
+        note = 'Codex Desktop holds this thread; it was not archived and the route is kept.'
     incomplete = any(result['status'] not in ('archived', 'already_archived') for result in results)
     result = {'closed': archived, 'method': 'archive', 'archived': archived,
             'session': sid, 'host': 'codex', 'archived_at': final.get('archived_at', row['archived_at']),
-            'resumable': True, 'note': 'Native Codex archive checked by saved-state readback.',
+            'resumable': True, 'note': note,
             'results': results, 'stopped': stopped, 'archive_incomplete': incomplete,
             'count': sum(result.get('archived') is True for result in results)}
     if final.get('status') == 'awaiting_native_archive':
