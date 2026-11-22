@@ -701,7 +701,7 @@ def self_archive_result(args, address, closed):
               'session': closed['session'], 'close_id': closed['closing']}
     result.update({key: closed[key] for key in ('route_removed', 'correspondence_cleanup',
                    'cleanup_error', 'route_error', 'retro_id', 'store', 'retro_recorded',
-                   'retro_error', 'notification', 'reason') if key in closed})
+                   'retro_error', 'notification', 'reason', 'wake_requested', 'wake_reason') if key in closed})
     if 'retro_message' in closed:
         push_retro_notification(args, result, closed['retro_message'])
     return result
