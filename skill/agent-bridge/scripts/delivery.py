@@ -421,6 +421,15 @@ def push_if_peer(path, m):
     return m
 
 
+def settle_submission(rpc, note):
+    result = rpc('finish', state='submitted', event='pushed', note=note)
+    # A finish after dispatch expiry or broker restart can return the current
+    # record without committing the requested transition.
+    if result['state'] not in DELIVERED:
+        raise PushFailed('Broker did not confirm delivery. Inspect the message before resolving.', result)
+    return result
+
+
 def push_codex(path, m, timeout=10, dry_run=False, *, close_dispatch=False, guarded_close=False):
     def rpc(op, **fields):
         return broker.request(path, {'op':op, 'id':m['id'], **fields})
@@ -462,11 +471,9 @@ def push_codex(path, m, timeout=10, dry_run=False, *, close_dispatch=False, guar
     if dry_run:
         return dict(state=m['state'], **receipt)
     if receipt['delivery_mode'] == 'queue':
-        result = rpc('finish', state='submitted', event='pushed',
-                     note='Codex Desktop queue accepted the Agent Bridge notification')
+        result = settle_submission(rpc, 'Codex Desktop queue accepted the Agent Bridge notification')
         return {**result, 'delivery_path': receipt['delivery_path']}
-    result = rpc('finish', state='submitted', event='pushed',
-                 note=f"Codex {receipt['delivery_mode']} tool output accepted by turn {receipt['turn_id']}")
+    result = settle_submission(rpc, f"Codex {receipt['delivery_mode']} tool output accepted by turn {receipt['turn_id']}")
     if close_request is not None:
         return result
     # Delivery is already terminally accepted before optional sidebar metadata.
@@ -498,5 +505,4 @@ def push_agy(path, m, timeout=10, dry_run=False):
     except BaseException:
         rpc('finish', state='uncertain', note='Antigravity delivery interrupted; check the receiving session before resolving')
         raise
-    return rpc('finish', state='submitted', event='pushed',
-               note=f"pushed to Antigravity session {receipt['session']} (pid {receipt['pid']})")
+    return settle_submission(rpc, f"pushed to Antigravity session {receipt['session']} (pid {receipt['pid']})")
