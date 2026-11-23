@@ -48,6 +48,11 @@ class QueueOwnerUnavailable(QueueUnavailable):
         super().__init__(self.SUMMARY, detail=f'{self.SUMMARY} {detail}')
 
 
+class QueueWorkspaceMismatch(QueueUnavailable):
+    def __init__(self):
+        super().__init__('Codex Desktop queue saved workspace differs from the route cwd.')
+
+
 # Read-only probes (ps, lsof, codesign). Two seconds was not enough on a loaded machine (#239).
 PROBE_TIMEOUT = 10
 
@@ -228,6 +233,18 @@ def check_route(route):
         configured_state = codex_preview.state_path(str(CLI))
     if configured_state != state:
         raise QueueUnavailable('Codex Desktop queue requires the default native state store.')
+    saved, archived = check_saved_route(route, state)
+    if archived:
+        raise ThreadArchived()
+    if not saved.is_dir():
+        raise missing_workspace(Path(route['cwd']))
+    with queue_check('Codex Desktop queue store is unavailable or is not owned and protected.'):
+        codex_preview.require_owned_store(queue)
+    if desktop_queue_owner(queue, checked_output, explain=True) is None:
+        raise QueueOwnerUnavailable('The queue holder could not be verified.')
+
+
+def check_saved_route(route, state):
     with queue_check('Codex Desktop queue could not verify the saved thread metadata.'):
         if route.get('closing_self_archive'):
             with codex_preview.private_store_copy(state) as copy:
@@ -237,15 +254,8 @@ def check_route(route):
     with queue_check('Codex Desktop queue could not verify the saved and registered workspaces.'):
         saved, registered = Path(cwd), Path(route['cwd'])
         if not saved.is_absolute() or not registered.is_absolute() or saved.resolve() != registered.resolve():
-            raise QueueUnavailable('Codex Desktop queue saved workspace differs from the route cwd.')
-        if archived:
-            raise ThreadArchived()
-        if not saved.is_dir():
-            raise missing_workspace(registered)
-    with queue_check('Codex Desktop queue store is unavailable or is not owned and protected.'):
-        codex_preview.require_owned_store(queue)
-    if desktop_queue_owner(queue, checked_output, explain=True) is None:
-        raise QueueOwnerUnavailable('The queue holder could not be verified.')
+            raise QueueWorkspaceMismatch()
+    return saved, archived
 
 
 def check_available(route):

@@ -1,9 +1,12 @@
 """MCP facade delivery through real pushes (issue #202)."""
+from contextlib import closing, contextmanager
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -175,118 +178,187 @@ class RealMcpDeliveryTests(unittest.TestCase):
         self.assertEqual(stored['failure']['message'], refusal.summary)
         self.assertNotIn(self.root, stored['failure']['message'])
 
-    def test_idle_closed_claude_and_offline_codex_refused_before_post_current_behavior(self):
-        # 1a. Idle-closed Claude session: dead pid in registry + desktop metadata ready to wake.
-        host_sid = 'local_a1b2c3d4'
+    def idle_claude(self, *, cwd=None, archived=False, host='local_a1b2c3d4'):
         self.fake_claude(pid=dead_pid(), listen=False,
-                         extra={'entrypoint': 'claude-desktop', 'hostSessionId': host_sid})
+                         extra={'entrypoint': 'claude-desktop', 'hostSessionId': host})
         desktop_dir = Path(self.root) / 'desktop'
-        desktop_dir.mkdir()
-        (desktop_dir / f'{host_sid}.json').write_text(json.dumps({
-            'sessionId': host_sid, 'cliSessionId': self.claude_sid,
-            'isArchived': False, 'cwd': self.root,
+        desktop_dir.mkdir(exist_ok=True)
+        (desktop_dir / f'{host}.json').write_text(json.dumps({
+            'sessionId': host, 'cliSessionId': self.claude_sid,
+            'isArchived': archived, 'cwd': cwd or self.root,
         }))
-        env = {
-            'CLAUDE_CONFIG_DIR': self.root,
-            'CLAUDE_DESKTOP_SESSIONS_DIR': str(desktop_dir),
-        }
-        with patch.dict(os.environ, env):
+        return host, {'CLAUDE_CONFIG_DIR': self.root, 'CLAUDE_DESKTOP_SESSIONS_DIR': str(desktop_dir)}
+
+    @contextmanager
+    def offline_codex(self, *, cwd=None, archived=False, default_broker=True):
+        state = Path(self.root) / 'state_5.sqlite'
+        with closing(sqlite3.connect(state)) as database, database:
+            database.execute('CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, archived INTEGER)')
+            database.execute('INSERT INTO threads VALUES (?, ?, ?)', (self.codex_sid, cwd or self.root, archived))
+        queue = state.with_name('queue_1.sqlite')
+        queue.touch()
+        endpoint = phase.codex_live.EndpointUnavailable
+        broker_path = self.running.path if default_broker else self.root + '/other.sock'
+        with (patch.dict(os.environ, {'CODEX_HOME': self.root}),
+              patch.object(broker, 'DEFAULT_SOCKET', Path(broker_path)),
+              patch.object(sessions, 'resolve_codex_peer', side_effect=sessions.DiscoveryError),
+              patch.object(phase.codex_live.Client, 'connect', side_effect=endpoint(endpoint.DEFAULT, endpoint.MISSING)),
+              patch.object(codex_queue, 'default_stores', return_value=(state, queue)),
+              patch.object(codex_queue, 'verify_signature'),
+              patch.object(codex_queue.codex_preview, 'state_path', return_value=state),
+              patch.object(codex_queue, 'desktop_queue_owner', return_value=123),
+              patch.object(codex_queue, 'enqueue', return_value=str(uuid.uuid4())) as enqueue,
+              patch('codex_wake_open.request_queued_wake') as wake):
+            yield enqueue, wake
+
+    def send_fixture(self, session, key):
+        return self.call('bridge_message_send', agent_session_id=session['id'],
+                         message='MCP send fixture', idempotency_key=key)
+
+    def test_idle_closed_claude_wakes_once_and_pushes_once(self):
+        host, env = self.idle_claude()
+
+        def open_wake(url, timeout=10):
+            self.assertEqual(url, f'claude://claude.ai/epitaxy/{host}')
+            self.assertEqual(self.running.call('ping')['messages'], 1)
+            self.fake_claude(extra={'entrypoint': 'claude-desktop', 'hostSessionId': host})
+
+        with patch.dict(os.environ, env), patch.object(sessions, 'open_url_background', side_effect=open_wake) as opener:
             self.assertEqual(self.backend.availability(self.claude_pin), 'unavailable')
-            refused = self.call('bridge_message_send',
-                                agent_session_id=self.claude_pin['id'],
-                                message='MCP send to idle-closed claude',
-                                idempotency_key='idle-claude-mcp-01')
-            self.assertEqual(refused, {
-                'ok': False,
-                'error': {'code': 'BACKEND_UNAVAILABLE', 'message': 'Backend unavailable', 'retryable': False},
-            })
-            self.assertEqual(self.engine.rows(), [])
+            accepted = self.send_fixture(self.claude_pin, 'idle-claude-mcp-01')
+            self.assertTrue(accepted['ok'], accepted)
+            opener.assert_not_called()
             self.assertEqual(self.running.call('ping')['messages'], 0)
-
-            # Contrast: CLI send posts and wakes the idle-closed session inside delivery.push.
-            woken = []
-            def open_wake(url, timeout=10):
-                woken.append(url)
-                for p in (Path(self.root) / 'sessions').glob('*.json'):
-                    p.unlink()
-                self.fake_claude(extra={'entrypoint': 'claude-desktop', 'hostSessionId': host_sid})
-
-            out = io.StringIO()
-            with patch.object(sessions, 'open_url_background', side_effect=open_wake), \
-                    patch('sys.stdin', io.StringIO('CLI wakes idle claude')), \
-                    patch('sys.stdout', out):
-                code = bridge.main(['--socket', self.running.path, 'send', '--project', self.project,
-                                    '--from', self.claude_pin['sender'], '--to', 'claude-worker',
-                                    '--key', 'cli-wake-claude', '--file', '-'])
-            self.assertEqual(code, 0, out.getvalue())
-            self.assertEqual(woken, [f'claude://claude.ai/epitaxy/{host_sid}'])
-            cli_msg = json.loads(out.getvalue())
-            shown = self.running.call('show', id=cli_msg['id'])
-            self.assertEqual(shown['state'], 'submitted')
-            self.assertEqual(shown['events'][-1]['event'], 'pushed')
-            self.assertIn('after wake (woken)', shown['note'])
+            self.engine.tick()
+            self.assertTrue(self.send_fixture(self.claude_pin, 'idle-claude-mcp-01')['data']['replayed'])
+            self.engine.tick()
+            opener.assert_called_once()
+            operation = self.engine.operation(accepted['data']['operation_id'], 'test-owner')
+            message = self.running.call('show', id=operation['backend_id'])
+            self.assertEqual(message['state'], 'submitted')
+            self.assertIn('after wake (woken)', message['note'])
             self.assertEqual(len(self.fakes[-1].received), 1)
 
-        # 1b. Offline Codex thread: no live IPC owner, while CLI on default socket can queue.
-        codex_Read = {'session': {'provider': 'codex', 'id': self.codex_sid,
-                                  'cwd': self.root, 'status': 'unknown', 'runtime_observed': False}}
-        with FakeDesktop('no-owner') as desktop, \
-                patch.dict(os.environ, {'AGENT_BRIDGE_CODEX_IPC': desktop.path}), \
-                patch.object(sessions, 'read_codex', return_value=codex_Read):
-            self.assertEqual(self.backend.availability(self.codex_pin), 'unavailable')
-            refused_codex = self.call('bridge_message_send',
-                                      agent_session_id=self.codex_pin['id'],
-                                      message='MCP send to offline codex',
-                                      idempotency_key='offline-codex-mcp-01')
-            self.assertEqual(refused_codex, {
-                'ok': False,
-                'error': {'code': 'BACKEND_UNAVAILABLE', 'message': 'Backend unavailable', 'retryable': False},
-            })
-            self.assertEqual(self.engine.rows(), [])
-            self.assertEqual(self.running.call('ping')['messages'], 1)  # Only the CLI claude message above.
-
-        # Contrast: CLI send on the default broker socket queues when the default IPC endpoint is absent.
-        default_missing = phase.delivery.codex_live.EndpointUnavailable(
-            phase.delivery.codex_live.EndpointUnavailable.DEFAULT,
-            phase.delivery.codex_live.EndpointUnavailable.MISSING,
-        )
-        out_codex = io.StringIO()
-        with patch.object(broker, 'DEFAULT_SOCKET', Path(self.running.path)), \
-                patch.object(phase.delivery.codex_live.Client, 'connect', side_effect=default_missing), \
-                patch.object(phase.delivery.codex_live, 'exact_saved_workspace', return_value=(None, None)), \
-                patch('codex_queue.check_route'), \
-                patch('codex_queue.enqueue', return_value=str(uuid.uuid4())) as enqueue, \
-                patch('codex_wake_open.request_queued_wake'), \
-                patch.dict(os.environ, {'CODEX_HOME': self.root}), \
-                patch('sys.stdin', io.StringIO('CLI queues offline codex')), \
-                patch('sys.stdout', out_codex):
-            code_codex = bridge.main(['--socket', self.running.path, 'send', '--project', self.project,
-                                      '--from', self.codex_pin['sender'], '--to', 'codex-worker',
-                                      '--key', 'cli-queue-codex', '--file', '-'])
-        self.assertEqual(code_codex, 0, out_codex.getvalue())
-        enqueue.assert_called_once()
-        queued_msg = json.loads(out_codex.getvalue())
-        shown_codex = self.running.call('show', id=queued_msg['id'])
-        self.assertEqual(shown_codex['state'], 'submitted')
-        self.assertEqual(shown_codex['events'][-1]['event'], 'pushed')
-        self.assertEqual(shown_codex['note'], 'Codex Desktop queue accepted the Agent Bridge notification')
-
-        # If accepted while live and the session goes offline before dispatch tick, dispatch also refuses before post.
-        live_row = {'provider': 'codex', 'id': self.codex_sid, 'cwd': self.root, 'status': 'idle'}
-        with patch.object(sessions, 'resolve_codex_peer', return_value=live_row):
-            accepted = self.data('bridge_message_send',
-                                 agent_session_id=self.codex_pin['id'],
-                                 message='MCP queued then offline before post',
-                                 idempotency_key='offline-codex-mcp-02')
-        with FakeDesktop('no-owner') as desktop, \
-                patch.dict(os.environ, {'AGENT_BRIDGE_CODEX_IPC': desktop.path}), \
-                patch.object(sessions, 'read_codex', return_value=codex_Read):
+    def test_uncertain_claude_wake_stays_pending_without_blocking_or_resend(self):
+        _, env = self.idle_claude()
+        timeout = subprocess.TimeoutExpired(['open', '-g'], 1)
+        with (patch.dict(os.environ, env), patch.object(sessions, 'open_url_background', side_effect=timeout) as opener,
+              patch.object(phase.delivery, 'push_frame') as push):
+            accepted = self.send_fixture(self.claude_pin, 'uncertain-claude-wake')
+            self.assertTrue(accepted['ok'], accepted)
             self.engine.tick()
-        failed_op = self.data('bridge_operation_get', operation_id=accepted['operation_id'])
-        self.assertEqual((failed_op['status'], failed_op['failure']['code'], failed_op['backend_message_state']),
-                         ('failed', 'BACKEND_UNAVAILABLE', None))
-        self.assertIsNone(self.engine.operation(accepted['operation_id'], 'test-owner')['backend_id'])
-        self.assertEqual(self.running.call('ping')['messages'], 2)
+            operation = self.engine.operation(accepted['data']['operation_id'], 'test-owner')
+            self.assertEqual((operation['status'], operation['backend_message_state']), ('failed', 'pending'))
+            self.assertIn('wake uncertain', operation['failure']['message'])
+            message = self.running.call('show', id=operation['backend_id'])
+            self.assertEqual((message['state'], message['wakes'][-1]['state']), ('pending', 'uncertain'))
+            self.assertTrue(self.send_fixture(self.claude_pin, 'uncertain-claude-wake')['data']['replayed'])
+            self.engine.tick()
+            opener.assert_called_once()
+            push.assert_not_called()
+            self.assertTrue(self.send_fixture(self.claude_pin, 'new-claude-send-after-wake')['ok'])
+
+    def test_offline_codex_queues_once(self):
+        with self.offline_codex() as (enqueue, wake):
+            self.assertEqual(self.backend.availability(self.codex_pin), 'unavailable')
+            accepted = self.send_fixture(self.codex_pin, 'offline-codex-mcp-01')
+            self.assertTrue(accepted['ok'], accepted)
+            enqueue.assert_not_called()
+            wake.assert_not_called()
+            self.assertEqual(self.running.call('ping')['messages'], 0)
+            self.engine.tick()
+            self.assertTrue(self.send_fixture(self.codex_pin, 'offline-codex-mcp-01')['data']['replayed'])
+            self.engine.tick()
+            operation = self.engine.operation(accepted['data']['operation_id'], 'test-owner')
+            message = self.running.call('show', id=operation['backend_id'])
+            self.assertEqual(message['state'], 'submitted')
+            self.assertEqual(message['note'], 'Codex Desktop queue accepted the Agent Bridge notification')
+            enqueue.assert_called_once()
+            self.assertEqual(enqueue.call_args.args[0], self.codex_sid)
+            wake.assert_called_once_with(self.codex_sid)
+
+    def test_offline_discovered_only_is_refused_without_post(self):
+        found = dict(self.codex_pin, id=phase.opaque('as_'), alias='codex-ws',
+                     workspace=self.config['workspaces']['codex-ws'], pinned=False, discovered=True,
+                     route='unregistered', registered=False)
+        with self.offline_codex() as (enqueue, wake), patch.object(self.backend, 'discover', return_value={found['id']: found}):
+            refused = self.send_fixture(found, 'offline-discovered')
+            self.assertEqual(refused['error']['code'], 'BACKEND_UNAVAILABLE')
+            self.assertEqual(self.engine.rows(), [])
+            self.assertEqual(self.running.call('ping')['messages'], 0)
+            enqueue.assert_not_called()
+            wake.assert_not_called()
+
+    def test_codex_loses_queue_after_live_acceptance_and_post(self):
+        live = {'id': self.codex_sid, 'cwd': self.root, 'status': 'idle'}
+        with patch.object(sessions, 'resolve_codex_peer', return_value=live):
+            accepted = self.send_fixture(self.codex_pin, 'codex-queue-lost-after-post')
+        self.assertTrue(accepted['ok'], accepted)
+        original_post = self.backend.post
+        refusal = codex_queue.QueueOwnerUnavailable('The queue holder could not be verified.')
+        with self.offline_codex() as (enqueue, wake):
+            def post_then_lose_queue(op, session):
+                message = original_post(op, session)
+                owner.side_effect = refusal
+                return message
+
+            with (patch.object(codex_queue, 'desktop_queue_owner', return_value=123) as owner,
+                  patch.object(self.backend, 'post', side_effect=post_then_lose_queue)):
+                self.engine.tick()
+            enqueue.assert_not_called()
+            wake.assert_not_called()
+        operation = self.data('bridge_operation_get', operation_id=accepted['data']['operation_id'])
+        self.assertEqual((operation['status'], operation['backend_message_state']), ('failed', 'pending'))
+        self.assertEqual(operation['failure']['message'], str(refusal))
+        self.assertEqual(self.running.call('ping')['messages'], 1)
+
+    def test_running_claude_without_inbox_is_refused_without_post(self):
+        _, env = self.idle_claude()
+        self.fake_claude(listen=False, extra={'messagingSocketPath': None})
+        with patch.dict(os.environ, env), patch.object(sessions, 'open_url_background') as opener:
+            refused = self.send_fixture(self.claude_pin, 'claude-inbox-disabled')
+            self.assertEqual(refused['error']['code'], 'BACKEND_UNAVAILABLE')
+            self.assertIn('cross-session inbox off', refused['error']['message'])
+            self.assertEqual(self.engine.rows(), [])
+            self.assertEqual(self.running.call('ping')['messages'], 0)
+            opener.assert_not_called()
+
+    def test_ambiguous_idle_claude_is_refused_without_post(self):
+        _, env = self.idle_claude()
+        self.idle_claude(host='local_a1b2c3d5')
+        with patch.dict(os.environ, env), patch.object(sessions, 'open_url_background') as opener:
+            refused = self.send_fixture(self.claude_pin, 'ambiguous-claude-wake')
+            self.assertIn('not choosing one', refused['error']['message'])
+            self.assertEqual(self.engine.rows(), [])
+            self.assertEqual(self.running.call('ping')['messages'], 0)
+            opener.assert_not_called()
+
+    def test_offline_codex_refusal_preserves_reason_before_post(self):
+        for options, reason in (({'archived': True}, phase.codex_live.ThreadArchived.MESSAGE),
+                                ({'default_broker': False}, str(phase.codex_live.EndpointUnavailable(
+                                    phase.codex_live.EndpointUnavailable.DEFAULT, phase.codex_live.EndpointUnavailable.MISSING)))):
+            with self.subTest(options=options), self.offline_codex(**options) as (enqueue, wake):
+                refused = self.send_fixture(self.codex_pin, 'offline-codex-refused')
+                self.assertEqual(refused['error']['message'], reason)
+                self.assertEqual(self.engine.rows(), [])
+                self.assertEqual(self.running.call('ping')['messages'], 0)
+                enqueue.assert_not_called()
+                wake.assert_not_called()
+            (Path(self.root) / 'state_5.sqlite').unlink()
+
+    def test_saved_workspace_mismatch_is_route_binding_refusal(self):
+        _, env = self.idle_claude(cwd=self.root + '/other')
+        with (patch.dict(os.environ, env), patch.object(sessions, 'open_url_background') as opener,
+              self.offline_codex(cwd=self.root + '/other') as (enqueue, wake)):
+            for target in (self.claude_pin, self.codex_pin):
+                with self.subTest(target=target['agent_type']):
+                    refused = self.send_fixture(target, 'offline-wrong-workspace')
+                    self.assertEqual(refused['error']['message'], phase.ROUTE_CHANGED_MESSAGE)
+            self.assertEqual(self.engine.rows(), [])
+            self.assertEqual(self.running.call('ping')['messages'], 0)
+            opener.assert_not_called()
+            enqueue.assert_not_called()
+            wake.assert_not_called()
 
     def test_backend_check_failing_inside_push_after_post_closes_unknown_blocks_and_leaves_pending(self):
         fake = self.fake_claude()
