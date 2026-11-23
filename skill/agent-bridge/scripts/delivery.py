@@ -453,7 +453,6 @@ def push_codex(path, m, timeout=10, dry_run=False, *, close_dispatch=False, guar
             raise ValueError('Only pending messages may be delivered')
         rpc('claim', **({'close_id': close_request['close_id']} if close_request else {}))
     allow_queue = Path(path).expanduser() == broker.DEFAULT_SOCKET and (close_request is None or guarded_close)
-    deadline = time.monotonic() + timeout
     try:
         receipt = codex_live.deliver(
             m['route'], m['id'], peer_text(m, path, escape_peer=False), timeout, dry_run=dry_run,
@@ -490,7 +489,7 @@ def push_codex(path, m, timeout=10, dry_run=False, *, close_dispatch=False, guar
         if not reserved:
             return {**result, **broker.wake_not_requested('The broker did not confirm a new queue wake reservation')}
         try:
-            codex_wake_open.request_queued_wake(m['route']['session'], deadline - time.monotonic())
+            codex_wake_open.request_queued_wake(m['route']['session'])
         except codex_wake_open.WakeError as error:
             return {**result, **broker.wake_not_requested(str(error))}
         return {**result, 'wake_requested': True}

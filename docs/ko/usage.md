@@ -364,9 +364,9 @@ python3 "$bridge_cli" archive-sweep --apply --manifest archive-manifest.json
 
 종료 결과와 브로커의 `close_archive` 이벤트는 검증이 끝나면 `archive_path: "self_archive"`를 표시한다. 제출 전에 큐를 사용할 수 없으면 이유와 함께 `not_archived`를 반환하고 예약을 풀어 라우트를 유지한다. 보관 비트가 이미 설정돼 있어도 네이티브 보관 rollout까지 확인해야 완료로 처리한다. 브로커 소유자의 `policy.json`에 `"codex_self_archive": false`를 설정하면 직접 네이티브 보관을 사용한다.
 
-검증된 Desktop 빌드에서 자기 보관 큐 접수가 확인되면 종료 명령은 정확히 등록된 스레드에 깨우기를 한 번 요청하며, URL 열기에 성공하면 `wake_requested: true`를, 그 외에는 `wake_requested: false`와 `wake_reason`을 반환한다.
+자기 보관 큐 접수가 확인되면 브로커는 예약에 접수 확인을 기록하고, 검증된 Desktop 빌드에서 해당 스레드를 한 번 깨우도록 요청한다. 깨우기에는 별도의 10초 한도가 있다. URL 열기에 성공하면 `wake_requested: true`를, 그 외에는 `wake_requested: false`와 `wake_reason`을 반환한다.
 
-큐 접수가 불확실하거나 제한 시간 안에 보관을 확인하지 못하면 `"pending_self_archive"`와 예약된 `close_id`를 반환하고 종료 코드 1로 끝난다. 브로커가 재시작해도 라우트는 종료 중으로 유지된다. `close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID`로 네이티브 보관 상태를 확인하고 라우트를 정리한다. 이 예약에서 Codex 쪽 동작은 보관 상태 확인으로 끝난다. 이어서 대기 중인 회고를 기록한다.
+큐 접수가 불확실하거나 제한 시간 안에 보관을 확인하지 못하면 `"pending_self_archive"`와 예약된 `close_id`를 반환하고 종료 코드 1로 끝난다. 브로커가 재시작해도 라우트는 종료 중으로 유지된다. `close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID`로 네이티브 보관 상태를 확인하고 라우트를 정리한다. 보관이 아직 확인되지 않았고 예약에 큐 접수 확인이 기록되어 있으면, 같은 시간 한도로 깨우기를 한 번 요청한 뒤 보관을 다시 확인한다. 이미 보관이 확인됐거나, 큐 접수가 불확실하거나, 이전 예약에 접수 확인 기록이 없으면 `wake_requested: false`와 `wake_reason`을 반환한다. 보관을 확인한 뒤 대기 중인 회고를 기록한다.
 
 보호 조건 확인과 네이티브 보관은 별도 동작이다. 마지막 확인 뒤에 라우트, 프로세스 작업 경로, 활동, 하위 관계가 바뀔 수 있다. 저장 앱 서버 경로에서 검토 목록 밖 스레드가 새로 보관되면 해당 하위 스레드 UUID로 즉시 `thread/unarchive`를 호출해 결과를 다시 읽는다. `restored_unlisted`는 복구를 확인한 목록이다. 복구 실패, 다른 스레드의 보관 비트 변경, 상태 확인 불가를 감지하면 추가 보관을 중단하고 종료 코드 1을 반환한다. 자동 재시도는 없다. 저장 앱 서버 경로는 보관을 확인한 뒤 같은 Codex 프로필에서 실행할 `undo` 명령을 출력한다. 네이티브 보관 해제는 이미 보관되어 있거나 이후 보관된 하위 스레드에도 연쇄 적용될 수 있으며 일부만 처리될 수도 있다. 따라서 출력된 ID만 해제하거나 앞선 상태를 모두 복원한다고 보장할 수 없다. 실행 전에 현재 하위 집합을 검토한다. 일괄 보관과 직접 종료의 저장 상태 경로에서는 저장된 보관 비트를 확인한다. Desktop 종료 인계는 보관된 원문 파일까지 확인한다.
 

@@ -23,6 +23,7 @@ import codex_live
 import codex_preview  # Read-only Codex state helpers.
 import codex_new
 import codex_queue
+from codex_wake_open import QUEUED_WAKE_TIMEOUT
 # Keep the existing CLI imports of the shared delivery helpers available.
 from delivery import (
     ARCHIVED_REASON, BEHIND_GRACE, BUSY_CLAIM, DELIVERED, FRESH_SESSION,
@@ -558,7 +559,7 @@ def close_participant(args):
             raise ValueError('Record the retrospective when preparing the archive handoff')
         request = {'op': 'close-finish', **address, 'close_id': str(uuid.UUID(args.finish)),
                    'session': str(uuid.UUID(args.expect_session)), 'timeout': args.timeout}
-        closed = broker.request(args.socket, request, timeout=args.timeout + 5)
+        closed = broker.request(args.socket, request, timeout=args.timeout + QUEUED_WAKE_TIMEOUT + 5)
         if 'archive_path' in closed:
             return self_archive_result(args, address, closed)
         result = {**address, 'transport': 'codex', 'method': 'archive', 'archived': True, 'resumable': True,
@@ -642,7 +643,7 @@ def close_participant(args):
             closed = broker.request(args.socket, {'op': 'close-self-archive', **address, 'expected_route': route,
                                                   'native_scope': scope, 'timeout': args.timeout,
                                                   'retro': {'store': str(path.absolute()), 'row': row, 'target': target}},
-                                    timeout=args.timeout + 10)
+                                    timeout=args.timeout + QUEUED_WAKE_TIMEOUT + 10)
             finished = self_archive_result(args, address, closed)
             result['results'][-1].update(status='archived' if finished['archived'] else finished['status'],
                                          archived=finished['archived'], method=finished['archive_path'])
