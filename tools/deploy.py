@@ -417,7 +417,9 @@ def start(system, label, plist, actions, name):
 
 
 def wait_ping(layout, system, bridge):
-    for _ in range(100):
+    # The broker listens only after it has verified every saved route, which took
+    # over two minutes with 100 routes on a loaded machine (#238). Wait up to ten.
+    for _ in range(2000):
         code, ping = system.cli(bridge, layout.socket, 'ping')
         if code == 0 and isinstance(ping, dict):
             return ping

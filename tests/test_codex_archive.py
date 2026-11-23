@@ -477,15 +477,33 @@ class CodexArchiveTests(unittest.TestCase):
         self.add(1)
         real_copy = archive.codex_preview.shutil.copyfile
 
+        writes = iter(range(2, 100))
+
         def change(source, target):
             result = real_copy(source, target)
-            self.add(2)
+            self.add(next(writes))
             return result
 
         with patch.object(archive.codex_preview.shutil, 'copyfile', side_effect=change):
             with self.assertRaisesRegex(ValueError, 'changed during preview'):
                 self.plan()
 
+
+    def test_preview_retries_a_copy_that_raced_one_write(self):
+        sid = self.add(1)
+        real_copy = archive.codex_preview.shutil.copyfile
+        calls = []
+
+        def change_once(source, target):
+            result = real_copy(source, target)
+            if not calls:
+                self.add(2)
+            calls.append(source)
+            return result
+
+        with patch.object(archive.codex_preview.shutil, 'copyfile', side_effect=change_once):
+            self.assertIn(sid, [row['id'] for row in self.plan()['candidates']])
+        self.assertGreater(len(calls), 1)
 
     def test_lsof_cwd_probe_keeps_parentheses_in_workspace_names(self):
         with patch.object(archive.wt.subprocess, 'Popen') as popen:

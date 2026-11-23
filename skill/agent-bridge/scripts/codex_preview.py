@@ -60,6 +60,9 @@ def require_owned_store(path):
         raise ValueError('Codex native store is not owned and protected')
 
 
+COPY_ATTEMPTS = 3
+
+
 @contextmanager
 def private_store_copy(path):
     """Read a stable DB/WAL pair without opening SQLite under the native home."""
@@ -77,20 +80,24 @@ def private_store_copy(path):
             raise ValueError('Codex preview source is not owned and protected')
         return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
 
-    before = (stamp(path), stamp(wal), stamp(journal))
-    if before[0] is None or before[2] is not None:
-        raise ValueError('Codex preview source missing or rollback journal present')
-    with tempfile.TemporaryDirectory(prefix='agent-bridge-archive-', dir='/tmp') as directory:
-        copy = Path(directory) / path.name
-        copy.touch(mode=0o600)
-        shutil.copyfile(path, copy)
-        if before[1] is not None:
-            wal_copy = copy.with_name(wal.name)
-            wal_copy.touch(mode=0o600)
-            shutil.copyfile(wal, wal_copy)
-        if before != (stamp(path), stamp(wal), stamp(journal)):
-            raise ValueError('Codex state changed during preview; manifest not generated')
-        yield copy
+    # Desktop writes this store constantly while sessions run. A copy that
+    # raced one write is retried; only a store that never holds still refuses.
+    for _ in range(COPY_ATTEMPTS):
+        before = (stamp(path), stamp(wal), stamp(journal))
+        if before[0] is None or before[2] is not None:
+            raise ValueError('Codex preview source missing or rollback journal present')
+        with tempfile.TemporaryDirectory(prefix='agent-bridge-archive-', dir='/tmp') as directory:
+            copy = Path(directory) / path.name
+            copy.touch(mode=0o600)
+            shutil.copyfile(path, copy)
+            if before[1] is not None:
+                wal_copy = copy.with_name(wal.name)
+                wal_copy.touch(mode=0o600)
+                shutil.copyfile(wal, wal_copy)
+            if before == (stamp(path), stamp(wal), stamp(journal)):
+                yield copy
+                return
+    raise ValueError('Codex state changed during preview; manifest not generated')
 
 
 def _saved_thread_row(route, include_rollout=False, *, path=None):
