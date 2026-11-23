@@ -245,7 +245,9 @@ class DeliveryMatrixTests(unittest.TestCase):
             self.assertEqual(self.show(message)['state'], 'submitted')
 
         self.open_wake.side_effect = open_wake
-        (code, result), queue = self.queue_delivery(message, receipt=receipt)
+        with patch.object(delivery, 'time', wraps=delivery.time) as clock:
+            clock.monotonic.side_effect = [10, 1000]
+            (code, result), queue = self.queue_delivery(message, receipt=receipt)
         self.assertEqual(code, 0, result)
         self.assertEqual(result['delivery_path'], codex_queue.DELIVERY_PATH)
         self.assertIs(result['wake_requested'], True)

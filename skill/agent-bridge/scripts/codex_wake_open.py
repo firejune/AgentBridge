@@ -16,6 +16,7 @@ import codex_queue
 
 APP_BUILD = ('26.1117.41037', '29803')
 APP_SIGNATURE = codex_queue.SIGNATURE.replace('identifier "codex"', 'identifier "com.openai.codex"')
+QUEUED_WAKE_TIMEOUT = 10.0  # allow up to 5 seconds for codesign and leave time for the opener
 MARKER = 'AB_WAKE_TEST_OK'
 PROMPT = (
     'Human-authorized Agent Bridge Desktop wake validation. '
@@ -112,7 +113,7 @@ def _uuid(value):
         return False
 
 
-def request_queued_wake(thread, timeout):
+def request_queued_wake(thread, timeout=QUEUED_WAKE_TIMEOUT):
     """Request one Desktop wake for an exact thread after queue acceptance."""
     if not _uuid(thread):
         raise WakeError('Invalid Codex Desktop wake thread identity')

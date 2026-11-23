@@ -196,6 +196,22 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assert_retro_discarded(retro)
         self.enqueue.assert_not_called()
 
+    async def test_confirmed_enqueue_that_consumes_close_deadline_still_wakes(self):
+        with mock.patch.object(broker, 'time', wraps=broker.time) as clock:
+            clock.monotonic.return_value = 10
+
+            def submit(*_):
+                clock.monotonic.return_value = 11
+                return self.queue_id
+
+            self.enqueue.side_effect = submit
+            result = await broker.start_self_archive(self.state, self.args)
+        self.assertEqual(result['archive_path'], 'pending_self_archive')
+        self.assertIs(result['wake_requested'], True)
+        self.opener.assert_called_once()
+        self.assertEqual(self.opener.call_args.args[0], self.sid)
+        self.assertEqual(codex_queue.verify_signature.call_args.args[-1], 5)
+
     async def test_existing_archive_bit_without_native_rollout_is_refused(self):
         self.record_archive_bit(self.rollout)
         self.available.side_effect = broker.ThreadArchived()
@@ -242,7 +258,7 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.enqueue.assert_called_once()
         self.opener.assert_called_once()
 
-    async def test_timeout_keeps_durable_guard_and_finish_only_verifies(self):
+    async def test_timeout_keeps_durable_guard_and_finish_wakes_once_before_verification(self):
         retro = self.prepare_stop_retro()
         result = await broker.start_self_archive(self.state, {**self.args, 'timeout': 0.15, 'retro': retro})
         self.assertEqual(result['archive_path'], 'pending_self_archive')
@@ -255,6 +271,8 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(self.state.messages), {self.mid})
         restored = broker.State(store=self.store)
         self.assertTrue(restored.endpoints[('p', 'target')]['closing_self_archive'])
+        self.assertIs(restored.endpoints[('p', 'target')]['closing_self_archive_enqueued'], True)
+        self.assertEqual(json.loads(self.store.path.read_text())['version'], 5)
         self.assertEqual(restored.messages[self.mid]['state'], 'done')
         with self.assertRaisesRegex(ValueError, 'already reserved'):
             await broker.start_self_archive(restored, self.args)
@@ -264,8 +282,15 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
             restored.route('p', 'target')
         self.state = restored
         self.record_archive_bit(self.rollout)
-        unverified = await broker.finish_close(restored, {**self.finish_args(result), 'timeout': 0.1})
+        calls = mock.Mock()
+        calls.attach_mock(self.opener, 'wake')
+        with mock.patch.object(broker, 'verify_self_archive_readback',
+                               wraps=broker.verify_self_archive_readback) as readback:
+            calls.attach_mock(readback, 'verify')
+            unverified = await broker.finish_close(restored, {**self.finish_args(result), 'timeout': 0.1})
         self.assertEqual(unverified['archive_path'], 'pending_self_archive')
+        self.assertIs(unverified['wake_requested'], True)
+        self.assertEqual([call[0] for call in calls.mock_calls[:3]], ['verify', 'wake', 'verify'])
         self.assertFalse(Path(retro['store']).exists())
         self.record_native_archive()
         with mock.patch.object(restored, 'routing_remove', side_effect=OSError('fixture route save failure')):
@@ -279,9 +304,9 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(restored.messages), {finished['notification']['id']})
         self.assertEqual(finished['notification'], incomplete['notification'])
         self.enqueue.assert_called_once()
-        self.opener.assert_called_once()
+        self.assertEqual([call.args[0] for call in self.opener.call_args_list], [self.sid, self.sid])
         self.assertIs(finished['wake_requested'], False)
-        self.assertEqual(finished['wake_reason'], 'Finish only verifies the native archive')
+        self.assertEqual(finished['wake_reason'], 'Thread was already natively archived')
 
     async def test_uncertain_acceptance_keeps_guard_without_fallback(self):
         self.enqueue.side_effect = broker.DeliveryError('ambiguous queue receipt', uncertain=True)
@@ -295,6 +320,14 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.opener.assert_not_called()
         self.assertIs(result['wake_requested'], False)
         self.assertEqual(result['wake_reason'], 'Queue acceptance is uncertain')
+        restored = broker.State(store=self.store)
+        self.assertEqual(json.loads(self.store.path.read_text())['version'], 4)
+        finished = await broker.finish_close(restored, {**self.finish_args(result), 'timeout': 0.1})
+        self.assertEqual(finished['archive_path'], 'pending_self_archive')
+        self.assertIs(finished['wake_requested'], False)
+        self.assertEqual(finished['wake_reason'], 'Self-archive queue acceptance was not confirmed')
+        self.enqueue.assert_called_once()
+        self.opener.assert_not_called()
 
     async def test_unfinished_correspondence_still_blocks_reservation(self):
         notice = self.state.action({'op': 'send', 'project': 'p', 'sender': 'target',
@@ -360,6 +393,7 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
                 run, ['--socket', str(self.cwd.parent / 'fixture.sock'), 'close', 'target', '--project', 'p',
                       '--finish', result['close_id'], '--expect-session', self.sid])
         self.assertEqual(retry_code, 1)
+        self.opener.assert_called_once()
         row, = retros.rows(store, 'p')
         self.assertEqual((row['id'], row['urgency']), (result['retro_id'], 'stop'))
         notice, = self.state.messages.values()

@@ -154,7 +154,7 @@ python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.
 
   - `self_archive`: archived and verified, route removed.
   - `not_archived`: nothing was submitted. The route stays registered, and `reason` says why.
-  - `pending_self_archive`: exit 1, with a `close_id`. The thread may still be finishing a turn. After a Codex Desktop restart, a thread nobody has opened yet does not take its queued entry until it is opened in Desktop (#221). Run `close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID` later. Do not run `close --archive` again.
+  - `pending_self_archive`: exit 1, with a `close_id`. Run `close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID` to verify the native archive. If archival is still unverified and the reservation has a confirmed queue receipt, finish requests one wake for the exact thread before checking again. The wake has its own 10-second budget. An uncertain receipt or an older reservation without a confirmed receipt is eligible for verification only. Use the original `close_id` for follow-up.
 
   When close is refused:
 

@@ -1621,9 +1621,7 @@ async def finish_close(state, args):
         # Agent Bridge never writes Codex state (#212); an older CLI may still send the flag.
         raise ValueError(SAVED_STATE_REMOVED)
     if route.get('closing_self_archive'):
-        result = await verify_self_archive(state, args, route, time.monotonic() + timeout,
-                                           'self_archive', 'Queued self-archive verified')
-        return {**result, **wake_not_requested('Finish only verifies the native archive')}
+        return await finish_self_archive(state, args, route, timeout)
     try:
         await asyncio.wait_for(asyncio.to_thread(codex_preview.verify_archive, route), timeout)
     except asyncio.TimeoutError:
@@ -1672,16 +1670,50 @@ async def start_self_archive(state, args):
                     **wake_not_requested('Queue acceptance is uncertain')}
         # The queue adapter marks failures after launch uncertain. A definite refusal is safe to release.
         return await state.serialized(refuse_self_archive, state, finish, route, str(error))
+    route = await state.serialized(confirm_self_archive_enqueue, state, finish, route)
+    wake, deadline = await wake_self_archive(route, deadline)
+    result = await verify_self_archive(state, finish, route, deadline,
+                                       'self_archive', 'Queued self-archive verified')
+    return {**result, **wake}
+
+
+async def confirm_self_archive_enqueue(state, args, route):
+    if state.closing_route(args) != route:
+        raise ValueError('Endpoint changed during self-archive enqueue')
+    return state.routing_change('endpoints', (route['project'], route['name']),
+                                {**route, 'closing_self_archive_enqueued': True})
+
+
+async def finish_self_archive(state, args, route, timeout):
+    deadline = time.monotonic() + timeout
+    note = 'Queued self-archive verified'
+    wake = wake_not_requested('Self-archive queue acceptance was not confirmed')
+    if route.get('closing_self_archive_enqueued'):
+        try:
+            await asyncio.wait_for(asyncio.to_thread(verify_self_archive_readback, route), timeout)
+        except ValueError:
+            if state.closing_route(args) != route:
+                raise ValueError('Endpoint changed during archive verification')
+            wake, deadline = await wake_self_archive(route, deadline)
+        except asyncio.TimeoutError:
+            wake = wake_not_requested('Native archive precheck timed out')
+        else:
+            result = await commit_self_archive(state, args, route, 'self_archive', note)
+            return {**result, **wake_not_requested('Thread was already natively archived')}
+    result = await verify_self_archive(state, args, route, deadline, 'self_archive', note)
+    return {**result, **wake}
+
+
+async def wake_self_archive(route, deadline):
+    started = time.monotonic()
     try:
-        await asyncio.to_thread(codex_wake_open.request_queued_wake, route['session'],
-                                deadline - time.monotonic())
+        await asyncio.to_thread(codex_wake_open.request_queued_wake, route['session'])
     except codex_wake_open.WakeError as error:
         wake = wake_not_requested(str(error))
     else:
         wake = {'wake_requested': True}
-    result = await verify_self_archive(state, finish, route, deadline,
-                                       'self_archive', 'Queued self-archive verified')
-    return {**result, **wake}
+    # Keep the verification time remaining before the independently bounded wake.
+    return wake, deadline + (time.monotonic() - started)
 
 
 def wake_not_requested(reason):
