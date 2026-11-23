@@ -48,7 +48,11 @@ class QueueOwnerUnavailable(QueueUnavailable):
         super().__init__(self.SUMMARY, detail=f'{self.SUMMARY} {detail}')
 
 
-def checked_output(args, timeout=2):
+# Read-only probes (ps, lsof, codesign). Two seconds was not enough on a loaded machine (#239).
+PROBE_TIMEOUT = 10
+
+
+def checked_output(args, timeout=PROBE_TIMEOUT):
     return subprocess.run(args, check=True, capture_output=True, text=True, timeout=timeout).stdout
 
 
@@ -190,7 +194,7 @@ def owner_refusal():
     return None
 
 
-def verify_signature(bundle=CLI_BUNDLE, requirement=SIGNATURE, timeout=2):
+def verify_signature(bundle=CLI_BUNDLE, requirement=SIGNATURE, timeout=PROBE_TIMEOUT):
     checked_output(['/usr/bin/codesign', '--verify', '--strict', '-R=' + requirement, str(bundle)], timeout=timeout)
 
 
