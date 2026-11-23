@@ -109,7 +109,7 @@ class EventTests(unittest.TestCase):
     def correlated(self, index=0, save_backend=True, body='private correlated answer'):
         session = self.owned[index]
         self.sequence += 1
-        with patch.object(self.engine.backend, 'availability', return_value='ready'):
+        with patch.object(self.engine.backend, 'require_send_availability'):
             accepted = self.engine.call('bridge_message_send', {'agent_session_id': session['id'],
                 'message': 'private parent request', 'idempotency_key': 'correlated-operation-' + str(self.sequence)})['data']
         op = self.engine.operation(accepted['operation_id'], self.engine.principal)

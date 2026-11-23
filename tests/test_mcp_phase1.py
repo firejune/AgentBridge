@@ -90,11 +90,11 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(self.engine.operation(op['operation_id'],'owner-a')['downstream_key'],downstream)
         legacy=dict(op);legacy.pop('downstream_key')
         backend=phase.Backend('/unused');session=self.engine.session(sid,'owner-a')
-        backend.verify_routes=lambda s:None
+        backend.verify_routes=lambda s, **options:None
         keys=[]
         def rpc(name,**kw):
             keys.append(kw['key'])
-            return {'route':{'session':session['uuid'],'transport':'claude-peer'}}
+            return {'route':{'session':session['uuid'],'transport':'claude-peer','cwd':str(self.root)}}
         backend.rpc=rpc;backend.post(legacy,session)
         self.assertEqual(keys,[op['key_hash']])
 
@@ -214,12 +214,11 @@ class PhaseTest(unittest.TestCase):
                     if boundary == 'preflight':
                         routes[0]['session'] = str(uuid.uuid4())
                     else:
-                        availability = backend.availability
-                        def changed_after_availability(value):
-                            status = availability(value)
+                        check = backend.require_send_availability
+                        def changed_after_preflight(value):
+                            check(value)
                             routes[0]['session'] = str(uuid.uuid4())
-                            return status
-                        backend.availability = changed_after_availability
+                        backend.require_send_availability = changed_after_preflight
                     self.engine.tick()
                     operation = self.call('bridge_operation_get', operation_id=accepted['operation_id'])['data']
                     self.assertEqual((operation['status'], operation['failure']['code'], operation['failure']['message']),
@@ -230,7 +229,7 @@ class PhaseTest(unittest.TestCase):
                     # An explicit operator repair permits a separately keyed send;
                     # replay of the failed operation never creates another intent.
                     routes[0]['session'] = original
-                    backend.availability = phase.Backend.availability.__get__(backend)
+                    backend.require_send_availability = phase.Backend.require_send_availability.__get__(backend)
                     self.assertTrue(self.send(sid, key='route_message_' + boundary)['data']['replayed'])
                     self.assertTrue(self.send(sid, key='after_route_fix_' + boundary)['ok'])
                     self.engine.fail(self.engine.rows()[-1], 'BACKEND_UNAVAILABLE', False)
@@ -1315,7 +1314,7 @@ assert 'bridge' not in sys.modules
                     sid=next(iter(phase.pinned_sessions(config)))
                     args={'agent_session_id':sid, 'message':'must stay on original provider',
                           'idempotency_key':'dispatch_retarget_001'}
-                    stage = 'availability' if boundary == 'acceptance' else boundary
+                    stage = 'require_send_availability' if boundary in ('acceptance', 'availability') else boundary
                     original=getattr(backend,stage)
                     def retarget(*args, **kwargs):
                         if boundary=='availability':

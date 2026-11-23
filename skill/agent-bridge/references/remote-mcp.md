@@ -165,6 +165,20 @@ A confirmed route/session conflict before broker posting returns `BACKEND_UNAVAI
 
 Preflight reads the bindings without changing them. A discovered session can be missing both generated bindings. A pinned session can be missing its generated sender binding but requires its target to exist. The facade checks both bindings before creating any missing one and translates the broker’s exact duplicate-name refusal into the same route error.
 
+For a registered or pinned route, send preflight can validate the target from
+saved metadata. An idle-closed Claude Desktop session must have an eligible
+saved Desktop record for the same session UUID and workspace. An offline Codex
+thread must pass the CLI's Desktop queue checks, including its saved workspace,
+archive status, and the default IPC and broker socket requirements. Preflight
+opens no session and queues no notification. A discovered-only session still
+requires a live peer. Session listing continues to report live availability.
+
+After posting, the facade uses the CLI delivery path. A failed, unsupported, or
+uncertain Claude wake leaves the broker message `pending` and ends the MCP
+operation as `failed` with `BACKEND_UNAVAILABLE` and a wake-specific message.
+The destination remains available for separately keyed sends. Only a possible
+peer write can leave delivery `uncertain` and quarantine the destination.
+
 Route validation and broker send are separate calls. A route change between them can still create a pending broker packet. An unexpected returned destination leaves the operation `unknown` without pushing the packet. An operator must correct the grant or route explicitly.
 
 Queued operations resume without duplicating completed writes. After an

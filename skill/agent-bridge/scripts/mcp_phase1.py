@@ -112,6 +112,10 @@ class Fault(Exception):
         super().__init__(self.payload['message'])
 
 
+class SendUnavailable(ValueError):
+    """A confirmed pre-post refusal with a client-safe reason."""
+
+
 class RouteBindingRefusal(ValueError):
     """Observed identity conflict before the broker send call."""
 
@@ -330,28 +334,87 @@ class Backend:
         # Return the acquired UUID immediately; registration rechecks exact cwd after it is durable.
         return sid
 
-    def check(self, session):
+    def check(self, session, *, offline=False, preflight=True):
         expected_cwd = Path(session.get('cwd') or session['workspace']['cwd']).resolve()
         transport = self.session_transport(session)
-        agent_type = TRANSPORT_AGENTS[transport]
-        if agent_type == 'claude':
-            row = sessions.resolve_claude_peer(session['uuid'])
-        elif agent_type == 'agy':
-            row = sessions.resolve_agy_peer(session['uuid'])
-        elif agent_type == 'codex':
-            row = sessions.resolve_codex_peer(session['uuid'])
-        else:
-            raise ValueError('Unsupported agent type')
+        resolve = {
+            'claude-peer': sessions.resolve_claude_peer,
+            'agy': sessions.resolve_agy_peer,
+            'codex': sessions.resolve_codex_peer,
+        }[transport]
+        try:
+            row = resolve(session['uuid'])
+        except (ValueError, OSError) as error:
+            if not offline or transport == 'agy' or not (session.get('registered') or session.get('pinned')):
+                raise
+            route = self.bound_target(session, transport, expected_cwd)
+            return self.check_offline(route, expected_cwd, error, preflight)
         if row['id'] != session['uuid'] or Path(row['cwd']).resolve() != expected_cwd:
             raise RouteBindingRefusal('Session identity changed')
         if session.get('pinned'):
-            rows = self.rpc('routes', project=session['workspace']['project'])
-            route = next((r for r in rows if r['name'] == session['route']), {})
-            route_cwd = Path(route['cwd']).resolve() if route.get('cwd') else None
-            if (route.get('transport'),route.get('session'),route_cwd) != (
-                    transport,session['uuid'],expected_cwd):
-                raise RouteBindingRefusal('Pinned route changed')
+            self.bound_target(session, transport, expected_cwd)
         return row
+
+    def bound_target(self, session, transport, expected_cwd):
+        rows = self.rpc('routes', project=session['workspace']['project'])
+        route = next((r for r in rows if r['name'] == session['route']), {})
+        route_cwd = Path(route['cwd']).resolve() if route.get('cwd') else None
+        if (route.get('transport'), route.get('session'), route_cwd) != (
+                transport, session['uuid'], expected_cwd):
+            raise RouteBindingRefusal('Route changed')
+        return route
+
+    def check_offline(self, route, expected_cwd, live_error, preflight):
+        sid = route['session']
+        if route['transport'] == 'claude-peer':
+            try:
+                target = sessions.claude_wake_target(sid, str(live_error))
+            except sessions.DiscoveryError:
+                raise SendUnavailable('Multiple Claude Desktop sessions claim this CLI session; not choosing one') from None
+            cwd = target.get('cwd')
+            if isinstance(cwd, str) and Path(cwd).is_absolute():
+                if Path(cwd).resolve() != expected_cwd:
+                    raise RouteBindingRefusal('Saved Claude session workspace changed')
+            elif not preflight or target.get('state') != 'unsupported':
+                raise live_error
+            if preflight and target.get('state') == 'unsupported':
+                if target['code'] == 'live_unreachable':
+                    raise SendUnavailable('The running Claude session inbox is unreachable.')
+                if target['code'] == 'no_desktop_session':
+                    raise SendUnavailable('No Claude Desktop session maps to this CLI session.')
+                raise SendUnavailable(target['reason'])
+        else:
+            self.check_offline_codex(route, live_error, preflight)
+        return {'id': sid, 'cwd': str(expected_cwd), 'status': 'idle'}
+
+    def check_offline_codex(self, route, live_error, preflight):
+        try:
+            if preflight:
+                self.check_queue_endpoint(live_error)
+                codex_queue.check_available(route)
+            else:
+                # Delivery owns queue readiness and archive outcomes after a post.
+                if Path(self.path).expanduser() != broker.DEFAULT_SOCKET or os.getenv('AGENT_BRIDGE_CODEX_URL'):
+                    raise live_error
+                state, _ = codex_queue.default_stores()
+                codex_queue.check_saved_route(route, state)
+        except codex_queue.QueueWorkspaceMismatch:
+            raise RouteBindingRefusal('Saved Codex thread workspace changed') from None
+        except codex_live.ThreadArchived as error:
+            raise SendUnavailable(str(error)) from None
+
+    def check_queue_endpoint(self, live_error):
+        client = codex_live.Client(timeout=0.5)
+        try:
+            client.connect()
+        except codex_live.EndpointUnavailable as error:
+            if (not error.default_absent or Path(self.path).expanduser() != broker.DEFAULT_SOCKET
+                    or os.getenv('AGENT_BRIDGE_CODEX_URL')):
+                raise SendUnavailable(str(error)) from None
+        else:
+            raise live_error  # A reachable IPC endpoint cannot fall back to the queue.
+        finally:
+            client.close()
 
     def availability(self, session):
         try:
@@ -359,36 +422,21 @@ class Backend:
             # conflicting one. Existing owned bindings must still match exactly.
             status = self.verify_routes(session, allow_missing=bool(
                 session.get('pinned') or session.get('discovered'))).get('status')
-            return 'ready' if status in ('idle','ready') else 'busy' if status in ('running','busy') else 'unavailable'
+            return self.live_availability(status)
         except RouteBindingRefusal:
             raise
         except (ValueError, OSError):
             return 'unavailable'
 
-    def queue_refusal(self, session):
-        if (self.session_transport(session) != 'codex' or Path(self.path).expanduser() != broker.DEFAULT_SOCKET
-                or os.getenv('AGENT_BRIDGE_CODEX_URL')):
-            return None
-        client = codex_live.Client(timeout=0.5)
-        try:
-            client.connect()
-        except codex_live.EndpointUnavailable as error:
-            if error.default_absent:
-                rows = self.rpc('routes', project=session['workspace']['project'])
-                route = next((row for row in rows if row['name'] == session['route']), None)
-                cwd = str(Path(session.get('cwd') or session['workspace']['cwd']).resolve())
-                if route is None and session.get('discovered') and not session.get('pinned'):
-                    route = {'transport': 'codex', 'session': session['uuid'], 'cwd': cwd}
-                if route is None or (route.get('transport'), route.get('session'), route.get('cwd')) != (
-                        'codex', session['uuid'], cwd):
-                    raise RouteBindingRefusal('Route changed')
-                try:
-                    codex_queue.check_available(route)
-                except codex_queue.QueueUnavailable as refusal:
-                    return refusal
-        finally:
-            client.close()
-        return None
+    @staticmethod
+    def live_availability(status):
+        return 'ready' if status in ('idle', 'ready') else 'busy' if status in ('running', 'busy') else 'unavailable'
+
+    def require_send_availability(self, session):
+        row = self.verify_routes(
+            session, allow_missing=bool(session.get('pinned') or session.get('discovered')), offline=True)
+        if self.live_availability(row.get('status')) == 'unavailable':
+            raise SendUnavailable('Backend unavailable')
 
     def discover(self, config):
         workspaces = config['workspaces']
@@ -499,8 +547,8 @@ class Backend:
             }
         return result
 
-    def register(self, session):
-        self.check(session)
+    def register(self, session, *, offline=False):
+        self.check(session, offline=offline)
         w = session['workspace']
         cwd = str(Path(session.get('cwd') or w['cwd']).resolve())
         transport = self.session_transport(session)
@@ -524,10 +572,10 @@ class Backend:
                     if str(error) != REGISTER_CONFLICT_ERROR:
                         raise
                     raise RouteBindingRefusal(REGISTER_CONFLICT_ERROR) from None
-        self.verify_routes(session)
+        self.verify_routes(session, offline=offline)
 
-    def verify_routes(self, session, allow_missing=False):
-        live = self.check(session)
+    def verify_routes(self, session, allow_missing=False, *, offline=False):
+        live = self.check(session, offline=offline)
         cwd = str(Path(session.get('cwd') or session['workspace']['cwd']).resolve())
         transport = self.session_transport(session)
         rows = self.rpc('routes', project=session['workspace']['project'])
@@ -543,22 +591,27 @@ class Backend:
 
     def post(self, op, session):
         if session.get('pinned') or session.get('discovered'):
-            self.register(session)  # Ensure routes exist before sending.
-        self.verify_routes(session)
+            self.register(session, offline=True)  # Ensure routes exist before sending.
+        else:
+            self.verify_routes(session, offline=True)
         transport = self.session_transport(session)
+        cwd = str(Path(session.get('cwd') or session['workspace']['cwd']).resolve())
         m = self.rpc('send', project=session['workspace']['project'],sender=session['sender'],
                      recipient=session['route'],body=op['message'],key=op.get('downstream_key',op['key_hash']),
                      mcp_operation_send=True)
-        # Validate broker snapshot before handing it to push; never route by name again.
-        if m['route']['session'] != session['uuid'] or m['route']['transport'] != transport:
+        # Validate the frozen broker snapshot before handing it to delivery.
+        if (m['route'].get('session'), m['route'].get('transport'), m['route'].get('cwd')) != (
+                session['uuid'], transport, cwd):
             raise ValueError('Unexpected message route')
         return m
 
     def push(self, message, session):
         route = message.get('route', {})
-        if (route.get('session'), route.get('transport')) != (session['uuid'], self.session_transport(session)):
+        cwd = str(Path(session.get('cwd') or session['workspace']['cwd']).resolve())
+        if (route.get('session'), route.get('transport'), route.get('cwd')) != (
+                session['uuid'], self.session_transport(session), cwd):
             raise ValueError('Unexpected message route')
-        self.check(session)
+        self.check(session, offline=True, preflight=False)
         return delivery.push_if_peer(self.path, message)
 
     def push_inbox_reply(self, message):
@@ -894,7 +947,7 @@ class Engine:
                     self.require_send_availability(target)
             except RouteBindingRefusal:
                 raise Fault('BACKEND_UNAVAILABLE', ROUTE_CHANGED_MESSAGE) from None
-            except codex_queue.QueueUnavailable as error:
+            except (codex_queue.QueueUnavailable, SendUnavailable) as error:
                 raise Fault('BACKEND_UNAVAILABLE', str(error)) from None
             except Exception:
                 raise Fault('BACKEND_UNAVAILABLE') from None
@@ -944,13 +997,11 @@ class Engine:
                     closed_epoch=time.time(),**fields)
 
     def require_send_availability(self, session):
-        if self.backend.availability(session) in ('ready', 'busy'):
-            return
-        diagnose = getattr(self.backend, 'queue_refusal', None)
-        refusal = diagnose(session) if diagnose else None
-        if refusal is not None:
-            raise refusal
-        raise Fault('BACKEND_UNAVAILABLE')
+        check = getattr(self.backend, 'require_send_availability', None)
+        if check is not None:
+            check(session)
+        elif self.backend.availability(session) not in ('ready', 'busy'):
+            raise Fault('BACKEND_UNAVAILABLE')
 
     def fail_queue(self, op, error):
         with self.lock:
@@ -1031,6 +1082,9 @@ class Engine:
         except codex_queue.QueueUnavailable as error:
             self.fail_queue(op, error)
             return
+        except SendUnavailable as error:
+            self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=str(error))
+            return
         except Exception:
             self.fail(op,'BACKEND_UNAVAILABLE',unknown=False)
             return
@@ -1072,6 +1126,12 @@ class Engine:
             except RouteBindingRefusal:
                 self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=ROUTE_CHANGED_MESSAGE)
                 return
+            except codex_queue.QueueUnavailable as error:
+                self.fail_queue(op, error)
+                return
+            except SendUnavailable as error:
+                self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=str(error))
+                return
             except ValueError as error:
                 # Only these exact broker admission refusals prove no post took
                 # place. Disconnects, timeouts and other errors remain ambiguous.
@@ -1098,6 +1158,9 @@ class Engine:
                     self.fail_queue(op, e)
                     return
                 detail = delivery.codex_prewrite_detail(m)
+                wake = m.get('wake', {}).get('state')
+                if m['state'] == 'pending' and wake in ('failed', 'uncertain', 'unsupported'):
+                    detail = f'Claude Desktop wake {wake}. Message was not delivered.'
                 if detail is not None or m['state'] == 'pending':
                     self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=detail)
                 else:
