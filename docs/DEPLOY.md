@@ -95,15 +95,18 @@ The three in-flight checks apply only when the broker or the facade moves.
    rollback command is printed here.
 4. Stop the facade: `launchctl bootout gui/<uid>/<facade label>`.
 5. Stop the broker: `launchctl bootout gui/<uid>/<broker label>`. The broker handles the
-   signal by writing its checkpoint; the script waits until launchd no longer lists the service.
+   signal by writing its checkpoint. Both stop steps succeed once launchd no longer lists
+   the service, including when it was already stopped.
 6. Rewrite the release id in the broker plist. Every other key is kept.
 7. Start the broker: `launchctl bootstrap gui/<uid> <plist>`, then wait for `ping`.
 8. Move the three pins (each replaced atomically).
 9. Rewrite the release id in the tunnel profile and start the facade.
 10. Verify and write the receipt.
 
-Nothing is retried. If a step fails the run stops there, writes the receipt with `error`,
-and prints the rollback command.
+If a deployment fails after the facade has stopped, the script attempts to restart it
+on the release it used before the deploy. The receipt records the original failure in
+`error` and the restart outcome in `facade_recovery`. The deploy still exits with
+status 1 and prints the rollback command.
 
 ## What is verified
 

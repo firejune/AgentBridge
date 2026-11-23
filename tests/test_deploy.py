@@ -52,7 +52,9 @@ class FakeSystem:
         self.calls.append(args)
         label = args[1].rsplit('/', 1)[-1] if args[0] == 'bootout' else plistlib.loads(Path(args[2]).read_bytes())['Label']
         if args[0] == 'bootout':
-            self.loaded_labels.discard(label)
+            if label not in self.loaded_labels:
+                return 3
+            self.loaded_labels.remove(label)
         else:
             self.loaded_labels.add(label)
             self.pids[label] += 1
@@ -337,7 +339,7 @@ class RealRunTests(DeployFixture):
         self.assertEqual({os.readlink(pin) for pin in self.layout.pins}, {str(self.layout.release('nana', NEW) / deploy.SKILL)})
         self.assertIn(OLD, self.layout.broker_plist.read_bytes().decode(errors='replace'))
 
-    def test_a_failed_check_after_the_switch_keeps_the_receipt_and_never_rolls_back_itself(self):
+    def test_a_failed_check_after_the_switch_recovers_only_the_facade(self):
         cases = (('skewed_cli', True, 'CLI and broker builds differ'), ('ready_after', False, 'the facade is not ready'))
         for attribute, value, problem in cases:
             self.setUp()
@@ -345,8 +347,15 @@ class RealRunTests(DeployFixture):
             with self.subTest(problem=problem):
                 self.assertEqual(self.run_deploy(), 1)
                 folder, = self.layout.runtime.glob(f'deploy-{NEW[:7]}-*')
-                self.assertIn(problem, json.loads((folder / 'result.json').read_text())['error'])
-                self.assertEqual([call[0] for call in self.system.calls], ['bootout', 'bootout', 'bootstrap', 'bootstrap'])
+                result = json.loads((folder / 'result.json').read_text())
+                self.assertIn(problem, result['error'])
+                self.assertEqual(result['facade_recovery'], dict(release=OLD, restarted=True))
+                self.assertEqual(self.system.calls[-2:], [
+                    ('bootout', f'gui/501/{FACADE_LABEL}'), ('bootstrap', 'gui/501', str(self.facade_plist))])
+                self.assertEqual(len(self.system.calls), 6)
+                self.assertTrue(all(NEW in os.readlink(pin) for pin in self.layout.pins))
+                self.assertIn(NEW, self.layout.broker_plist.read_text())
+                self.assertIn(OLD, self.layout.tunnel_profile.read_text())
                 self.assertEqual(self.lines[-1], f'rollback: {deploy.rollback_command(folder)}')
 
     def test_a_route_dropped_for_a_missing_workspace_warns_and_any_other_route_change_fails(self):
@@ -381,12 +390,12 @@ class RealRunTests(DeployFixture):
         self.assertEqual((code, result['routes_preserved'], result['routes_dropped_workspace_missing']), (1, False, 0))
         self.assertIn('routes changed', result['error'])
 
-    def test_a_broker_that_does_not_come_back_stops_before_pins_and_facade_move(self):
+    def test_a_broker_that_does_not_come_back_restarts_the_previous_facade(self):
         real = self.system.launchctl
 
         def launchctl(*args):
             code = real(*args)
-            if args[0] == 'bootstrap':
+            if args == ('bootstrap', 'gui/501', str(self.layout.broker_plist)):
                 self.system.answers = False
             return code
 
@@ -395,7 +404,72 @@ class RealRunTests(DeployFixture):
         self.assertIn('FAILED: the broker did not answer ping after its start', self.lines)
         self.assertEqual({os.readlink(pin) for pin in self.layout.pins}, {str(self.layout.release('nana', OLD) / deploy.SKILL)})
         self.assertIn(OLD, self.layout.tunnel_profile.read_text())
-        self.assertEqual([call[0] for call in self.system.calls], ['bootout', 'bootout', 'bootstrap'])
+        self.assertEqual([call[0] for call in self.system.calls], ['bootout', 'bootout', 'bootstrap', 'bootstrap'])
+        self.assertEqual(self.system.calls[-1], ('bootstrap', 'gui/501', str(self.facade_plist)))
+        self.assertTrue(self.system.loaded(FACADE_LABEL))
+        folder, = self.layout.runtime.glob('deploy-*')
+        result = json.loads((folder / 'result.json').read_text())
+        self.assertEqual(result['facade_recovery'], dict(release=OLD, restarted=True))
+        self.assertEqual(result['actions']['restart previous facade']['exit'], 0)
+
+    def test_failed_facade_bootstrap_restores_the_original_profile_before_restarting(self):
+        original_profile = self.layout.tunnel_profile.read_bytes()
+        real = self.system.launchctl
+        profiles_at_start = []
+
+        def launchctl(*args):
+            if args == ('bootstrap', 'gui/501', str(self.facade_plist)):
+                profiles_at_start.append(self.layout.tunnel_profile.read_bytes())
+                if len(profiles_at_start) == 1:
+                    return 5
+            return real(*args)
+
+        self.system.launchctl = launchctl
+        self.assertEqual(self.run_deploy(), 1)
+        self.assertEqual(profiles_at_start, [original_profile.replace(OLD.encode(), NEW.encode()), original_profile])
+        self.assertTrue(self.system.loaded(FACADE_LABEL))
+        folder, = self.layout.runtime.glob('deploy-*')
+        result = json.loads((folder / 'result.json').read_text())
+        self.assertIn('start facade: launchctl bootstrap refused', result['error'])
+        self.assertEqual(result['actions']['start facade']['exit'], 5)
+        self.assertEqual(result['facade_recovery'], dict(release=OLD, restarted=True))
+
+    def test_cli_and_facade_deploy_accepts_an_already_stopped_facade(self):
+        self.system.loaded_labels.remove(FACADE_LABEL)
+        broker = self.layout.broker_label
+        self.layout.broker_plist.write_bytes(self.layout.broker_plist.read_bytes().replace(OLD.encode(), NEW.encode()))
+        self.assertEqual(self.run_deploy(components=('cli', 'facade')), 0, self.lines)
+        self.assertTrue(self.system.loaded(FACADE_LABEL))
+        self.assertEqual(self.system.pid(broker), 100)
+        folder, = self.layout.runtime.glob('deploy-*')
+        result = json.loads((folder / 'result.json').read_text())
+        self.assertEqual(result['actions']['stop facade']['exit'], 0)
+        self.assertEqual(result['actions']['stop facade']['bootout_exit'], 3)
+
+    def test_stop_accepts_an_already_stopped_broker(self):
+        broker = self.layout.broker_label
+        self.system.loaded_labels.remove(broker)
+        actions = {}
+        deploy.stop(self.system, broker, actions, 'stop broker')
+        self.assertEqual(actions['stop broker']['exit'], 0)
+        self.assertEqual(actions['stop broker']['bootout_exit'], 3)
+
+    def test_recovery_failure_preserves_both_errors_in_the_receipt(self):
+        real = self.system.launchctl
+
+        def launchctl(*args):
+            if args[0] == 'bootstrap':
+                return 5
+            return real(*args)
+
+        self.system.launchctl = launchctl
+        self.assertEqual(self.run_deploy(), 1)
+        folder, = self.layout.runtime.glob('deploy-*')
+        result = json.loads((folder / 'result.json').read_text())
+        self.assertIn('start broker: launchctl bootstrap refused', result['error'])
+        self.assertIn('restart previous facade: launchctl bootstrap refused', result['facade_recovery']['error'])
+        self.assertFalse(result['facade_recovery']['restarted'])
+        self.assertEqual(result['actions']['restart previous facade']['exit'], 5)
 
     def test_an_existing_release_that_differs_from_the_commit_is_refused(self):
         scripts = self.layout.release('nana', NEW) / deploy.SKILL / 'scripts'
