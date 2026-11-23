@@ -1649,9 +1649,10 @@ async def start_self_archive(state, args):
     except codex_queue.QueueOwnerUnavailable as error:
         return await state.serialized(refuse_self_archive, state, finish, route,
                                       f'{error} No self-archive entry was submitted.')
-    except codex_queue.QueueUnavailable:
+    except codex_queue.QueueUnavailable as error:
+        # The queue adapter supplies a fixed summary. Details can include the route path.
         return await state.serialized(refuse_self_archive, state, finish, route,
-                                      'Desktop queue unavailable; no self-archive entry was submitted')
+                                      f'{error.summary} No self-archive entry was submitted.')
     except ThreadArchived:
         try:
             await asyncio.wait_for(asyncio.to_thread(verify_self_archive_readback, route),

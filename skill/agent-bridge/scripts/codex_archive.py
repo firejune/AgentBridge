@@ -541,7 +541,7 @@ def close(route, directory, timeout, *, prefer_native=None):
                                          defer_native_root=defer_native_root)
     final = next((result for result in results if result['id'] == sid), {})
     archived = final.get('archived') is True or final.get('status') == 'already_archived'
-    note = 'Native Codex archive verified: archive bit and rollout under archived_sessions.'
+    note = 'Native Codex archive was not verified. Closing route kept.'
     if archived:
         # The bit alone is not an archive: Codex moves the rollout when it archives natively (#212).
         try:
@@ -551,8 +551,13 @@ def close(route, directory, timeout, *, prefer_native=None):
             final['status'] = 'not_archived'
             final['reason'] = 'rollout_not_archived'
             note = 'Codex archive not verified: the rollout is not under archived_sessions. Closing route kept.'
+        else:
+            note = 'Native Codex archive verified: archive bit and rollout under archived_sessions.'
     elif final.get('reason') == 'desktop_holds_thread':
         note = 'Codex Desktop holds this thread; it was not archived and the route is kept.'
+    elif final.get('status') == 'descendant_not_archived' and any(
+            result.get('reason') == 'desktop_holds_thread' and result.get('archived') is False for result in results):
+        note = 'Codex Desktop holds an unarchived descendant. The parent was not archived and the route is kept.'
     incomplete = any(result['status'] not in ('archived', 'already_archived') for result in results)
     result = {'closed': archived, 'method': 'archive', 'archived': archived,
             'session': sid, 'host': 'codex', 'archived_at': final.get('archived_at', row['archived_at']),

@@ -148,13 +148,14 @@ python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.
 - 기본적으로 Codex 직접 종료(`close --archive`)는 그 스레드에 고정된 자기 보관 항목 하나를 큐에 넣는다. 스레드가 Desktop의 네이티브 도구로 스스로를 보관하고, 사이드바에서도 재시작 없이 사라진다. 라우트는 Agent Bridge가 보관 비트와 `archived_sessions` 아래의 rollout을 다시 읽어 확인한 뒤에만 지운다. Agent Bridge는 Codex 상태를 읽기만 하고 절대 쓰지 않는다. 결과의 `archive_path`가 무슨 일이 있었는지 알려 준다.
 
   - `self_archive`: 보관과 확인이 끝났고 라우트를 지웠다.
-  - `not_archived`: 아무것도 제출하지 않았다. 라우트는 그대로이고, 이유는 `reason`에 있다.
+  - `not_archived`: 아무것도 제출하지 않았다. 라우트는 유지되며, `reason`에는 작업 폴더가 사라졌다는 안내처럼 정해진 큐 거절 사유가 표시될 수 있다.
   - `pending_self_archive`: 종료 코드 1과 `close_id`를 준다. `close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID`로 네이티브 보관을 확인한다. 보관이 아직 확인되지 않았고 예약에 큐 접수 확인이 기록되어 있으면, 해당 스레드를 한 번 깨우도록 요청한 뒤 보관을 다시 확인한다. 깨우기에는 별도의 10초 한도가 있다. 큐 접수가 불확실하거나 이전 예약에 접수 확인 기록이 없으면 보관만 확인한다. 후속 확인에는 원래 `close_id`를 쓴다.
 
   종료가 거절될 때:
 
   - `unfinished correspondence`: 오류에 종료를 막는 메시지 ID가 표시된다. 해당 메시지를 읽고 처리한다. `received` 상태의 단방향 메시지와 회신은 종료 검사에서 완료로 본다. 발신자를 종료할 때는 라이브 `claude-peer` 또는 `agy` 세션에 직접 전송한 `submitted` 회신도 완료로 본다.
   - `running_process_cwd`: Desktop의 `node_repl` 도우미가 아닌 프로세스가 작업 폴더를 CWD로 쓰고 있다. `lsof`로 찾고, 멈추기 전에 그 주인에게 묻는다.
+  - Desktop이 미보관 하위 스레드를 점유해 부모 보관을 막으면, 부모의 종료 결과 `note`에 그 이유가 표시되고 부모 라우트는 유지된다.
   - 큐를 쓸 수 없다(`not_archived`): `lsof -t -- ~/.codex/queue_1.sqlite`를 확인한다. 소유자가 둘 이상이면 보통 어떤 스레드가 CUA로 자기 `codex app-server`를 띄운 것이다(#210). 그 프로세스는 주인의 승인을 받은 뒤에만 멈춘다.
   - 보관 비트는 켜져 있는데 rollout이 아직 `sessions/`에 있는 스레드는 지금은 Agent Bridge로 닫을 수 없다. 큐가 보관된 스레드로 보고 거절한다. 그대로 두고 보고한다.
 

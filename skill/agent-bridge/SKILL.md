@@ -154,13 +154,14 @@ python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.
 - By default, direct Codex `close --archive` queues one fixed self-archive entry for the exact thread. The thread archives itself with the native Desktop tool, and the sidebar entry disappears without a restart. The route is removed only after Agent Bridge reads back the archive bit and the rollout under `archived_sessions`. Agent Bridge only reads Codex state and never writes it. The result's `archive_path` says what happened:
 
   - `self_archive`: archived and verified, route removed.
-  - `not_archived`: nothing was submitted. The route stays registered, and `reason` says why.
+  - `not_archived`: nothing was submitted. The route stays registered, and `reason` can include a fixed queue diagnostic such as a missing workspace.
   - `pending_self_archive`: exit 1, with a `close_id`. Run `close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID` to verify the native archive. If archival is still unverified and the reservation has a confirmed queue receipt, finish requests one wake for the exact thread before checking again. The wake has its own 10-second budget. An uncertain receipt or an older reservation without a confirmed receipt is eligible for verification only. Use the original `close_id` for follow-up.
 
   When close is refused:
 
   - `unfinished correspondence`: the error lists the blocking message IDs. Read and reconcile those messages. A one-way message or reply in `received` already qualifies as finished for close. A `submitted` reply sent directly to a live `claude-peer` or `agy` session also qualifies when closing the sender.
   - `running_process_cwd`: a process other than the Desktop `node_repl` helpers has its CWD in the workspace. Find it with `lsof`, and ask its owner before stopping it.
+  - If an unarchived descendant held by Desktop blocks the parent archive, the parent's close result reports the blocker in `note` and keeps the parent route.
   - The queue is unavailable (`not_archived`): check `lsof -t -- ~/.codex/queue_1.sqlite`. More than one owner usually means a thread started its own `codex app-server` through CUA (#210). Stop that process only with the owner's approval.
   - A thread whose archive bit is set while its rollout is still in `sessions/` cannot be closed through Agent Bridge yet. The queue refuses it as archived. Leave it and report it.
 

@@ -54,6 +54,8 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
                                         'cwd': str(self.cwd), 'session': self.sid})
         self.patch(codex_archive, 'sweep_store', return_value=self.db)
         self.patch(codex_preview, 'state_path', return_value=self.db)
+        self.real_check_available = codex_queue.check_available
+        self.real_enqueue = codex_queue.enqueue
         self.available = self.patch(codex_queue, 'check_available')
         self.queue_id = str(uuid.uuid4())
         self.enqueue = self.patch(codex_queue, 'enqueue', return_value=self.queue_id)
@@ -115,6 +117,7 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['archive_path'], 'not_archived')
         self.assertFalse(result['route_removed'])
         self.assertEqual(result['reason'], reason)
+        self.assertEqual(result['note'], reason)
         self.assertEqual(self.archive_events(), [('not_archived', reason)])
         self.assertEqual(self.state.route('p', 'target'), self.route)
         self.assertEqual(broker.State(store=self.store).route('p', 'target'), self.route)
@@ -149,15 +152,37 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result['wake_requested'], True)
         self.assertNotIn('wake_reason', result)
 
-    async def test_definite_submit_refusal_reopens_route_without_touching_codex(self):
-        self.enqueue.side_effect = codex_queue.QueueUnavailable()
+    async def test_queue_preflight_reports_missing_workspace_without_the_path(self):
+        self.cwd.rmdir()
+        self.available.side_effect = self.real_check_available
+        before = self.db.read_bytes()
+        with (mock.patch.object(codex_queue, 'default_stores', return_value=(self.db, self.db)),
+              mock.patch.object(codex_queue, 'desktop_queue_owner') as owner):
+            result = await broker.start_self_archive(self.state, self.args)
+        self.assertFalse(self.cwd.exists())
+        # Restore the fixture workspace before independently loading the routing checkpoint.
+        self.cwd.mkdir()
+        reason = 'Codex Desktop queue route cwd no longer exists. No self-archive entry was submitted.'
+        self.assert_refused_keeps_open_route(result, reason)
+        self.assertEqual(self.db.read_bytes(), before)
+        self.assertTrue(self.rollout.exists())
+        owner.assert_not_called()
+        self.enqueue.assert_not_called()
+        self.opener.assert_not_called()
+
+    async def test_queue_launch_refusal_reopens_route_without_touching_codex(self):
+        self.enqueue.side_effect = self.real_enqueue
         retro = self.prepare_stop_retro()
         before = self.db.read_bytes()
-        result = await broker.start_self_archive(self.state, {**self.args, 'retro': retro})
-        self.assert_refused_keeps_open_route(result, 'Desktop queue unavailable; no self-archive entry was submitted')
+        with mock.patch.object(codex_queue.subprocess, 'Popen',
+                               side_effect=OSError('fixture launch failure at /private/codex')) as launch:
+            result = await broker.start_self_archive(self.state, {**self.args, 'retro': retro})
+        reason = 'Codex Desktop queue CLI could not be started. No self-archive entry was submitted.'
+        self.assert_refused_keeps_open_route(result, reason)
         self.assertEqual(self.db.read_bytes(), before)
         self.assertTrue(self.rollout.exists())
         self.assert_retro_discarded(retro)
+        launch.assert_called_once()
         self.enqueue.assert_called_once()
         self.opener.assert_not_called()
         self.assertIs(result['wake_requested'], False)
