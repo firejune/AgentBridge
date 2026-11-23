@@ -396,14 +396,17 @@ def snapshot(layout, live, sha, components):
 
 def stop(system, label, actions, name):
     started = time.monotonic()
-    code = system.launchctl('bootout', f'gui/{system.uid()}/{label}')
+    bootout_exit = system.launchctl('bootout', f'gui/{system.uid()}/{label}')
     for _ in range(150):  # Graceful shutdown writes the checkpoint first.
         if not system.loaded(label):
+            code = 0
             break
         system.sleep(.2)
     else:
-        code = code or 1
+        code = bootout_exit or 1
     actions[name] = dict(seconds=round(time.monotonic() - started, 3), exit=code)
+    if bootout_exit != code:
+        actions[name]['bootout_exit'] = bootout_exit
     if code:
         raise StepFailed(f'{name}: launchctl bootout did not stop {label}')
 
@@ -495,6 +498,23 @@ def write_receipt(folder, result):
     atomic_bytes(folder / 'result.json', (json.dumps(result, indent=2) + '\n').encode())
 
 
+def recover_facade(layout, system, live, sha, result):
+    actions = result['actions']
+    if actions.get('stop facade', {}).get('exit') != 0:
+        return
+    recovery = result['facade_recovery'] = dict(release=live.facade)
+    try:
+        if 'start facade' in actions:
+            if system.loaded(live.facade_label):
+                stop(system, live.facade_label, actions, 'stop facade for recovery')
+            point_facade(layout, sha, live.facade)
+        start(system, live.facade_label, live.facade_plist, actions, 'restart previous facade')
+    except (StepFailed, OSError, subprocess.SubprocessError) as error:
+        recovery.update(restarted=False, error=str(error))
+    else:
+        recovery['restarted'] = True
+
+
 def rollback_command(folder):
     return f'python3 {Path(__file__).resolve()} --rollback {folder}'
 
@@ -532,6 +552,7 @@ def deploy(layout, system, commit, components, dry_run=False, allow_non_ancestor
         apply(layout, system, live, sha, components, folder, result)
         verify(layout, system, live, sha, components, before, result)
     except StepFailed as error:
+        recover_facade(layout, system, live, sha, result)
         result.update(error=str(error), elapsed_seconds=round(time.monotonic() - started, 3))
         write_receipt(folder, result)
         out(f'FAILED: {error}')
