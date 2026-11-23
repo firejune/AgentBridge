@@ -17,6 +17,15 @@ import sessions
 ROUTE_FIELDS = ('project', 'name', 'transport', 'cwd', 'session', 'executable')
 CHANNEL_FIELDS = ('project', 'name', 'owner', 'description', 'generation', 'active', 'route')
 MAX_SNAPSHOT = 4 * 1024 * 1024
+CASCADE_FIELDS = ('closing_reviewed_descendants', 'closing_cascade_deferred')
+
+
+def descendant_ids(values, root):
+    if (not isinstance(values, list)
+            or any(not isinstance(sid, str) or sid == root or str(uuid.UUID(sid)) != sid for sid in values)
+            or values != sorted(set(values))):
+        raise ValueError('Invalid reviewed Codex descendant IDs')
+    return list(values)
 
 
 def sync_descriptor(fd, measure=nullcontext):
@@ -139,6 +148,13 @@ def endpoint_record(item):
         if item['closing_self_archive_enqueued'] is not True or 'closing_self_archive' not in result:
             raise ValueError('Invalid Codex self-archive enqueue confirmation')
         result['closing_self_archive_enqueued'] = True
+    if any(field in item for field in CASCADE_FIELDS):
+        if 'closing_self_archive' not in result or not all(field in item for field in CASCADE_FIELDS):
+            raise ValueError('Invalid Codex self-archive subtree guard')
+        reviewed, deferred = (descendant_ids(item[field], result['session']) for field in CASCADE_FIELDS)
+        if not set(deferred) <= set(reviewed):
+            raise ValueError('Codex deferred IDs must be reviewed descendants')
+        result.update(zip(CASCADE_FIELDS, (reviewed, deferred)))
     return result
 
 
@@ -242,7 +258,7 @@ def read_snapshot(path):
             data = json.load(source)
         except (ValueError, UnicodeError):
             raise ValueError('Invalid routing snapshot; refusing to overwrite it') from None
-    if (not isinstance(data, dict) or data.get('version') not in (1, 2, 3, 4, 5)
+    if (not isinstance(data, dict) or data.get('version') not in (1, 2, 3, 4, 5, 6)
             or not isinstance(data.get('endpoints'), list) or not isinstance(data.get('channels'), list)):
         raise ValueError('Unsupported routing snapshot; refusing to overwrite it')
     return data
@@ -277,6 +293,8 @@ class RouteStore:
             version = 4
         if any('closing_self_archive_enqueued' in item for item in endpoints.values()):
             version = 5
+        if any(any(field in item for field in CASCADE_FIELDS) for item in endpoints.values()):
+            version = 6
         snapshot = dict(version=version,
                         endpoints=[endpoint_record(item) for item in endpoints.values()],
                         channels=[channel_record(item) for item in channels.values()])
@@ -300,13 +318,15 @@ class RouteStore:
                 failed_check = 'invalid routing record'
                 closing = (kind == 'endpoint' and isinstance(raw, dict)
                            and any(field in raw for field in ('closing', 'closing_native_scope',
-                                                              'closing_self_archive', 'closing_self_archive_enqueued')))
+                                                              'closing_self_archive', 'closing_self_archive_enqueued',
+                                                              *CASCADE_FIELDS)))
                 try:
                     item = normalize(raw)
                     if ((closing and data['version'] < 2)
                             or ('closing_native_scope' in item and data['version'] < 3)
                             or ('closing_self_archive' in item and data['version'] < 4)
-                            or ('closing_self_archive_enqueued' in item and data['version'] < 5)):
+                            or ('closing_self_archive_enqueued' in item and data['version'] < 5)
+                            or (CASCADE_FIELDS[0] in item and data['version'] < 6)):
                         raise ValueError('Unsupported Codex close snapshot')
                     route = item['route'] if kind == 'channel' else item
                     identity = tuple(route.get(field) for field in ROUTE_FIELDS)

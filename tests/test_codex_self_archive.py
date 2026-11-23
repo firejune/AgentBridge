@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -37,7 +38,7 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.archived_rollout = root / 'archived_sessions' / self.rollout.name
         self.rollout.parent.mkdir()
         self.archived_rollout.parent.mkdir()
-        self.rollout.write_text('{}\n', encoding='utf-8')
+        self.write_rollout(self.rollout, self.sid)
         self.db = root / 'state_5.sqlite'
         with closing(sqlite3.connect(self.db)) as db, db:
             db.execute('CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, archived INTEGER, archived_at INTEGER, '
@@ -48,12 +49,16 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.db.chmod(0o600)
         self.store = route_store.RouteStore(root / 'routing')
         self.addCleanup(self.store.close)
+        self.patch(route_store.sessions, 'inspect_session',
+                   return_value={'session': {'id': self.sid, 'cwd': str(self.cwd)}})
         self.state = broker.State(store=self.store)
         self.address = {'project': 'p', 'name': 'target'}
         self.route = self.state.action({'op': 'register', **self.address, 'transport': 'codex',
                                         'cwd': str(self.cwd), 'session': self.sid})
         self.patch(codex_archive, 'sweep_store', return_value=self.db)
         self.patch(codex_preview, 'state_path', return_value=self.db)
+        self.real_check_available = codex_queue.check_available
+        self.real_enqueue = codex_queue.enqueue
         self.available = self.patch(codex_queue, 'check_available')
         self.queue_id = str(uuid.uuid4())
         self.enqueue = self.patch(codex_queue, 'enqueue', return_value=self.queue_id)
@@ -75,6 +80,361 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         patcher = mock.patch.object(target, field, **kwargs)
         self.addCleanup(patcher.stop)
         return patcher.start()
+
+    def write_rollout(self, path, sid, *events):
+        rows = [{'type': 'session_meta', 'payload': {'id': sid}}]
+        rows.extend({'type': 'event_msg', 'payload': {'type': event, 'turn_id': turn}} for event, turn in events)
+        path.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
+
+    def configure_cascade(self):
+        self.queue = self.cwd.parent / 'queue_1.sqlite'
+        with closing(sqlite3.connect(self.queue)) as db, db:
+            db.execute('CREATE TABLE queued_items (thread_id TEXT NOT NULL, message TEXT)')
+        self.patch(codex_queue, 'default_stores', return_value=(self.db, self.queue))
+        self.patch(codex_archive, 'executable', return_value='/fixture/codex')
+        self.patch(codex_archive.wt, 'open_files', return_value=[])
+        self.sleep = mock.Mock()
+        original = codex_archive.check_cascade_quiescence
+        self.patch(codex_archive, 'check_cascade_quiescence',
+                   side_effect=lambda *args, **kwargs: original(*args, **kwargs, sleep=self.sleep))
+        self.saved = self.patch(codex_archive.sessions, 'CodexClient').return_value.__enter__.return_value.call
+
+        def held(method, params):
+            sid = params['threadId']
+            raise codex_archive.sessions.CodexRpcError(
+                method, {'code': -32600, 'message': f'thread {sid} already has an active writer'})
+
+        self.held = held
+        self.saved.side_effect = held
+        loop = asyncio.get_running_loop()
+
+        def request(path, args, timeout=10):
+            async def dispatch():
+                if args['op'] == 'close-self-archive':
+                    return await broker.start_self_archive(self.state, args)
+                if args['op'] == 'close-finish':
+                    return await broker.finish_close(self.state, args)
+                return await self.state.action_async(args)
+            return asyncio.run_coroutine_threadsafe(dispatch(), loop).result(timeout)
+
+        self.request = self.patch(bridge.broker, 'request', side_effect=request)
+
+    def add_cascade_child(self, *, parent=None, archived=False, events=None):
+        sid = str(uuid.uuid4())
+        path = (self.archived_rollout if archived else self.rollout).with_name(f'rollout-{sid}.jsonl')
+        if events is None:
+            events = [('task_started', '1'), ('task_complete', '1')]
+        self.write_rollout(path, sid, *events)
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute("INSERT INTO threads VALUES (?, ?, ?, NULL, 'fixture', 1, ?)",
+                       (sid, str(self.cwd), int(archived), str(path)))
+            db.execute('INSERT INTO thread_spawn_edges VALUES (?, ?)', (parent or self.sid, sid))
+        return sid, path
+
+    def archive_cascade_child(self, child, *, move=True):
+        sid, path = child
+        if move:
+            target = self.archived_rollout.with_name(path.name)
+            path.rename(target)
+            path = target
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute('UPDATE threads SET archived=1, archived_at=2, rollout_path=? WHERE id=?', (str(path), sid))
+
+    async def cascade_cli(self, *flags, timeout=2):
+        return await asyncio.to_thread(run, ['--socket', str(self.cwd.parent / 'fixture.sock'), 'close', 'target',
+                                             '--project', 'p', '--state-dir', str(self.store.directory),
+                                             '--timeout', str(timeout), *flags])
+
+    async def cascade_close(self, **kwargs):
+        return await self.cascade_cli('--archive', '--no-retro', 'fixture', **kwargs)
+
+    async def cascade_finish(self, result, **kwargs):
+        return await self.cascade_cli('--finish', result['close_id'], '--expect-session', self.sid, **kwargs)
+
+    def wake_archiving(self, *children):
+        def archive(thread, _timeout):
+            self.assertEqual(thread, self.sid)
+            self.record_native_archive()
+            for child in children:
+                self.archive_cascade_child(child)
+        self.opener.side_effect = archive
+
+    def assert_only_root_entry(self):
+        self.enqueue.assert_called_once()
+        self.opener.assert_called_once()
+        self.assertEqual(self.enqueue.call_args.args[:2],
+                         (self.sid, 'Archive this Codex Desktop thread now. Call the Codex app '
+                          f'set_thread_archived tool with threadId "{self.sid}", hostId "local", '
+                          'source "codex", and archived true. Take no other action.'))
+        self.assertEqual(self.opener.call_args.args[0], self.sid)
+
+    async def test_cascade_terminal_child_and_dispatch_removed_queue_row(self):
+        self.configure_cascade()
+        child = self.add_cascade_child()
+        with closing(sqlite3.connect(self.queue)) as db, db:
+            db.execute('INSERT INTO queued_items VALUES (?, ?)', (child[0], 'fixture'))
+            db.execute('DELETE FROM queued_items WHERE thread_id=?', (child[0],))
+        self.wake_archiving(child)
+        reads = []
+        self.available.side_effect = lambda route: reads.append('availability')
+        self.sleep.side_effect = lambda _: reads.append('settle')
+        with mock.patch.object(codex_archive, 'check_descendant_queue',
+                               wraps=codex_archive.check_descendant_queue) as queue_check:
+            code, result = await self.cascade_close()
+        self.assertEqual((code, result['archive_path'], result['count'], result['route_removed']),
+                         (0, 'root_cascade', 2, True))
+        self.assertEqual(result['results'][0]['method'], 'root_cascade')
+        self.assertEqual(reads, ['availability', 'settle'])
+        self.assertEqual(queue_check.call_args_list, [mock.call(self.queue, [child[0]])] * 2)
+        self.saved.assert_called_once_with('thread/archive', {'threadId': child[0]})
+        self.sleep.assert_called_once_with(1)
+        self.assert_only_root_entry()
+
+    async def test_cascade_mixed_saved_previous_and_multiple_nested_workers(self):
+        self.configure_cascade()
+        intermediate = self.add_cascade_child()
+        worker = self.add_cascade_child(parent=intermediate[0])
+        previous = self.add_cascade_child(archived=True)
+        second = self.add_cascade_child(events=[('task_started', '1'), ('turn_aborted', '1')])
+        saved = self.add_cascade_child()
+
+        def rpc(method, params):
+            if params['threadId'] == saved[0]:
+                self.archive_cascade_child(saved)
+                return {}
+            self.held(method, params)
+
+        self.saved.side_effect = rpc
+        self.wake_archiving(worker, intermediate, second)
+        code, result = await self.cascade_close()
+        self.assertEqual((code, result['count']), (0, 6))
+        rows = {row['id']: row for row in result['results']}
+        self.assertEqual(rows[previous[0]]['status'], 'already_archived')
+        self.assertEqual(rows[saved[0]]['status'], 'archived')
+        self.assertEqual([rows[child[0]]['method'] for child in (intermediate, worker, second)], ['root_cascade'] * 3)
+        self.assertEqual({call.args[1]['threadId'] for call in self.saved.call_args_list},
+                         {worker[0], second[0], saved[0]})
+        self.sleep.assert_called_once_with(1)
+        self.assert_only_root_entry()
+
+    async def test_cascade_nonwriter_failure_anywhere_blocks_the_root(self):
+        self.configure_cascade()
+        child = self.add_cascade_child()
+        rejected = self.add_cascade_child()
+
+        def rpc(method, params):
+            if params['threadId'] == rejected[0]:
+                raise codex_archive.sessions.CodexRpcError(
+                    method, {'code': -32600, 'message': f'thread {child[0]} already has an active writer'})
+            self.held(method, params)
+
+        self.saved.side_effect = rpc
+        code, result = await self.cascade_close()
+        self.assertEqual((code, result['route_removed'], result['count']), (1, False, 0))
+        self.assertEqual(self.state.route('p', 'target'), self.route)
+        self.enqueue.assert_not_called()
+        self.opener.assert_not_called()
+
+    async def test_cascade_partial_root_archive_persists_exact_review_and_finishes_after_restart(self):
+        self.configure_cascade()
+        child = self.add_cascade_child()
+        previous = self.add_cascade_child(archived=True)
+        self.wake_archiving()
+        code, pending = await self.cascade_close(timeout=1.2)
+        self.assertEqual((code, pending['archive_path'], pending['root_archived'], pending['count']),
+                         (1, 'pending_self_archive', True, 2))
+        self.assertFalse(pending['route_removed'])
+        data = json.loads(self.store.path.read_text())
+        reservation = next(row for row in data['endpoints'] if row['name'] == 'target')
+        self.assertEqual(data['version'], 6)
+        self.assertEqual(reservation['closing_reviewed_descendants'], sorted([child[0], previous[0]]))
+        self.assertEqual(reservation['closing_cascade_deferred'], [child[0]])
+        self.state = broker.State(store=self.store)
+        self.archive_cascade_child(child, move=False)
+        code, pending = await self.cascade_finish(pending, timeout=.15)
+        self.assertEqual((code, pending['count'], pending['route_removed']), (1, 2, False))
+        self.assertFalse(pending['wake_requested'])
+        self.archive_cascade_child(child)
+        self.write_rollout(previous[1], child[0])  # An archived sibling with the wrong session_meta.
+        code, pending = await self.cascade_finish(pending, timeout=.15)
+        self.assertEqual((code, pending['count'], pending['route_removed']), (1, 2, False))
+        self.write_rollout(previous[1], previous[0])
+        code, closed = await self.cascade_finish(pending)
+        self.assertEqual((code, closed['archive_path'], closed['count'], closed['route_removed']),
+                         (0, 'root_cascade', 3, True))
+        methods = {row['id']: row['method'] for row in closed['results']}
+        self.assertEqual((methods[child[0]], methods[previous[0]]), ('root_cascade', 'saved_or_previously_archived'))
+        self.assert_only_root_entry()
+
+    async def test_cascade_already_archived_root_keeps_pending_when_child_is_unmet(self):
+        self.configure_cascade()
+        child = self.add_cascade_child()
+        self.record_native_archive()
+        self.available.side_effect = broker.ThreadArchived()
+        code, pending = await self.cascade_close()
+        self.assertEqual((code, pending['archive_path'], pending['root_archived'], pending['count']),
+                         (1, 'pending_self_archive', True, 1))
+        self.archive_cascade_child(child)
+        code, result = await self.cascade_finish(pending)
+        self.assertEqual((code, result['archive_path'], result['count']), (0, 'self_archive', 2))
+        self.assertEqual(result['results'][0]['method'], 'deferred_native_readback')
+        self.enqueue.assert_not_called()
+        self.opener.assert_not_called()
+
+    async def test_cascade_enqueue_checkpoint_failure_keeps_reservation_without_retry(self):
+        self.configure_cascade()
+        child = self.add_cascade_child()
+        save = self.store.save
+
+        def fail_confirmation(endpoints, channels):
+            if endpoints[('p', 'target')].get('closing_self_archive_enqueued'):
+                raise OSError('fixture checkpoint failure')
+            return save(endpoints, channels)
+
+        with mock.patch.object(self.store, 'save', side_effect=fail_confirmation):
+            code, pending = await self.cascade_close()
+        self.assertEqual((code, pending['archive_path']), (1, 'pending_self_archive'))
+        self.state = broker.State(store=self.store)
+        self.assertEqual(self.state.endpoints[('p', 'target')]['closing'], pending['close_id'])
+        self.record_native_archive()
+        self.archive_cascade_child(child)
+        code, result = await self.cascade_finish(pending)
+        self.assertEqual((code, result['count'], result['route_removed']), (0, 2, True))
+        self.enqueue.assert_called_once()
+        self.opener.assert_not_called()
+
+    async def test_cascade_held_open_unreadable_unbound_or_without_lifecycle(self):
+        self.configure_cascade()
+        child, path = self.add_cascade_child()
+        for state in ('open', 'unreadable', 'unbound', 'no_lifecycle'):
+            with self.subTest(state=state):
+                if state == 'open':
+                    self.write_rollout(path, child, ('task_started', '1'), ('task_complete', 'another-turn'))
+                elif state == 'unreadable':
+                    path.unlink()
+                elif state == 'unbound':
+                    self.write_rollout(path, self.sid, ('task_complete', '1'))
+                else:
+                    self.write_rollout(path, child)
+                code, result = await self.cascade_close()
+                expected = 'open' if state == 'open' else 'unknown'
+                self.assertEqual((code, result['reason'], result['descendant'], result['descendant_state']),
+                                 (1, 'descendant_turn_' + expected, child, expected))
+                self.assertEqual(self.state.route('p', 'target'), self.route)
+        self.enqueue.assert_not_called()
+        self.opener.assert_not_called()
+
+    async def test_cascade_nested_open_ancestor_refuses_without_saved_ancestor_archive(self):
+        self.configure_cascade()
+        ancestor, _ = self.add_cascade_child(events=[('task_started', '1')])
+        worker, _ = self.add_cascade_child(parent=ancestor)
+        code, result = await self.cascade_close()
+        self.assertEqual((code, result['reason'], result['descendant']), (1, 'descendant_turn_open', ancestor))
+        self.saved.assert_called_once_with('thread/archive', {'threadId': worker})
+        self.enqueue.assert_not_called()
+
+    async def test_cascade_pending_wal_queue_row_and_unreadable_store_refuse(self):
+        self.configure_cascade()
+        child, _ = self.add_cascade_child()
+        wal_queue = self.queue.with_name('queue-writer')
+        with closing(sqlite3.connect(wal_queue)) as db, db:
+            db.execute('PRAGMA journal_mode=WAL')
+            db.execute('CREATE TABLE queued_items (thread_id TEXT, message TEXT)')
+            db.execute('INSERT INTO queued_items VALUES (?, ?)', (child, 'sensitive fixture payload'))
+            db.commit()
+            shutil.copyfile(wal_queue, self.queue)
+            shutil.copyfile(str(wal_queue) + '-wal', str(self.queue) + '-wal')
+            before = {p.name: p.read_bytes() for p in (self.queue, Path(str(self.queue) + '-wal'))}
+            code, result = await self.cascade_close()
+            self.assertEqual((code, result['reason'], result['descendant'], result['descendant_state']),
+                             (1, 'descendant_queue_pending', child, 'pending'))
+            self.assertNotIn('sensitive fixture payload', json.dumps(result))
+            self.assertFalse(Path(str(self.queue) + '-shm').exists())
+            self.assertEqual({name: self.queue.with_name(name).read_bytes() for name in before}, before)
+        self.queue.unlink()
+        code, result = await self.cascade_close()
+        self.assertEqual((code, result['reason'], result['descendant'], result['descendant_state']),
+                         (1, 'descendant_queue_unknown', child, 'unknown'))
+        self.assertNotIn(str(self.queue), json.dumps(result))
+        self.sleep.assert_not_called()
+        self.enqueue.assert_not_called()
+
+    async def test_cascade_settle_refuses_rollover_and_late_queue_entry(self):
+        self.configure_cascade()
+        child, path = self.add_cascade_child()
+        self.sleep.side_effect = lambda _: self.write_rollout(
+            path, child, ('task_started', '2'), ('task_complete', '2'))
+        code, result = await self.cascade_close()
+        self.assertEqual((code, result['reason'], result['descendant'], result['descendant_state']),
+                         (1, 'descendant_turn_unknown', child, 'changed'))
+
+        def populate(_):
+            with closing(sqlite3.connect(self.queue)) as db, db:
+                db.execute('INSERT INTO queued_items VALUES (?, ?)', (child, 'arrived during settle'))
+
+        self.sleep.side_effect = populate
+        code, result = await self.cascade_close()
+        self.assertEqual((code, result['reason'], result['descendant']), (1, 'descendant_queue_pending', child))
+        self.assertEqual(self.sleep.call_args_list, [mock.call(1)] * 2)
+        self.enqueue.assert_not_called()
+        self.opener.assert_not_called()
+
+    async def test_cascade_does_not_wait_or_enqueue_past_deadline(self):
+        self.configure_cascade()
+        self.add_cascade_child()
+        code, result = await self.cascade_close(timeout=.9)
+        self.assertEqual((code, result['archive_path']), (1, 'not_archived'))
+        self.assertIn('deadline', result['reason'])
+        self.assertEqual(self.state.route('p', 'target'), self.route)
+        self.sleep.assert_not_called()
+        self.enqueue.assert_not_called()
+
+    async def test_cascade_rejects_unbound_review_and_requested_held_ids(self):
+        self.configure_cascade()
+        held, _ = self.add_cascade_child()
+        archived, _ = self.add_cascade_child(archived=True)
+        snapshot = codex_archive.preview_snapshot(self.db)
+        reviewed = sorted([held, archived])
+        scope = codex_archive.cascade_digest(self.db, self.route, snapshot, reviewed, [held])
+        for review in ({'reviewed': [held], 'deferred': [held], 'held': [held]},
+                       {'reviewed': reviewed, 'deferred': [held], 'held': [archived]},
+                       {'reviewed': reviewed, 'deferred': [archived], 'held': [archived]}):
+            with self.subTest(review=review), self.assertRaises(ValueError):
+                await broker.start_self_archive(self.state, {**self.args, 'native_scope': scope, 'cascade': review})
+        self.assertEqual(self.state.route('p', 'target'), self.route)
+        self.available.assert_not_called()
+        self.enqueue.assert_not_called()
+
+    async def test_cascade_rechecks_topology_after_queue_availability(self):
+        self.configure_cascade()
+        parent, _ = self.add_cascade_child(archived=True)
+        child, _ = self.add_cascade_child()
+
+        def reparent(_):
+            with closing(sqlite3.connect(self.db)) as db, db:
+                db.execute('UPDATE thread_spawn_edges SET parent_thread_id=? WHERE child_thread_id=?', (parent, child))
+
+        self.available.side_effect = reparent
+        code, result = await self.cascade_close()
+        self.assertEqual((code, result['archive_path']), (1, 'not_archived'))
+        self.assertIn('subtree or saved profile changed', result['reason'])
+        self.sleep.assert_not_called()
+        self.enqueue.assert_not_called()
+
+    async def test_legacy_pending_descendant_must_match_exact_archive_after_restart(self):
+        child, path = self.add_cascade_child(archived=True)
+        self.wake_archiving()
+        self.write_rollout(path, self.sid)
+        _, scope = codex_archive.native_handoff_scope(self.route)
+        pending = await broker.start_self_archive(
+            self.state, {**self.args, 'native_scope': scope, 'timeout': .15})
+        self.assertEqual(pending['archive_path'], 'pending_self_archive')
+        self.assertEqual(json.loads(self.store.path.read_text())['version'], 5)
+        self.state = broker.State(store=self.store)
+        self.write_rollout(path, child)
+        closed = await broker.finish_close(self.state, self.finish_args(pending))
+        self.assertEqual((closed['archive_path'], closed['route_removed']), ('self_archive', True))
+        self.assert_only_root_entry()
 
     def write_app_build(self, version, build):
         self.plist.write_bytes(plistlib.dumps({
@@ -115,6 +475,7 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['archive_path'], 'not_archived')
         self.assertFalse(result['route_removed'])
         self.assertEqual(result['reason'], reason)
+        self.assertEqual(result['note'], reason)
         self.assertEqual(self.archive_events(), [('not_archived', reason)])
         self.assertEqual(self.state.route('p', 'target'), self.route)
         self.assertEqual(broker.State(store=self.store).route('p', 'target'), self.route)
@@ -149,15 +510,37 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result['wake_requested'], True)
         self.assertNotIn('wake_reason', result)
 
-    async def test_definite_submit_refusal_reopens_route_without_touching_codex(self):
-        self.enqueue.side_effect = codex_queue.QueueUnavailable()
+    async def test_queue_preflight_reports_missing_workspace_without_the_path(self):
+        self.cwd.rmdir()
+        self.available.side_effect = self.real_check_available
+        before = self.db.read_bytes()
+        with (mock.patch.object(codex_queue, 'default_stores', return_value=(self.db, self.db)),
+              mock.patch.object(codex_queue, 'desktop_queue_owner') as owner):
+            result = await broker.start_self_archive(self.state, self.args)
+        self.assertFalse(self.cwd.exists())
+        # Restore the fixture workspace before independently loading the routing checkpoint.
+        self.cwd.mkdir()
+        reason = 'Codex Desktop queue route cwd no longer exists. No self-archive entry was submitted.'
+        self.assert_refused_keeps_open_route(result, reason)
+        self.assertEqual(self.db.read_bytes(), before)
+        self.assertTrue(self.rollout.exists())
+        owner.assert_not_called()
+        self.enqueue.assert_not_called()
+        self.opener.assert_not_called()
+
+    async def test_queue_launch_refusal_reopens_route_without_touching_codex(self):
+        self.enqueue.side_effect = self.real_enqueue
         retro = self.prepare_stop_retro()
         before = self.db.read_bytes()
-        result = await broker.start_self_archive(self.state, {**self.args, 'retro': retro})
-        self.assert_refused_keeps_open_route(result, 'Desktop queue unavailable; no self-archive entry was submitted')
+        with mock.patch.object(codex_queue.subprocess, 'Popen',
+                               side_effect=OSError('fixture launch failure at /private/codex')) as launch:
+            result = await broker.start_self_archive(self.state, {**self.args, 'retro': retro})
+        reason = 'Codex Desktop queue CLI could not be started. No self-archive entry was submitted.'
+        self.assert_refused_keeps_open_route(result, reason)
         self.assertEqual(self.db.read_bytes(), before)
         self.assertTrue(self.rollout.exists())
         self.assert_retro_discarded(retro)
+        launch.assert_called_once()
         self.enqueue.assert_called_once()
         self.opener.assert_not_called()
         self.assertIs(result['wake_requested'], False)
@@ -357,7 +740,10 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
 
         def close_session(route, timeout, **options):
             self.assertTrue(options['prefer_native']())
-            return {'status': 'awaiting_native_archive', 'native_scope': self.args['native_scope'],
+            snapshot = codex_archive.preview_snapshot(self.db)
+            return {'status': 'awaiting_native_archive',
+                    'native_scope': codex_archive.cascade_digest(self.db, route, snapshot, [], []),
+                    'cascade': {'reviewed': [], 'deferred': [], 'held': []},
                     'results': [{'id': self.sid, 'status': 'awaiting_native_archive'}], 'count': 0}
 
         def enqueue(*_):

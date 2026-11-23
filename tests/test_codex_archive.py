@@ -154,6 +154,7 @@ class CodexArchiveTests(unittest.TestCase):
         result = archive.close(route, self.routes, 1)
         self.assertEqual(self.calls, [('thread/archive', leaf), ('thread/archive', root)])
         self.assertEqual((result['closed'], result['count'], result['archived_at']), (True, 2, 2))
+        self.assertIn('Native Codex archive verified', result['note'])
 
     def test_close_archives_recent_root_and_child_rejected_by_sweep(self):
         now = int(archive.time.time())
@@ -249,8 +250,40 @@ class CodexArchiveTests(unittest.TestCase):
             raise archive.sessions.CodexRpcError(method, {'code': -32600, 'message': 'invalid request'})
 
         self.behavior = rejected
-        self.assertFalse(archive.close(route, self.routes, 1)['closed'])
+        result = archive.close(route, self.routes, 1)
+        self.assertFalse(result['closed'])
+        self.assertEqual(result['note'], 'Native Codex archive was not verified. Closing route kept.')
         self.assertEqual(self.bits(other), [0])
+
+    def test_close_reports_held_child_without_attempting_parent_or_native_handoff(self):
+        self.cwd.mkdir(parents=True)
+        root = self.add(1)
+        child = self.add(2, parent=root)
+        route = self.route(root)
+        self.register(route)
+        before = self.db.read_bytes()
+
+        def held(method, sid):
+            raise archive.sessions.CodexRpcError(method, {
+                'code': -32600, 'message': f'thread {sid} already has an active writer'})
+
+        self.behavior = held
+        with patch.object(archive, 'sweep_store', return_value=self.db):
+            result = archive.close(route, self.routes, 1, prefer_native=lambda: True)
+
+        self.assertEqual(self.calls, [('thread/archive', child)])
+        self.assertEqual((result['closed'], result['archived'], result['archive_incomplete'], result['count']),
+                         (False, False, True, 0))
+        self.assertNotIn('native_scope', result)
+        self.assertEqual(result['note'], 'Codex Desktop holds an unarchived descendant. '
+                                         'The parent was not archived and the route is kept.')
+        child_receipt, parent_receipt = result['results']
+        self.assertEqual((child_receipt['id'], child_receipt['status'], child_receipt['reason']),
+                         (child, 'not_archived', 'desktop_holds_thread'))
+        self.assertEqual(parent_receipt, {'id': root, 'status': 'descendant_not_archived'})
+        self.assertEqual(self.db.read_bytes(), before)
+        self.assertTrue((self.sessions / f'{child}.jsonl').is_file())
+        self.assertTrue((self.sessions / f'{root}.jsonl').is_file())
 
     def test_close_reports_a_bit_only_archive_as_not_closed(self):
         # The bit is set but the rollout is still in sessions/: Codex never archived the thread (#212).
@@ -442,14 +475,14 @@ class CodexArchiveTests(unittest.TestCase):
 
     def test_preview_refuses_database_changed_during_copy(self):
         self.add(1)
-        real_copy = archive.shutil.copyfile
+        real_copy = archive.codex_preview.shutil.copyfile
 
         def change(source, target):
             result = real_copy(source, target)
             self.add(2)
             return result
 
-        with patch.object(archive.shutil, 'copyfile', side_effect=change):
+        with patch.object(archive.codex_preview.shutil, 'copyfile', side_effect=change):
             with self.assertRaisesRegex(ValueError, 'changed during preview'):
                 self.plan()
 
