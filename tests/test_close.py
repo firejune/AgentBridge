@@ -841,6 +841,30 @@ class CloseCodexTests(unittest.TestCase):
 
 
 class CloseCommandTests(unittest.TestCase):
+    def test_busy_provider_close_exits_nonzero_and_keeps_route(self):
+        with RunningBroker() as server, tempfile.TemporaryDirectory() as cwd, \
+                FakeAgyServer(cwd, str(uuid.uuid4())) as fake, \
+                mock.patch.dict(os.environ, {'AGENT_BRIDGE_AGY_URL': fake.url, 'AGENT_BRIDGE_AGY_CSRF': CSRF}):
+            claude_sid = str(uuid.uuid4())
+            registry = Path(cwd) / 'claude-session.json'
+            registry.write_text(json.dumps({'entrypoint': 'claude-desktop'}), encoding='utf-8')
+            claude_session = {'id': claude_sid, 'registry': str(registry), 'pid': 123}
+            server.call('register', project='p', name='claude', cwd=cwd, transport='claude-peer', session=claude_sid)
+            server.call('register', project='p', name='agy', cwd=cwd, transport='agy', session=fake.sid)
+            routes = server.call('routes', project='p')
+            for name, reason in (('claude', 'is still running'), ('agy', 'is running')):
+                for flags in ([], ['--archive']):
+                    with self.subTest(name=name, flags=flags):
+                        command = ['--socket', server.path, 'close', name, '--project', 'p',
+                                   '--timeout', '0.01', '--no-retro', 'fixture', *flags]
+                        with mock.patch.object(sessions, 'resolve_claude_peer', return_value=claude_session), \
+                                mock.patch.object(sessions, 'pid_alive', return_value=True), \
+                                mock.patch.object(sessions.os, 'kill'):
+                            code, result = run(command)
+                        self.assertEqual(code, 1)
+                        self.assertIn(reason, result['error'])
+                        self.assertEqual(server.call('routes', project='p'), routes)
+
     def test_a_failed_close_writes_no_retro_and_a_confirmed_one_writes_it_once(self):
         with RunningBroker() as server, tempfile.TemporaryDirectory() as cwd:
             store = Path(cwd) / 'retros.jsonl'
