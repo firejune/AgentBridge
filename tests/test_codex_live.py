@@ -204,15 +204,17 @@ class CodexLiveTests(unittest.TestCase):
                         codex_live.deliver(self.route, self.message_id, 'PEER_BODY')
                     queue.assert_not_called()
 
-    def test_ineligible_queue_preserves_distinct_default_socket_refusal(self):
+    def test_attempted_queue_preserves_its_own_prewrite_refusal(self):
+        refusal = codex_queue.QueueUnavailable('Codex Desktop queue CLI signature check failed.')
         for reason in (codex_live.EndpointUnavailable.MISSING, codex_live.EndpointUnavailable.REFUSED):
             error = codex_live.EndpointUnavailable(codex_live.EndpointUnavailable.DEFAULT, reason)
             with self.subTest(reason=reason), patch.object(codex_live.Client, 'connect',
                     side_effect=error), patch.object(codex_queue, 'deliver',
-                    side_effect=codex_queue.QueueUnavailable):
-                with self.assertRaises(codex_live.EndpointUnavailable) as raised:
+                    side_effect=refusal):
+                with self.assertRaises(codex_queue.QueueUnavailable) as raised:
                     codex_live.deliver(self.route, self.message_id, 'PEER_BODY')
-                self.assertIs(raised.exception, error)
+                self.assertIs(raised.exception, refusal)
+                self.assertFalse(raised.exception.uncertain)
 
     def test_queue_submits_only_pointer_and_requires_exact_receipt(self):
         thread, item = self.route['session'], str(uuid.uuid4())

@@ -393,12 +393,7 @@ def deliver(route, message_id, text, timeout=10, dry_run=False, path=None, *, al
         if allow_queue and not client.mutation_sent and error.default_absent:
             import codex_queue
 
-            try:
-                return codex_queue.deliver(route, thread, message_id, timeout, dry_run, close_handoff=close_handoff)
-            except codex_queue.QueueOwnerUnavailable as refusal:
-                raise refusal from None
-            except codex_queue.QueueUnavailable:
-                raise error from None
+            return codex_queue.deliver(route, thread, message_id, timeout, dry_run, close_handoff=close_handoff)
         raise
     except DeliveryError as error:
         if client.mutation_sent:

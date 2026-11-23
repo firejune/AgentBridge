@@ -1,4 +1,5 @@
 """Submit a pointer to a saved local Desktop thread through the official CLI queue."""
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import re
@@ -35,15 +36,16 @@ def notice(message_id):
 
 
 class QueueUnavailable(DeliveryError):
-    def __init__(self, reason=UNAVAILABLE):
-        super().__init__(reason)
+    def __init__(self, summary=UNAVAILABLE, *, detail=None):
+        super().__init__(detail if detail is not None else summary)
+        self.summary = summary
 
 
 class QueueOwnerUnavailable(QueueUnavailable):
     SUMMARY = 'No unique local Desktop queue owner.'
 
     def __init__(self, detail):
-        super().__init__(f'{self.SUMMARY} {detail}')
+        super().__init__(self.SUMMARY, detail=f'{self.SUMMARY} {detail}')
 
 
 def checked_output(args, timeout=2):
@@ -192,35 +194,55 @@ def verify_signature(bundle=CLI_BUNDLE, requirement=SIGNATURE, timeout=2):
     checked_output(['/usr/bin/codesign', '--verify', '--strict', '-R=' + requirement, str(bundle)], timeout=timeout)
 
 
+@contextmanager
+def queue_check(summary):
+    """Normalize provider failures at the check that observed them."""
+    try:
+        yield
+    except (ThreadArchived, QueueUnavailable):
+        raise
+    except (OSError, subprocess.SubprocessError, ValueError, RuntimeError, KeyError, TypeError):
+        raise QueueUnavailable(summary) from None
+
+
+def missing_workspace(cwd):
+    return QueueUnavailable(
+        'Codex Desktop queue route cwd no longer exists.',
+        detail=f"route cwd {cwd} no longer exists; the Codex thread's saved cwd must exist for queue delivery")
+
+
 def check_route(route):
     if route.get('executable') not in (None, 'codex', str(CLI)):
-        raise ValueError('non-default route executable')
-    state, queue = default_stores()
-    verify_signature()
+        raise QueueUnavailable('Codex Desktop queue requires the default route executable.')
+    with queue_check('Codex Desktop queue requires the default Desktop configuration.'):
+        state, queue = default_stores()
+    with queue_check('Codex Desktop queue CLI signature check failed.'):
+        verify_signature()
     # Cross-check where the signed CLI itself would locate the store, including
     # configuration and requirements. Verify the saved target in that same store.
-    if codex_preview.state_path(str(CLI)) != state:
-        raise ValueError('non-default state store')
-    cwd, archived = codex_preview._saved_thread_row(route, path=state)
-    saved, registered = Path(cwd), Path(route['cwd'])
-    if not saved.is_absolute() or not registered.is_absolute() or saved.resolve() != registered.resolve():
-        raise ValueError('workspace differs')
-    if archived:
-        raise ThreadArchived()
-    if not saved.is_dir():
-        raise ValueError('workspace missing')
-    codex_preview.require_owned_store(queue)
+    with queue_check('Codex Desktop queue could not verify the native state store configuration.'):
+        configured_state = codex_preview.state_path(str(CLI))
+    if configured_state != state:
+        raise QueueUnavailable('Codex Desktop queue requires the default native state store.')
+    with queue_check('Codex Desktop queue could not verify the saved thread metadata.'):
+        cwd, archived = codex_preview._saved_thread_row(route, path=state)
+    with queue_check('Codex Desktop queue could not verify the saved and registered workspaces.'):
+        saved, registered = Path(cwd), Path(route['cwd'])
+        if not saved.is_absolute() or not registered.is_absolute() or saved.resolve() != registered.resolve():
+            raise QueueUnavailable('Codex Desktop queue saved workspace differs from the route cwd.')
+        if archived:
+            raise ThreadArchived()
+        if not saved.is_dir():
+            raise missing_workspace(registered)
+    with queue_check('Codex Desktop queue store is unavailable or is not owned and protected.'):
+        codex_preview.require_owned_store(queue)
     if desktop_queue_owner(queue, checked_output, explain=True) is None:
         raise QueueOwnerUnavailable('The queue holder could not be verified.')
 
 
 def check_available(route):
-    try:
+    with queue_check(UNAVAILABLE):
         check_route(route)
-    except (ThreadArchived, QueueOwnerUnavailable):
-        raise
-    except (OSError, subprocess.SubprocessError, ValueError, RuntimeError, KeyError, TypeError):
-        raise QueueUnavailable() from None
 
 
 def enqueue_self_archive(route, timeout):
@@ -239,7 +261,7 @@ def deliver(route, thread, message_id, timeout, dry_run, *, close_handoff=False)
         if mid != message_id or str(uuid.UUID(route['session'])) != thread:
             raise ValueError('invalid exact identity')
     except (ValueError, KeyError, TypeError):
-        raise QueueUnavailable() from None
+        raise QueueUnavailable('Codex Desktop queue could not verify the exact delivery identity.') from None
     check_available(route)
     receipt = dict(session=thread, transport='codex', delivery_mode='queue',
                    delivery_path=DELIVERY_PATH, input_role='notification')
@@ -258,7 +280,7 @@ def enqueue(thread, message, timeout):
         process = subprocess.Popen(args, stdin=subprocess.DEVNULL,
                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     except OSError:
-        raise QueueUnavailable() from None
+        raise QueueUnavailable('Codex Desktop queue CLI could not be started.') from None
     try:
         stdout, _ = process.communicate(timeout=timeout)
     except (OSError, subprocess.TimeoutExpired, UnicodeError, ValueError):
