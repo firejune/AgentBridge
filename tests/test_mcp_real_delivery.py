@@ -127,7 +127,6 @@ class RealMcpDeliveryTests(unittest.TestCase):
         with (patch.object(broker, 'DEFAULT_SOCKET', Path(self.running.path)),
               patch.object(phase.codex_live.Client, 'connect', side_effect=endpoint),
               patch.object(phase.codex_live, 'exact_saved_workspace', return_value=(None, None)),
-              patch.object(codex_queue, 'owner_refusal', return_value=refusal),
               patch.object(codex_queue, 'check_route', side_effect=refusal),
               patch.object(codex_queue, 'enqueue') as enqueue):
             with patch.object(sessions, 'resolve_codex_peer', side_effect=ValueError):
@@ -149,6 +148,32 @@ class RealMcpDeliveryTests(unittest.TestCase):
             enqueue.assert_not_called()
         self.assertEqual(code, 1)
         self.assertEqual(json.loads(out.getvalue())['error'], str(refusal))
+
+    def test_missing_queue_workspace_reaches_mcp_preflight_and_delivery(self):
+        endpoint = phase.codex_live.EndpointUnavailable
+        refusal = codex_queue.missing_workspace(self.root)
+        args = dict(agent_session_id=self.codex_pin['id'], message='fixture')
+        live = {'id': self.codex_sid, 'cwd': self.root, 'status': 'idle'}
+        with (patch.object(broker, 'DEFAULT_SOCKET', Path(self.running.path)),
+              patch.object(phase.codex_live.Client, 'connect', side_effect=endpoint(endpoint.DEFAULT, endpoint.REFUSED)),
+              patch.object(phase.codex_live, 'exact_saved_workspace', return_value=(None, None)),
+              patch.object(codex_queue, 'check_route', side_effect=refusal),
+              patch.object(codex_queue, 'enqueue') as enqueue):
+            with patch.object(sessions, 'resolve_codex_peer', side_effect=ValueError):
+                refused = self.call('bridge_message_send', **args, idempotency_key='missing-mcp-offline')
+            self.assertEqual(refused['error']['message'], str(refusal))
+            self.assertEqual(self.engine.rows(), [])
+            with patch.object(sessions, 'resolve_codex_peer', return_value=live):
+                accepted = self.data('bridge_message_send', **args, idempotency_key='missing-mcp-online')
+                self.engine.tick()
+            enqueue.assert_not_called()
+        operation_id = accepted['operation_id']
+        operation = self.data('bridge_operation_get', operation_id=operation_id)
+        self.assertEqual((operation['backend_message_state'], operation['failure']['message']),
+                         ('pending', str(refusal)))
+        stored = self.engine.operation(operation_id, 'test-owner')
+        self.assertEqual(stored['failure']['message'], refusal.summary)
+        self.assertNotIn(self.root, stored['failure']['message'])
 
     def test_idle_closed_claude_and_offline_codex_refused_before_post_current_behavior(self):
         # 1a. Idle-closed Claude session: dead pid in registry + desktop metadata ready to wake.

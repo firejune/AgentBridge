@@ -365,7 +365,7 @@ class Backend:
         except (ValueError, OSError):
             return 'unavailable'
 
-    def queue_owner_refusal(self, session):
+    def queue_refusal(self, session):
         if (self.session_transport(session) != 'codex' or Path(self.path).expanduser() != broker.DEFAULT_SOCKET
                 or os.getenv('AGENT_BRIDGE_CODEX_URL')):
             return None
@@ -374,7 +374,18 @@ class Backend:
             client.connect()
         except codex_live.EndpointUnavailable as error:
             if error.default_absent:
-                return codex_queue.owner_refusal()
+                rows = self.rpc('routes', project=session['workspace']['project'])
+                route = next((row for row in rows if row['name'] == session['route']), None)
+                cwd = str(Path(session.get('cwd') or session['workspace']['cwd']).resolve())
+                if route is None and session.get('discovered') and not session.get('pinned'):
+                    route = {'transport': 'codex', 'session': session['uuid'], 'cwd': cwd}
+                if route is None or (route.get('transport'), route.get('session'), route.get('cwd')) != (
+                        'codex', session['uuid'], cwd):
+                    raise RouteBindingRefusal('Route changed')
+                try:
+                    codex_queue.check_available(route)
+                except codex_queue.QueueUnavailable as refusal:
+                    return refusal
         finally:
             client.close()
         return None
@@ -632,7 +643,7 @@ class Engine:
         self.observe_retry_limit, self.observe_retry_base = OBSERVE_RETRY_LIMIT, OBSERVE_RETRY_BASE
         self.reply_watch_fast, self.reply_watch_slow = REPLY_WATCH_FAST, REPLY_WATCH_SLOW
         self.observe_at, self.watch_at = {}, {}  # Volatile schedules; a restart only reads sooner.
-        self.queue_refusals = {}  # Volatile process diagnostics for operation responses.
+        self.queue_refusals = {}  # Volatile queue diagnostics for operation responses.
         self.events = None
         self.recover()
         if config.get('events_enabled', False):
@@ -883,7 +894,7 @@ class Engine:
                     self.require_send_availability(target)
             except RouteBindingRefusal:
                 raise Fault('BACKEND_UNAVAILABLE', ROUTE_CHANGED_MESSAGE) from None
-            except codex_queue.QueueOwnerUnavailable as error:
+            except codex_queue.QueueUnavailable as error:
                 raise Fault('BACKEND_UNAVAILABLE', str(error)) from None
             except Exception:
                 raise Fault('BACKEND_UNAVAILABLE') from None
@@ -935,18 +946,19 @@ class Engine:
     def require_send_availability(self, session):
         if self.backend.availability(session) in ('ready', 'busy'):
             return
-        diagnose = getattr(self.backend, 'queue_owner_refusal', None)
+        diagnose = getattr(self.backend, 'queue_refusal', None)
         refusal = diagnose(session) if diagnose else None
         if refusal is not None:
             raise refusal
         raise Fault('BACKEND_UNAVAILABLE')
 
-    def fail_queue_owner(self, op, error):
+    def fail_queue(self, op, error):
         with self.lock:
-            self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=codex_queue.QueueOwnerUnavailable.SUMMARY)
-            if len(self.queue_refusals) >= 64:
-                del self.queue_refusals[next(iter(self.queue_refusals))]
-            self.queue_refusals[op['operation_id']] = str(error)
+            self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=error.summary)
+            if str(error) != error.summary:
+                if len(self.queue_refusals) >= 64:
+                    del self.queue_refusals[next(iter(self.queue_refusals))]
+                self.queue_refusals[op['operation_id']] = str(error)
 
     def recover(self):
         for op in self.rows():
@@ -1016,8 +1028,8 @@ class Engine:
         except RouteBindingRefusal:
             self.fail(op, 'BACKEND_UNAVAILABLE', unknown=False, message=ROUTE_CHANGED_MESSAGE)
             return
-        except codex_queue.QueueOwnerUnavailable as error:
-            self.fail_queue_owner(op, error)
+        except codex_queue.QueueUnavailable as error:
+            self.fail_queue(op, error)
             return
         except Exception:
             self.fail(op,'BACKEND_UNAVAILABLE',unknown=False)
@@ -1082,8 +1094,8 @@ class Engine:
                 # A recorded pre-send failure is definite; uncertain stays blocked.
                 m = e.message
                 self.update(op,backend_message_state=m['state'])
-                if isinstance(e, delivery.QueueOwnerPushFailed) and m['state'] == 'pending':
-                    self.fail_queue_owner(op, e)
+                if isinstance(e, delivery.QueuePushFailed) and m['state'] == 'pending':
+                    self.fail_queue(op, e)
                     return
                 detail = delivery.codex_prewrite_detail(m)
                 if detail is not None or m['state'] == 'pending':
@@ -1535,7 +1547,7 @@ class Engine:
                     message = self.backend.push_inbox_reply(message)
                 except delivery.PushFailed as error:
                     message = error.message
-                    if isinstance(error, delivery.QueueOwnerPushFailed) and message['state'] == 'pending':
+                    if isinstance(error, delivery.QueuePushFailed) and message['state'] == 'pending':
                         detail = str(error)
                 except Exception:
                     # Fixed text only: never ids, routes or bodies (the facade's stderr is its log).

@@ -352,30 +352,97 @@ class QueueRouteTests(DefaultDesktopFixture):
     def test_any_store_override_is_refused_before_a_process_runs(self):
         for name in OVERRIDES:
             with self.subTest(override=name), patch.dict(os.environ, {name: 'x'}):
-                with self.assertRaises(ValueError):
+                with self.assertRaisesRegex(codex_queue.QueueUnavailable, 'default Desktop configuration'):
                     codex_queue.check_route(self.route)
         self.assertEqual((self.signed, self.owned), ([], []))
 
-    def test_each_remaining_refusal(self):
-        with patch.object(codex_queue, 'checked_output',
-                          side_effect=subprocess.CalledProcessError(1, 'codesign')):
-            with self.assertRaises(subprocess.CalledProcessError):
-                codex_queue.check_route(self.route)
-        with patch.object(codex_preview, 'state_path', lambda executable: self.cwd / 'elsewhere.sqlite'):
-            with self.assertRaisesRegex(ValueError, 'non-default state store'):
-                codex_queue.check_route(self.route)
-        with self.assertRaisesRegex(ValueError, 'non-default route executable'):
-            codex_queue.check_route(dict(self.route, executable='/opt/other/codex'))
-        self.saved = (str(self.cwd / 'other'), 0)
-        with self.assertRaisesRegex(ValueError, 'workspace differs'):
-            codex_queue.check_route(self.route)
+    def test_archived_route_is_still_terminal(self):
         self.saved = (str(self.cwd), 1)
         with self.assertRaises(ThreadArchived):
-            codex_queue.check_route(self.route)
-        self.saved = (str(self.cwd), 0)
-        with patch.object(codex_queue, 'desktop_queue_owner', return_value=None):
-            with self.assertRaisesRegex(ValueError, 'No unique local Desktop queue owner'):
-                codex_queue.check_route(self.route)
+            codex_queue.check_available(self.route)
+
+    def cli(self, server, *args):
+        with redirect_stdout(io.StringIO()) as stdout, patch('sys.stdin', io.StringIO('private body')):
+            code = bridge.main(['--socket', server.path, *args])
+        return code, json.loads(stdout.getvalue())
+
+    def test_queue_causes_reach_send_deliver_and_the_stored_note(self):
+        endpoint = codex_live.EndpointUnavailable
+        removed = self.cwd / 'removed'
+        removed.mkdir()
+        cases = (
+            ('executable', patch.dict(os.environ), 'requires the default route executable'),
+            ('configuration', patch.dict(os.environ, {'CODEX_SQLITE_HOME': 'fixture'}),
+             'requires the default Desktop configuration'),
+            ('signature', patch.object(codex_queue, 'checked_output',
+                                       side_effect=subprocess.CalledProcessError(1, 'private diagnostic')),
+             'CLI signature check failed'),
+            ('state-config', patch.object(codex_preview, 'state_path', side_effect=ValueError('private diagnostic')),
+             'could not verify the native state store configuration'),
+            ('state-store', patch.object(codex_preview, 'state_path', return_value=self.cwd / 'elsewhere.sqlite'),
+             'requires the default native state store'),
+            ('saved-thread', patch.object(codex_preview, '_saved_thread_row', side_effect=OSError('private diagnostic')),
+             'could not verify the saved thread metadata'),
+            ('workspace', patch.object(codex_preview, '_saved_thread_row', return_value=(str(removed), 0)),
+             'saved workspace differs from the route cwd'),
+            ('missing', patch.object(codex_preview, '_saved_thread_row', return_value=(str(removed), 0)),
+             f"route cwd {removed} no longer exists; the Codex thread's saved cwd must exist for queue delivery"),
+            ('store-owner', patch.object(codex_preview, 'require_owned_store', side_effect=OSError('private diagnostic')),
+             'store is unavailable or is not owned and protected'),
+            ('desktop-owner', patch.object(codex_queue, 'desktop_queue_owner', return_value=None),
+             'No unique local Desktop queue owner. The queue holder could not be verified.'),
+            ('cli-start', patch.object(codex_queue.subprocess, 'Popen', side_effect=OSError('private diagnostic')),
+             'CLI could not be started'),
+        )
+        with (RunningBroker() as server,
+              patch.object(bridge.broker, 'DEFAULT_SOCKET', Path(server.path)),
+              patch.object(codex_live, 'exact_saved_workspace', return_value=(None, None)),
+              patch.object(codex_live.Client, 'connect', side_effect=endpoint(endpoint.DEFAULT, endpoint.REFUSED))):
+            server.call('register', project='p', name='sender', transport='realtime', cwd=str(self.cwd))
+            for name, check, detail in cases:
+                with self.subTest(cause=name), check:
+                    route = dict(self.route, cwd=str(removed)) if name == 'missing' else dict(self.route)
+                    if name == 'executable':
+                        route['executable'] = '/opt/other/codex'
+                    server.call('register', project='p', name=name, **route)
+                    if name == 'missing':
+                        removed.rmdir()
+                    code, failure = self.cli(server, 'send', '--project', 'p', '--from', 'sender',
+                                             '--to', name, '--key', name, '--file', '-')
+                    self.assertEqual(code, 1)
+                    self.assertIn(detail, failure['error'])
+                    self.assertNotIn('IPC', failure['error'])
+                    self.assertNotIn('private diagnostic', failure['error'])
+                    mid = failure['message']['id']
+                    stored = server.call('show', id=mid)
+                    self.assertEqual((stored['state'], stored['note']), ('pending', failure['error']))
+                    code, result = self.cli(server, 'deliver', mid)
+                    self.assertEqual((code, result['error']), (1, failure['error']))
+
+            code, routes = self.cli(server, 'routes', '--project', 'p', '--no-model')
+            self.assertEqual(code, 0)
+            self.assertEqual([route['name'] for route in routes if 'cwd_warning' in route], ['missing'])
+            self.assertIn(str(removed), next(route['cwd_warning'] for route in routes if route['name'] == 'missing'))
+
+    def test_existing_workspace_submits_the_same_notice_bytes(self):
+        endpoint = codex_live.EndpointUnavailable
+        with (RunningBroker() as server,
+              patch.object(bridge.broker, 'DEFAULT_SOCKET', Path(server.path)),
+              patch.object(codex_live, 'exact_saved_workspace', return_value=(None, None)),
+              patch.object(codex_live.Client, 'connect', side_effect=endpoint(endpoint.DEFAULT, endpoint.REFUSED)),
+              patch.object(codex_queue, 'enqueue', return_value=str(uuid.uuid4())) as enqueue,
+              patch.object(codex_wake_open, 'request_queued_wake') as wake):
+            server.call('register', project='p', name='sender', transport='realtime', cwd=str(self.cwd))
+            server.call('register', project='p', name='desktop', **self.route)
+            code, result = self.cli(server, 'send', '--project', 'p', '--from', 'sender',
+                                    '--to', 'desktop', '--key', 'ok', '--file', '-')
+            self.assertEqual((code, result['state'], result['delivery_path']), (0, 'submitted', codex_queue.DELIVERY_PATH))
+            self.assertEqual(server.call('show', id=result['id'])['body'].encode(), b'private body')
+            enqueue.assert_called_once()
+            thread, notice, _ = enqueue.call_args.args
+            self.assertEqual(thread, self.route['session'])
+            self.assertEqual(notice.encode(), codex_queue.notice(result['id']).encode())
+            wake.assert_called_once()
 
 
 class WakePreflightTests(DefaultDesktopFixture):

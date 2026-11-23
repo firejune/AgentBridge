@@ -293,7 +293,7 @@ class DeliveryMatrixTests(unittest.TestCase):
                 queue.assert_called_once()
                 self.assertEqual(self.open_wake.call_count, int(reason == opener_failed))
 
-    def test_queue_refusal_drops_private_reason_current_behavior(self):
+    def test_queue_refusal_uses_fixed_queue_text_without_private_diagnostics(self):
         message = self.post('codex')
         (code, result), queue = self.queue_delivery(message, refusal=ValueError('fixture private queue check'))
         self.assertEqual(code, 1, result)
@@ -301,8 +301,7 @@ class DeliveryMatrixTests(unittest.TestCase):
         self.open_wake.assert_not_called()
         record = self.assert_record(message, 'pending', result['error'], 'push_failed')
         self.assertNotIn('fixture private queue check', json.dumps(record))
-        self.assertEqual(result['error'], codex_live.EndpointUnavailable(
-            codex_live.EndpointUnavailable.DEFAULT, codex_live.EndpointUnavailable.MISSING).args[0])
+        self.assertEqual(result['error'], codex_queue.UNAVAILABLE)
 
     def test_claude_interrupt_when_finish_fails_current_behavior(self):
         message = self.post('claude')

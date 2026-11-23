@@ -309,7 +309,8 @@ class InboxIntegrationTests(unittest.TestCase):
         detail = 'No unique local Desktop queue owner. Queue holders: pid 4242, pid 4243.'
 
         def refuse(message):
-            raise phase.delivery.QueueOwnerPushFailed(detail, message)
+            error = phase.codex_queue.QueueOwnerUnavailable('Queue holders: pid 4242, pid 4243.')
+            raise phase.delivery.QueuePushFailed(error, message)
 
         with patch.object(self.engine.backend, 'push_inbox_reply', side_effect=refuse):
             result = self.data('bridge_message_reply', **args)

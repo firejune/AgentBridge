@@ -1508,6 +1508,13 @@ def ping_command(args):
 
 def routes_command(args):
     result = broker.request(args.socket, request_fields(args))
+    for route in result:
+        if route.get('transport') == 'codex' and route.get('cwd'):
+            try:
+                if not Path(route['cwd']).is_dir():
+                    route['cwd_warning'] = str(codex_queue.missing_workspace(route['cwd']))
+            except OSError:
+                pass  # An unreadable path does not establish that it is gone.
     if not args.no_model:
         with_models(result, models.load_policy(broker_state_dir(args)), 5)
     output(result)

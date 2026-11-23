@@ -56,8 +56,12 @@ class PushFailed(ValueError):
         self.message = message
 
 
-class QueueOwnerPushFailed(PushFailed):
+class QueuePushFailed(PushFailed):
     """The Desktop queue guard refused this dispatch before submission."""
+
+    def __init__(self, error, message):
+        super().__init__(str(error), message)
+        self.summary = error.summary
 
 
 class ClaudeDispatchUnknown(ValueError):
@@ -468,8 +472,9 @@ def push_codex(path, m, timeout=10, dry_run=False, *, close_dispatch=False, guar
         # The enrolled operator can claim or finish before the queue CLI returns.
         if close_request is not None and message['state'] in ('in_progress', 'done'):
             return message
-        refusal = QueueOwnerPushFailed if isinstance(error, codex_queue.QueueOwnerUnavailable) else PushFailed
-        raise refusal(str(error), message) from None
+        if isinstance(error, codex_queue.QueueUnavailable):
+            raise QueuePushFailed(error, message) from None
+        raise PushFailed(str(error), message) from None
     except BaseException:
         # Cancellation may arrive after the owner accepted the output.
         if not dry_run:
