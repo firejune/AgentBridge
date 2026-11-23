@@ -475,14 +475,14 @@ class CodexArchiveTests(unittest.TestCase):
 
     def test_preview_refuses_database_changed_during_copy(self):
         self.add(1)
-        real_copy = archive.shutil.copyfile
+        real_copy = archive.codex_preview.shutil.copyfile
 
         def change(source, target):
             result = real_copy(source, target)
             self.add(2)
             return result
 
-        with patch.object(archive.shutil, 'copyfile', side_effect=change):
+        with patch.object(archive.codex_preview.shutil, 'copyfile', side_effect=change):
             with self.assertRaisesRegex(ValueError, 'changed during preview'):
                 self.plan()
 

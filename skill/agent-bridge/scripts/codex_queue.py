@@ -225,7 +225,11 @@ def check_route(route):
     if configured_state != state:
         raise QueueUnavailable('Codex Desktop queue requires the default native state store.')
     with queue_check('Codex Desktop queue could not verify the saved thread metadata.'):
-        cwd, archived = codex_preview._saved_thread_row(route, path=state)
+        if route.get('closing_self_archive'):
+            with codex_preview.private_store_copy(state) as copy:
+                cwd, archived = codex_preview._saved_thread_row(route, path=copy)
+        else:
+            cwd, archived = codex_preview._saved_thread_row(route, path=state)
     with queue_check('Codex Desktop queue could not verify the saved and registered workspaces.'):
         saved, registered = Path(cwd), Path(route['cwd'])
         if not saved.is_absolute() or not registered.is_absolute() or saved.resolve() != registered.resolve():

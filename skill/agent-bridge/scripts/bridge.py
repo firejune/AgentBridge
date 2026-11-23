@@ -613,7 +613,7 @@ def close_participant(args):
         if operator is not None:
             return True
         self_archive = load_policy(directory).get(CODEX_SELF_ARCHIVE, True)
-        return self_archive
+        return 'self_archive' if self_archive else False
 
     preflight = prefer_native if archive and not args.keep_route else None
     try:
@@ -631,9 +631,10 @@ def close_participant(args):
     if result.get('status') == 'awaiting_native_archive':
         scope = result.pop('native_scope')
         if self_archive:
+            cascade = result.pop('cascade')
             # The process scan exempts the calling CLI's PID.
             try:
-                codex_archive.check_native_operator_processes(route, scope)
+                codex_archive.check_native_operator_processes(route, scope, cascade=cascade)
             except ValueError:
                 error = codex_queue.owner_refusal()
                 if error is not None:
@@ -641,10 +642,24 @@ def close_participant(args):
                 raise
             path, row, target = retro
             closed = broker.request(args.socket, {'op': 'close-self-archive', **address, 'expected_route': route,
-                                                  'native_scope': scope, 'timeout': args.timeout,
+                                                  'native_scope': scope, 'cascade': cascade, 'timeout': args.timeout,
                                                   'retro': {'store': str(path.absolute()), 'row': row, 'target': target}},
                                     timeout=args.timeout + QUEUED_WAKE_TIMEOUT + 10)
             finished = self_archive_result(args, address, closed)
+            if 'count' in finished:
+                observed = {row['id']: row for row in finished['results']}
+                for row in result['results']:
+                    if row['id'] in observed:
+                        readback = observed[row['id']]
+                        if readback['method'] == 'saved_or_previously_archived':
+                            saved_status = row['status']
+                            if not readback['archived']:
+                                row.update(saved_status=saved_status, **readback)
+                            row['method'] = 'previously_archived' if saved_status == 'already_archived' else 'saved_archive'
+                        else:
+                            row.update(readback)
+                finished['results'] = result['results']
+                return {**result, **finished}
             result['results'][-1].update(status='archived' if finished['archived'] else finished['status'],
                                          archived=finished['archived'], method=finished['archive_path'])
             return {**result, **finished,
@@ -718,7 +733,7 @@ def queue_archive_refusal(result, error):
 
 def self_archive_result(args, address, closed):
     path = closed['archive_path']
-    archived = path == 'self_archive'
+    archived = path in ('self_archive', 'root_cascade')
     status = ('closed' if closed['route_removed'] else 'archive_verified') if archived else path
     result = {**address, 'transport': 'codex', 'host': 'codex', 'method': 'archive',
               'archive_path': path, 'archived': archived, 'closed': archived, 'resumable': True,
@@ -726,7 +741,8 @@ def self_archive_result(args, address, closed):
               'session': closed['session'], 'close_id': closed['closing']}
     result.update({key: closed[key] for key in ('route_removed', 'correspondence_cleanup',
                    'cleanup_error', 'route_error', 'retro_id', 'store', 'retro_recorded',
-                   'retro_error', 'notification', 'reason', 'wake_requested', 'wake_reason') if key in closed})
+                   'retro_error', 'notification', 'reason', 'wake_requested', 'wake_reason',
+                   'descendant', 'descendant_state', 'readback', 'root_archived', 'count', 'results') if key in closed})
     if 'retro_message' in closed:
         push_retro_notification(args, result, closed['retro_message'])
     return result

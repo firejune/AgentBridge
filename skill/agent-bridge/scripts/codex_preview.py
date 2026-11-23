@@ -3,12 +3,14 @@
 Agent Bridge never writes Codex state (#212): every connection here opens the
 store read-only, and archive status is verified as Codex itself records it.
 """
-from contextlib import closing
+from contextlib import closing, contextmanager
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import stat
 from subprocess import TimeoutExpired
+import tempfile
 import time
 import uuid
 
@@ -56,6 +58,39 @@ def require_owned_store(path):
             not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid() or
             info.st_mode & 0o022 or parent.st_mode & 0o022):
         raise ValueError('Codex native store is not owned and protected')
+
+
+@contextmanager
+def private_store_copy(path):
+    """Read a stable DB/WAL pair without opening SQLite under the native home."""
+    require_owned_store(path)
+    wal = path.with_name(path.name + '-wal')
+    journal = path.with_name(path.name + '-journal')
+
+    def stamp(file):
+        try:
+            info = file.lstat()
+        except FileNotFoundError:
+            return None
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o022):
+            raise ValueError('Codex preview source is not owned and protected')
+        return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+    before = (stamp(path), stamp(wal), stamp(journal))
+    if before[0] is None or before[2] is not None:
+        raise ValueError('Codex preview source missing or rollback journal present')
+    with tempfile.TemporaryDirectory(prefix='agent-bridge-archive-', dir='/tmp') as directory:
+        copy = Path(directory) / path.name
+        copy.touch(mode=0o600)
+        shutil.copyfile(path, copy)
+        if before[1] is not None:
+            wal_copy = copy.with_name(wal.name)
+            wal_copy.touch(mode=0o600)
+            shutil.copyfile(wal, wal_copy)
+        if before != (stamp(path), stamp(wal), stamp(journal)):
+            raise ValueError('Codex state changed during preview; manifest not generated')
+        yield copy
 
 
 def _saved_thread_row(route, include_rollout=False, *, path=None):

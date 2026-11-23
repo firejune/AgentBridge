@@ -6,16 +6,14 @@ import math
 import os
 from pathlib import Path
 import shlex
-import shutil
 import sqlite3
-import stat
 import subprocess
-import tempfile
 import time
 import uuid
 
 import codex_preview
 import codex_queue
+import codex_rollout
 import route_store
 import sessions
 import wt
@@ -56,7 +54,7 @@ def absolute_path(value):
 
 
 class Snapshot:
-    def __init__(self, path):
+    def __init__(self, path, *, include_rollouts=False):
         codex_preview.require_owned_store(path)
         try:
             with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True,
@@ -67,6 +65,8 @@ class Snapshot:
                             if 'updated_at_ms' in columns else 'updated_at')
                 rows = db.execute(f'SELECT id, title, cwd, {activity}, archived, archived_at FROM threads').fetchall()
                 edges = db.execute('SELECT parent_thread_id, child_thread_id FROM thread_spawn_edges').fetchall()
+                self.rollouts = (dict(db.execute('SELECT id, rollout_path FROM threads'))
+                                 if include_rollouts else {})
         except sqlite3.Error:
             raise ValueError('Codex thread or spawn-edge metadata unavailable') from None
         self.rows, self.parents, self.children = {}, {}, {}
@@ -108,36 +108,9 @@ class Snapshot:
         return False
 
 
-def preview_snapshot(path):
-    """Copy a stable DB/WAL pair so preview cannot create native SQLite sidecars."""
-    codex_preview.require_owned_store(path)
-    wal = path.with_name(path.name + '-wal')
-    journal = path.with_name(path.name + '-journal')
-
-    def stamp(file):
-        try:
-            info = file.lstat()
-        except FileNotFoundError:
-            return None
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                or info.st_mode & 0o022):
-            raise ValueError('Codex preview source is not owned and protected')
-        return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
-
-    before = (stamp(path), stamp(wal), stamp(journal))
-    if before[0] is None or before[2] is not None:
-        raise ValueError('Codex preview source missing or rollback journal present')
-    with tempfile.TemporaryDirectory(prefix='agent-bridge-archive-') as directory:
-        copy = Path(directory) / path.name
-        copy.touch(mode=0o600)
-        shutil.copyfile(path, copy)
-        if before[1] is not None:
-            wal_copy = copy.with_name(wal.name)
-            wal_copy.touch(mode=0o600)
-            shutil.copyfile(wal, wal_copy)
-        if before != (stamp(path), stamp(wal), stamp(journal)):
-            raise ValueError('Codex state changed during preview; manifest not generated')
-        return Snapshot(copy)
+def preview_snapshot(path, *, include_rollouts=False):
+    with codex_preview.private_store_copy(path) as copy:
+        return Snapshot(copy, include_rollouts=include_rollouts)
 
 
 DESKTOP_HELPER = codex_queue.APP / 'Contents/Resources/cua_node/bin/node_repl'
@@ -321,8 +294,8 @@ def invoke(binary, timeout, method, sid, before_call=None):
     return before, error
 
 
-def readback(path, before, sid):
-    after = Snapshot(path)
+def readback(path, before, sid, *, self_archive=False):
+    after = preview_snapshot(path, include_rollouts=True) if self_archive else Snapshot(path)
     affected = before.descendants(sid) | after.descendants(sid) | {sid}
     if not affected <= after.rows.keys():
         raise ValueError('Thread metadata missing during archive readback')
@@ -333,11 +306,139 @@ def native_handoff_digest(path, descendants):
     return digest({'store': str(path), 'descendants': sorted(descendants)})
 
 
+class DescendantRefusal(ValueError):
+    def __init__(self, reason, descendant, state):
+        super().__init__(reason + '; no self-archive entry was submitted')
+        self.fields = {'reason': reason, 'descendant': descendant, 'descendant_state': state}
+
+
+def require_terminal(snapshot, sid, deadline=None):
+    state, stamp = codex_rollout.turn_state(snapshot.rollouts.get(sid), sid, deadline)
+    if state != 'terminal':
+        raise DescendantRefusal('descendant_turn_' + state, sid, state)
+    return stamp
+
+
+def cascade_digest(path, route, snapshot, reviewed, deferred):
+    members = [route['session'], *reviewed]
+    return digest({'store': str(path), 'route': route_store.route_record(route),
+                   'members': [(sid, snapshot.parents.get(sid), snapshot.rows[sid]['cwd']) for sid in members],
+                   'deferred': deferred})
+
+
+def self_archive_snapshot(route, reviewed, deferred, scope):
+    path = sweep_store()
+    try:
+        snapshot = preview_snapshot(path, include_rollouts=True)
+        root = route['session']
+        descendants = snapshot.descendants(root)
+        if (absolute_path(snapshot.rows[root]['cwd']) != absolute_path(route['cwd'])
+                or not descendants <= snapshot.rows.keys()
+                or (reviewed is not None and (reviewed != sorted(descendants)
+                    or cascade_digest(path, route, snapshot, reviewed, deferred) != scope))
+                or (reviewed is None and native_handoff_digest(path, descendants) != scope)):
+            raise ValueError('scope mismatch')
+    except NATIVE_ERRORS + (KeyError,):
+        raise ValueError('Codex native close subtree or saved profile changed') from None
+    return snapshot, descendants
+
+
+def self_archive_scope(route, reviewed, deferred, scope, *, reserving=False):
+    snapshot, descendants = self_archive_snapshot(route, reviewed, deferred, scope)
+    unarchived = {sid for sid in descendants if not snapshot.rows[sid]['archived']}
+    approved = set(deferred)
+    if not unarchived <= approved or (reserving and unarchived != approved):
+        raise ValueError('Codex native close has an unapproved unarchived descendant or the deferred set changed')
+    return snapshot, unarchived
+
+
+def self_archive_readback(route):
+    reviewed = route.get('closing_reviewed_descendants')
+    deferred = set(route.get('closing_cascade_deferred', ()))
+    root = route['session']
+    snapshot, descendants = self_archive_snapshot(route, reviewed, sorted(deferred), route['closing_native_scope'])
+    members = [*(sorted(descendants) if reviewed is None else reviewed), root]
+    verified = {sid: snapshot.rows[sid]['archived'] and codex_rollout.verify_archived(snapshot.rollouts[sid], sid)
+                for sid in members}
+    if reviewed is None:
+        # Version 4/5 pending reservations have the original subtree digest.
+        # Recover the bound membership and apply the same exact rollout proof.
+        if not all(verified.values()):
+            raise ValueError('Native Codex archive could not be verified; closing route kept')
+        return None
+    result = []
+    cascade = deferred and route.get('closing_self_archive_enqueued')
+    for sid in members:
+        bit = snapshot.rows[sid]['archived']
+        archived = verified[sid]
+        if sid == root:
+            method = 'root_cascade' if cascade else 'self_archive'
+        elif sid in deferred:
+            method = 'root_cascade' if cascade else 'deferred_native_readback'
+        else:
+            method = 'saved_or_previously_archived'
+        result.append({'id': sid, 'archived': archived, 'method': method,
+                       'status': 'archived' if archived else 'archive_unverified' if bit else 'not_archived'})
+    return {'root_archived': result[-1]['archived'], 'results': result,
+            'count': sum(row['archived'] for row in result)}
+
+
+def check_descendant_queue(path, descendants):
+    sid = descendants[0]
+    try:
+        with codex_preview.private_store_copy(path) as copy:
+            with closing(sqlite3.connect(copy.as_uri() + '?mode=ro', uri=True,
+                                         timeout=codex_preview.LOCK_TIMEOUT)) as db:
+                db.execute('BEGIN')
+                for sid in descendants:
+                    if db.execute('SELECT 1 FROM queued_items WHERE thread_id=? LIMIT 1', (sid,)).fetchone():
+                        raise DescendantRefusal('descendant_queue_pending', sid, 'pending')
+    except DescendantRefusal:
+        raise
+    except (OSError, ValueError, sqlite3.Error):
+        raise DescendantRefusal('descendant_queue_unknown', sid, 'unknown') from None
+
+
+CASCADE_SETTLE_SECONDS = 1
+
+
+def check_cascade_quiescence(route, deadline, *, clock=time.monotonic, sleep=None):
+    reviewed = route['closing_reviewed_descendants']
+    deferred = route['closing_cascade_deferred']
+    scope = route['closing_native_scope']
+    snapshot, unarchived = self_archive_scope(route, reviewed, deferred, scope)
+    descendants = sorted(unarchived)
+    if not descendants:
+        return
+    sid = descendants[0]
+    try:
+        state, queue = codex_queue.default_stores()
+        if state != sweep_store():
+            raise ValueError('store differs')
+    except (OSError, ValueError):
+        raise DescendantRefusal('descendant_queue_unknown', sid, 'unknown') from None
+    check_descendant_queue(queue, descendants)
+    before = {sid: require_terminal(snapshot, sid, deadline) for sid in descendants}
+    if deadline - clock() <= CASCADE_SETTLE_SECONDS:
+        raise ValueError('Codex self-archive deadline would expire during the descendant settle wait')
+    (sleep or time.sleep)(CASCADE_SETTLE_SECONDS)
+    if clock() >= deadline:
+        raise ValueError('Codex self-archive deadline expired during the descendant settle wait')
+    latest, still_unarchived = self_archive_scope(route, reviewed, deferred, scope)
+    for sid in descendants:
+        if (sid not in still_unarchived or require_terminal(latest, sid, deadline) != before[sid]):
+            raise DescendantRefusal('descendant_turn_unknown', sid, 'changed')
+    check_descendant_queue(queue, descendants)
+    # Accepted residual races: input after these checks, a dispatched start still
+    # absent from the rollout after the settle interval, and the time before
+    # Desktop runs the root entry. The caller enqueues immediately after this.
+
+
 def native_handoff_snapshot(route):
     """Check the saved Desktop subtree before delegating a root-only native archive."""
     try:
         path = sweep_store()
-        snapshot = Snapshot(path)
+        snapshot = preview_snapshot(path) if route.get('closing_self_archive') else Snapshot(path)
         root = route['session']
         row = snapshot.rows[root]
         if absolute_path(row['cwd']) != absolute_path(route['cwd']):
@@ -357,16 +458,20 @@ def native_handoff_scope(route):
     return descendants, scope
 
 
-def check_native_operator_processes(route, expected_scope):
+def check_native_operator_processes(route, expected_scope, *, cascade=None):
     """Recheck process CWDs in the claiming CLI, outside the broker's serialized mutations."""
     try:
         _, holders = process_cwds(exempt_desktop=True)
     except NATIVE_ERRORS:
         raise ValueError('Codex native close could not verify process working directories. Closing route kept.') from None
     try:
-        snapshot, descendants, scope = native_handoff_snapshot(route)
-        if scope != expected_scope:
-            raise ValueError('Codex native close subtree or saved profile changed')
+        if cascade is None:
+            snapshot, descendants, scope = native_handoff_snapshot(route)
+            if scope != expected_scope:
+                raise ValueError('Codex native close subtree or saved profile changed')
+        else:
+            snapshot, descendants = self_archive_snapshot(
+                route, cascade['reviewed'], cascade['deferred'], expected_scope)
         workspaces = {absolute_path(snapshot.rows[sid]['cwd']) for sid in descendants | {route['session']}}
         if any(holder.is_relative_to(cwd) for holder in holders for cwd in workspaces):
             raise ValueError('A running process uses the Codex native close workspace')
@@ -404,24 +509,27 @@ def restore_unlisted(binary, path, timeout, after, late):
     return after, restored, errors, None
 
 
-def archive_group(binary, path, directory, prefix, item, timeout, close_route=None, own=None, *, defer_native_root=False):
+def archive_group(binary, path, directory, prefix, item, timeout, close_route=None, own=None, *,
+                  defer_native_root=False, self_archive=False):
     root = item['id']
     expected = {row['id']: row for row in [item, *item['members']]}
     subtrees = {sid: set(row['descendants']) for sid, row in expected.items()}
     try:
-        initial = Snapshot(path)
+        read_snapshot = preview_snapshot if self_archive else Snapshot
+        initial = read_snapshot(path)
         if not expected.keys() <= initial.rows.keys() or any(
                 initial.descendants(sid) != descendants for sid, descendants in subtrees.items()):
             return [{'id': root, 'status': 'descendants_changed'}], False
     except NATIVE_ERRORS:
         return [{'id': root, 'status': 'readback_unavailable'}], True
-    receipts, failed = [], set()
+    receipts, failed, deferred = [], set(), set()
     for sid in sorted(expected, key=lambda key: (len(subtrees[key]), key)):
         check = {}
+        cascade_ancestor = bool(subtrees[sid] & deferred)
 
         def before_call():
             guard = Protections(directory, prefix, close_route, own)
-            before = Snapshot(path)
+            before = read_snapshot(path, include_rollouts=self_archive)
             if (before.descendants(root) != subtrees[root]
                     or before.descendants(sid) != subtrees[sid]):
                 check['status'] = 'descendants_changed'
@@ -438,7 +546,7 @@ def archive_group(binary, path, directory, prefix, item, timeout, close_route=No
             if before.rows[sid]['archived'] and (sid != root or not defer_native_root):
                 check.update(status='already_archived', archived_at=before.rows[sid]['archived_at'])
                 return None
-            if any(not before.rows[key]['archived'] for key in subtrees[sid]):
+            if any(not before.rows[key]['archived'] for key in subtrees[sid] - deferred):
                 check['status'] = 'descendant_not_archived'
                 return None
             return before
@@ -457,6 +565,18 @@ def archive_group(binary, path, directory, prefix, item, timeout, close_route=No
                     check['status'] = 'awaiting_native_archive'
                 receipts.append({**receipt, **check})
                 return receipts, False
+            if cascade_ancestor:
+                # A saved archive here would recursively reach the held worker.
+                # Only the reviewed root may run that cascade.
+                before = before_call()
+                if before is not None:
+                    require_terminal(before, sid)
+                    deferred.add(sid)
+                    check['status'] = 'deferred_cascade_ancestor'
+                receipts.append({**receipt, **check})
+                if check['status'] in ('already_archived', 'deferred_cascade_ancestor'):
+                    continue
+                return receipts, False
             before, error = invoke(binary, timeout, 'thread/archive', sid, before_call)
             if before is None:
                 receipts.append({**receipt, **check})
@@ -468,7 +588,7 @@ def archive_group(binary, path, directory, prefix, item, timeout, close_route=No
                 # Desktop holds the thread's writer. Agent Bridge never writes Codex state (#212):
                 # the thread stays open and the route is kept until Codex archives it natively.
                 receipt['reason'] = 'desktop_holds_thread'
-            after, affected = readback(path, before, sid)
+            after, affected = readback(path, before, sid, self_archive=self_archive)
             late = {key for key in affected - subtrees[sid] - {sid} if after.rows[key]['archived']
                     and not before.rows.get(key, {}).get('archived')}
             if late:
@@ -492,12 +612,28 @@ def archive_group(binary, path, directory, prefix, item, timeout, close_route=No
             if (error or {}).get('shutdown_unconfirmed'):
                 receipt.setdefault('status', 'provider_shutdown_unconfirmed')
             receipt.setdefault('status', 'archived' if row['archived'] and not missing else 'not_archived')
+            if self_archive and error:
+                if (receipt['status'] == 'not_archived' and not row['archived'] and not missing and not late
+                        and error == {'kind': 'rpc_rejected', 'code': -32600, 'active_writer': True}
+                        and after.descendants(sid) == subtrees[sid]
+                        and after.descendants(root) == subtrees[root]
+                        and before.rollouts[sid] == after.rollouts[sid]):
+                    require_terminal(after, sid)
+                    receipt['status'] = 'deferred_active_writer'
+                    deferred.add(sid)
+                elif receipt['status'] == 'archived':
+                    receipt['status'] = 'provider_archive_unconfirmed'
+        except DescendantRefusal as error:
+            receipt.update(status='refused', **error.fields)
+            receipts.append(receipt)
+            failed.add(sid)
+            continue
         except NATIVE_ERRORS:
             receipt['status'] = 'restore_failed' if 'unlisted' in receipt else 'readback_unavailable'
         receipts.append(receipt)
         if receipt['status'] in ('restore_failed', 'readback_unavailable', 'provider_shutdown_unconfirmed'):
             return receipts, True
-        if receipt['status'] == 'not_archived':
+        if receipt['status'] in ('not_archived', 'provider_archive_unconfirmed'):
             failed.add(sid)
     return receipts, False
 
@@ -524,7 +660,7 @@ def close(route, directory, timeout, *, prefer_native=None):
     route = route_store.endpoint_record(route)
     binary = executable()
     path = codex_preview.state_path(binary).resolve()
-    snapshot = Snapshot(path)
+    snapshot = preview_snapshot(path) if prefer_native is not None else Snapshot(path)
     sid = thread_id(route['session'])
     row = snapshot.rows.get(sid)
     if row is None or absolute_path(row['cwd']) != absolute_path(route['cwd']):
@@ -534,11 +670,12 @@ def close(route, directory, timeout, *, prefer_native=None):
     if item['refusals']:
         results, stopped = [{'id': sid, 'status': 'refused', 'refusals': item['refusals']}], False
     else:
-        defer_native_root = prefer_native is not None and prefer_native()
+        preference = prefer_native() if prefer_native is not None else False
+        defer_native_root = bool(preference)
         if defer_native_root and path != sweep_store():
             raise ValueError('The enrolled close operator requires the saved Desktop profile')
         results, stopped = archive_group(binary, path, directory, None, item, timeout, route, guard.own,
-                                         defer_native_root=defer_native_root)
+                                         defer_native_root=defer_native_root, self_archive=preference == 'self_archive')
     final = next((result for result in results if result['id'] == sid), {})
     archived = final.get('archived') is True or final.get('status') == 'already_archived'
     note = 'Native Codex archive was not verified. Closing route kept.'
@@ -568,4 +705,13 @@ def close(route, directory, timeout, *, prefer_native=None):
         result.update(status='awaiting_native_archive',
                       native_scope=native_handoff_digest(path, item['descendants']),
                       note='The enrolled Codex Desktop operator archives the root.')
+        if preference == 'self_archive':
+            held = sorted(row['id'] for row in results if row['status'] == 'deferred_active_writer')
+            deferred = sorted(held + [row['id'] for row in results if row['status'] == 'deferred_cascade_ancestor'])
+            result.update(cascade={'reviewed': item['descendants'], 'deferred': deferred, 'held': held},
+                          native_scope=cascade_digest(path, route, snapshot, item['descendants'], deferred),
+                          note='The root self-archive covers the reviewed Codex subtree.')
+    elif (refusal := next((row for row in results if 'descendant_state' in row), None)):
+        result.update(status='not_archived', archive_path='not_archived')
+        result.update({key: refusal[key] for key in ('reason', 'descendant', 'descendant_state')})
     return result

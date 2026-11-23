@@ -148,8 +148,11 @@ python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.
 - 기본적으로 Codex 직접 종료(`close --archive`)는 그 스레드에 고정된 자기 보관 항목 하나를 큐에 넣는다. 스레드가 Desktop의 네이티브 도구로 스스로를 보관하고, 사이드바에서도 재시작 없이 사라진다. 라우트는 Agent Bridge가 보관 비트와 `archived_sessions` 아래의 rollout을 다시 읽어 확인한 뒤에만 지운다. Agent Bridge는 Codex 상태를 읽기만 하고 절대 쓰지 않는다. 결과의 `archive_path`가 무슨 일이 있었는지 알려 준다.
 
   - `self_archive`: 보관과 확인이 끝났고 라우트를 지웠다.
+  - `root_cascade`는 큐 접수가 확인된 루트 항목이 루트와 보관을 미룬 하위 스레드를 보관했고, 검토 대상 전체의 보관을 확인했다는 뜻이다.
   - `not_archived`: 아무것도 제출하지 않았다. 라우트는 유지되며, `reason`에는 작업 폴더가 사라졌다는 안내처럼 정해진 큐 거절 사유가 표시될 수 있다.
   - `pending_self_archive`: 종료 코드 1과 `close_id`를 준다. `close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID`로 네이티브 보관을 확인한다. 보관이 아직 확인되지 않았고 예약에 큐 접수 확인이 기록되어 있으면, 해당 스레드를 한 번 깨우도록 요청한 뒤 보관을 다시 확인한다. 깨우기에는 별도의 10초 한도가 있다. 큐 접수가 불확실하거나 이전 예약에 접수 확인 기록이 없으면 보관만 확인한다. 후속 확인에는 원래 `close_id`를 쓴다.
+
+  기본 Codex 큐 종료에서만 부모의 자기 보관 큐 항목 한 건으로 Desktop이 점유한 하위 스레드까지 보관할 수 있으며, 검토한 정확한 하위 트리와 디스크에 기록된 턴 종료 상태를 읽기 전용으로 확인하고 마지막에 빈 큐 → 안정된 종료 상태의 rollout → 공통 1초 대기 → 안정된 종료 상태의 rollout → 빈 큐 순으로 확인한다. Agent Bridge는 루트와 검토한 모든 하위 스레드의 보관 비트와 `archived_sessions`의 rollout을 확인한 뒤 라우트를 제거하며, 일부만 확인되면 대기 상태를 유지하고 `--finish`는 처음 검토한 집합을 확인한다.
 
   종료가 거절될 때:
 
@@ -161,7 +164,7 @@ python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.
 
   `--handoff`와 등록된 담당자는 그것을 설정한 소유자에게 계속 열려 있다. [세션 닫기](usage.md#세션-닫기) 참고.
 - Codex 러너는 CUA(`cua.getState`, `cua.getApp`)를 쓰지 않고, 실제 `~/.codex`에 대고 `codex app-server`나 Codex CLI를 띄우지 않는다. 둘 다 Desktop 큐에 두 번째 소유자를 만들어 모든 Codex 전달을 멈춘다(#210). 테스트에는 임시 `CODEX_HOME`을 쓴다.
-- Codex 직접 종료(`close --archive`)는 등록 라우트와 실행 중인 프로세스의 작업 경로를 확인하고 하위 스레드부터 보관한다. 네이티브 보관(보관 비트와 `archived_sessions` 아래의 정확한 rollout)을 확인한 뒤에만 라우트를 제거한다. Agent Bridge는 Codex 상태에 쓰지 않으며, Desktop이 스레드를 쥐고 있으면 `not_archived`(`desktop_holds_thread`)로 알리고 라우트를 유지한다. `archive-sweep --cwd-prefix /absolute/workspace`로 후보와 거부 사유를 확인하고 비공개 JSON 검토 후 `archive-sweep --apply --manifest FILE`로 적용한다. 되돌리기는 하위 스레드에도 영향을 줄 수 있다. [Codex 일괄 보관](usage.md#codex-일괄-보관).
+- Codex 직접 종료(`close --archive`)는 등록 라우트와 실행 중인 프로세스의 작업 경로를 확인하고 하위 스레드부터 보관한다. 네이티브 보관(보관 비트와 `archived_sessions` 아래의 정확한 rollout)을 확인한 뒤에만 라우트를 제거한다. Agent Bridge는 Codex 상태에 쓰지 않으며, 직접 네이티브 보관에서 Desktop이 스레드를 쥐고 있으면 `not_archived`(`desktop_holds_thread`)로 알리고 라우트를 유지한다. `archive-sweep --cwd-prefix /absolute/workspace`로 후보와 거부 사유를 확인하고 비공개 JSON 검토 후 `archive-sweep --apply --manifest FILE`로 적용한다. 되돌리기는 하위 스레드에도 영향을 줄 수 있다. [Codex 일괄 보관](usage.md#codex-일괄-보관).
 
 - 저장된 메타데이터에서 정확한 수신 Codex 대화의 보관이 확인되면 CLI는 Desktop에 연결하기 전에 `state: "failed"`와 `reason: "archived"`를 반환한다. 종료 코드는 1이다.
 - 전달에 필요한 정확한 Desktop 소유자를 찾지 못하면 메시지는 `pending`에 머문다. CLI와 MCP는 조회 이유와 확인된 작업 경로 누락을 보고한다. 브리지는 대화를 자동으로 다시 열거나 메시지를 재전송하지 않는다.

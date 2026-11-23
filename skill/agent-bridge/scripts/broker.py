@@ -1485,8 +1485,14 @@ class State:
         if native_root_only and not self_archive and (operator is None or operator != args.get('expected_operator')):
             raise ValueError('Enrolled Codex close operator changed before native archive preparation')
         self.check_close_scope(current, operator)
+        cascade = None
         if native_root_only:
-            self.check_native_close(current, native_scope)
+            if self_archive and 'cascade' in args:
+                if self.close_operator(prefer_native_for_direct=True) is not None:
+                    raise ValueError('The enrolled Codex close operator is preferred for this route')
+                cascade = self.check_cascade_review(current, native_scope, args['cascade'])
+            else:
+                self.check_native_close(current, native_scope)
         if args.get('check_only') is True:
             return {'ready': True}
         route = dict(current, closing=str(uuid.uuid4()))
@@ -1494,6 +1500,8 @@ class State:
             route['closing_native_scope'] = native_scope
         if self_archive:
             route['closing_self_archive'] = True
+            if cascade is not None:
+                route.update(cascade)
             if 'retro' in args:
                 stage_close_retro(self, route, args['retro'])
         route = self.routing_change('endpoints', key, route)
@@ -1552,7 +1560,24 @@ class State:
         descendants, scope = codex_archive.native_handoff_scope(target)
         if scope != expected_scope:
             raise ValueError('Codex native close subtree or saved profile changed')
-        subtree = descendants | {target['session']}
+        self.check_native_routes(target, descendants)
+
+    def check_cascade_review(self, target, scope, review):
+        if not isinstance(review, dict) or review.keys() != {'reviewed', 'deferred', 'held'}:
+            raise ValueError('Invalid Codex self-archive review')
+        reviewed, deferred, held = (route_store.descendant_ids(review[key], target['session'])
+                                    for key in ('reviewed', 'deferred', 'held'))
+        snapshot, unarchived = codex_archive.self_archive_scope(target, reviewed, deferred, scope, reserving=True)
+        # The saved leaf-first pass can prove writer refusal only on the
+        # bottom-most unarchived members. Their unarchived ancestors are covered.
+        expected_held = sorted(sid for sid in unarchived if not snapshot.descendants(sid) & unarchived)
+        if held != expected_held:
+            raise ValueError('Codex held descendants differ from the reviewed cascade')
+        self.check_native_routes(target, reviewed)
+        return dict(zip(route_store.CASCADE_FIELDS, (reviewed, deferred)))
+
+    def check_native_routes(self, target, descendants):
+        subtree = set(descendants) | {target['session']}
         protected = [route for route in self.endpoints.values() if route != target]
         protected.extend(channel['route'] for channel in self.channels.values() if channel['active'])
         if any(route['transport'] == 'codex' and route['session'] in subtree for route in protected):
@@ -1644,8 +1669,25 @@ async def start_self_archive(state, args):
     route = await state.serialized(reserve)
     finish = {'project': route['project'], 'name': route['name'],
               'session': route['session'], 'close_id': route['closing']}
-    try:
+
+    async def submit_reviewed():
+        if state.closing_route(finish) != route:
+            raise ValueError('Endpoint changed before self-archive enqueue')
+        state.check_native_routes(route, route['closing_reviewed_descendants'])
         await asyncio.to_thread(queue_self_archive, route, deadline)
+        try:
+            return await confirm_self_archive_enqueue(state, finish, route)
+        except (OSError, ValueError):
+            raise DeliveryError('Self-archive enqueue checkpoint could not be confirmed', uncertain=True) from None
+
+    reviewed = 'closing_reviewed_descendants' in route
+    try:
+        if reviewed:
+            route = await state.serialized(submit_reviewed)
+        else:
+            await asyncio.to_thread(queue_self_archive, route, deadline)
+    except codex_archive.DescendantRefusal as error:
+        return await state.serialized(refuse_self_archive, state, finish, route, str(error), error.fields)
     except codex_queue.QueueOwnerUnavailable as error:
         return await state.serialized(refuse_self_archive, state, finish, route,
                                       f'{error} No self-archive entry was submitted.')
@@ -1655,9 +1697,17 @@ async def start_self_archive(state, args):
                                       f'{error.summary} No self-archive entry was submitted.')
     except ThreadArchived:
         try:
-            await asyncio.wait_for(asyncio.to_thread(verify_self_archive_readback, route),
-                                   max(0, deadline - time.monotonic()))
+            readback = await asyncio.wait_for(asyncio.to_thread(verify_self_archive_readback, route),
+                                              max(0, deadline - time.monotonic()))
         except (ValueError, asyncio.TimeoutError):
+            if route.get('closing_reviewed_descendants'):
+                return {**pending_self_archive(state, route), **wake_not_requested('Root archive bit was already set')}
+            return await state.serialized(refuse_self_archive, state, finish, route,
+                                          'Existing archive bit has no verified native archive')
+        if readback is not None and not readback['complete']:
+            if any(not row['archived'] for row in readback['results'] if row['id'] != route['session']):
+                return {**pending_self_archive(state, route, readback),
+                        **wake_not_requested('Root archive bit was already set')}
             return await state.serialized(refuse_self_archive, state, finish, route,
                                           'Existing archive bit has no verified native archive')
         result = await commit_self_archive(state, finish, route, 'self_archive',
@@ -1666,12 +1716,12 @@ async def start_self_archive(state, args):
     except ValueError as error:
         if isinstance(error, DeliveryError) and error.uncertain:
             note = 'Queue acceptance is uncertain; verify with --finish'
-            state.close_archive_event(route, 'pending_self_archive', note)
-            return {**route, 'archive_path': 'pending_self_archive', 'route_removed': False, 'note': note,
+            return {**pending_self_archive(state, route, note=note),
                     **wake_not_requested('Queue acceptance is uncertain')}
         # The queue adapter marks failures after launch uncertain. A definite refusal is safe to release.
         return await state.serialized(refuse_self_archive, state, finish, route, str(error))
-    route = await state.serialized(confirm_self_archive_enqueue, state, finish, route)
+    if not reviewed:
+        route = await state.serialized(confirm_self_archive_enqueue, state, finish, route)
     wake, deadline = await wake_self_archive(route, deadline)
     result = await verify_self_archive(state, finish, route, deadline,
                                        'self_archive', 'Queued self-archive verified')
@@ -1690,17 +1740,24 @@ async def finish_self_archive(state, args, route, timeout):
     note = 'Queued self-archive verified'
     wake = wake_not_requested('Self-archive queue acceptance was not confirmed')
     if route.get('closing_self_archive_enqueued'):
+        readback = {}
         try:
-            await asyncio.wait_for(asyncio.to_thread(verify_self_archive_readback, route), timeout)
+            readback = await asyncio.wait_for(asyncio.to_thread(verify_self_archive_readback, route), timeout)
         except ValueError:
+            pass
+        except asyncio.TimeoutError:
+            wake = wake_not_requested('Native archive precheck timed out')
+            return {**pending_self_archive(state, route), **wake}
+        else:
+            if readback is None or readback['complete']:
+                result = await commit_self_archive(state, args, route, 'self_archive', note)
+                return {**result, **wake_not_requested('Thread was already natively archived')}
+        if not readback.get('root_archived'):
             if state.closing_route(args) != route:
                 raise ValueError('Endpoint changed during archive verification')
             wake, deadline = await wake_self_archive(route, deadline)
-        except asyncio.TimeoutError:
-            wake = wake_not_requested('Native archive precheck timed out')
         else:
-            result = await commit_self_archive(state, args, route, 'self_archive', note)
-            return {**result, **wake_not_requested('Thread was already natively archived')}
+            wake = wake_not_requested('Root archive is already verified')
     result = await verify_self_archive(state, args, route, deadline, 'self_archive', note)
     return {**result, **wake}
 
@@ -1723,52 +1780,91 @@ def wake_not_requested(reason):
 
 def queue_self_archive(route, deadline):
     codex_queue.check_available(route)
-    _, scope = codex_archive.native_handoff_scope(route)
-    if scope != route['closing_native_scope']:
-        raise ValueError('Codex native close subtree or saved profile changed before queue submission')
+    if 'closing_reviewed_descendants' in route:
+        codex_archive.check_cascade_quiescence(route, deadline, clock=time.monotonic)
+    else:
+        _, scope = codex_archive.native_handoff_scope(route)
+        if scope != route['closing_native_scope']:
+            raise ValueError('Codex native close subtree or saved profile changed before queue submission')
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise ValueError('Codex self-archive deadline expired before queue submission')
     codex_queue.enqueue_self_archive(route, remaining)
 
 
-async def refuse_self_archive(state, args, route, reason):
+async def refuse_self_archive(state, args, route, reason, fields=None):
     if state.closing_route(args) != route:
         raise ValueError('Endpoint changed during archive refusal')
     reopened = route_store.route_record(route)
     state.routing_change('endpoints', (route['project'], route['name']), reopened)
     result = {**route, 'route_removed': False, 'archive_path': 'not_archived',
-              'reason': reason, 'note': reason, **wake_not_requested('No queue entry was accepted')}
+              'reason': reason, 'note': reason, **(fields or {}), **wake_not_requested('No queue entry was accepted')}
     remove_close_retro(state, route, result)
     state.close_archive_event(route, 'not_archived', reason)
     return result
 
 
 def verify_self_archive_readback(route):
-    codex_preview.verify_archive(route, path=codex_archive.sweep_store())
+    report = codex_archive.self_archive_readback(route)
+    if report is not None:
+        report['complete'] = all(row['archived'] for row in report['results'])
+    return report
+
+
+def pending_self_archive(state, route, report=None, *, note='Codex self-archive is not yet verified; verify with --finish'):
+    state.close_archive_event(route, 'pending_self_archive', note)
+    fields = {}
+    if report is not None:
+        fields = {key: report[key] for key in ('root_archived', 'count', 'results')}
+    elif 'closing_reviewed_descendants' in route:
+        fields = {'readback': 'unavailable', 'root_archived': None}
+    return {**route, **fields, 'archive_path': 'pending_self_archive', 'route_removed': False, 'note': note}
 
 
 async def verify_self_archive(state, args, route, deadline, path, note):
+    report = None
     while True:
         remaining = deadline - time.monotonic()
         try:
-            await asyncio.wait_for(asyncio.to_thread(verify_self_archive_readback, route),
-                                   max(0, remaining))
-        except (ValueError, asyncio.TimeoutError):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                note = 'Codex self-archive is not yet verified; verify with --finish'
-                state.close_archive_event(route, 'pending_self_archive', note)
-                return {**route, 'archive_path': 'pending_self_archive', 'route_removed': False, 'note': note}
-            await asyncio.sleep(min(0.25, remaining))
+            report = await asyncio.wait_for(asyncio.to_thread(verify_self_archive_readback, route),
+                                            max(0, remaining))
+        except ValueError:
+            report = None
+        except asyncio.TimeoutError:
+            pass
         else:
-            return await commit_self_archive(state, args, route, path, note)
+            if report is None or report['complete']:
+                return await commit_self_archive(state, args, route, path, note)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return pending_self_archive(state, route, report)
+        await asyncio.sleep(min(0.25, remaining))
 
 
 async def commit_self_archive(state, args, route, path, note):
-    result = await state.serialized(commit_close, state, args, route)
-    state.close_archive_event(route, path, note)
-    return {**result, 'archive_path': path, 'note': note}
+    async def commit():
+        if 'closing_reviewed_descendants' not in route:
+            result = await commit_close(state, args, route)
+            state.close_archive_event(route, path, note)
+            return {**result, 'archive_path': path, 'note': note}
+        try:
+            report = await asyncio.to_thread(verify_self_archive_readback, route)
+        except ValueError:
+            return pending_self_archive(state, route)
+        if not report['complete']:
+            return pending_self_archive(state, route, report)
+        result = await commit_close(state, args, route)
+        archive_path = report['results'][-1]['method']
+        archive_note = note
+        if archive_path == 'root_cascade':
+            archive_note = 'Native root cascade and all reviewed archives verified'
+        elif not route.get('closing_self_archive_enqueued'):
+            archive_note = 'Native archives for the reviewed subtree verified'
+        state.close_archive_event(route, archive_path, archive_note)
+        return {**result, 'root_archived': report['root_archived'], 'results': report['results'],
+                'count': report['count'], 'archive_path': archive_path, 'note': archive_note}
+
+    return await state.serialized(commit)
 
 
 def close_retro_path(state, route):
@@ -1828,7 +1924,10 @@ async def commit_close(state, args, route):
     if state.closing_route(args) != route:
         raise ValueError('Endpoint changed during archive verification')
     if 'closing_native_scope' in route:
-        state.check_native_close(route, route['closing_native_scope'])
+        if 'closing_reviewed_descendants' in route:
+            state.check_native_routes(route, route['closing_reviewed_descendants'])
+        else:
+            state.check_native_close(route, route['closing_native_scope'])
 
     result = {**route, 'route_removed': False}
     self_archive = route.get('closing_self_archive')
