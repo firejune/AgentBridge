@@ -343,10 +343,12 @@ After archive is confirmed, the broker removes eligible retained correspondence 
 
 | Transport | Plain close | With direct `--archive` |
 | --- | --- | --- |
-| `claude-peer` | Sends `SIGTERM` to the exact registered CLI process | Archives supported Desktop sessions |
+| `claude-peer` | Sends `SIGTERM` to the exact registered CLI process | Archives supported Desktop sessions and re-reads the flag for 5 s |
 | `agy` | Detaches an idle conversation | Archives the conversation and checks readback |
 | `codex` | Detaches the route | Checks and archives the workspace-matched subtree, with native Desktop handoff for the root when enabled |
 | `realtime` / `claude` | Removes the route | — |
+
+On a Claude Desktop session, direct archive writes `isArchived: true` to the session's `claude-code-sessions/**/local_*.json` metadata and re-reads it for 5 s. The running app keeps each session in memory and its debounced save (1 s, 3 s while running) rewrites that file, so an outside write can be lost. If a re-read shows the flag gone or the file unreadable, close reports `archived: false`, `status: archive_unconfirmed` and `archive_incomplete: true` with what was read in `note`, exits 1 and keeps the route. Archive the session in the app. A flag that survives the window is reported archived, and a later app save of that session can still revert it.
 
 ### Codex archive sweep
 
