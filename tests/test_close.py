@@ -43,6 +43,21 @@ def run(argv):
     return code, json.loads(out.getvalue())
 
 
+class FakeClock:
+    """A monotonic clock that advances only when sleep is called; on_sleep may act."""
+    def __init__(self, on_sleep=None):
+        self.now, self.on_sleep, self.sleeps = 1000.0, on_sleep, 0
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps += 1
+        self.now += seconds
+        if self.on_sleep:
+            self.on_sleep(self)
+
+
 class UnregisterTests(unittest.TestCase):
     def test_unregister_removes_route_and_survives_restart(self):
         with RunningBroker() as server, tempfile.TemporaryDirectory() as cwd:
@@ -107,6 +122,7 @@ class CloseClaudeTests(unittest.TestCase):
         desktop_dir = self.root / 'claude-desktop-sessions' / 'acct' / 'org'
         desktop_dir.mkdir(parents=True)
         meta_file = desktop_dir / 'local_5678.json'
+        clock = FakeClock()
         meta_file.write_text(
             json.dumps({'sessionId': 'local_5678', 'cliSessionId': self.sid, 'isArchived': False}),
             encoding='utf-8',
@@ -120,12 +136,60 @@ class CloseClaudeTests(unittest.TestCase):
             poll=0.01,
             archive=True,
             desktop_dir=desktop_dir,
+            clock=clock,
+            sleep=clock.sleep,
         )
         self.assertEqual(
             (archived['closed'], archived['method'], archived['archived'], archived['host']),
             (True, 'archive', True, 'claude-desktop'),
         )
+        self.assertNotIn('archive_incomplete', archived)
+        self.assertIn('still read 5.0s after the write', archived['note'])
+        self.assertGreaterEqual(clock.now - 1000.0, sessions.ARCHIVE_SETTLE_SECONDS)
         self.assertIs(json.loads(meta_file.read_text(encoding='utf-8'))['isArchived'], True)
+
+    def desktop_archive(self, on_sleep=None, metadata=None):
+        """Close a desktop fake with archive=True; on_sleep(meta_file, clock) simulates the app."""
+        child = subprocess.Popen(['sleep', '30'])
+        self.fake(pid=child.pid, extra={'entrypoint': 'claude-desktop', 'hostSessionId': 'local_9abc'})
+        desktop_dir = self.root / 'claude-desktop-sessions' / 'acct' / 'org'
+        desktop_dir.mkdir(parents=True)
+        meta_file = desktop_dir / 'local_9abc.json'
+        meta_file.write_text(json.dumps(metadata or {'sessionId': 'local_9abc', 'cliSessionId': self.sid,
+                                                     'isArchived': False}), encoding='utf-8')
+        clock = FakeClock(on_sleep and (lambda clock: on_sleep(meta_file, clock)))
+        def kill(pid, sig):
+            os.kill(pid, sig); child.wait()
+        result = sessions.close_claude(self.sid, sessions_dir=self.root/'sessions', killer=kill, poll=0.01,
+                                       archive=True, desktop_dir=desktop_dir, clock=clock, sleep=clock.sleep)
+        return result, meta_file, clock
+
+    def test_desktop_archive_overwritten_by_the_app_during_the_settle_window_is_unconfirmed(self):
+        def app_saves(meta_file, clock):
+            if clock.sleeps == 2:  # the app's debounced save lands one second in
+                meta_file.write_text(json.dumps({'sessionId': 'local_9abc', 'cliSessionId': self.sid,
+                                                 'isArchived': False}), encoding='utf-8')
+        result, _, clock = self.desktop_archive(app_saves)
+        self.assertEqual((result['closed'], result['archived'], result['status'], result['archive_incomplete']),
+                         (True, False, 'archive_unconfirmed', True))
+        self.assertIn('local_9abc.json read isArchived=false 1.0s after the write', result['note'])
+        self.assertLess(clock.now - 1000.0, sessions.ARCHIVE_SETTLE_SECONDS)  # stops at the first lost read
+
+    def test_desktop_archive_with_unreadable_metadata_is_unconfirmed(self):
+        def app_truncates(meta_file, clock):
+            meta_file.write_text('{', encoding='utf-8')
+        result, _, _ = self.desktop_archive(app_truncates)
+        self.assertEqual((result['archived'], result['status']), (False, 'archive_unconfirmed'))
+        self.assertIn('local_9abc.json was unreadable 0.5s after the write', result['note'])
+
+        self.fakes.pop().close()
+        (self.root / 'sessions').rename(self.root / 'sessions-old')
+        (self.root / 'claude-desktop-sessions').rename(self.root / 'desktop-old')
+        def app_drops_the_key(meta_file, clock):
+            meta_file.write_text(json.dumps({'sessionId': 'local_9abc'}), encoding='utf-8')
+        result, _, _ = self.desktop_archive(app_drops_the_key)
+        self.assertEqual((result['archived'], result['status']), (False, 'archive_unconfirmed'))
+        self.assertIn('read isArchived=null', result['note'])
 
     def test_refuses_own_session_unknown_host_and_never_escalates(self):
         self.fake()
@@ -864,6 +928,36 @@ class CloseCommandTests(unittest.TestCase):
                         self.assertEqual(code, 1)
                         self.assertIn(reason, result['error'])
                         self.assertEqual(server.call('routes', project='p'), routes)
+
+    def test_desktop_archive_the_app_overwrote_exits_nonzero_and_keeps_the_route(self):
+        real_archive = sessions.archive_claude_desktop
+        with RunningBroker() as server, tempfile.TemporaryDirectory() as cwd:
+            sid, host = str(uuid.uuid4()), 'local_' + str(uuid.uuid4())
+            registry = Path(cwd) / 'claude-session.json'
+            registry.write_text(json.dumps({'entrypoint': 'claude-desktop', 'hostSessionId': host}), encoding='utf-8')
+            desktop = Path(cwd) / 'desktop' / 'acct' / 'org'
+            desktop.mkdir(parents=True)
+            meta = desktop / f'{host}.json'
+            original = json.dumps({'sessionId': host, 'cliSessionId': sid, 'isArchived': False})
+            meta.write_text(original, encoding='utf-8')
+            clock = FakeClock(lambda clock: meta.write_text(original, encoding='utf-8'))
+            def archive(*args, **kwargs):
+                return real_archive(*args, **{**kwargs, 'clock': clock, 'sleep': clock.sleep})
+            server.call('register', project='p', name='claude', cwd=cwd, transport='claude-peer', session=sid)
+            routes = server.call('routes', project='p')
+            with mock.patch.dict(os.environ, {'CLAUDE_DESKTOP_SESSIONS_DIR': str(Path(cwd) / 'desktop')}), \
+                    mock.patch.object(sessions, 'resolve_claude_peer',
+                                      return_value={'id': sid, 'registry': str(registry), 'pid': 123}), \
+                    mock.patch.object(sessions, 'pid_alive', return_value=False), \
+                    mock.patch.object(sessions.os, 'kill'), \
+                    mock.patch.object(sessions, 'archive_claude_desktop', side_effect=archive):
+                code, result = run(['--socket', server.path, 'close', 'claude', '--project', 'p',
+                                    '--no-retro', 'fixture', '--archive'])
+            self.assertEqual(code, 1)
+            self.assertEqual((result['archived'], result['status'], result['route_removed']),
+                             (False, 'archive_unconfirmed', False))
+            self.assertEqual(result['cleanup_error'], 'Provider archival was not confirmed')
+            self.assertEqual(server.call('routes', project='p'), routes)
 
     def test_a_failed_close_writes_no_retro_and_a_confirmed_one_writes_it_once(self):
         with RunningBroker() as server, tempfile.TemporaryDirectory() as cwd:

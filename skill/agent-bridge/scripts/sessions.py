@@ -750,7 +750,25 @@ def claude_desktop_sessions_dir():
     return Path.home() / 'Library' / 'Application Support' / 'Claude' / 'claude-code-sessions'
 
 
-def archive_claude_desktop(host_session_id, cli_session_id=None, desktop_dir=None):
+# Read from the Claude Desktop 5.11492.0 bundle (app.asar, LocalSessionManager): the
+# running app keeps every session in memory and its debounced save (1 s idle, 3 s while
+# running) writes the whole in-memory object over local_<id>.json. It does not watch that
+# directory. An outside isArchived=true therefore lasts only until the app next saves the
+# session; issue #124 saw that happen after the close. The app's own archive path is the
+# in-app ccd_session_mgmt archive_session tool, reachable only from inside a Desktop
+# session; there is no URL route, CLI subcommand or socket for it. So the write is
+# re-read across a window longer than that debounce before it is reported (issue #124).
+ARCHIVE_SETTLE_SECONDS = 5.0
+ARCHIVE_SETTLE_POLL = 0.5
+
+
+def archive_claude_desktop(host_session_id, cli_session_id=None, desktop_dir=None, *,
+                           settle=ARCHIVE_SETTLE_SECONDS, poll=ARCHIVE_SETTLE_POLL,
+                           clock=time.monotonic, sleep=time.sleep):
+    """Write isArchived=true and re-read it across the settle window.
+
+    Returns {'confirmed': bool, 'read': text}. A failed write raises; a flag that is gone
+    or unreadable during the window is reported unconfirmed, never as archived."""
     root = Path(desktop_dir) if desktop_dir else claude_desktop_sessions_dir()
     if not root.is_dir():
         raise DiscoveryError(f'Claude Desktop session directory is missing: {root}')
@@ -784,16 +802,30 @@ def archive_claude_desktop(host_session_id, cli_session_id=None, desktop_dir=Non
             tmp = path.with_suffix('.json.tmp')
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
             os.replace(tmp, path)
-            readback = json.loads(path.read_text(encoding='utf-8'))
         except (OSError, ValueError) as error:
             raise DiscoveryError(f'Failed to archive Claude Desktop session {path.name}: {error}') from None
-        if not isinstance(readback, dict) or readback.get('isArchived') is not True:
-            raise DiscoveryError(f'Claude Desktop session {path.name} did not read back as archived')
-    return True
+    written = clock()
+    deadline = written + settle
+    while True:
+        elapsed = clock() - written
+        for path in matched:
+            try:
+                readback = json.loads(path.read_text(encoding='utf-8'))
+            except (OSError, ValueError) as error:
+                return {'confirmed': False,
+                        'read': f'{path.name} was unreadable {elapsed:.1f}s after the write: {error}'}
+            flag = readback.get('isArchived') if isinstance(readback, dict) else None
+            if flag is not True:
+                return {'confirmed': False,
+                        'read': f'{path.name} read isArchived={json.dumps(flag)} {elapsed:.1f}s after the write'}
+        if clock() >= deadline:
+            return {'confirmed': True, 'read': f'isArchived=true still read {elapsed:.1f}s after the write'}
+        sleep(poll)
 
 
 def close_claude(sid, own_session=None, timeout=10, sessions_dir=None, killer=None, poll=0.2,
-                 archive=False, desktop_dir=None):
+                 archive=False, desktop_dir=None, archive_settle=ARCHIVE_SETTLE_SECONDS,
+                 clock=time.monotonic, sleep=time.sleep):
     row = resolve_claude_peer(sid, sessions_dir)
     if own_session and str(own_session) == row['id']:
         raise DiscoveryError('Refusing to close the calling session itself')
@@ -806,34 +838,27 @@ def close_claude(sid, own_session=None, timeout=10, sessions_dir=None, killer=No
         raise DiscoveryError(f'unsupported host {host}')
     pid = row['pid']
     (killer or os.kill)(pid, signal.SIGTERM)
-    deadline = time.monotonic() + timeout
+    deadline = clock() + timeout
     while pid_alive(pid):
-        if time.monotonic() >= deadline:
+        if clock() >= deadline:
             raise DiscoveryError(f'Claude session {sid} (pid {pid}) is still running {timeout:g}s after SIGTERM; '
                                  'not escalating. Check it before trying again.')
-        time.sleep(poll)
+        sleep(poll)
+    result = {'closed': True, 'session': row['id'], 'host': host, 'pid': pid, 'resumable': True}
     if archive and host == 'claude-desktop':
-        archive_claude_desktop(record.get('hostSessionId'), cli_session_id=row['id'], desktop_dir=desktop_dir)
-        return {
-            'closed': True,
-            'method': 'archive',
-            'archived': True,
-            'session': row['id'],
-            'host': host,
-            'pid': pid,
-            'resumable': True,
-            'note': 'Terminated CLI process and marked isArchived=true in Claude Desktop session metadata.',
-        }
-    return {
-        'closed': True,
-        'method': 'terminate',
-        'archived': False,
-        'session': row['id'],
-        'host': host,
-        'pid': pid,
-        'resumable': True,
-        'note': CLOSABLE_CLAUDE_HOSTS[host],
-    }
+        archived = archive_claude_desktop(record.get('hostSessionId'), cli_session_id=row['id'],
+                                          desktop_dir=desktop_dir, settle=archive_settle, clock=clock, sleep=sleep)
+        if not archived['confirmed']:
+            return {**result, 'method': 'archive', 'archived': False, 'status': 'archive_unconfirmed',
+                    'archive_incomplete': True,
+                    'note': f'Terminated the CLI process and wrote isArchived=true, but {archived["read"]}: the '
+                            'running Claude Desktop app rewrote its own copy. The session stays in the sidebar; '
+                            'archive it in the app.'}
+        return {**result, 'method': 'archive', 'archived': True,
+                'note': f'Terminated the CLI process and marked isArchived=true in Claude Desktop session metadata; '
+                        f'{archived["read"]}. The running app keeps its own copy and can still rewrite it on a '
+                        'later save of this session.'}
+    return {**result, 'method': 'terminate', 'archived': False, 'note': CLOSABLE_CLAUDE_HOSTS[host]}
 
 
 # --- Waking an idle-closed Claude Code session (issue #115) -----------------

@@ -144,6 +144,7 @@ python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.
 - `ack`와 `progress`는 수신 확인·진행 보고이며 최종 답변이 아니다. `ask`/`wait`의 종료 코드 2는 대기 시간 초과이므로 요청을 다시 보내지 말고 같은 ID로 `wait`한다.
 - 내가 소유하거나 소유자 또는 HQ가 종료를 지시한 세션만 닫는다. 일반 `close`는 정확한 Claude CLI 프로세스를 중지하거나, 대기 중인 Antigravity 대화 또는 Codex 라우트를 분리한다. 세션을 보관하려면 `--archive`를 사용한다.
 - Claude나 Antigravity가 세션이 아직 실행 중이라 종료를 거부하면 일반 `close`와 `close --archive`는 `error` 필드와 0이 아닌 종료 코드를 반환하고 라우트를 유지하므로, `close ... && <cleanup>`에서 정리 명령은 실행되지 않는다.
+- Claude Desktop 세션의 `close --archive`는 세션 메타데이터에 `isArchived: true`를 쓰고 5초 동안 다시 읽는다. 실행 중인 앱이 자기 사본으로 그 파일을 다시 쓰기 때문이다. 플래그가 사라졌거나 읽을 수 없으면 결과는 `archived: false`와 `status: archive_unconfirmed`를 보고하고 0이 아닌 종료 코드로 라우트를 유지한다. 그 세션은 앱에서 보관한다.
 - 보관이 확인되면 브로커는 별칭을 포함해 정확한 세션의 정리 가능한 서신을 삭제하고, 영향을 받은 수신함 스냅샷을 만료시킨다. 공급자 대화 원문은 유지한다. 일반 종료는 서신을 유지한다. 직접 보관에 `--keep-route`를 사용해도 서신 정리는 수행한다.
 - 기본적으로 Codex 직접 종료(`close --archive`)는 그 스레드에 고정된 자기 보관 항목 하나를 큐에 넣는다. 스레드가 Desktop의 네이티브 도구로 스스로를 보관하고, 사이드바에서도 재시작 없이 사라진다. 라우트는 Agent Bridge가 보관 비트와 `archived_sessions` 아래의 rollout을 다시 읽어 확인한 뒤에만 지운다. Agent Bridge는 Codex 상태를 읽기만 하고 절대 쓰지 않는다. 결과의 `archive_path`가 무슨 일이 있었는지 알려 준다.
 

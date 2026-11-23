@@ -342,10 +342,12 @@ python3 "$bridge_cli" close NAME --project PROJECT --finish CLOSE_ID --expect-se
 
 | Transport | 일반 종료 | 직접 보관 (`--archive`) |
 | --- | --- | --- |
-| `claude-peer` | 정확히 등록된 CLI 프로세스에 `SIGTERM`을 보낸다 | 지원되는 Desktop 세션을 보관한다 |
+| `claude-peer` | 정확히 등록된 CLI 프로세스에 `SIGTERM`을 보낸다 | 지원되는 Desktop 세션을 보관하고 플래그를 5초 동안 다시 읽는다 |
 | `agy` | 대기 중인 대화를 분리한다 | 대화를 보관하고 상태를 재확인한다 |
 | `codex` | 라우트를 분리한다 | 작업 경로가 일치하는 스레드와 하위 스레드를 확인해 보관한다. 설정에 따라 루트를 Desktop 네이티브 보관으로 인계한다 |
 | `realtime` / `claude` | 라우트를 제거한다 | — |
+
+Claude Desktop 세션의 직접 보관은 세션의 `claude-code-sessions/**/local_*.json` 메타데이터에 `isArchived: true`를 쓰고 5초 동안 다시 읽는다. 실행 중인 앱은 세션을 메모리에 두고 지연 저장(1초, 실행 중에는 3초)으로 그 파일을 다시 쓰므로 바깥에서 쓴 값이 사라질 수 있다. 다시 읽은 값에서 플래그가 사라졌거나 파일을 읽을 수 없으면 `archived: false`, `status: archive_unconfirmed`, `archive_incomplete: true`와 읽은 내용을 `note`에 보고하고 종료 코드 1로 라우트를 유지한다. 그 세션은 앱에서 보관한다. 창이 끝날 때까지 남은 플래그는 보관으로 보고하지만, 이후 앱이 그 세션을 저장하면 되돌아갈 수 있다.
 
 ### Codex 일괄 보관
 
