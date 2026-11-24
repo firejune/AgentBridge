@@ -333,11 +333,12 @@ python3 "$bridge_cli" resolve MESSAGE_ID --state done --note 'Completed'
 
 ```bash
 python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.txt [--archive] [--keep-route] [--timeout 10]
+python3 "$bridge_cli" close --archive --session UUID --provider agy [--timeout 10]
 python3 "$bridge_cli" close NAME --project PROJECT --retro-file /absolute/retro.txt --archive --handoff
 python3 "$bridge_cli" close NAME --project PROJECT --finish CLOSE_ID --expect-session UUID
 ```
 
-Plain `close` stops or detaches the session and removes its route unless you pass `--keep-route`. Use `--archive` to archive the exact session as part of closing.
+Plain `close` stops or detaches the session and removes its route unless you pass `--keep-route`. Use `--archive` to archive the exact session as part of closing. When an Antigravity (`agy`) session's route and worktree have already been removed, `close --archive --session UUID --provider agy` archives the idle conversation directly by UUID without requiring a registered route or existing workspace directory.
 
 After archive is confirmed, the broker removes eligible retained correspondence for the exact session, including aliases, and expires inbox snapshots affected by removal. Provider transcripts remain available. Ordinary close preserves correspondence. Direct archive with `--keep-route` still cleans correspondence. Before direct archive, the CLI checks broker support and active delivery, continuation and wait. Any of those active operations blocks archive. Cleanup matches the frozen transport, UUID and workspace at either endpoint. Activity that races archive and uncertain deliveries are protected. Cleanup and route removal are separate writes. Archive succeeds when the provider archive and requested route operation are confirmed and only uncertain correspondence is retained. The cleanup receipt still reports `retained`, `complete: false` and `active_retained: 0`. Exit 1 reports retained active or unclassified correspondence, unconfirmed cleanup, or unconfirmed route removal alongside the confirmed archive result. The CLI leaves retries to the caller.
 

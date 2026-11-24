@@ -954,6 +954,120 @@ class AgyLiveTests(unittest.TestCase):
         with mock.patch.object(agy_live.urllib.request, 'urlopen', side_effect=URLError('connection refused')):
             self.assertEqual(agy_live.wake_session(url, CSRF, self.sid, initial_status='idle'), 'failed')
 
+    def test_two_hub_servers_pick_sessions_owner_for_third_folder_and_name_truly_ambiguous_servers(self):
+        import agy_live
+
+        third_sid = str(uuid.uuid4())
+        deleted_wt_sid = str(uuid.uuid4())
+        proj_linked_sid = str(uuid.uuid4())
+        win_a = self.root / 'win-a'
+        win_b = self.root / 'win-b'
+        lane_c = self.root / 'lane-c'
+        win_a.mkdir()
+        (win_b / '.git').mkdir(parents=True)
+        lane_c.mkdir()
+        deleted_wt = self.root / '.worktrees' / 'win-b' / 'jinni-144'
+        # Note: deleted_wt is intentionally NOT created on disk (worktree already deleted).
+
+        config_dir = self.root / 'gemini-config'
+        projects_dir = config_dir / 'projects'
+        projects_dir.mkdir(parents=True)
+        proj_b = str(uuid.uuid4())
+        (projects_dir / f'{proj_b}.json').write_text(
+            json.dumps({'id': proj_b, 'name': 'win-b', 'workspacePaths': [str(win_b)]}),
+            encoding='utf-8',
+        )
+
+        with FakeAgyServer(win_a, str(uuid.uuid4())) as ide_a_srv, \
+                FakeAgyServer(win_b, str(uuid.uuid4())) as ide_b_srv:
+            shared_third = {
+                'summary': 'Third Folder Runner',
+                'stepCount': 42,
+                'status': 'CASCADE_RUN_STATUS_IDLE',
+                'workspaces': [{'workspaceFolderAbsoluteUri': lane_c.as_uri()}],
+                'lastModifiedTime': '2026-11-24T01:00:00Z',
+            }
+            ide_a_srv.trajectories[third_sid] = json.loads(json.dumps(shared_third))
+            ide_b_srv.trajectories[third_sid] = json.loads(json.dumps(shared_third))
+
+            shared_deleted_wt = {
+                'summary': 'Deleted Worktree Runner',
+                'stepCount': 15,
+                'status': 'CASCADE_RUN_STATUS_IDLE',
+                'workspaces': [{'workspaceFolderAbsoluteUri': deleted_wt.as_uri()}],
+                'lastModifiedTime': '2026-11-24T01:05:00Z',
+            }
+            ide_a_srv.trajectories[deleted_wt_sid] = json.loads(json.dumps(shared_deleted_wt))
+            ide_b_srv.trajectories[deleted_wt_sid] = json.loads(json.dumps(shared_deleted_wt))
+
+            shared_proj_linked = {
+                'summary': 'Project Linked Lane Runner',
+                'stepCount': 19,
+                'status': 'CASCADE_RUN_STATUS_IDLE',
+                'workspaces': [{'workspaceFolderAbsoluteUri': lane_c.as_uri()}],
+                'trajectoryMetadata': {'projectId': proj_b},
+                'lastModifiedTime': '2026-11-24T01:06:00Z',
+            }
+            ide_a_srv.trajectories[proj_linked_sid] = json.loads(json.dumps(shared_proj_linked))
+            ide_b_srv.trajectories[proj_linked_sid] = json.loads(json.dumps(shared_proj_linked))
+
+            servers = [
+                {
+                    'pid': 3002, 'ppid': 3000, 'orphaned': False, 'app_dir': 'antigravity',
+                    'host': 'ide', 'add_dirs': (str(win_a),), 'url': ide_a_srv.url,
+                    'csrf': CSRF, 'summaries': ide_a_srv.trajectories,
+                },
+                {
+                    'pid': 3003, 'ppid': 3000, 'orphaned': False, 'app_dir': 'antigravity',
+                    'host': 'ide', 'add_dirs': (str(win_b),), 'url': ide_b_srv.url,
+                    'csrf': CSRF, 'summaries': ide_b_srv.trajectories,
+                },
+            ]
+
+            with mock.patch.dict(os.environ, {'GEMINI_CONFIG_DIR': str(config_dir)}, clear=False), \
+                    mock.patch.object(agy_live, 'discover_servers', return_value=servers):
+                # 1) Third-folder idle session tied across two unified agy --hub servers resolves
+                #    to the exact server `list_agy` (`sessions`) names (pid 3002).
+                listed = agy_live.list_agy()
+                by_id = {row['id']: row for row in listed['sessions']}
+                self.assertEqual(by_id[third_sid]['pid'], 3002)
+                srv, row = agy_live.resolve_agy(third_sid)
+                self.assertEqual((srv['pid'], row['pid']), (3002, 3002))
+
+                # 2) Deleted worktree of win_b and project-linked lane of win_b both resolve to win_b's server (3003).
+                self.assertEqual(by_id[deleted_wt_sid]['pid'], 3003)
+                self.assertEqual(agy_live.resolve_agy(deleted_wt_sid)[0]['pid'], 3003)
+                self.assertEqual(by_id[proj_linked_sid]['pid'], 3003)
+                self.assertEqual(agy_live.resolve_agy(proj_linked_sid)[0]['pid'], 3003)
+
+                # 3) Archiving third_sid updates pid 3002, and subsequent list_agy hides it even though
+                #    pid 3003 still holds the older unarchived summary in memory.
+                archived = agy_live.archive_agy(third_sid)
+                self.assertTrue(archived['archived'])
+                listed_after = agy_live.list_agy()
+                self.assertNotIn(third_sid, {r['id'] for r in listed_after['sessions']})
+
+                # 4) Truly ambiguous: two servers both report the trajectory as RUNNING -> names both servers.
+                ide_a_srv.trajectories[third_sid]['status'] = 'CASCADE_RUN_STATUS_RUNNING'
+                ide_b_srv.trajectories[third_sid]['status'] = 'CASCADE_RUN_STATUS_RUNNING'
+                with self.assertRaises(agy_live.DeliveryError) as ctx_run:
+                    agy_live.resolve_agy(third_sid)
+                self.assertIn('pid 3002 (ide:', str(ctx_run.exception))
+                self.assertIn('pid 3003 (ide:', str(ctx_run.exception))
+
+                # 5) Truly ambiguous: two IDE servers both positively claim the same workspace (affinity == 2).
+                same_ws_servers = [
+                    {**servers[0], 'add_dirs': (str(lane_c),)},
+                    {**servers[1], 'add_dirs': (str(lane_c),)},
+                ]
+                ide_a_srv.trajectories[third_sid] = json.loads(json.dumps(shared_third))
+                ide_b_srv.trajectories[third_sid] = json.loads(json.dumps(shared_third))
+                with mock.patch.object(agy_live, 'discover_servers', return_value=same_ws_servers):
+                    with self.assertRaises(agy_live.DeliveryError) as ctx_ws:
+                        agy_live.resolve_agy(third_sid)
+                    self.assertIn('pid 3002', str(ctx_ws.exception))
+                    self.assertIn('pid 3003', str(ctx_ws.exception))
+
 
 FAILURE_FIXTURE = Path(__file__).with_name('fixtures') / 'agy-provider-failure.json'
 

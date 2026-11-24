@@ -530,22 +530,23 @@ def _git_main_worktree(cwd):
     for candidate in (target, *target.parents):
         git_marker = candidate / '.git'
         try:
-            if not git_marker.is_file():
-                continue
-            first_line = git_marker.read_text(encoding='utf-8', errors='replace').splitlines()[0].strip()
-        except (OSError, IndexError):
-            continue
-        if not first_line.startswith('gitdir:'):
-            continue
-        raw_gitdir = first_line[len('gitdir:'):].strip()
-        if not raw_gitdir:
-            continue
-        try:
-            gitdir = (candidate / raw_gitdir).resolve()
-        except (OSError, ValueError):
-            continue
-        if gitdir.parent.name == 'worktrees' and gitdir.parent.parent.name == '.git':
-            return gitdir.parent.parent.parent.resolve()
+            if git_marker.is_file():
+                first_line = git_marker.read_text(encoding='utf-8', errors='replace').splitlines()[0].strip()
+                if first_line.startswith('gitdir:'):
+                    raw_gitdir = first_line[len('gitdir:'):].strip()
+                    if raw_gitdir:
+                        gitdir = (candidate / raw_gitdir).resolve()
+                        if gitdir.parent.name == 'worktrees' and gitdir.parent.parent.name == '.git':
+                            return gitdir.parent.parent.parent.resolve()
+        except (OSError, IndexError, ValueError):
+            pass
+        if candidate.parent.name == '.worktrees' and candidate.parent.parent != candidate.parent:
+            sibling = candidate.parent.parent / candidate.name
+            try:
+                if (sibling / '.git').exists():
+                    return sibling.resolve()
+            except OSError:
+                pass
     return None
 
 
@@ -923,17 +924,50 @@ def _summary_cwd(item, fallback_cwd=None):
     )
 
 
-def _workspace_affinity(server, cwd):
+def _summary_related_paths(item):
+    if not isinstance(item, dict):
+        return ()
+    paths = []
+    meta = item.get('trajectoryMetadata') if isinstance(item.get('trajectoryMetadata'), dict) else {}
+    ann = item.get('annotations') if isinstance(item.get('annotations'), dict) else {}
+    for workspaces in (item.get('workspaces'), meta.get('workspaces')):
+        if not isinstance(workspaces, list):
+            continue
+        for ws in workspaces:
+            if isinstance(ws, dict):
+                for key in ('workspaceFolderAbsoluteUri', 'gitRootAbsoluteUri'):
+                    path = uri_to_path(ws.get(key))
+                    if path and path not in paths:
+                        paths.append(path)
+    project_id = meta.get('projectId') or ann.get('projectId')
+    if isinstance(project_id, str) and project_id and project_id not in IGNORED_PROJECT_IDS:
+        record = _load_project_record(project_id)
+        for path in _project_default_paths(record):
+            if path not in paths:
+                paths.append(path)
+    return tuple(paths)
+
+
+def _workspace_affinity(server, cwd, item=None):
     if server_host(server) == 'ide':
         add_dirs = server.get('add_dirs') or ()
         if add_dirs:
-            return 2 if _server_matches_cwd(server, cwd) else 0
+            if _server_matches_cwd(server, cwd):
+                return 2
+            if any(_server_matches_cwd(server, path) for path in _summary_related_paths(item)):
+                return 2
+            return 0
     return 1
+
+
+def _is_archived(item):
+    annotations = item.get('annotations') if isinstance(item, dict) else None
+    return isinstance(annotations, dict) and annotations.get('archived') is True
 
 
 def _summary_rank(server, item, fallback_cwd=None):
     if not isinstance(item, dict):
-        return (0, 0, -1, '', 0)
+        return (0, 0, -1, '', '', 0, '', 0)
     is_running = 1 if normalize_status(item.get('status')) == 'running' else 0
     not_orphaned = 0 if (isinstance(server, dict) and server.get('orphaned')) else 1
     try:
@@ -941,9 +975,55 @@ def _summary_rank(server, item, fallback_cwd=None):
     except (TypeError, ValueError):
         steps = 0
     modified = str(item.get('lastModifiedTime') or '')
+    annotations = item.get('annotations') if isinstance(item.get('annotations'), dict) else {}
+    archived_ts = str(annotations.get('archivalStatusTimestamp') or '')
+    is_archived = 1 if annotations.get('archived') is True else 0
+    view_ts = str(annotations.get('lastUserViewTime') or '')
     cwd = _summary_cwd(item, fallback_cwd)
-    affinity = _workspace_affinity(server, cwd)
-    return (is_running, not_orphaned, steps, modified, affinity)
+    affinity = _workspace_affinity(server, cwd, item)
+    return (is_running, not_orphaned, steps, modified, archived_ts, is_archived, view_ts, affinity)
+
+
+def _describe_servers(servers):
+    parts = []
+    for server in servers:
+        pid = server.get('pid') if isinstance(server, dict) else None
+        host = server_host(server)
+        add_dirs = (server.get('add_dirs') if isinstance(server, dict) else None) or ()
+        detail = f"{host}: {', '.join(add_dirs)}" if add_dirs else host
+        parts.append(f'pid {pid} ({detail})')
+    return ', '.join(parts)
+
+
+def _pick_summary_server(in_summaries, sid):
+    running = [pair for pair in in_summaries if normalize_status(pair[1].get('status')) == 'running']
+    if len(running) > 1:
+        raise DeliveryError(
+            f'Antigravity session {sid} matched multiple live servers: '
+            f'{_describe_servers([pair[0] for pair in running])}'
+        )
+    ranked = sorted(
+        in_summaries,
+        key=lambda pair: _summary_rank(pair[0], pair[1]),
+        reverse=True,
+    )
+    if len(ranked) > 1:
+        top_rank = _summary_rank(ranked[0][0], ranked[0][1])
+        tied = [pair for pair in ranked if _summary_rank(pair[0], pair[1]) == top_rank]
+        if len(tied) > 1:
+            app_dirs = {(pair[0].get('app_dir') or 'antigravity') if isinstance(pair[0], dict) else 'antigravity'
+                        for pair in tied}
+            # Multiple unified hubs sharing one app_data_dir load the same idle on-disk summary
+            # for a third-folder trajectory that no server's --add-dir claims (affinity < 2).
+            # Pick tied[0] — the exact server list_agy (`sessions`) attributes the session to.
+            # When two servers both positively claim the workspace (affinity == 2) or use
+            # distinct app_data_dirs, ownership is genuinely ambiguous: name the servers.
+            if len(app_dirs) > 1 or top_rank[-1] >= 2:
+                raise DeliveryError(
+                    f'Antigravity session {sid} matched multiple live servers: '
+                    f'{_describe_servers([pair[0] for pair in tied])}'
+                )
+    return ranked[0]
 
 
 def agy_row(sid, item, pid, fallback_cwd=None, app_dir='antigravity', host=None):
@@ -983,7 +1063,7 @@ def list_agy(cwd=None, search=None, limit=100, timeout=5):
             if prev is None or rank > prev[0]:
                 best_by_sid[sid] = (rank, server, item)
     combined = sorted(
-        ((server, sid, item) for sid, (_, server, item) in best_by_sid.items()),
+        ((server, sid, item) for sid, (_, server, item) in best_by_sid.items() if not _is_archived(item)),
         key=lambda entry: (entry[2].get('lastModifiedTime') or '') if isinstance(entry[2], dict) else '',
         reverse=True,
     )
@@ -1011,7 +1091,7 @@ def list_agy(cwd=None, search=None, limit=100, timeout=5):
     }
 
 
-def resolve_agy(sid, timeout=5):
+def resolve_agy(sid, timeout=5, *, require_cwd=True):
     sid = str(uuid.UUID(sid))
     servers = discover_servers(timeout=timeout)
     in_summaries = [
@@ -1020,17 +1100,7 @@ def resolve_agy(sid, timeout=5):
         if isinstance(server.get('summaries'), dict) and isinstance(server['summaries'].get(sid), dict)
     ]
     if in_summaries:
-        running = [pair for pair in in_summaries if normalize_status(pair[1].get('status')) == 'running']
-        if len(running) > 1:
-            raise DeliveryError(f'Antigravity session {sid} matched multiple live servers')
-        ranked = sorted(
-            in_summaries,
-            key=lambda pair: _summary_rank(pair[0], pair[1]),
-            reverse=True,
-        )
-        if len(ranked) > 1 and _summary_rank(ranked[0][0], ranked[0][1]) == _summary_rank(ranked[1][0], ranked[1][1]):
-            raise DeliveryError(f'Antigravity session {sid} matched multiple live servers')
-        candidates = ranked[:1]
+        candidates = [_pick_summary_server(in_summaries, sid)]
     else:
         candidates = [(server, None) for server in servers]
 
@@ -1064,7 +1134,7 @@ def resolve_agy(sid, timeout=5):
             app_dir=server.get('app_dir', 'antigravity'),
             host=server.get('host'),
         )
-        if not row['cwd']:
+        if require_cwd and not row['cwd']:
             last_error = DeliveryError(f'Antigravity session {sid} has no workspace directory')
             continue
         matches.append((server, row))
@@ -1081,7 +1151,11 @@ def resolve_agy(sid, timeout=5):
         second_affinity = _workspace_affinity(ranked_matches[1][0], ranked_matches[1][1]['cwd'])
         if top_affinity > second_affinity:
             return ranked_matches[0]
-        raise DeliveryError(f'Antigravity session {sid} matched multiple live servers')
+        tied_servers = [pair[0] for pair in ranked_matches
+                        if _workspace_affinity(pair[0], pair[1]['cwd']) == top_affinity]
+        raise DeliveryError(
+            f'Antigravity session {sid} matched multiple live servers: {_describe_servers(tied_servers)}'
+        )
     return matches[0]
 
 
@@ -1457,7 +1531,7 @@ def deliver(route, message_id, text, sender=None, project=None, timeout=10, dry_
 # active conversation stack across both IDE and Desktop, matching Claude and Codex.
 # Passing `--archive` calls archive_agy() to hide the conversation from the sidebar.
 def close_agy(sid, timeout=5):
-    _, row = resolve_agy(sid, timeout=timeout)
+    _, row = resolve_agy(sid, timeout=timeout, require_cwd=False)
     if row['status'] == 'running':
         raise DeliveryError(f'Antigravity session {sid} is running; close it after the turn ends')
     return {
@@ -1472,7 +1546,7 @@ def close_agy(sid, timeout=5):
 
 
 def archive_agy(sid, timeout=5):
-    server, row = resolve_agy(sid, timeout=timeout)
+    server, row = resolve_agy(sid, timeout=timeout, require_cwd=False)
     if row['status'] == 'running':
         raise DeliveryError(f'Antigravity session {sid} is running; archive it after the turn ends')
     try:
@@ -1578,17 +1652,10 @@ def select_summary_server(servers, sid, cwd=None):
         in_summaries.append((server, summary))
     if not in_summaries:
         return None, None
-    running = [pair for pair in in_summaries if normalize_status(pair[1].get('status')) == 'running']
-    if len(running) > 1:
+    try:
+        return _pick_summary_server(in_summaries, sid)
+    except DeliveryError:
         return None, None
-    ranked = sorted(
-        in_summaries,
-        key=lambda pair: _summary_rank(pair[0], pair[1]),
-        reverse=True,
-    )
-    if len(ranked) > 1 and _summary_rank(ranked[0][0], ranked[0][1]) == _summary_rank(ranked[1][0], ranked[1][1]):
-        return None, None
-    return ranked[0]
 
 
 def read_tail_steps(server, sid, step_count, timeout=5):

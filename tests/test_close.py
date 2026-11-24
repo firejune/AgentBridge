@@ -12,8 +12,9 @@ import unittest
 from unittest import mock
 import uuid
 
-import agy_live
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bridge
+import agy_live
 import codex_live
 import codex_archive
 import codex_preview
@@ -278,6 +279,34 @@ class ArchiveAgyTests(unittest.TestCase):
                     agy_live.archive_agy(fake.other_sid)
         updates = [c for c in calls.call_args_list if c.args[2] == 'UpdateConversationAnnotations']
         self.assertEqual(len(updates), 1)
+
+    def test_archive_and_close_succeed_when_workspace_folder_is_deleted_or_absent(self):
+        gone_dir = self.root / 'deleted-worktree'
+        gone_dir.mkdir()
+        gone_sid = str(uuid.uuid4())
+        no_ws_sid = str(uuid.uuid4())
+        with FakeAgyServer(self.root, self.sid) as fake, self.env(fake):
+            fake.trajectories[gone_sid] = {
+                'summary': 'Deleted Folder Session',
+                'status': 'CASCADE_RUN_STATUS_IDLE',
+                'workspaces': [{'workspaceFolderAbsoluteUri': gone_dir.as_uri()}],
+                'lastModifiedTime': '2026-11-24T01:00:00Z',
+            }
+            fake.trajectories[no_ws_sid] = {
+                'summary': 'No Workspace Session',
+                'status': 'CASCADE_RUN_STATUS_IDLE',
+                'workspaces': [],
+                'lastModifiedTime': '2026-11-24T01:00:00Z',
+            }
+            gone_dir.rmdir()
+            self.assertFalse(gone_dir.exists())
+            self.assertTrue(agy_live.close_agy(gone_sid)['closed'])
+            self.assertTrue(agy_live.archive_agy(gone_sid)['archived'])
+            self.assertTrue(agy_live.close_agy(no_ws_sid)['closed'])
+            self.assertTrue(agy_live.archive_agy(no_ws_sid)['archived'])
+            # Discovery / delivery resolution still requires a workspace directory.
+            with self.assertRaisesRegex(agy_live.DeliveryError, 'has no workspace directory'):
+                agy_live.read_agy(no_ws_sid)
 
 
 class CloseCodexTests(unittest.TestCase):
@@ -1107,6 +1136,128 @@ class CloseCommandTests(unittest.TestCase):
             self.assertIn('restart it', out['route_note'])
             code, out = run(['--socket', server.path, 'close', 'gone', '--project', 'p', '--no-retro', 'provider behavior fixture'])
             self.assertEqual(code, 1)
+
+    def test_close_agy_with_two_live_servers_and_third_folder_picks_sessions_server(self):
+        with RunningBroker() as server, tempfile.TemporaryDirectory() as base:
+            root = Path(base).resolve()
+            win_a = root / 'win-a'
+            win_b = root / 'win-b'
+            lane_c = root / 'lane-c'
+            win_a.mkdir()
+            win_b.mkdir()
+            lane_c.mkdir()
+            retro_file = root / 'retro.txt'
+            retro_file.write_text('Completed lane task cleanly.\n', encoding='utf-8')
+            store = root / 'retros.jsonl'
+            runner_sid = str(uuid.uuid4())
+
+            with FakeAgyServer(win_a, str(uuid.uuid4())) as srv_a, \
+                    FakeAgyServer(win_b, str(uuid.uuid4())) as srv_b:
+                summary = {
+                    'summary': 'Lane Runner',
+                    'stepCount': 12,
+                    'status': 'CASCADE_RUN_STATUS_IDLE',
+                    'workspaces': [{'workspaceFolderAbsoluteUri': lane_c.as_uri()}],
+                    'lastModifiedTime': '2026-11-24T01:00:00Z',
+                }
+                srv_a.trajectories[runner_sid] = json.loads(json.dumps(summary))
+                srv_b.trajectories[runner_sid] = json.loads(json.dumps(summary))
+                servers = [
+                    {
+                        'pid': 4101, 'ppid': 4000, 'orphaned': False, 'app_dir': 'antigravity',
+                        'host': 'ide', 'add_dirs': (str(win_a),), 'url': srv_a.url,
+                        'csrf': CSRF, 'summaries': srv_a.trajectories,
+                    },
+                    {
+                        'pid': 4102, 'ppid': 4000, 'orphaned': False, 'app_dir': 'antigravity',
+                        'host': 'ide', 'add_dirs': (str(win_b),), 'url': srv_b.url,
+                        'csrf': CSRF, 'summaries': srv_b.trajectories,
+                    },
+                ]
+                server.call('register', project='p', name='runner', cwd=str(lane_c),
+                            transport='agy', session=runner_sid)
+                with mock.patch.object(agy_live, 'discover_servers', return_value=servers):
+                    code_s, listed = run(['--socket', server.path, 'sessions', '--provider', 'agy', '--with-model'])
+                    self.assertEqual(code_s, 0)
+                    row = next(r for r in listed['providers']['agy']['sessions'] if r['id'] == runner_sid)
+                    self.assertEqual(row['pid'], 4101)
+                    self.assertNotIn('matched multiple live servers', row['model'].get('reason', ''))
+
+                    code_c, closed = run([
+                        '--socket', server.path, 'close', 'runner', '--project', 'p',
+                        '--archive', '--retro-file', str(retro_file), '--store', str(store),
+                        '--card', 'repo#144', '--urgency', 'note', '--tags', 'agy',
+                    ])
+                self.assertEqual((code_c, closed['closed'], closed['archived'], closed['route_removed']),
+                                 (0, True, True, True))
+                self.assertIn('retro_id', closed)
+                self.assertEqual(server.call('routes', project='p'), [])
+                sent_a = [b for p, _, b in srv_a.requests if p.endswith('/UpdateConversationAnnotations')]
+                sent_b = [b for p, _, b in srv_b.requests if p.endswith('/UpdateConversationAnnotations')]
+                self.assertEqual(sent_a, [{'cascadeId': runner_sid, 'annotations': {'archived': True}, 'mergeAnnotations': True}])
+                self.assertEqual(sent_b, [])
+
+    def test_close_archive_by_provider_and_session_without_route_or_folder(self):
+        with tempfile.TemporaryDirectory() as base:
+            root = Path(base).resolve()
+            gone_wt = root / '.worktrees' / 'repo' / 'jinni-150'
+            gone_wt.mkdir(parents=True)
+            orphan_sid = str(uuid.uuid4())
+            unused_sock = root / 'unused.sock'
+
+            with FakeAgyServer(root, str(uuid.uuid4())) as fake, \
+                    mock.patch.dict(os.environ, {'AGENT_BRIDGE_AGY_URL': fake.url, 'AGENT_BRIDGE_AGY_CSRF': CSRF}):
+                fake.trajectories[orphan_sid] = {
+                    'summary': 'Landed Runner With Deleted Worktree',
+                    'stepCount': 30,
+                    'status': 'CASCADE_RUN_STATUS_IDLE',
+                    'workspaces': [{'workspaceFolderAbsoluteUri': gone_wt.as_uri()}],
+                    'lastModifiedTime': '2026-11-24T01:20:00Z',
+                }
+                gone_wt.rmdir()
+                self.assertFalse(gone_wt.exists())
+
+                # Validation refusals on route-less close.
+                for argv, expected in (
+                    (['close', '--session', orphan_sid, '--provider', 'agy'],
+                     'Route-less close --provider and --session requires --archive'),
+                    (['close', '--archive', '--session', orphan_sid, '--provider', 'codex'],
+                     "Route-less close --session is supported only for --provider agy, not 'codex'"),
+                    (['close', '--archive', '--session', orphan_sid],
+                     'Use close NAME --project P or close --archive --provider agy --session UUID'),
+                    (['close', 'runner', '--project', 'p', '--archive', '--session', orphan_sid, '--provider', 'agy'],
+                     'Use close NAME --project P or close --archive --provider agy --session UUID, not both'),
+                    (['close', '--archive', '--session', orphan_sid, '--provider', 'agy', '--keep-route'],
+                     '--finish, --handoff, --keep-route and --expect-session require a registered route NAME --project P'),
+                    (['close', '--archive', '--session', orphan_sid, '--provider', 'agy', '--retro-file', '/tmp/x'],
+                     '--retro-file requires a registered route NAME --project P; use retro add for standalone records'),
+                    (['close', '--archive', '--session', orphan_sid, '--provider', 'agy', '--no-retro', '   '],
+                     'RETRO_REASON_EMPTY'),
+                ):
+                    with self.subTest(argv=argv):
+                        code, err = run(['--socket', str(unused_sock), *argv])
+                        self.assertEqual(code, 1)
+                        self.assertIn(expected, err['error'])
+
+                # Archiving by --provider agy --session UUID succeeds without a broker route or folder on disk.
+                code, out = run(['--socket', str(unused_sock), 'close', '--archive',
+                                 '--session', orphan_sid, '--provider', 'agy'])
+                self.assertEqual(
+                    (code, out['provider'], out['transport'], out['closed'], out['archived'], out['route_removed']),
+                    (0, 'agy', 'agy', True, True, False),
+                )
+                self.assertEqual(out['session'], orphan_sid)
+                _, listed = run(['--socket', str(unused_sock), 'sessions', '--provider', 'agy'])
+                self.assertNotIn(orphan_sid, {r['id'] for r in listed['providers']['agy']['sessions']})
+
+                # ArchiveUncertain without a route reports provider and session instead of name=None.
+                fake.ignore_archive = True
+                fake.trajectories[orphan_sid]['annotations'] = {}
+                code_u, err_u = run(['--socket', str(unused_sock), 'close', '--archive',
+                                     '--session', orphan_sid, '--provider', 'agy'])
+                self.assertEqual((code_u, err_u['uncertain'], err_u['provider'], err_u['session']),
+                                 (1, True, 'agy', orphan_sid))
+                self.assertNotIn('name', err_u)
 
 
 if __name__ == '__main__':
