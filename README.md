@@ -136,6 +136,8 @@ python3 "$bridge_cli" register codex-worker --project my-app --transport codex \
 
 # Close a finished worker session and remove its route (pass --archive to archive):
 python3 "$bridge_cli" close agy-worker --project my-app --retro-file /absolute/retro.txt [--archive]
+# Or archive an Antigravity session by UUID after its route and worktree are already gone:
+python3 "$bridge_cli" close --archive --session AGY_UUID --provider agy
 
 # Bring an idle-closed Claude Desktop session back (prints woken, already-live, unsupported or uncertain):
 python3 "$bridge_cli" wake claude-tower --project my-app [--timeout 30]
