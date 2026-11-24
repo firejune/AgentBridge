@@ -1,4 +1,4 @@
-"""Issue #48 isolated acceptance. No real HQ/Nana, live discovery or deployment.
+"""Issue #48 isolated acceptance. No real owner inbox, live discovery or deployment.
 
 Checklist: defaults/scopes; immutable Unicode/list paging; receipt reconciliation;
 facade reconstruction; broker loss; route races; correlation exclusion; bounds.
@@ -732,7 +732,7 @@ class AdoptedRouteInboxTests(unittest.TestCase):
             cwd=self.root, transport='realtime'), **overrides))
 
     def adopt(self, prefixes=None):
-        self.config['inbox_route_prefixes'] = {'test-project': ['nana-']} if prefixes is None else prefixes
+        self.config['inbox_route_prefixes'] = {'test-project': ['owner-']} if prefixes is None else prefixes
 
     def mail(self, recipient, body, sender='writer', project='test-project'):
         self.sequence += 1
@@ -753,7 +753,7 @@ class AdoptedRouteInboxTests(unittest.TestCase):
         return reads, patch.object(self.engine.backend, 'rpc', side_effect=counted)
 
     def test_absent_or_empty_field_keeps_routes_digest_and_reads_no_routes(self):
-        self.register('nana-x')
+        self.register('owner-x')
         self.register('writer')
         reads, counting = self.count_routes_reads()
         with counting:
@@ -764,28 +764,28 @@ class AdoptedRouteInboxTests(unittest.TestCase):
             self.assertEqual(self.engine.inbox_routes(self.engine.principal, self.sid), selected)
         self.assertEqual(reads, [])
         self.assertEqual([e['slot'] for e in baseline], sorted(s['id'] for s in self.owned))
-        self.mail('nana-x', 'not adopted without the field')
+        self.mail('owner-x', 'not adopted without the field')
         self.assertEqual(self.listing()['messages'], [])
-        self.assertEqual(self.call('bridge_inbox_list', agent_session_id=self.slot('nana-x'))['error']['code'],
+        self.assertEqual(self.call('bridge_inbox_list', agent_session_id=self.slot('owner-x'))['error']['code'],
                          'NOT_FOUND')
 
     def test_adopted_route_is_listed_readable_ackable_and_replyable(self):
         elsewhere = str(Path(self.running.temp.name).resolve())
-        self.register('nana-x', cwd=elsewhere)  # Its cwd need not be a workspace.
+        self.register('owner-x', cwd=elsewhere)  # Its cwd need not be a workspace.
         self.register('writer')
         owned_before = self.engine.inbox_routes(self.engine.principal)
         self.adopt()
         routes = self.engine.inbox_routes(self.engine.principal)
-        slot = self.slot('nana-x')
-        adopted = {'slot': slot, 'route': {'project': 'test-project', 'name': 'nana-x', 'cwd': elsewhere,
+        slot = self.slot('owner-x')
+        adopted = {'slot': slot, 'route': {'project': 'test-project', 'name': 'owner-x', 'cwd': elsewhere,
                                            'transport': 'realtime', 'session': None}}
         self.assertEqual(routes, sorted(owned_before + [adopted], key=lambda e: e['slot']))
         self.assertEqual(self.engine.inbox_routes(self.engine.principal, slot), [adopted])
-        parent = self.mail('nana-x', 'parent for the adopted route')
-        second = self.mail('nana-x', 'second pending mail')
+        parent = self.mail('owner-x', 'parent for the adopted route')
+        second = self.mail('owner-x', 'second pending mail')
         unfiltered = self.listing()
         self.assertEqual([m['agent_session_id'] for m in unfiltered['messages']], [slot, slot])
-        self.assertEqual(unfiltered['messages'][0]['recipient']['name'], 'nana-x')
+        self.assertEqual(unfiltered['messages'][0]['recipient']['name'], 'owner-x')
         self.assertNotIn(elsewhere, json.dumps(unfiltered))
         first = self.listing(agent_session_id=slot, limit=1)
         self.assertTrue(first['has_more'])
@@ -805,33 +805,33 @@ class AdoptedRouteInboxTests(unittest.TestCase):
         self.assertEqual(reply, dict(message_id=handle, delivery_state='pending', replayed=False))
         # The reply is sent as the adopted route the mail arrived on.
         self.assertEqual((pushed[0]['sender'], pushed[0]['recipient'], pushed[0]['reply_to']),
-                         ('nana-x', 'writer', parent['id']))
+                         ('owner-x', 'writer', parent['id']))
         self.restart_facade()
         self.assertEqual([m['body_sha256'] for m in self.listing()['messages']],
                          [hashlib.sha256(second['body'].encode()).hexdigest()])
 
     def test_only_matching_realtime_sessionless_routes_in_configured_projects_are_adopted(self):
-        self.running.call('register', project='foreign', name='nana-x', cwd=self.root, transport='realtime')
+        self.running.call('register', project='foreign', name='owner-x', cwd=self.root, transport='realtime')
         self.running.call('register', project='foreign', name='writer', cwd=self.root, transport='realtime')
         self.register('writer')
         self.register('other-x')
-        self.register('nana-session', session=str(uuid.uuid4()))
-        self.register('nana-peer', transport='claude-peer', session=str(uuid.uuid4()))
-        self.register('nana-x')
+        self.register('owner-session', session=str(uuid.uuid4()))
+        self.register('owner-peer', transport='claude-peer', session=str(uuid.uuid4()))
+        self.register('owner-x')
         self.adopt()
-        for name in ('other-x', 'nana-session'):
+        for name in ('other-x', 'owner-session'):
             self.mail(name, 'must stay out of the inbox: ' + name)
-        self.mail('nana-x', 'foreign mail', project='foreign')
+        self.mail('owner-x', 'foreign mail', project='foreign')
         self.assertEqual([e['route']['name'] for e in self.engine.inbox_routes(self.engine.principal)
-                          if e['slot'].startswith('ar_')], ['nana-x'])
+                          if e['slot'].startswith('ar_')], ['owner-x'])
         self.assertEqual(self.listing()['messages'], [])
-        for name, project in (('other-x', 'test-project'), ('nana-session', 'test-project'),
-                              ('nana-peer', 'test-project'), ('nana-x', 'foreign')):
+        for name, project in (('other-x', 'test-project'), ('owner-session', 'test-project'),
+                              ('owner-peer', 'test-project'), ('owner-x', 'foreign')):
             with self.subTest(name=name, project=project):
                 self.assertEqual(self.call('bridge_inbox_list',
                     agent_session_id=self.slot(name, project))['error']['code'], 'NOT_FOUND')
         # An adopted slot is inbox-only: the send schema accepts only as_ session ids.
-        refused = self.engine.call('bridge_message_send', {'agent_session_id': self.slot('nana-x'),
+        refused = self.engine.call('bridge_message_send', {'agent_session_id': self.slot('owner-x'),
             'message': 'no new send authority', 'idempotency_key': 'adopted-send-key-1'})
         self.assertEqual(refused['error']['code'], 'INVALID_ARGUMENT')
         self.assertEqual(self.engine.rows(), [])
@@ -848,13 +848,13 @@ class AdoptedRouteInboxTests(unittest.TestCase):
     def test_combined_capacity_is_bounded(self):
         self.adopt()
         for index in range(62):
-            self.register('nana-%02d' % index)
+            self.register('owner-%02d' % index)
         self.assertEqual(len(self.engine.inbox_routes(self.engine.principal)), 64)
-        self.register('nana-62')
+        self.register('owner-62')
         self.assertEqual(self.call('bridge_inbox_list')['error']['code'], 'CAPACITY_EXCEEDED')
 
     def test_route_reads_are_bounded_and_broker_loss_is_backend_unavailable(self):
-        self.register('nana-x')
+        self.register('owner-x')
         self.adopt()
         reads, counting = self.count_routes_reads()
         with counting:
@@ -863,7 +863,7 @@ class AdoptedRouteInboxTests(unittest.TestCase):
             del reads[:]
             self.listing(agent_session_id=self.sid)
             self.assertEqual(reads, [])
-            self.listing(agent_session_id=self.slot('nana-x'))
+            self.listing(agent_session_id=self.slot('owner-x'))
             self.assertEqual(reads, ['test-project'])
         rpc = self.engine.backend.rpc
         def down(op, **kwargs):
@@ -872,18 +872,18 @@ class AdoptedRouteInboxTests(unittest.TestCase):
             return rpc(op, **kwargs)
         with patch.object(self.engine.backend, 'rpc', side_effect=down):
             self.assertEqual(self.call('bridge_inbox_list')['error']['code'], 'BACKEND_UNAVAILABLE')
-            self.assertEqual(self.call('bridge_inbox_list', agent_session_id=self.slot('nana-x'))['error']['code'],
+            self.assertEqual(self.call('bridge_inbox_list', agent_session_id=self.slot('owner-x'))['error']['code'],
                              'BACKEND_UNAVAILABLE')
             self.assertTrue(self.call('bridge_inbox_list', agent_session_id=self.sid)['ok'])
 
     def test_replaced_adopted_route_invalidates_its_handles(self):
-        self.register('nana-x')
+        self.register('owner-x')
         self.register('writer')
         self.adopt()
-        self.mail('nana-x', 'before replacement')
+        self.mail('owner-x', 'before replacement')
         handle = self.listing()['messages'][0]['message_id']
-        self.running.call('unregister', project='test-project', name='nana-x')
-        self.register('nana-x', cwd=str(Path(self.running.temp.name).resolve()))
+        self.running.call('unregister', project='test-project', name='owner-x')
+        self.register('owner-x', cwd=str(Path(self.running.temp.name).resolve()))
         self.assertEqual(self.call('bridge_message_get', message_id=handle)['error']['code'], 'NOT_FOUND')
         self.config['inbox_route_prefixes'] = {}
         self.assertEqual(self.call('bridge_message_ack', message_id=handle)['error']['code'], 'NOT_FOUND')
@@ -894,16 +894,16 @@ class AdoptedRouteInboxTests(unittest.TestCase):
             config = dict(self.config, inbox_route_prefixes=value)
             path.write_text(json.dumps(config)); path.chmod(0o600)
             return phase.load_config(path)
-        self.assertEqual(load({'test-project': ['nana-', 'n_2']})['inbox_route_prefixes'],
-                         {'test-project': ['nana-', 'n_2']})
+        self.assertEqual(load({'test-project': ['owner-', 'n_2']})['inbox_route_prefixes'],
+                         {'test-project': ['owner-', 'n_2']})
         self.assertEqual(load({})['inbox_route_prefixes'], {})
-        for bad in ({'foreign': ['nana-']}, {'test-project': []}, {'test-project': ['']},
-                    {'test-project': ['Nana-']}, {'test-project': ['-nana']}, {'test-project': ['nana x']},
-                    {'test-project': ['n' * 33]}, {'test-project': 'nana-'}, {'test-project': [7]},
-                    {'test-project': ['p%d' % i for i in range(9)]}, ['nana-'],
-                    {'p%d' % i: ['nana-'] for i in range(9)},
+        for bad in ({'foreign': ['owner-']}, {'test-project': []}, {'test-project': ['']},
+                    {'test-project': ['Owner-']}, {'test-project': ['-owner']}, {'test-project': ['owner x']},
+                    {'test-project': ['n' * 33]}, {'test-project': 'owner-'}, {'test-project': [7]},
+                    {'test-project': ['p%d' % i for i in range(9)]}, ['owner-'],
+                    {'p%d' % i: ['owner-'] for i in range(9)},
                     {'test-project': ['mcp-']}, {'test-project': ['mcp-a']}, {'test-project': ['m']},
-                    {'test-project': ['mc']}, {'test-project': ['nana-', 'mcp']}):
+                    {'test-project': ['mc']}, {'test-project': ['owner-', 'mcp']}):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     load(bad)

@@ -251,8 +251,8 @@ def receipt(state, reference):
             raise ValueError('log sha256 mismatch')
         code, head, kind = data.get('exit_code'), data.get('head'), 'bridge'
     elif 'exitCode' in data and path.name == 'result.json':
-        # Actual Nova pool shape has no log path field. root/out refer to remote paths.
-        code, head, kind = data['exitCode'], data.get('sourceCommit'), 'nova'
+        # Actual remote pool shape has no log path field. root/out refer to remote paths.
+        code, head, kind = data['exitCode'], data.get('sourceCommit'), 'pool'
         log = read_locked(path.with_name('command.log'))
     elif not local_id and 'exit_code' in data and isinstance(data.get('log'), str) and data['log']:
         code, head, kind = data['exit_code'], data.get('head'), 'external'

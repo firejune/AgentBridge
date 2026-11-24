@@ -100,13 +100,13 @@ class DeployFixture(unittest.TestCase):
         self.layout = deploy.Layout(repo=root / 'repo', runtime=runtime, socket=runtime / 'bridge.sock',
                                     launch_agents=root / 'LaunchAgents', tunnel_profile=root / 'config/tunnel.yaml',
                                     pins=tuple(root / name / 'skills/agent-bridge' for name in ('one', 'two', 'three')))
-        for kind in ('nana', 'broker'):
+        for kind in ('facade', 'broker'):
             scripts = self.layout.release(kind, OLD) / deploy.SKILL / 'scripts'
             scripts.mkdir(parents=True)
             (scripts / 'bridge.py').write_text(f'# {OLD}\n')
         for pin in self.layout.pins:
             pin.parent.mkdir(parents=True)
-            os.symlink(self.layout.release('nana', OLD) / deploy.SKILL, pin)
+            os.symlink(self.layout.release('facade', OLD) / deploy.SKILL, pin)
         self.layout.launch_agents.mkdir()
         self.broker_arguments = ['/usr/bin/python3',
                                  str(self.layout.release('broker', OLD) / deploy.SKILL / 'scripts/bridge.py'),
@@ -119,12 +119,12 @@ class DeployFixture(unittest.TestCase):
         self.layout.tunnel_profile.parent.mkdir()
         self.layout.tunnel_profile.write_text(
             'api_key: FIXTURE-SECRET\nmcp:\n  commands:\n    - command: "python3 '
-            f'{self.layout.release("nana", OLD)}/skill/agent-bridge/scripts/mcp_server.py --phase1-config x"\n')
+            f'{self.layout.release("facade", OLD)}/skill/agent-bridge/scripts/mcp_server.py --phase1-config x"\n')
         self.layout.state.mkdir()
         self.write_state([('pending', 3), ('submitted', 2), ('uncertain', 1)], closing=0)
         (self.layout.state / 'policy.json').write_text('{}')
-        (runtime / 'nana-runtime/state').mkdir()
-        (runtime / 'nana-runtime/state/events.json').write_text('{}')
+        (runtime / 'facade-runtime/state').mkdir()
+        (runtime / 'facade-runtime/state/events.json').write_text('{}')
         self.system = FakeSystem(self.layout)
         self.lines = []
 
@@ -200,7 +200,7 @@ class DryRunAndRefusalTests(DeployFixture):
         case('CLOSE_HANDOFF_OPEN', lambda: self.write_state([('pending', 1)], closing=2))
         case('WAITS_ACTIVE', lambda: setattr(self.system, 'waits', 2))
         case('PIN_NOT_A_LINK', lambda: (self.layout.pins[1].unlink(), self.layout.pins[1].mkdir()))
-        case('PINS_DISAGREE', lambda: deploy.move_pin(self.layout.pins[2], str(self.layout.release('nana', NEW) / deploy.SKILL)))
+        case('PINS_DISAGREE', lambda: deploy.move_pin(self.layout.pins[2], str(self.layout.release('facade', NEW) / deploy.SKILL)))
         case('BROKER_SERVICE_MISSING', lambda: self.layout.broker_plist.unlink())
         case('FACADE_PROFILE_UNREADABLE', lambda: self.layout.tunnel_profile.write_text('api_key: FIXTURE-SECRET\n'))
         case('FACADE_SERVICE_MISSING', lambda: self.facade_plist.unlink())
@@ -246,13 +246,13 @@ class RealRunTests(DeployFixture):
         self.assertEqual(self.system.calls, [
             ('bootout', f'{uid}/{FACADE_LABEL}'), ('bootout', f'{uid}/{broker}'),
             ('bootstrap', uid, str(self.layout.broker_plist)), ('bootstrap', uid, str(self.facade_plist))])
-        target = str(self.layout.release('nana', NEW) / deploy.SKILL)
+        target = str(self.layout.release('facade', NEW) / deploy.SKILL)
         self.assertEqual([os.readlink(pin) for pin in self.layout.pins], [target] * 3)
         config = plistlib.loads(self.layout.broker_plist.read_bytes())
         self.assertEqual(config['ProgramArguments'], [value.replace(OLD, NEW) for value in self.broker_arguments])
         self.assertEqual((config['KeepAlive'], config['Umask']), (True, 63))
         profile = self.layout.tunnel_profile.read_text()
-        self.assertIn(f'{self.layout.release("nana", NEW)}/skill', profile)
+        self.assertIn(f'{self.layout.release("facade", NEW)}/skill', profile)
         self.assertNotIn(OLD, profile)
         self.assertIn('api_key: FIXTURE-SECRET', profile)
         folder, = self.layout.runtime.glob(f'deploy-{NEW[:7]}-*')
@@ -286,9 +286,9 @@ class RealRunTests(DeployFixture):
         self.assertEqual(deploy.rollback(self.layout, self.system, folder, out=self.lines.append), 0)
         self.assertEqual({path: path.read_bytes() for path in before}, before)
         self.assertEqual([os.readlink(pin) for pin in self.layout.pins],
-                         [str(self.layout.release('nana', OLD) / deploy.SKILL)] * 3)
+                         [str(self.layout.release('facade', OLD) / deploy.SKILL)] * 3)
         self.assertEqual([call[0] for call in self.system.calls], ['bootout', 'bootout', 'bootstrap', 'bootstrap'])
-        self.assertTrue(self.layout.release('nana', NEW).is_dir(), 'a rollback keeps the new release on disk')
+        self.assertTrue(self.layout.release('facade', NEW).is_dir(), 'a rollback keeps the new release on disk')
         with self.assertRaisesRegex(deploy.Refusal, 'SNAPSHOT_UNUSABLE'):
             deploy.rollback(self.layout, self.system, self.layout.state, out=self.lines.append)
 
@@ -318,14 +318,14 @@ class RealRunTests(DeployFixture):
     def test_rollback_restores_pins_that_an_interrupted_deploy_left_mixed(self):
         self.run_deploy()
         folder, = self.layout.runtime.glob(f'deploy-{NEW[:7]}-*')
-        deploy.move_pin(self.layout.pins[0], str(self.layout.release('nana', OLD) / deploy.SKILL))
+        deploy.move_pin(self.layout.pins[0], str(self.layout.release('facade', OLD) / deploy.SKILL))
         self.assertEqual(deploy.rollback(self.layout, self.system, folder, out=self.lines.append), 0)
         self.assertEqual([os.readlink(pin) for pin in self.layout.pins],
-                         [str(self.layout.release('nana', OLD) / deploy.SKILL)] * 3)
+                         [str(self.layout.release('facade', OLD) / deploy.SKILL)] * 3)
         self.assertIn(OLD, self.layout.tunnel_profile.read_text())
 
     def test_an_existing_release_that_has_run_is_still_the_same_release(self):
-        scripts = self.layout.release('nana', NEW) / deploy.SKILL / 'scripts'
+        scripts = self.layout.release('facade', NEW) / deploy.SKILL / 'scripts'
         scripts.mkdir(parents=True)
         (scripts / 'bridge.py').write_text(f'# {NEW}\n')
         (scripts / '__pycache__').mkdir()
@@ -336,7 +336,7 @@ class RealRunTests(DeployFixture):
     def test_cli_only_deploy_leaves_both_services_alone(self):
         self.assertEqual(self.run_deploy(components=('cli',)), 1, 'old broker and new CLI are different builds')
         self.assertEqual(self.system.calls, [])
-        self.assertEqual({os.readlink(pin) for pin in self.layout.pins}, {str(self.layout.release('nana', NEW) / deploy.SKILL)})
+        self.assertEqual({os.readlink(pin) for pin in self.layout.pins}, {str(self.layout.release('facade', NEW) / deploy.SKILL)})
         self.assertIn(OLD, self.layout.broker_plist.read_bytes().decode(errors='replace'))
 
     def test_a_failed_check_after_the_switch_recovers_only_the_facade(self):
@@ -402,7 +402,7 @@ class RealRunTests(DeployFixture):
         self.system.launchctl = launchctl
         self.assertEqual(self.run_deploy(), 1)
         self.assertIn('FAILED: the broker did not answer ping after its start', self.lines)
-        self.assertEqual({os.readlink(pin) for pin in self.layout.pins}, {str(self.layout.release('nana', OLD) / deploy.SKILL)})
+        self.assertEqual({os.readlink(pin) for pin in self.layout.pins}, {str(self.layout.release('facade', OLD) / deploy.SKILL)})
         self.assertIn(OLD, self.layout.tunnel_profile.read_text())
         self.assertEqual([call[0] for call in self.system.calls], ['bootout', 'bootout', 'bootstrap', 'bootstrap'])
         self.assertEqual(self.system.calls[-1], ('bootstrap', 'gui/501', str(self.facade_plist)))
@@ -472,12 +472,38 @@ class RealRunTests(DeployFixture):
         self.assertEqual(result['actions']['restart previous facade']['exit'], 5)
 
     def test_an_existing_release_that_differs_from_the_commit_is_refused(self):
-        scripts = self.layout.release('nana', NEW) / deploy.SKILL / 'scripts'
+        scripts = self.layout.release('facade', NEW) / deploy.SKILL / 'scripts'
         scripts.mkdir(parents=True)
         (scripts / 'bridge.py').write_text('# edited in place\n')
         with self.assertRaisesRegex(deploy.Refusal, 'RELEASE_MISMATCH'):
             self.run_deploy()
         self.assertEqual(self.system.calls, [])
+
+
+class DefaultLayoutTests(unittest.TestCase):
+    def layout_with(self, config):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as home:
+            if config is not None:
+                path = Path(home) / '.config/agent-bridge/deploy.json'
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps(config))
+            with mock.patch.object(Path, 'home', return_value=Path(home)):
+                return Path(home), deploy.Layout.default(Path(home) / 'repo')
+
+    def test_neutral_names_without_a_local_config(self):
+        home, layout = self.layout_with(None)
+        self.assertEqual(layout.release('facade', 'abc'), home / '.local/share/agent-bridge/facade-runtime/releases/abc')
+        self.assertEqual(layout.tunnel_profile, home / '.config/agent-bridge/facade/tunnel.yaml')
+
+    def test_local_config_names_the_facade_runtime_and_profile(self):
+        home, layout = self.layout_with({'facade_runtime': 'local-runtime', 'tunnel_profile': '/srv/profile.yaml'})
+        self.assertEqual(layout.facade_home, home / '.local/share/agent-bridge/local-runtime')
+        self.assertEqual(layout.tunnel_profile, Path('/srv/profile.yaml'))
+
+    def test_a_runtime_name_with_a_path_is_refused(self):
+        with self.assertRaises(deploy.Refusal):
+            self.layout_with({'facade_runtime': '../elsewhere'})
 
 
 if __name__ == '__main__':

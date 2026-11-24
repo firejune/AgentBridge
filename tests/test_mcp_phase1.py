@@ -1381,7 +1381,7 @@ assert 'bridge' not in sys.modules
     def test_multi_provider_discovery_pinned_and_send(self):
         with RunningBroker() as running, tempfile.TemporaryDirectory(prefix='mcp-multi-', dir='/tmp') as temp:
             root = str(Path(temp).resolve())
-            wt = Path(root) / 'wt-jinni'
+            wt = Path(root) / 'wt-agy'
             wt.mkdir()
             wt_str = str(wt.resolve())
             agy_sid = str(uuid.uuid4())
@@ -1391,9 +1391,9 @@ assert 'bridge' not in sys.modules
             pinned_agy_sid = str(uuid.uuid4())
             outside_sid = str(uuid.uuid4())
 
-            running.call('register', project='mcp-test', name='jinni-hq',
+            running.call('register', project='mcp-test', name='agy-hq',
                          cwd=root, transport='agy', session=pinned_agy_sid)
-            running.call('register', project='mcp-test', name='naru-offline',
+            running.call('register', project='mcp-test', name='codex-offline',
                          cwd=root, transport='codex', session=offline_codex_sid)
 
             config = {
@@ -1406,11 +1406,11 @@ assert 'bridge' not in sys.modules
                     'test': {'cwd': root, 'root': root, 'project': 'mcp-test', 'ide': sessions_ide()},
                 },
                 'pinned_sessions': {
-                    'jinni-pin': {
+                    'agy-pin': {
                         'uuid': pinned_agy_sid,
                         'cwd': root,
                         'project': 'mcp-test',
-                        'route': 'jinni-hq',
+                        'route': 'agy-hq',
                         'authorized_at': phase.stamp(),
                     },
                 },
@@ -1419,15 +1419,15 @@ assert 'bridge' not in sys.modules
             engine = phase.Engine(config, backend, start=False)
 
             agy_rows = [
-                {'provider': 'agy', 'id': agy_sid, 'name': 'Jinni Worker Task', 'cwd': wt_str, 'status': 'running', 'updated_at': '2026-11-01T00:00:00Z'},
-                {'provider': 'agy', 'id': pinned_agy_sid, 'name': 'Jinni HQ Session', 'cwd': root, 'status': 'idle', 'updated_at': '2026-11-01T00:00:00Z'},
+                {'provider': 'agy', 'id': agy_sid, 'name': 'Antigravity Worker Task', 'cwd': wt_str, 'status': 'running', 'updated_at': '2026-11-01T00:00:00Z'},
+                {'provider': 'agy', 'id': pinned_agy_sid, 'name': 'Antigravity HQ Session', 'cwd': root, 'status': 'idle', 'updated_at': '2026-11-01T00:00:00Z'},
                 {'provider': 'agy', 'id': outside_sid, 'name': 'Outside Session', 'cwd': '/tmp', 'status': 'idle', 'updated_at': '2026-11-01T00:00:00Z'},
             ]
             codex_rows = [
-                {'provider': 'codex', 'id': codex_sid, 'name': 'Naru Codex Thread', 'cwd': root, 'status': 'idle', 'updated_at': 1730419200},
+                {'provider': 'codex', 'id': codex_sid, 'name': 'Codex Thread', 'cwd': root, 'status': 'idle', 'updated_at': 1730419200},
             ]
             claude_rows = [
-                {'provider': 'claude', 'id': claude_sid, 'name': 'Roa Claude HQ', 'cwd': root, 'status': 'idle'},
+                {'provider': 'claude', 'id': claude_sid, 'name': 'Claude HQ', 'cwd': root, 'status': 'idle'},
             ]
             by_agy = {r['id']: r for r in agy_rows}
 
@@ -1463,26 +1463,26 @@ assert 'bridge' not in sys.modules
                     self.assertEqual(len(by_type['claude']), 1)
 
                     busy_agy = next(item for item in by_type['agy'] if item['state'] == 'busy')
-                    pinned_agy = next(item for item in by_type['agy'] if item['workspace_alias'] == 'jinni-pin')
+                    pinned_agy = next(item for item in by_type['agy'] if item['workspace_alias'] == 'agy-pin')
                     live_codex = next(item for item in by_type['codex'] if item['state'] == 'ready')
                     offline_codex = next(item for item in by_type['codex'] if item['state'] == 'unavailable')
-                    self.assertEqual(busy_agy['title'], 'Jinni Worker Task')
+                    self.assertEqual(busy_agy['title'], 'Antigravity Worker Task')
                     self.assertIsNone(busy_agy['route_name'])
                     self.assertIsNone(busy_agy['created_at'])
                     self.assertEqual(busy_agy['last_activity_at'], '2026-11-01T00:00:00+00:00')
-                    self.assertEqual(pinned_agy['title'], 'Jinni HQ Session')
-                    self.assertEqual(pinned_agy['route_name'], 'jinni-hq')
-                    self.assertEqual(live_codex['title'], 'Naru Codex Thread')
+                    self.assertEqual(pinned_agy['title'], 'Antigravity HQ Session')
+                    self.assertEqual(pinned_agy['route_name'], 'agy-hq')
+                    self.assertEqual(live_codex['title'], 'Codex Thread')
                     self.assertIsNone(offline_codex['title'])
-                    self.assertEqual(offline_codex['route_name'], 'naru-offline')
+                    self.assertEqual(offline_codex['route_name'], 'codex-offline')
                     self.assertIsNone(offline_codex['created_at'])
                     self.assertIsNone(offline_codex['last_activity_at'])
-                    self.assertEqual(by_type['claude'][0]['title'], 'Roa Claude HQ')
+                    self.assertEqual(by_type['claude'][0]['title'], 'Claude HQ')
                     self.assertIsNone(by_type['claude'][0]['created_at'])
                     self.assertIsNone(by_type['claude'][0]['last_activity_at'])
                     sent = engine.call('bridge_message_send', {
                         'agent_session_id': busy_agy['agent_session_id'],
-                        'message': 'ping jinni worker',
+                        'message': 'ping agy worker',
                         'idempotency_key': 'multi_send_agy_001',
                     })['data']
 
@@ -1498,11 +1498,11 @@ assert 'bridge' not in sys.modules
 
                     op = engine.operation(sent['operation_id'], 'test-owner')
                     self.assertEqual(op['status'], 'running')
-                    running.call('reply', id=op['backend_id'], body='jinni reply ok', key='jinni-reply-1')
+                    running.call('reply', id=op['backend_id'], body='agy reply ok', key='agy-reply-1')
                     engine.tick()
                     res = engine.get({'operation_id': op['operation_id']}, 'test-owner')
                     self.assertEqual(res['status'], 'succeeded')
-                    self.assertEqual(res['result']['text'], 'jinni reply ok')
+                    self.assertEqual(res['result']['text'], 'agy reply ok')
             finally:
                 engine.close()
 

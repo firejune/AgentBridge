@@ -719,7 +719,7 @@ orphan log but no completed receipt. There is no automatic expiry: the owner
 manages these files privately. Logs can contain sensitive command output.
 
 A reference is a bridge id or a JSON path. Bridge logs are checked against their
-recorded byte count and SHA-256. The Nova pool shape reads integer `exitCode`,
+recorded byte count and SHA-256. The remote pool shape reads integer `exitCode`,
 optional `sourceCommit` (full SHA or empty/absent = unknown), and **sibling
 `command.log`** beside `result.json`; remote `root`/`out` are not local log paths.
 A generic external JSON may instead supply integer `exit_code`, `log` (relative

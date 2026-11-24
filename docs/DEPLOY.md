@@ -13,15 +13,19 @@ Releases are plain `git archive` extractions named by the full commit id.
 
 | Part | Runs from | Pinned by |
 | --- | --- | --- |
-| CLI and skill | `~/.local/share/agent-bridge/nana-runtime/releases/<commit>/skill/agent-bridge` | Three symlinks: `~/.agents/skills/agent-bridge`, `~/.codex/skills/agent-bridge`, `~/.claude/skills/agent-bridge` |
+| CLI and skill | `~/.local/share/agent-bridge/facade-runtime/releases/<commit>/skill/agent-bridge` | Three symlinks: `~/.agents/skills/agent-bridge`, `~/.codex/skills/agent-bridge`, `~/.claude/skills/agent-bridge` |
 | Broker | `~/.local/share/agent-bridge/broker-runtime/releases/<commit>/…/bridge.py serve` | `ProgramArguments` of `~/Library/LaunchAgents/com.agent-bridge.broker.<socket hash>.plist` |
-| MCP facade | `…/nana-runtime/releases/<commit>/…/mcp_server.py`, started by the tunnel client | One command line in the tunnel profile (`~/.config/agent-bridge/nana/tunnel.yaml`), run by its own launchd agent |
+| MCP facade | `…/facade-runtime/releases/<commit>/…/mcp_server.py`, started by the tunnel client | One command line in the tunnel profile (`~/.config/agent-bridge/facade/tunnel.yaml`), run by its own launchd agent |
+
+An install that uses other names for the facade runtime folder or the tunnel profile records them in
+`~/.config/agent-bridge/deploy.json` (`facade_runtime`: one folder name, `tunnel_profile`: a path; both optional).
+That file is local and private; the defaults above apply without it.
 
 The tunnel profile also holds a credential. The script rewrites only the release id in it,
 never prints the file and never copies it.
 
 The broker state (`~/.local/share/agent-bridge/bridge.state`) and the facade state
-(`nana-runtime/state`) are not part of a release and are not moved.
+(`facade-runtime/state`) are not part of a release and are not moved.
 
 ## One commit for every part
 
@@ -83,7 +87,7 @@ The three in-flight checks apply only when the broker or the facade moves.
 ## Steps of a full deploy
 
 1. Read the live pins, broker plist and tunnel profile; check the source and the refusals above.
-2. Extract the commit into `nana-runtime/releases/<commit>` and `broker-runtime/releases/<commit>`
+2. Extract the commit into `facade-runtime/releases/<commit>` and `broker-runtime/releases/<commit>`
    (staged beside the final place, then renamed). If a release directory with that id already
    exists it must match the commit; `__pycache__` folders and `.pyc` files written by an earlier
    run are ignored in that comparison. The new CLI must be able to ping the broker.
@@ -115,7 +119,7 @@ status 1 and prints the rollback command.
 - `correspondence_lost` is false.
 - Every endpoint saved in `routes.json` before the restart is still there, none was added, and the channel count is unchanged. One exception is a warning, not a failure: the broker does not restore a route whose workspace folder no longer exists, so such a route missing after the restart is reported as a count (`routes_dropped_workspace_missing`).
 - No `pending` or `uncertain` message disappeared from `correspondence.json`.
-- The facade's `/readyz` answers (through `nana-runtime/health.url`).
+- The facade's `/readyz` answers (through `facade-runtime/health.url`).
 
 `result.json` in the snapshot folder records these with the commit ids before and after,
 the broker and tunnel PIDs, the message counts by state, the subscriber counts, the time

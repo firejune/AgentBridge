@@ -117,7 +117,7 @@ class ReceiptTests(unittest.TestCase):
         checked = self.check([self.row(self.fixture(head=OLD), head=OLD)])
         body = receipts.message('#141', HEAD, checked)
         self.assertIn('earlier/different head: ' + OLD, body)
-        self.assertIn('verified (nova)', body)
+        self.assertIn('verified (pool)', body)
 
     def test_pool_reads_sibling_ignores_remote_paths(self):
         reference = self.fixture()
@@ -125,7 +125,7 @@ class ReceiptTests(unittest.TestCase):
         data['log'] = '/nonlocal/misleading.log'
         Path(reference).write_text(json.dumps(data))
         found = self.check([self.row(reference)])[0]
-        self.assertEqual((found['recorded_head'], found['receipt_kind']), (HEAD, 'nova'))
+        self.assertEqual((found['recorded_head'], found['receipt_kind']), (HEAD, 'pool'))
 
     def test_empty_and_absent_pool_head_stay_unknown(self):
         for head in ('', None):
@@ -231,7 +231,7 @@ class ReceiptTests(unittest.TestCase):
                          ('send', 'p', 'w', 't'))
         body = payload['body']
         for text in ('Card: "#141"', 'Head: "' + HEAD + '"', '| Claim | Exit | Figures | Receipt reference',
-                     '12 tests passed', 'verified (nova)', 'Unverified free-text note'):
+                     '12 tests passed', 'verified (pool)', 'Unverified free-text note'):
             self.assertIn(text, body)
         self.assertTrue(body.endswith(note.read_bytes().decode()))
         self.assertNotIn('12 tests passed\n', body)  # full log was not attached

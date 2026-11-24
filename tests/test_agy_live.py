@@ -400,10 +400,10 @@ class AgyLiveTests(unittest.TestCase):
 
             # 4) Omitting --title falls back to participant name on register --new,
             #    workspace folder name on open, and first message line when untitled.
-            reg_fallback = self.cli(server.path, env, 'register', 'jinni-desk-76', '--project', 'demo',
+            reg_fallback = self.cli(server.path, env, 'register', 'agy-desk-76', '--project', 'demo',
                                     '--transport', 'agy', '--new', '--cwd', str(unregistered_dir))
             self.assertEqual(reg_fallback.returncode, 0, reg_fallback.stdout)
-            self.assertEqual(json.loads(reg_fallback.stdout)['discovery']['session']['name'], 'jinni-desk-76')
+            self.assertEqual(json.loads(reg_fallback.stdout)['discovery']['session']['name'], 'agy-desk-76')
 
             open_fallback = self.cli(sock, env, 'open', '--provider', 'agy', '--cwd', str(unregistered_dir))
             self.assertEqual(open_fallback.returncode, 0, open_fallback.stdout)
@@ -417,10 +417,10 @@ class AgyLiveTests(unittest.TestCase):
             sent_untitled = self.cli(
                 server.path, env, 'send', '--project', 'demo',
                 '--from', 'codex-agent', '--to', 'agy-untitled', '--key', 'k-untitled', '--file', '-',
-                stdin='# Card: rig-c/adapters#76 — phaser, three\nDetails here',
+                stdin='# Card: demo/adapters#76 — phaser, three\nDetails here',
             )
             self.assertEqual(sent_untitled.returncode, 0, sent_untitled.stdout)
-            self.assertEqual(fake.trajectories[untitled_sid]['summary'], 'Card: rig-c/adapters#76 — phaser, three')
+            self.assertEqual(fake.trajectories[untitled_sid]['summary'], 'Card: demo/adapters#76 — phaser, three')
 
     def test_discovers_both_desktop_and_ide_servers_while_skipping_lsp_workers(self):
         from unittest import mock
@@ -610,11 +610,11 @@ class AgyLiveTests(unittest.TestCase):
         running_sid = str(uuid.uuid4())
         repo_a = self.root / 'repo-a'
         repo_b = self.root / 'repo-b'
-        wt_b = self.root / '.worktrees' / 'repo-b' / 'jinni-52'
-        (repo_b / '.git' / 'worktrees' / 'jinni-52').mkdir(parents=True)
+        wt_b = self.root / '.worktrees' / 'repo-b' / 'agy-52'
+        (repo_b / '.git' / 'worktrees' / 'agy-52').mkdir(parents=True)
         repo_a.mkdir()
         wt_b.mkdir(parents=True)
-        (wt_b / '.git').write_text(f"gitdir: {repo_b / '.git' / 'worktrees' / 'jinni-52'}\n", encoding='utf-8')
+        (wt_b / '.git').write_text(f"gitdir: {repo_b / '.git' / 'worktrees' / 'agy-52'}\n", encoding='utf-8')
 
         with FakeAgyServer(self.root, str(uuid.uuid4())) as orphan_srv, \
                 FakeAgyServer(repo_a, str(uuid.uuid4())) as ide_a_srv, \
@@ -736,10 +736,10 @@ class AgyLiveTests(unittest.TestCase):
         projects_dir.mkdir(parents=True)
 
         repo_a = self.root / 'repo-a'
-        wt_a = self.root / '.worktrees' / 'repo-a' / 'jinni-71'
-        (repo_a / '.git' / 'worktrees' / 'jinni-71').mkdir(parents=True)
+        wt_a = self.root / '.worktrees' / 'repo-a' / 'agy-71'
+        (repo_a / '.git' / 'worktrees' / 'agy-71').mkdir(parents=True)
         wt_a.mkdir(parents=True)
-        (wt_a / '.git').write_text(f"gitdir: {repo_a / '.git' / 'worktrees' / 'jinni-71'}\n", encoding='utf-8')
+        (wt_a / '.git').write_text(f"gitdir: {repo_a / '.git' / 'worktrees' / 'agy-71'}\n", encoding='utf-8')
 
         proj_a = str(uuid.uuid4())
         (projects_dir / f'{proj_a}.json').write_text(
@@ -755,10 +755,10 @@ class AgyLiveTests(unittest.TestCase):
 
         # Unregistered git repo and its worktree
         repo_b = self.root / 'repo-b'
-        wt_b = self.root / '.worktrees' / 'repo-b' / 'jinni-80'
-        (repo_b / '.git' / 'worktrees' / 'jinni-80').mkdir(parents=True)
+        wt_b = self.root / '.worktrees' / 'repo-b' / 'agy-80'
+        (repo_b / '.git' / 'worktrees' / 'agy-80').mkdir(parents=True)
         wt_b.mkdir(parents=True)
-        (wt_b / '.git').write_text(f"gitdir: {repo_b / '.git' / 'worktrees' / 'jinni-80'}\n", encoding='utf-8')
+        (wt_b / '.git').write_text(f"gitdir: {repo_b / '.git' / 'worktrees' / 'agy-80'}\n", encoding='utf-8')
 
         with FakeAgyServer(repo_a, str(uuid.uuid4())) as hub_srv:
             unified_rows = [{
@@ -776,7 +776,7 @@ class AgyLiveTests(unittest.TestCase):
                     mock.patch.object(agy_live, 'discover_servers', return_value=unified_rows):
                 # 1) Opening a worktree of registered repo_a on a unified hub (host='ide')
                 #    resolves proj_a, registers a worktree environment, and keeps wt_a as cwd.
-                opened_wt = agy_live.open_agy(str(wt_a), title='jinni-desk-71', host='ide')
+                opened_wt = agy_live.open_agy(str(wt_a), title='agy-desk-71', host='ide')
                 self.assertEqual(opened_wt['project_id'], proj_a)
                 self.assertEqual(opened_wt['session']['cwd'], str(wt_a))
                 add_env_calls = [b for p, _, b in hub_srv.requests if p.endswith('/AddEnvironmentToProject')]
@@ -792,7 +792,7 @@ class AgyLiveTests(unittest.TestCase):
 
                 # 2) Opening a worktree of unregistered git repo_b auto-creates a project
                 #    for repo_b and attaches the worktree environment.
-                opened_unreg = agy_live.open_agy(str(wt_b), title='jinni-desk-80', host='desktop')
+                opened_unreg = agy_live.open_agy(str(wt_b), title='agy-desk-80', host='desktop')
                 create_proj_calls = [b for p, _, b in hub_srv.requests if p.endswith('/CreateProject')]
                 self.assertEqual(len(create_proj_calls), 1)
                 created_proj = create_proj_calls[0]['project']
@@ -966,7 +966,7 @@ class AgyLiveTests(unittest.TestCase):
         win_a.mkdir()
         (win_b / '.git').mkdir(parents=True)
         lane_c.mkdir()
-        deleted_wt = self.root / '.worktrees' / 'win-b' / 'jinni-144'
+        deleted_wt = self.root / '.worktrees' / 'win-b' / 'agy-144'
         # Note: deleted_wt is intentionally NOT created on disk (worktree already deleted).
 
         config_dir = self.root / 'gemini-config'
