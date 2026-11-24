@@ -517,4 +517,9 @@ def push_agy(path, m, timeout=10, dry_run=False):
     except BaseException:
         rpc('finish', state='uncertain', note='Antigravity delivery interrupted; check the receiving session before resolving')
         raise
-    return settle_submission(rpc, f"pushed to Antigravity session {receipt['session']} (pid {receipt['pid']})")
+    wake = receipt.get('wake')
+    wake_state = (wake if isinstance(wake, str) and wake in agy_live.WAKE_STATES
+                  else ('unknown' if wake is not None else None))
+    detail = f"pid {receipt['pid']}" + (f', wake {wake_state}' if wake_state else '')
+    result = settle_submission(rpc, f"pushed to Antigravity session {receipt['session']} ({detail})")
+    return {**result, 'wake': wake_state} if wake_state else result

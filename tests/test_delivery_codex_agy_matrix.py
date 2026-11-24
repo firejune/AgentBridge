@@ -73,7 +73,7 @@ class DeliveryMatrixTests(unittest.TestCase):
     def provider_receipt(self, transport):
         if transport == 'codex':
             return {'delivery_mode': 'active', 'turn_id': 'fixture-turn'}
-        return {'session': self.thread, 'pid': 42}
+        return {'session': self.thread, 'pid': 42, 'wake': 'woke'}
 
     def test_lost_claim_reply_current_behavior(self):
         for transport, provider in (('codex', codex_live), ('agy', agy_live)):
@@ -120,7 +120,7 @@ class DeliveryMatrixTests(unittest.TestCase):
                     send.assert_called_once()
                     if committed:
                         note = ('Codex active tool output accepted by turn fixture-turn' if transport == 'codex'
-                                else f'pushed to Antigravity session {self.thread} (pid 42)')
+                                else f'pushed to Antigravity session {self.thread} (pid 42, wake woke)')
                         self.assert_record(message, 'submitted', note, 'pushed')
                     else:
                         self.assert_record(message, 'dispatching', None)
@@ -215,9 +215,46 @@ class DeliveryMatrixTests(unittest.TestCase):
         self.assertEqual(code, 0, result)
         wake.assert_called_once()
         self.assertEqual(methods, ['SendAgentMessage', 'SendUserCascadeMessage', 'UpdateConversationAnnotations'])
+        self.assertEqual(result['wake'], 'rejected')
         record = self.assert_record(message, 'submitted',
-                                    f'pushed to Antigravity session {self.thread} (pid 42)', 'pushed')
+                                    f'pushed to Antigravity session {self.thread} (pid 42, wake rejected)', 'pushed')
         self.assertNotIn('fixture auxiliary RPC refused', json.dumps(record))
+
+    def test_agy_push_note_records_measured_wake_states(self):
+        server = {'url': 'http://127.0.0.1:1', 'csrf': CSRF, 'pid': 84}
+        cases = (
+            ('idle-200', 'idle', (200, {}), 'woke'),
+            ('running-200', 'running', (200, {}), 'woke'),
+            ('running-benign', 'idle', (500, {'code': 'internal', 'message': 'executor has not processed the previous input yet'}), 'running'),
+            ('rejected-404', 'idle', (404, {'code': 'not_found', 'message': f'not_found: trajectory not found: {self.thread}: not found'}), 'rejected'),
+        )
+        for key, status, (http_code, payload), expected_wake in cases:
+            with self.subTest(case=key):
+                message = self.post('agy', key=f'wake-{key}')
+                target = {'cwd': self.server.temp.name, 'status': status, 'name': 'Worker'}
+
+                def fake_urlopen(req, timeout=None, context=None):
+                    if req.full_url.endswith('/SendAgentMessage'):
+                        resp = Mock()
+                        resp.__enter__ = Mock(return_value=Mock(read=Mock(return_value=b'{}')))
+                        resp.__exit__ = Mock(return_value=False)
+                        return resp
+                    raw = json.dumps(payload).encode('utf-8')
+                    if http_code == 200:
+                        resp = Mock()
+                        resp.__enter__ = Mock(return_value=Mock(read=Mock(return_value=raw)))
+                        resp.__exit__ = Mock(return_value=False)
+                        return resp
+                    raise HTTPError(req.full_url, http_code, 'error', None, io.BytesIO(raw))
+
+                with patch.object(agy_live, 'resolve_agy', return_value=(server, target)), \
+                        patch.object(agy_live.urllib.request, 'urlopen', side_effect=fake_urlopen):
+                    code, result = self.cli('deliver', message['id'])
+                self.assertEqual(code, 0, result)
+                self.assertEqual(result['wake'], expected_wake)
+                expected_note = f'pushed to Antigravity session {self.thread} (pid 84, wake {expected_wake})'
+                record = self.assert_record(message, 'submitted', expected_note, 'pushed')
+                self.assertNotIn(CSRF, json.dumps(record))
 
     def queue_delivery(self, message, *, refusal=None, receipt=None):
         endpoint = codex_live.EndpointUnavailable
