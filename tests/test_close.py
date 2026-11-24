@@ -1198,7 +1198,7 @@ class CloseCommandTests(unittest.TestCase):
                 self.assertEqual(sent_b, [])
 
     def test_close_archive_by_provider_and_session_without_route_or_folder(self):
-        with tempfile.TemporaryDirectory() as base:
+        with RunningBroker() as server, tempfile.TemporaryDirectory() as base:
             root = Path(base).resolve()
             gone_wt = root / '.worktrees' / 'repo' / 'jinni-150'
             gone_wt.mkdir(parents=True)
@@ -1214,8 +1214,6 @@ class CloseCommandTests(unittest.TestCase):
                     'workspaces': [{'workspaceFolderAbsoluteUri': gone_wt.as_uri()}],
                     'lastModifiedTime': '2026-11-24T01:20:00Z',
                 }
-                gone_wt.rmdir()
-                self.assertFalse(gone_wt.exists())
 
                 # Validation refusals on route-less close.
                 for argv, expected in (
@@ -1239,22 +1237,84 @@ class CloseCommandTests(unittest.TestCase):
                         self.assertEqual(code, 1)
                         self.assertIn(expected, err['error'])
 
-                # Archiving by --provider agy --session UUID succeeds without a broker route or folder on disk.
-                code, out = run(['--socket', str(unused_sock), 'close', '--archive',
-                                 '--session', orphan_sid, '--provider', 'agy'])
+                def archive_calls():
+                    return [b for p, _, b in fake.requests if p.endswith('/UpdateConversationAnnotations')]
+
+                # 1) Broker unreachable -> refused before any provider call.
+                code_unreach, err_unreach = run([
+                    '--socket', str(unused_sock), 'close', '--archive',
+                    '--session', orphan_sid, '--provider', 'agy', '--state-dir', server.state_dir,
+                ])
+                self.assertEqual(code_unreach, 1)
+                self.assertIn('Agent Bridge broker is unavailable', err_unreach['error'])
+                self.assertEqual(archive_calls(), [])
+
+                # 2) Route bound in another project -> refused naming the route and project, no archive call.
+                server.call('register', project='other-proj', name='worker-150',
+                            cwd=str(gone_wt), transport='agy', session=orphan_sid)
+                code_bound, err_bound = run([
+                    '--socket', server.path, 'close', '--archive',
+                    '--session', orphan_sid, '--provider', 'agy', '--state-dir', server.state_dir,
+                ])
+                self.assertEqual(code_bound, 1)
+                self.assertIn("registered as route 'worker-150' in project 'other-proj'", err_bound['error'])
+                self.assertIn('use close worker-150 --project other-proj --archive', err_bound['error'])
+                self.assertEqual(archive_calls(), [])
+
+                # Unregister the route and delete the worktree folder.
+                server.call('unregister', project='other-proj', name='worker-150')
+                gone_wt.rmdir()
+                self.assertFalse(gone_wt.exists())
+
+                # 3) Unreadable, missing, or corrupt routing snapshot -> refused, no archive call.
+                missing_state = root / 'missing.state'
+                code_missing, err_missing = run([
+                    '--socket', server.path, 'close', '--archive',
+                    '--session', orphan_sid, '--provider', 'agy', '--state-dir', str(missing_state),
+                ])
+                self.assertEqual(code_missing, 1)
+                self.assertIn('Routing snapshot could not be read', err_missing['error'])
+                self.assertEqual(archive_calls(), [])
+
+                bad_state = root / 'bad.state'
+                bad_state.mkdir(mode=0o700)
+                bad_routes = bad_state / 'routes.json'
+                bad_routes.write_text('{corrupt-json', encoding='utf-8')
+                bad_routes.chmod(0o600)
+                code_corrupt, err_corrupt = run([
+                    '--socket', server.path, 'close', '--archive',
+                    '--session', orphan_sid, '--provider', 'agy', '--state-dir', str(bad_state),
+                ])
+                self.assertEqual(code_corrupt, 1)
+                self.assertIn('Routing snapshot could not be read', err_corrupt['error'])
+                self.assertEqual(archive_calls(), [])
+
+                bad_routes.chmod(0o644)
+                code_perm, err_perm = run([
+                    '--socket', server.path, 'close', '--archive',
+                    '--session', orphan_sid, '--provider', 'agy', '--state-dir', str(bad_state),
+                ])
+                self.assertEqual(code_perm, 1)
+                self.assertIn('Routing snapshot could not be read', err_perm['error'])
+                self.assertEqual(archive_calls(), [])
+
+                # 4) No route + reachable broker + deleted folder -> archives cleanly.
+                code, out = run(['--socket', server.path, 'close', '--archive',
+                                 '--session', orphan_sid, '--provider', 'agy', '--state-dir', server.state_dir])
                 self.assertEqual(
                     (code, out['provider'], out['transport'], out['closed'], out['archived'], out['route_removed']),
                     (0, 'agy', 'agy', True, True, False),
                 )
                 self.assertEqual(out['session'], orphan_sid)
-                _, listed = run(['--socket', str(unused_sock), 'sessions', '--provider', 'agy'])
+                self.assertEqual(len(archive_calls()), 1)
+                _, listed = run(['--socket', server.path, 'sessions', '--provider', 'agy'])
                 self.assertNotIn(orphan_sid, {r['id'] for r in listed['providers']['agy']['sessions']})
 
                 # ArchiveUncertain without a route reports provider and session instead of name=None.
                 fake.ignore_archive = True
                 fake.trajectories[orphan_sid]['annotations'] = {}
-                code_u, err_u = run(['--socket', str(unused_sock), 'close', '--archive',
-                                     '--session', orphan_sid, '--provider', 'agy'])
+                code_u, err_u = run(['--socket', server.path, 'close', '--archive',
+                                     '--session', orphan_sid, '--provider', 'agy', '--state-dir', server.state_dir])
                 self.assertEqual((code_u, err_u['uncertain'], err_u['provider'], err_u['session']),
                                  (1, True, 'agy', orphan_sid))
                 self.assertNotIn('name', err_u)

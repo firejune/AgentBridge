@@ -149,14 +149,24 @@ def process_cwds(own=None, *, exempt_desktop=False):
     return own, {absolute_path(cwd) for pid, _, cwd in rows if pid not in own}
 
 
+def snapshot_routes(directory, *, require_store=False):
+    root = Path(directory)
+    snapshot = route_store.read_snapshot(root / 'routes.json')
+    if snapshot is None:
+        if require_store and not (root / 'routes.lock').is_file():
+            raise ValueError('Routing snapshot is missing; check --state-dir')
+        return [], []
+    try:
+        return ([route_store.endpoint_record(item) for item in snapshot['endpoints']],
+                [route_store.channel_record(item) for item in snapshot['channels']])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError('Invalid routing snapshot; refusing to overwrite it') from error
+
+
 class Protections:
     def __init__(self, directory, prefix=None, close_route=None, own=None):
-        snapshot = route_store.read_snapshot(directory / 'routes.json')
+        endpoints, channels = snapshot_routes(directory)
         self.protected = set()
-        endpoints, channels = [], []
-        if snapshot is not None:
-            endpoints = [route_store.endpoint_record(item) for item in snapshot['endpoints']]
-            channels = [route_store.channel_record(item) for item in snapshot['channels']]
         if close_route is not None and close_route not in endpoints:
             raise ValueError('Closing route differs from routing snapshot; check --state-dir')
         for route in endpoints + [channel['route'] for channel in channels if channel['active']]:

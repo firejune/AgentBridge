@@ -542,6 +542,46 @@ def retro_command(args):
     return retros.tally(found) if args.retro_cmd == 'tally' else found
 
 
+def require_unrouted_agy_session(args, sid):
+    """Refuse route-less archive when the broker or routing snapshot cannot confirm the session has no route."""
+    try:
+        ping = broker.request(args.socket, {'op': 'ping'}, timeout=args.timeout)
+    except (broker.BrokerConnectError, broker.BrokerResponseError, OSError, ValueError, KeyError, TypeError) as error:
+        raise ValueError(
+            f'Agent Bridge broker is unavailable; cannot confirm session {sid} has no registered route: {error}'
+        ) from None
+    if not isinstance(ping, dict) or not ping.get('instance'):
+        raise ValueError(f'Agent Bridge broker did not return a valid ping response for session {sid}')
+    directory = broker_state_dir(args).expanduser().resolve()
+    try:
+        endpoints, channels = codex_archive.snapshot_routes(directory, require_store=True)
+    except (OSError, ValueError) as error:
+        raise ValueError(f'Routing snapshot could not be read: {error}') from None
+    projects = sorted({item['project'] for item in (*endpoints, *channels)})
+    bound = None
+    for project in projects:
+        try:
+            routes = broker.request(args.socket, {'op': 'routes', 'project': project}, timeout=args.timeout)
+        except (broker.BrokerConnectError, broker.BrokerResponseError, OSError, ValueError, KeyError, TypeError) as error:
+            raise ValueError(f'Could not verify routes in project {project!r}: {error}') from None
+        if not isinstance(routes, list) or any(not isinstance(row, dict) for row in routes):
+            raise ValueError(f'Broker returned invalid routes for project {project!r}')
+        bound = next((row for row in routes if row.get('transport') == 'agy' and row.get('session') == sid), None)
+        if bound is not None:
+            break
+    if bound is None:
+        bound = next(
+            (route for route in endpoints + [channel['route'] for channel in channels if channel['active']]
+             if route['transport'] == 'agy' and route['session'] == sid),
+            None,
+        )
+    if bound is not None:
+        raise ValueError(
+            f"Antigravity session {sid} is registered as route {bound['name']!r} in project {bound['project']!r}; "
+            f"use close {bound['name']} --project {bound['project']} --archive"
+        )
+
+
 def close_participant(args):
     if not 0 < args.timeout <= 600:
         raise ValueError('Timeout must be between 0 and 600 seconds')
@@ -561,6 +601,7 @@ def close_participant(args):
         if args.provider != 'agy':
             raise ValueError(f'Route-less close --session is supported only for --provider agy, not {args.provider!r}')
         sid = str(uuid.UUID(args.session))
+        require_unrouted_agy_session(args, sid)
         return {'provider': 'agy', 'transport': 'agy', **agy_live.archive_agy(sid, timeout=args.timeout),
                 'route_removed': False}
     if args.provider or args.session:
