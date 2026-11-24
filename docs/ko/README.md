@@ -237,7 +237,7 @@ Claude는 transcript의 중복 없는 응답을 합산하고 sub-agent는 따로
 메인 저장소 체크아웃은 항상 `main`으로 유지하고, 각 에이전트의 코드 작업은 `<workspace>/.worktrees/<repo>/<agent>-<issue>` 아래 격리된 워크트리에서 수행한다.
 
 ```bash
-python3 "$bridge_cli" wt new . jinni 42 --slug fix-bug --provider agy --session UUID
+python3 "$bridge_cli" wt new . agy-worker 42 --slug fix-bug --provider agy --session UUID
 python3 "$bridge_cli" wt list --text
 python3 "$bridge_cli" wt sweep          # 머지 완료 및 소유 세션이 종료된 워크트리 정리 대상 확인 (dry-run)
 python3 "$bridge_cli" wt sweep --apply  # 대상 워크트리 및 브랜치 실제 제거
@@ -372,7 +372,7 @@ receipts 폴더는 0700, 영수증과 로그는 0600이다. retros와 같은 `O_
 있다. 자동 만료는 없으며 소유자가 비공개로 관리한다. 명령 출력에는 민감한 정보가 있을 수 있다.
 
 영수증 참조는 bridge id 또는 JSON 경로다. bridge 로그는 바이트 수와 SHA-256을 검사한다.
-Nova `result.json`은 정수 `exitCode`, 선택적 `sourceCommit`(전체 SHA 또는 빈 값/누락 = unknown),
+원격 풀 `result.json`은 정수 `exitCode`, 선택적 `sourceCommit`(전체 SHA 또는 빈 값/누락 = unknown),
 **형제 `command.log`**를 읽는다. 원격 `root`/`out`은 로컬 경로로 쓰지 않는다.
 일반 외부 JSON은 정수 `exit_code`, JSON 기준 상대/절대 `log`, 선택적 `head`를 받는다.
 외부 형식에는 필수 로그 해시가 없다. 어떤 형식도 암호학적 출처를 인증하지 않으며,
@@ -414,6 +414,6 @@ printf 'probe-141\n' | python3 "$bridge_cli" run --label pipe-smoke -- python3 -
 # stdout/stderr를 별도로 보존하며 합산 로그는 관측된 읽기 순서다.
 printf 'probe-141\n' | python3 "$bridge_cli" run --label routed-smoke -- python3 -c \
   'import sys; print("OUT="+input()); print("ERR",file=sys.stderr)' >"$lane/out" 2>"$lane/err"
-# 회수된 Nova 결과는 receipt를 result.json 절대 경로로 바꾸고 형제 command.log를 유지한다.
+# 회수된 원격 풀 결과는 receipt를 result.json 절대 경로로 바꾸고 형제 command.log를 유지한다.
 # sourceCommit이 이전 SHA면 행에 head를 명시한다. 비어 있으면 unknown으로 남는다.
 ```

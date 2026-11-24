@@ -35,7 +35,7 @@ If installed elsewhere, use the sibling `scripts/bridge.py` next to the `SKILL.m
 
    To reach an existing Codex thread, send to its registered route as usual. See the Desktop queue notice below for delivery requirements.
 
-   **Give every session you open a title that identifies it.** The person reads the session list in the desktop apps and has to tell the sessions apart without opening each one. Use `PROJECT/NAME · WORK`, where NAME is the route name and WORK is the card or purpose in a few words, for example `rig-c/naru-49 · create#49 ground ask`.
+   **Give every session you open a title that identifies it.** The person reads the session list in the desktop apps and has to tell the sessions apart without opening each one. Use `PROJECT/NAME · WORK`, where NAME is the route name and WORK is the card or purpose in a few words, for example `my-app/codex-49 · #49 parser fix`.
    - Codex: `register NAME --project PROJECT --transport codex --new` and `open --provider codex --register NAME --project PROJECT` default to `PROJECT/NAME` when `--title` is absent. An explicit `--title` wins. Prefer an explicit `PROJECT/NAME · WORK` title to include the purpose. `open --provider codex` without `--register` has no default title, so pass `--title` to name it.
    - Antigravity: pass `--title` on every `open` and `register --new`.
    - Claude Desktop: `--title` is the pre-filled first message, not the name. The route label `PROJECT/NAME` is written on the first push. Write the WORK part into that first message.
@@ -405,7 +405,7 @@ orphan log but no completed receipt. There is no automatic expiry: the owner
 manages these files privately. Logs can contain sensitive command output.
 
 A reference is a bridge id or a JSON path. Bridge logs are checked against their
-recorded byte count and SHA-256. The Nova pool shape reads integer `exitCode`,
+recorded byte count and SHA-256. The remote pool shape reads integer `exitCode`,
 optional `sourceCommit` (full SHA or empty/absent = unknown), and **sibling
 `command.log`** beside `result.json`; remote `root`/`out` are not local log paths.
 A generic external JSON may instead supply integer `exit_code`, `log` (relative

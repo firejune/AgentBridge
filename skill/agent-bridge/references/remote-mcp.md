@@ -100,7 +100,7 @@ first operation was running with no result when the second was accepted, and the
 working target received both requests. Operator replies in reverse order settled
 both operations with separate results. Native `bridge_operation_get` returned
 each complete result with its own marker and without the other. That revision passed
-709 Nova tests in 94.617 s. The live check covered that configured Codex target.
+709 remote-pool tests in 94.617 s. The live check covered that configured Codex target.
 Isolated tests cover busy Claude and Antigravity targets.
 
 The worker commits intent before create/post/push, saves returned UUID/message
@@ -442,10 +442,10 @@ and MCP handler, with synthetic configured routes. It covers unsolicited receipt
 owner/route isolation, ACK-response loss and eviction, immutable Unicode/list
 pagination, facade reconstruction, explicit broker loss, atomic route races,
 correlation exclusion, frame budgets and bounded retention. It does not create
-Claude sessions or contact a real HQ/Nana inbox. The required full suite remains
+Claude sessions or contact a real owner inbox. The required full suite remains
 `python3 -m unittest discover -s tests -v` without added skips.
 
-Actual HQ -> Nana acceptance, client tool exposure and deployment are **not run**
+Actual owner-inbox acceptance, client tool exposure and deployment are **not run**
 by these tests. Owner actions, in order: (1) deploy the reviewed broker/facade code
 and coordinate any separately required broker upgrade, preserving the private
 correspondence checkpoint and checking the broker’s corruption/loss diagnostics;
@@ -453,7 +453,7 @@ correspondence checkpoint and checking the broker’s corruption/loss diagnostic
 restart only the corresponding facade while preserving its ledger and the broker;
 (4) refresh/reconnect the intended client's tool list and verify ten tools (with all three scopes);
 (5) have the authorized HQ send a new independent `reply_to:null` message, retrieve
-it through Nana's direct tools, confirm sender still sees it unacknowledged, then
+it through the owner client's direct tools, confirm sender still sees it unacknowledged, then
 explicitly ACK and verify the sender's `done`/`acknowledged_at` transition. Do not
 silently ACK an existing pending response or replay an original request. With
 the send scope in place, use another fresh independent message to verify a
@@ -589,7 +589,7 @@ The successful combination is a verified setup recipe; individual causality
 between the tunnel version, protocol option and rescan was not isolated. This
 does not establish that all legacy Events deployments fail.
 
-At that revision, the full Nova regression suite passed 677 tests. A separate
+At that revision, the full remote-pool regression suite passed 677 tests. A separate
 owner-authorized live test verified subscription creation, signed callback
 verification, notification delivery and an automatic Cloud turn. After a new
 independent inbox message arrived, the intended chat started an automation turn
@@ -602,7 +602,7 @@ After the test, its task was retained paused, the host's unsubscribe completed,
 and AB reported zero active subscriptions and zero inbox watchers. The existing
 broker continued running.
 
-The reply extension passed all 697 Nova regression tests in 104.536 seconds.
+The reply extension passed all 697 remote-pool regression tests in 104.536 seconds.
 On the same date, a separate owner-authorized test reused that existing paused
 Cloud task with updated reply-aware instructions and the same event name; no
 replacement task was created. A native `bridge_message_send` request received

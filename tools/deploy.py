@@ -58,6 +58,7 @@ class Layout:
     launch_agents: Path
     tunnel_profile: Path
     pins: tuple
+    facade_runtime: str = 'facade-runtime'
 
     @property
     def state(self):
@@ -71,18 +72,34 @@ class Layout:
     def broker_plist(self):
         return self.launch_agents / (self.broker_label + '.plist')
 
+    @property
+    def facade_home(self):
+        return self.runtime / self.facade_runtime
+
     def release(self, kind, sha):
-        """kind: 'broker' for the broker runtime; 'nana' for the CLI and facade runtime."""
-        return self.runtime / f'{kind}-runtime' / 'releases' / sha
+        """kind: 'broker' for the broker runtime; 'facade' for the CLI and facade runtime."""
+        home = self.facade_home if kind == 'facade' else self.runtime / f'{kind}-runtime'
+        return home / 'releases' / sha
 
     @classmethod
     def default(cls, repo):
         home = Path.home()
         runtime = home / '.local/share/agent-bridge'
+        # An install may name its facade runtime and tunnel profile differently; that choice stays
+        # in a private local file, never in the repository.
+        local = home / '.config/agent-bridge/deploy.json'
+        names = json.loads(local.read_text(encoding='utf-8')) if local.is_file() else {}
+        facade_runtime = names.get('facade_runtime', 'facade-runtime')
+        if not isinstance(facade_runtime, str) or not re.fullmatch(r'[A-Za-z0-9._-]+', facade_runtime):
+            raise Refusal('DEPLOY_CONFIG_INVALID', f'{local}: facade_runtime must be one folder name')
+        profile = names.get('tunnel_profile', '~/.config/agent-bridge/facade/tunnel.yaml')
+        if not isinstance(profile, str) or not profile:
+            raise Refusal('DEPLOY_CONFIG_INVALID', f'{local}: tunnel_profile must be a path')
         return cls(repo=repo, runtime=runtime, socket=runtime / 'bridge.sock',
                    launch_agents=home / 'Library/LaunchAgents',
-                   tunnel_profile=home / '.config/agent-bridge/nana/tunnel.yaml',
-                   pins=tuple(home / base / 'skills/agent-bridge' for base in ('.agents', '.codex', '.claude')))
+                   tunnel_profile=home / profile[2:] if profile.startswith('~/') else Path(profile),
+                   pins=tuple(home / base / 'skills/agent-bridge' for base in ('.agents', '.codex', '.claude')),
+                   facade_runtime=facade_runtime)
 
 
 class System:
@@ -170,7 +187,7 @@ def read_facade(layout):
     if not layout.tunnel_profile.is_file():
         raise Refusal('FACADE_PROFILE_MISSING', 'the tunnel profile is missing')
     # The profile also holds a credential: read it, never print or copy it.
-    facade = only_sha(rf'{prefix}/nana-runtime/releases/({SHA})/', layout.tunnel_profile.read_text(encoding='utf-8'),
+    facade = only_sha(rf'{prefix}/{re.escape(layout.facade_runtime)}/releases/({SHA})/', layout.tunnel_profile.read_text(encoding='utf-8'),
                       'FACADE_PROFILE_UNREADABLE', 'the tunnel profile')
     facade_label = facade_plist = None
     for candidate in sorted(layout.launch_agents.glob('*.plist')):
@@ -188,7 +205,7 @@ def read_facade(layout):
 
 def point_facade(layout, current, target):
     """Rewrite the release id in the tunnel profile in place; the rest of the file is kept as it is."""
-    prefix = f'{layout.runtime}/nana-runtime/releases/'
+    prefix = f'{layout.facade_home}/releases/'
     text = layout.tunnel_profile.read_text(encoding='utf-8')
     atomic_bytes(layout.tunnel_profile, text.replace(prefix + current + '/', prefix + target + '/').encode('utf-8'))
 
@@ -197,7 +214,7 @@ def read_live(layout, components):
     pins = read_pins(layout)
     prefix = re.escape(str(layout.runtime))
     targets = set(pins.values())
-    pinned = re.fullmatch(rf'{prefix}/nana-runtime/releases/({SHA})/{SKILL}', targets.pop()) if len(targets) == 1 else None
+    pinned = re.fullmatch(rf'{prefix}/{re.escape(layout.facade_runtime)}/releases/({SHA})/{SKILL}', targets.pop()) if len(targets) == 1 else None
     if pinned is None:
         raise Refusal('PINS_DISAGREE', 'the skill pins do not all point at one release of this runtime')
     cli = pinned[1]
@@ -306,7 +323,7 @@ def plan_steps(layout, live, sha, components, uid):
     """The steps in order, as (name, description). The real run performs exactly these."""
     steps = []
     if {'cli', 'facade'} & set(components):
-        steps.append(('build cli release', f'git archive {sha} -> {layout.release("nana", sha)}'))
+        steps.append(('build cli release', f'git archive {sha} -> {layout.release("facade", sha)}'))
     if 'broker' in components:
         steps.append(('build broker release', f'git archive {sha} -> {layout.release("broker", sha)}'))
     steps.append(('snapshot', f'copy state, plists, pins and the facade release id to {layout.runtime}/deploy-{sha[:7]}-*'))
@@ -383,7 +400,7 @@ def snapshot(layout, live, sha, components):
     if 'facade' in components:
         # Not the tunnel profile: it holds a credential. Rollback needs only the release id it named.
         copies += [(live.facade_plist, live.facade_plist.name)]
-        copies += [(layout.runtime / 'nana-runtime/state' / name, name) for name in FACADE_STATE_FILES]
+        copies += [(layout.facade_home / 'state' / name, name) for name in FACADE_STATE_FILES]
     for source, name in copies:
         if source.is_file():
             shutil.copy2(source, folder / name)
@@ -447,7 +464,7 @@ def apply(layout, system, live, sha, components, folder, result):
         wait_ping(layout, system, layout.release('broker', sha) / SKILL / 'scripts/bridge.py')
     if 'cli' in components:
         for pin in layout.pins:
-            move_pin(pin, str(layout.release('nana', sha) / SKILL))
+            move_pin(pin, str(layout.release('facade', sha) / SKILL))
     if 'facade' in components:
         point_facade(layout, live.facade, sha)
         start(system, live.facade_label, live.facade_plist, actions, 'start facade')
@@ -474,7 +491,7 @@ def verify(layout, system, live, sha, components, before, result):
                                                before['states'].items() if state in ('pending', 'uncertain')),
         pins=len(after.pins))
     if 'facade' in components:
-        url = layout.runtime / 'nana-runtime/health.url'
+        url = layout.facade_home / 'health.url'
         for _ in range(40):
             result['facade_ready'] = system.ready(url)
             if result['facade_ready']:
@@ -538,7 +555,7 @@ def deploy(layout, system, commit, components, dry_run=False, allow_non_ancestor
     before = dict(broker_pid=system.pid(layout.broker_label), routes=route_counts(layout),
                   endpoints=saved_endpoints(layout), states=correspondence_states(layout))
     if {'cli', 'facade'} & set(components):
-        release = build_release(layout, system, 'nana', sha)
+        release = build_release(layout, system, 'facade', sha)
         if system.cli(release / SKILL / 'scripts/bridge.py', layout.socket, 'ping')[0]:
             raise Refusal('RELEASE_UNUSABLE', 'the new CLI release could not ping the running broker')
     if 'broker' in components:

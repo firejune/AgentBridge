@@ -39,11 +39,11 @@ class ClaudeTitleTests(unittest.TestCase):
         return sessions.claude_title(self.sid, text, projects_dir=self.projects, **kw)
 
     def test_writes_once_then_keeps(self):
-        self.assertEqual(self.title('rig-c/parts-tower')['state'],'written')
-        self.assertEqual(self.title('rig-c/parts-tower')['state'],'kept')
-        self.assertEqual(titles(self.transcript),['rig-c/parts-tower'])
-        self.assertIn('{"type":"custom-title","customTitle":"rig-c/parts-tower",', self.transcript.read_text())
-        self.assertEqual(self.title('rig-c/parts-tower',force=True)['state'],'written')
+        self.assertEqual(self.title('demo/parts-tower')['state'],'written')
+        self.assertEqual(self.title('demo/parts-tower')['state'],'kept')
+        self.assertEqual(titles(self.transcript),['demo/parts-tower'])
+        self.assertIn('{"type":"custom-title","customTitle":"demo/parts-tower",', self.transcript.read_text())
+        self.assertEqual(self.title('demo/parts-tower',force=True)['state'],'written')
 
     def test_a_title_buried_outside_the_tail_is_appended_again(self):
         self.assertEqual(self.title('p/n')['state'],'written')
@@ -64,11 +64,11 @@ class ClaudeTitleTests(unittest.TestCase):
     def test_never_overwrites_a_user_title_unless_forced(self):
         with self.transcript.open('a') as handle:
             handle.write(json.dumps({'type':'custom-title','customTitle':'mine','sessionId':self.sid})+'\n')
-        kept = self.title('rig-c/parts-tower')
+        kept = self.title('demo/parts-tower')
         self.assertEqual((kept['state'],kept['title']),('kept','mine'))
-        forced = self.title('rig-c/parts-tower',force=True)
+        forced = self.title('demo/parts-tower',force=True)
         self.assertEqual((forced['state'],forced['previous']),('written','mine'))
-        self.assertEqual(titles(self.transcript),['mine','rig-c/parts-tower'])
+        self.assertEqual(titles(self.transcript),['mine','demo/parts-tower'])
 
     def test_ai_title_does_not_block(self):
         with self.transcript.open('a') as handle:

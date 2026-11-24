@@ -1200,7 +1200,7 @@ class CloseCommandTests(unittest.TestCase):
     def test_close_archive_by_provider_and_session_without_route_or_folder(self):
         with RunningBroker() as server, tempfile.TemporaryDirectory() as base:
             root = Path(base).resolve()
-            gone_wt = root / '.worktrees' / 'repo' / 'jinni-150'
+            gone_wt = root / '.worktrees' / 'repo' / 'agy-150'
             gone_wt.mkdir(parents=True)
             orphan_sid = str(uuid.uuid4())
             unused_sock = root / 'unused.sock'

@@ -528,9 +528,9 @@ class WakeCommandTests(WakeFixture):
 
     def test_other_transports_are_unsupported(self):
         with RunningBroker() as server:
-            server.call('register',project='demo',name='naru',cwd=self.temp.name,transport='codex',
+            server.call('register',project='demo',name='codex-worker',cwd=self.temp.name,transport='codex',
                         session=str(uuid.uuid4()))
-            result = self.cli(server,'wake','naru','--project','demo')
+            result = self.cli(server,'wake','codex-worker','--project','demo')
             self.assertEqual(result.returncode,1)
             out = json.loads(result.stdout)
             self.assertEqual(out['state'],'unsupported')

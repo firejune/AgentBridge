@@ -243,7 +243,7 @@ for fields, formula, offline lookup and reader extension details.
 Keep the main repository checkout clean on `main` and isolate every agent's work under `<workspace>/.worktrees/<repo>/<agent>-<issue>`:
 
 ```bash
-python3 "$bridge_cli" wt new . jinni 42 --slug fix-bug --provider agy --session UUID
+python3 "$bridge_cli" wt new . agy-worker 42 --slug fix-bug --provider agy --session UUID
 python3 "$bridge_cli" wt list --text
 python3 "$bridge_cli" wt sweep          # Dry-run cleanup of merged worktrees whose owner session is gone
 python3 "$bridge_cli" wt sweep --apply  # Remove eligible worktrees and branches
@@ -398,7 +398,7 @@ orphan log but no completed receipt. There is no automatic expiry: the owner
 manages these files privately. Logs can contain sensitive command output.
 
 A reference is a bridge id or a JSON path. Bridge logs are checked against their
-recorded byte count and SHA-256. The Nova pool shape reads integer `exitCode`,
+recorded byte count and SHA-256. The remote pool shape reads integer `exitCode`,
 optional `sourceCommit` (full SHA or empty/absent = unknown), and **sibling
 `command.log`** beside `result.json`; remote `root`/`out` are not local log paths.
 A generic external JSON may instead supply integer `exit_code`, `log` (relative
