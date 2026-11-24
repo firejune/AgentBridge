@@ -14,6 +14,7 @@ import re
 import shutil
 import signal
 import ssl
+import stat
 import subprocess
 import threading
 import time
@@ -27,12 +28,18 @@ import provider_failures
 SERVICE = '/exa.language_server_pb.LanguageServerService'
 NEXT_INVOCATION = 'MESSAGE_DELIVERY_STRATEGY_NEXT_INVOCATION'
 WAKE_RETRY_DELAY = 0.05
+WAKE_STATES = frozenset(('woke', 'running', 'rejected', 'failed'))
 BENIGN_WAKE_ERRORS = (
     'cannot queue empty user input step',
     'executor has not processed the previous input yet',
-    'unimplemented',
+)
+TRANSPORT_WAKE_ERRORS = (
+    'connection failed:',
+    'returned invalid json',
+    'returned a non-object response',
 )
 CSRF_RE = re.compile(r'--csrf_token(?:=|\s+)([0-9a-fA-F-]+)')
+CSRF_VALUE_RE = re.compile(r'[0-9a-fA-F-]+')
 APP_DIR_RE = re.compile(r'--app_data_dir(?:=|\s+)(antigravity(?:-ide)?)(?:\s|$)')
 LSP_FLAG_RE = re.compile(r'(?:^|\s)--enable_lsp(?:\s|$)')
 HUB_FLAG_RE = re.compile(r'(?:^|\s)--hub(?:\s|$)')
@@ -45,9 +52,11 @@ ORIGIN_CHARS = re.compile(r'[^A-Za-z0-9%:_/.\-]')
 
 
 class DeliveryError(ValueError):
-    def __init__(self, reason, uncertain=False):
+    def __init__(self, reason, uncertain=False, *, http_status=None, rejected=False):
         super().__init__(reason)
         self.uncertain = uncertain
+        self.http_status = http_status
+        self.rejected = rejected
 
 
 def observed_now():
@@ -109,7 +118,11 @@ def rpc_call(url, csrf, method, payload, timeout=5):
                 detail = f": {err_json['message']}"
         except Exception:
             pass
-        raise DeliveryError(f'Antigravity {method} HTTP {error.code}{detail}') from None
+        raise DeliveryError(
+            f'Antigravity {method} HTTP {error.code}{detail}',
+            http_status=error.code,
+            rejected=True,
+        ) from None
     except (urllib.error.URLError, OSError, TimeoutError) as error:
         reason = getattr(error, 'reason', error)
         raise DeliveryError(f'Antigravity {method} connection failed: {reason}') from None
@@ -120,7 +133,7 @@ def rpc_call(url, csrf, method, payload, timeout=5):
     if not isinstance(data, dict):
         raise DeliveryError(f'Antigravity {method} returned a non-object response')
     if 'code' in data and 'message' in data and method != 'GetAllCascadeTrajectories':
-        raise DeliveryError(f"Antigravity {method}: {data['message']}")
+        raise DeliveryError(f"Antigravity {method}: {data['message']}", rejected=True)
     return data
 
 
@@ -155,6 +168,91 @@ def server_host(server):
     return 'desktop'
 
 
+def _daemon_dir(app_dir='antigravity'):
+    return Path.home() / '.gemini' / app_dir / 'daemon'
+
+
+def _read_single_descriptor(path, uid):
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None, 'missing'
+    except OSError as error:
+        return None, f'Antigravity hub descriptor {path.name} could not be opened: {error.strerror or error}'
+    try:
+        with os.fdopen(fd, 'rb') as handle:
+            st = os.fstat(handle.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != uid or stat.S_IMODE(st.st_mode) != 0o600:
+                return None, (
+                    f'Antigravity hub descriptor {path.name} must be a regular mode 0600 file owned by uid {uid}'
+                )
+            raw = handle.read(65537)
+    except OSError as error:
+        return None, f'Antigravity hub descriptor {path.name} could not be read: {error.strerror or error}'
+    if len(raw) > 65536:
+        return None, f'Antigravity hub descriptor {path.name} exceeds size limit'
+    try:
+        data = json.loads(raw.decode('utf-8'))
+    except (ValueError, UnicodeError):
+        return None, f'Antigravity hub descriptor {path.name} contains invalid JSON'
+    if not isinstance(data, dict):
+        return None, f'Antigravity hub descriptor {path.name} is not a JSON object'
+    return data, None
+
+
+def _read_hub_descriptor(pid, app_dir='antigravity', hub_port=None, *, uid=None, daemon_dir=None):
+    uid = os.getuid() if uid is None else uid
+    root = Path(daemon_dir) if daemon_dir is not None else _daemon_dir(app_dir)
+    if hub_port is not None:
+        candidates = [root / f'hub_{hub_port}.json']
+    else:
+        try:
+            candidates = sorted(root.glob('hub_*.json')) if root.is_dir() else []
+        except OSError:
+            candidates = []
+    if not candidates:
+        raise DeliveryError(f'Antigravity hub descriptor is missing for pid {pid}')
+
+    mismatch_reason = None
+    other_error = None
+    saw_file = False
+    for path in candidates:
+        data, err = _read_single_descriptor(path, uid)
+        if err == 'missing':
+            continue
+        saw_file = True
+        if err is not None:
+            other_error = err
+            continue
+        desc_pid = data.get('pid')
+        if type(desc_pid) is not int or desc_pid != pid:
+            mismatch_reason = f'Antigravity hub descriptor {path.name} pid mismatch for pid {pid}'
+            continue
+        http_port = data.get('httpPort')
+        if hub_port is not None and http_port is not None and (type(http_port) is not int or http_port != hub_port):
+            other_error = f'Antigravity hub descriptor {path.name} port mismatch for port {hub_port}'
+            continue
+        csrf = data.get('csrfToken')
+        if not isinstance(csrf, str) or not CSRF_VALUE_RE.fullmatch(csrf):
+            raise DeliveryError(f'Antigravity hub descriptor {path.name} has no valid csrfToken')
+        return {
+            'csrf': csrf,
+            'http_port': http_port if type(http_port) is int and 1 <= http_port <= 65535 else None,
+            'https_port': (
+                data['httpsPort']
+                if type(data.get('httpsPort')) is int and 1 <= data['httpsPort'] <= 65535
+                else None
+            ),
+        }
+
+    if not saw_file:
+        raise DeliveryError(f'Antigravity hub descriptor is missing for pid {pid}')
+    if mismatch_reason:
+        raise DeliveryError(mismatch_reason)
+    raise DeliveryError(other_error or f'Antigravity hub descriptor is unusable for pid {pid}')
+
+
 def _parse_server_command(cmd):
     if LSP_FLAG_RE.search(cmd):
         return None
@@ -164,10 +262,10 @@ def _parse_server_command(cmd):
         return None
     app_match = APP_DIR_RE.search(cmd)
     csrf_match = CSRF_RE.search(cmd)
-    if not app_match or not csrf_match:
+    if not app_match or (not csrf_match and not is_agy_hub):
         return None
     app_dir = app_match.group(1)
-    csrf = csrf_match.group(1)
+    csrf = csrf_match.group(1) if csrf_match else None
     host = 'ide' if (is_agy_hub or app_dir == 'antigravity-ide' or SUBCLIENT_IDE_RE.search(cmd)) else 'desktop'
     port_match = HUB_PORT_RE.search(cmd)
     hub_port = int(port_match.group(1)) if port_match else None
@@ -200,7 +298,8 @@ def _resolve_lsof():
     return 'lsof'
 
 
-def _connect_candidate(pid, app_dir, csrf, timeout=5, host=None, add_dirs=(), hub_port=None, ppid=None, orphaned=False):
+def _connect_candidate(pid, app_dir, csrf, timeout=5, host=None, add_dirs=(), hub_port=None, https_port=None,
+                       ppid=None, orphaned=False):
     lsof_out = ''
     try:
         lsof_out = subprocess.check_output(
@@ -208,7 +307,7 @@ def _connect_candidate(pid, app_dir, csrf, timeout=5, host=None, add_dirs=(), hu
             text=True, stderr=subprocess.DEVNULL, timeout=5,
         )
     except (OSError, subprocess.SubprocessError) as error:
-        if not hub_port:
+        if not hub_port and not https_port:
             raise DeliveryError(f'Failed to inspect listening ports for Antigravity pid {pid}: {error}') from None
 
     ports = []
@@ -218,8 +317,9 @@ def _connect_candidate(pid, app_dir, csrf, timeout=5, host=None, add_dirs=(), hu
             port = int(match.group(1))
             if port not in ports:
                 ports.append(port)
-    if hub_port and hub_port not in ports:
-        ports.append(hub_port)
+    for fallback_port in (hub_port, https_port):
+        if fallback_port and fallback_port not in ports:
+            ports.append(fallback_port)
 
     if not ports:
         raise DeliveryError(f'Antigravity {app_dir} language_server (pid {pid}) has no loopback listening port')
@@ -369,14 +469,23 @@ def discover_servers(timeout=5):
     reaped_orphan = False
     for pid, info in (*desktop_items, *legacy_ide_items, *hub_ide_items):
         try:
+            csrf = info['csrf']
+            hub_port = info['hub_port']
+            https_port = None
+            if not csrf:
+                descriptor = _read_hub_descriptor(pid, info['app_dir'], hub_port=hub_port, uid=uid)
+                csrf = descriptor['csrf']
+                hub_port = hub_port or descriptor['http_port']
+                https_port = descriptor['https_port']
             candidate = _connect_candidate(
                 pid,
                 info['app_dir'],
-                info['csrf'],
+                csrf,
                 timeout=timeout,
                 host=info['host'],
                 add_dirs=info['add_dirs'],
-                hub_port=info['hub_port'],
+                hub_port=hub_port,
+                https_port=https_port,
                 ppid=info.get('ppid'),
                 orphaned=info.get('orphaned', False),
             )
@@ -1246,16 +1355,11 @@ def build_wake_frame(sid):
 def wake_session(url, csrf, sid, initial_status=None, timeout=5):
     """Nudge an Antigravity cascade so an inbox message is consumed without delay.
 
-    SendAgentMessage enqueues a high-priority SYSTEM_MESSAGE with NEXT_INVOCATION
-    delivery, which a running turn consumes at its next step boundary without
-    interrupting active tool execution. However, when a turn has yielded to wait
-    on a background command or subagent (status IDLE while SubagentsAndTasksIdle()
-    is false) or just crossed the post-invocation boundary into IDLE, the agent
-    inbox wakeup is suppressed until all background tasks finish. Calling
-    SendUserCascadeMessage with empty items and NEXT_INVOCATION triggers
-    setPendingInvocation(steps=[]) when the cascade is not RUNNING, waking the
-    turn immediately without injecting a fake USER_INPUT step, while returning a
-    benign 'cannot queue empty user input step' when the cascade is already RUNNING.
+    On lsVersion 2.34.0+, SendUserCascadeMessage with empty items and
+    NEXT_INVOCATION returns HTTP 200 {} for both IDLE and RUNNING cascades.
+    Older servers (or cascades tearing down a previous turn) return one of
+    BENIGN_WAKE_ERRORS, which resolves to 'running'. Any other server rejection
+    returns 'rejected'; transport or response-decode failures return 'failed'.
     """
     frame = build_wake_frame(sid)
     for attempt in range(2 if initial_status == 'running' else 1):
@@ -1270,7 +1374,9 @@ def wake_session(url, csrf, sid, initial_status=None, timeout=5):
                 if attempt == 0 and initial_status == 'running':
                     continue
                 return 'running'
-            return 'ignored'
+            if error.rejected or not any(marker in text for marker in TRANSPORT_WAKE_ERRORS):
+                return 'rejected'
+            return 'failed'
     return 'running'
 
 

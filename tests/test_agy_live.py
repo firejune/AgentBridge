@@ -804,6 +804,156 @@ class AgyLiveTests(unittest.TestCase):
                 self.assertEqual(opened_unreg['project_id'], created_proj['id'])
                 self.assertEqual(opened_unreg['session']['cwd'], str(wt_b))
 
+    def test_hub_discovery_flag_and_descriptor_matrix(self):
+        import agy_live
+
+        sid = str(uuid.uuid4())
+        home_dir = self.root / 'fake-home'
+        daemon_dir = home_dir / '.gemini' / 'antigravity' / 'daemon'
+        daemon_dir.mkdir(parents=True)
+        uid = os.getuid()
+
+        with FakeAgyServer(self.root, sid) as hub_srv:
+            port = hub_srv.httpd.server_port
+            cmd_with_flag = (
+                f"7001 7000 {uid} /Users/test/.gemini/bin/agy --hub --hub-port={port} "
+                f"--app_data_dir=antigravity --csrf_token={CSRF} --add-dir={self.root}\n"
+            )
+            cmd_without_flag = (
+                f"7002 7000 {uid} /Users/test/.gemini/bin/agy --hub --hub-port={port} "
+                f"--app_data_dir=antigravity --add-dir={self.root}\n"
+            )
+            ps_state = {'text': cmd_with_flag}
+
+            def fake_check_output(cmd, *args, **kwargs):
+                if cmd[0] == 'ps':
+                    return ps_state['text']
+                if cmd[0] == 'lsof':
+                    pid = cmd[cmd.index('-p') + 1]
+                    return f"agy {pid} user 10u IPv4 0x0 0t0 TCP 127.0.0.1:{port} (LISTEN)\n"
+                raise AssertionError(f'Unexpected command: {cmd}')
+
+            def write_descriptor(filename, payload, mode=0o600):
+                target = daemon_dir / filename
+                target.write_text(json.dumps(payload), encoding='utf-8')
+                os.chmod(target, mode)
+                return target
+
+            with mock.patch.dict(os.environ, {}, clear=False), \
+                    mock.patch.object(Path, 'home', return_value=home_dir), \
+                    mock.patch('subprocess.check_output', side_effect=fake_check_output):
+                os.environ.pop('AGENT_BRIDGE_AGY_URL', None)
+                os.environ.pop('AGENT_BRIDGE_AGY_CSRF', None)
+
+                # 1) Flag present: works directly without any descriptor file.
+                parsed_flag = agy_live._parse_server_command(cmd_with_flag.split(None, 3)[3])
+                self.assertEqual(parsed_flag['csrf'], CSRF)
+                discovered_flag = agy_live.discover_servers()
+                self.assertEqual(len(discovered_flag), 1)
+                self.assertEqual(discovered_flag[0]['pid'], 7001)
+
+                # 2) Flag absent + descriptor missing: refused loudly.
+                ps_state['text'] = cmd_without_flag
+                parsed_no_flag = agy_live._parse_server_command(cmd_without_flag.split(None, 3)[3])
+                self.assertIsNotNone(parsed_no_flag)
+                self.assertIsNone(parsed_no_flag['csrf'])
+                with self.assertRaisesRegex(agy_live.DeliveryError, 'descriptor is missing for pid 7002'):
+                    agy_live.discover_servers()
+
+                # 3) Flag absent + descriptor pid mismatch: refused loudly without leaking token.
+                desc_file = write_descriptor(f'hub_{port}.json', {
+                    'pid': 9999,
+                    'httpPort': port,
+                    'httpsPort': port + 1,
+                    'lsVersion': '2.34.0',
+                    'csrfToken': CSRF,
+                })
+                with self.assertRaises(agy_live.DeliveryError) as mismatch_ctx:
+                    agy_live.discover_servers()
+                self.assertIn('pid mismatch for pid 7002', str(mismatch_ctx.exception))
+                self.assertNotIn(CSRF, str(mismatch_ctx.exception))
+
+                # 4) Flag absent + unsafe permissions (0644 instead of 0600): refused.
+                write_descriptor(f'hub_{port}.json', {
+                    'pid': 7002,
+                    'httpPort': port,
+                    'httpsPort': port + 1,
+                    'lsVersion': '2.34.0',
+                    'csrfToken': CSRF,
+                }, mode=0o644)
+                with self.assertRaisesRegex(agy_live.DeliveryError, 'mode 0600'):
+                    agy_live.discover_servers()
+
+                # 5) Flag absent + valid 0600 descriptor owned by user with matching pid (plus stale sibling): succeeds.
+                write_descriptor('hub_61509.json', {
+                    'pid': 36452,
+                    'httpPort': 61509,
+                    'httpsPort': 61522,
+                    'lsVersion': '2.31.0',
+                    'csrfToken': '00000000-0000-0000-0000-000000000000',
+                })
+                os.chmod(desc_file, 0o600)
+                discovered_desc = agy_live.discover_servers()
+                self.assertEqual(len(discovered_desc), 1)
+                self.assertEqual((discovered_desc[0]['pid'], discovered_desc[0]['host']), (7002, 'ide'))
+                listed = agy_live.list_agy(cwd=str(self.root))
+                self.assertEqual([r['id'] for r in listed['sessions']], [sid])
+                self.assertNotIn(CSRF, json.dumps(listed))
+
+    def test_wake_session_outcomes_match_measured_server_answers(self):
+        import io
+        from urllib.error import HTTPError, URLError
+        import agy_live
+
+        url = 'http://127.0.0.1:60428'
+
+        def http_response(code, payload):
+            raw = json.dumps(payload).encode('utf-8')
+            if code == 200:
+                resp = mock.MagicMock()
+                resp.__enter__.return_value.read.return_value = raw
+                return resp
+            return HTTPError(url, code, 'error', None, io.BytesIO(raw))
+
+        # 1) Measured lsVersion 2.34.0 IDLE: HTTP 200 {} -> 'woke'
+        with mock.patch.object(agy_live.urllib.request, 'urlopen', return_value=http_response(200, {})) as req:
+            self.assertEqual(agy_live.wake_session(url, CSRF, self.sid, initial_status='idle'), 'woke')
+            self.assertEqual(req.call_count, 1)
+
+        # 2) Measured lsVersion 2.34.0 RUNNING: HTTP 200 {} on first call -> 'woke' (single request)
+        with mock.patch.object(agy_live.urllib.request, 'urlopen', return_value=http_response(200, {})) as req:
+            self.assertEqual(agy_live.wake_session(url, CSRF, self.sid, initial_status='running'), 'woke')
+            self.assertEqual(req.call_count, 1)
+
+        # 3) Legacy RUNNING / teardown benign errors -> 'running'
+        for benign_msg in (
+            'cannot queue empty user input step',
+            'executor has not processed the previous input yet',
+        ):
+            err_pair = [
+                http_response(500, {'code': 'internal', 'message': benign_msg}),
+                http_response(500, {'code': 'internal', 'message': benign_msg}),
+            ]
+            with mock.patch.object(agy_live.urllib.request, 'urlopen', side_effect=err_pair) as req:
+                self.assertEqual(agy_live.wake_session(url, CSRF, self.sid, initial_status='running'), 'running')
+                self.assertEqual(req.call_count, 2)
+
+        # 4) Measured server rejection (HTTP 404 trajectory not found, HTTP 404 unimplemented, HTTP 500 other) -> 'rejected'
+        for code, body in (
+            (404, {'code': 'not_found', 'message': f'not_found: trajectory not found: {self.sid}: not found'}),
+            (404, {'code': 'unimplemented', 'message': 'unknown method SendUserCascadeMessage'}),
+            (400, {'code': 'invalid_argument', 'message': 'empty user message rejected'}),
+            (500, {'code': 'internal', 'message': 'unexpected executor failure'}),
+        ):
+            with mock.patch.object(agy_live.urllib.request, 'urlopen', side_effect=http_response(code, body)) as req:
+                outcome = agy_live.wake_session(url, CSRF, self.sid, initial_status='idle')
+                self.assertEqual(outcome, 'rejected')
+                self.assertEqual(req.call_count, 1)
+
+        # 5) Transport failure -> 'failed' (never silent 'ignored')
+        with mock.patch.object(agy_live.urllib.request, 'urlopen', side_effect=URLError('connection refused')):
+            self.assertEqual(agy_live.wake_session(url, CSRF, self.sid, initial_status='idle'), 'failed')
+
 
 FAILURE_FIXTURE = Path(__file__).with_name('fixtures') / 'agy-provider-failure.json'
 
