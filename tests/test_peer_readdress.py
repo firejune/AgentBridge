@@ -128,5 +128,21 @@ class ReaddressTests(unittest.TestCase):
             self.assertEqual(stored['state'], 'pending')
 
 
+class ChannelHandoffDroppedTests(unittest.TestCase):
+    def test_channel_handed_to_another_realtime_owner_flags_old_mail(self):
+        import broker
+        state = broker.State()
+        for name in ('first', 'second', 'asker'):
+            state.action({'op': 'register', 'project': 'demo', 'name': name, 'cwd': '/tmp', 'transport': 'realtime'})
+        state.action({'op': 'channel-bind', 'project': 'demo', 'name': 'desk', 'owner': 'first', 'description': 'd'})
+        mid = state.action({'op': 'send', 'project': 'demo', 'sender': 'asker', 'channel': 'desk',
+                            'body': 'Q', 'key': 'k'})['id']
+        rows = lambda: {r['id']: r for r in state.action({'op': 'inbox', 'project': 'demo', 'channel': 'desk'})}
+        self.assertFalse(rows()[mid]['route_dropped'])
+        state.action({'op': 'channel-bind', 'project': 'demo', 'name': 'desk', 'owner': 'second',
+                      'description': 'd', 'expect_generation': 1})
+        self.assertTrue(rows()[mid]['route_dropped'])
+
+
 if __name__ == '__main__':
     unittest.main()

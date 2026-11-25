@@ -1385,7 +1385,8 @@ class State:
             current = item['route'] if item and item.get('active') else None
         else:
             current = self.endpoints.get((route['project'], route['name']))
-        return current is None or any(current.get(field) != route.get(field) for field in ('transport', 'session'))
+        fields = ('transport', 'session', 'name', 'generation') if route.get('channel') is not None else ('transport', 'session')
+        return current is None or any(current.get(field) != route.get(field) for field in fields)
 
     def message_action(self, args):
         op = args['op']
