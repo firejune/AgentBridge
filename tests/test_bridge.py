@@ -425,6 +425,58 @@ class SocketTests(unittest.TestCase):
         self.assertEqual(result['replies'][0]['state'],'pending')
         self.assertEqual(result['replies'][0]['body'],'Reviewed')
 
+    def test_cli_send_and_reply_warn_only_on_unwatched_sessionless_realtime_route(self):
+        def run_cli(*arguments, body='Hello'):
+            out = StringIO()
+            with patch('sys.stdin', StringIO(body)), redirect_stdout(out):
+                code = bridge.main(['--socket', self.server.path, *arguments])
+            self.assertEqual(code, 0)
+            return json.loads(out.getvalue())
+
+        # 0 subscribers on session-less realtime routes: both send and reply emit the top-level warning.
+        unwatched_send = run_cli('send', '--project', 'demo', '--from', 'beta', '--to', 'alpha',
+                                 '--key', 'unwatched-send', '--file', '-')
+        self.assertEqual(unwatched_send['warning'],
+                         'no watcher attached to demo/alpha; the recipient will not be woken until one subscribes')
+        stored_send = self.server.call('show', id=unwatched_send['id'])
+        self.assertIsNone(stored_send['note'])
+        self.assertNotIn('warning', stored_send)
+
+        unwatched_reply = run_cli('reply', unwatched_send['id'], '--key', 'unwatched-reply', '--file', '-')
+        self.assertEqual(unwatched_reply['warning'],
+                         'no watcher attached to demo/beta; the recipient will not be woken until one subscribes')
+        stored_reply = self.server.call('show', id=unwatched_reply['id'])
+        self.assertIsNone(stored_reply['note'])
+        self.assertNotIn('warning', stored_reply)
+
+        # 1 subscriber attached: neither send nor reply emits a warning.
+        alpha_stream = broker.stream(self.server.path, {'op': 'watch', 'project': 'demo', 'name': 'alpha'}, timeout=3)
+        self.addCleanup(alpha_stream.close)
+        self.assertEqual(next(alpha_stream)['type'], 'subscribed')
+        beta_stream = broker.stream(self.server.path, {'op': 'watch', 'project': 'demo', 'name': 'beta'}, timeout=3)
+        self.addCleanup(beta_stream.close)
+        self.assertEqual(next(beta_stream)['type'], 'subscribed')
+
+        watched_send = run_cli('send', '--project', 'demo', '--from', 'beta', '--to', 'alpha',
+                               '--key', 'watched-send', '--file', '-')
+        self.assertNotIn('warning', watched_send)
+        watched_reply = run_cli('reply', watched_send['id'], '--key', 'watched-reply', '--file', '-')
+        self.assertNotIn('warning', watched_reply)
+
+        # Session-bearing realtime route and non-realtime (codex) route: no warning even with 0 subscribers.
+        self.server.call('register', project='demo', name='realtime-session', transport='realtime',
+                         session=str(uuid.uuid4()), cwd=self.server.temp.name)
+        session_realtime = run_cli('send', '--project', 'demo', '--from', 'beta', '--to', 'realtime-session',
+                                   '--key', 'session-realtime-send', '--file', '-')
+        self.assertNotIn('warning', session_realtime)
+
+        self.codex_route()
+        with FakeDesktop() as desktop, patch.dict(os.environ, {'AGENT_BRIDGE_CODEX_IPC': desktop.path}):
+            codex_sent = run_cli('send', '--project', 'demo', '--from-channel', 'beta', '--channel', 'alpha',
+                                 '--key', 'codex-send', '--file', '-')
+            self.assertEqual(codex_sent['state'], 'submitted')
+            self.assertNotIn('warning', codex_sent)
+
 
 if __name__=='__main__':
     unittest.main()

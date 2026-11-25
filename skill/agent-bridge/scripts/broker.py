@@ -1149,7 +1149,13 @@ class State:
         if op == 'channel-close':
             return self.close_channel(args)
         if op in ('send','send-with-retention','reply'):
-            return public_message(self.post(args, args.get('id') if op=='reply' else None))
+            result = public_message(self.post(args, args.get('id') if op=='reply' else None))
+            route = result['route']
+            if (args.get('warn_unwatched') is True and route['transport'] == 'realtime'
+                    and route.get('session') is None and self.route_subscribers(route) == 0):
+                return {**result, 'warning': (f"no watcher attached to {route['project']}/{route['name']}; "
+                                              'the recipient will not be woken until one subscribes')}
+            return result
         if op == 'show':
             message = public_message(self.get(args['id']))
             if message['state'] == 'pending':
@@ -1264,11 +1270,15 @@ class State:
                     route=route,generation=generation+1,active=True)
         return self.routing_change('channels', (project,name), item)
 
+    def route_subscribers(self, route):
+        target = route_key(route)
+        return sum(sub['route'] == target for sub in self.subscribers)
+
     def list_channels(self, args):
         result = []
         for (project,_),item in self.channels.items():
             if project==args['project']:
-                result.append({**item,'subscribers':sum(sub['route']==route_key(item['route']) for sub in self.subscribers)})
+                result.append({**item,'subscribers':self.route_subscribers(item['route'])})
         return result
 
     def close_channel(self, args):

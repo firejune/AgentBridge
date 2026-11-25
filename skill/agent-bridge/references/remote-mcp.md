@@ -563,7 +563,8 @@ subscription and its actual consumer behavior separately from local tests.
    credentials. Users should not paste callback credentials into the chat. To
    watch one session, request the filter using its facade-issued `agent_session_id`.
 5. Verify both a saved event task in ChatGPT and an accepted server subscription.
-   `bridge_status` reports `data.events.active_subscriptions` and the volatile
+   `bridge_status` reports `data.events.active_subscriptions`,
+   `data.events.last_lease_expired_at` (ISO UTC or `null`), and the volatile
    `events/subscribe` accepted count under `request_diagnostics.methods`; the
    bounded receipt audit records the corresponding method and outcome. Callback
    challenge verification must succeed before the subscription becomes active.
@@ -626,8 +627,9 @@ target chat continued running; no provider session or receive route was removed.
   address validation and signed challenge verification before activation.
   Repeating the same owner, callback, name and canonical arguments refreshes the
   existing subscription. The response includes `id`, finite `refreshBefore`,
-  `cursor: null` and `truncated: false`. The default lease is one hour and the
-  maximum is 24 hours; `ttlMs: null` still grants the finite default lease.
+  `cursor: null` and `truncated: false`. The default lease is 24 hours and the
+  maximum is 24 hours; omitting `ttlMs` or passing `ttlMs: null` grants the
+  24-hour default lease, and larger explicit values are clamped to 24 hours.
 - `events/unsubscribe` takes the same `name`, canonical `arguments` and `delivery`
   (`mode: "webhook"`, `url`), without a signing secret, and stops that subscription.
   The returned subscription `id` is informational, not an unsubscribe argument.
@@ -744,7 +746,7 @@ delivery trace in this audit. Audit write failure does not change request
 behavior; volatile `data.events.audit_write_failures` and `audit_last_error`
 (`"audit_write_failed"` or null) disclose logging failures.
 
-Subscriptions survive facade restart in bounded, owner-only
+Subscriptions and `last_lease_expired_at` survive facade restart in bounded, owner-only
 `state_dir/events.json` (0600), separate from routing, correspondence and the
 operation ledger. Metadata is bound to the principal, tunnel, ledger namespace
 and configured policy. Policy changes revoke persisted subscriptions accepted

@@ -721,6 +721,67 @@ class EventTests(unittest.TestCase):
         self.service.arrival(*self.send())
         self.assertEqual(self.applications(), [])
 
+    def test_default_null_clamped_and_explicit_small_ttl_with_fake_clock(self):
+        self.assertEqual(events.DEFAULT_TTL_MS, 86400000)
+        self.assertEqual(events.MAX_TTL_MS, 86400000)
+        clock = [1_800_000_000.0]
+        cases = (
+            ('omitted', None, False, 86400.0),
+            ('null', None, True, 86400.0),
+            ('above_max', events.MAX_TTL_MS + 3600000, True, 86400.0),
+            ('explicit_small', 60000, True, 60.0),
+        )
+        with patch.object(events.time, 'time', side_effect=lambda: clock[0]):
+            for label, ttl_ms, include_key, expected_seconds in cases:
+                with self.subTest(case=label):
+                    clock[0] += 10.0
+                    params = copy.deepcopy(self.params)
+                    if include_key:
+                        params['ttlMs'] = ttl_ms
+                    else:
+                        params.pop('ttlMs', None)
+                    result = self.rpc('events/subscribe', params)['result']
+                    expected_expiry = clock[0] + expected_seconds
+                    self.assertEqual(result['refreshBefore'], events.timestamp(expected_expiry))
+                    self.assertEqual(self.service.subscriptions[result['id']]['expires'], expected_expiry)
+
+    def test_status_reports_and_persists_last_lease_expired_at_with_fake_clock(self):
+        clock = [1_800_000_000.0]
+        with patch.object(events.time, 'time', side_effect=lambda: clock[0]):
+            initial = self.rpc('tools/call', {'name': 'bridge_status', 'arguments': {}})['result']['structuredContent']['data']['events']
+            self.assertEqual((initial['active_subscriptions'], initial['last_lease_expired_at']), (0, None))
+            accepted = self.subscribe()
+            expected_expiry = clock[0] + 86400.0
+            expected_stamp = events.timestamp(expected_expiry)
+            active = self.rpc('tools/call', {'name': 'bridge_status', 'arguments': {}})['result']['structuredContent']['data']['events']
+            self.assertEqual((active['active_subscriptions'], active['last_lease_expired_at']), (1, None))
+
+            # Advance fake clock past the 24 h lease without sleeping.
+            clock[0] = expected_expiry + 5.0
+            after_expiry = self.rpc('tools/call', {'name': 'bridge_status', 'arguments': {}})['result']['structuredContent']['data']['events']
+            self.assertEqual((after_expiry['active_subscriptions'], after_expiry['last_lease_expired_at']), (0, expected_stamp))
+
+            self.service.sweep()
+            saved = json.loads(self.service.path.read_text())
+            self.assertEqual(saved['subscriptions'], {})
+            self.assertEqual(saved['last_lease_expired_at'], expected_stamp)
+            for sensitive in (self.params['delivery']['url'], self.secret, accepted['id']):
+                self.assertNotIn(sensitive, self.service.path.read_text())
+                self.assertNotIn(sensitive, json.dumps(after_expiry))
+
+            # Restarting the facade preserves last_lease_expired_at from events.json.
+            self.service.close()
+            self.service = events.EventService(self.engine, self.keys, self.callback, start=False)
+            self.engine.events = self.service
+            restarted = self.rpc('tools/call', {'name': 'bridge_status', 'arguments': {}})['result']['structuredContent']['data']['events']
+            self.assertEqual((restarted['active_subscriptions'], restarted['last_lease_expired_at']), (0, expected_stamp))
+
+            # Resubscribing restores active_subscriptions=1 while keeping the prior expiry timestamp.
+            clock[0] += 10.0
+            self.subscribe()
+            resubscribed = self.rpc('tools/call', {'name': 'bridge_status', 'arguments': {}})['result']['structuredContent']['data']['events']
+            self.assertEqual((resubscribed['active_subscriptions'], resubscribed['last_lease_expired_at']), (1, expected_stamp))
+
     def test_real_broker_watch_delivers_and_stops(self):
         self.service.close()
         self.service = events.EventService(self.engine, self.keys, self.callback, start=True)

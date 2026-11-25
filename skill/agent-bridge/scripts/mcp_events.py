@@ -31,7 +31,7 @@ import broker
 NAME = 'bridge.inbox.message.created'
 MAX_SUBSCRIPTIONS = 64
 MAX_REPLY_EVIDENCE = 128
-DEFAULT_TTL_MS = 3600000
+DEFAULT_TTL_MS = 86400000
 MAX_TTL_MS = 86400000
 EVENT_METHODS = ('events/list', 'events/subscribe', 'events/unsubscribe')
 REQUEST_STAGES = ('received', 'authorize', 'validate', 'resolve_routes',
@@ -64,6 +64,14 @@ def canonical(value):
 
 def timestamp(epoch):
     return datetime.fromtimestamp(epoch, timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def parse_timestamp(value):
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.endswith('Z') or len(value) > 40:
+        raise ValueError('Invalid MCP Events timestamp')
+    return datetime.fromisoformat(value[:-1] + '+00:00').timestamp()
 
 
 def signing_key(value):
@@ -273,6 +281,7 @@ class EventService:
         self.policy = engine.inbox_policy()
         self.subscriptions = {}
         self.retired_keys = []
+        self.last_lease_expired_at = None
         self.uninitialized = []
         self.revoked = False
         if self.path.exists():
@@ -287,6 +296,11 @@ class EventService:
             self.retired_keys = doc.get('retired_keys', [])
             if doc['policy'] == self.policy:
                 self.subscriptions = doc['subscriptions']
+                saved_expired = doc.get('last_lease_expired_at')
+                parse_timestamp(saved_expired)
+                self.last_lease_expired_at = saved_expired
+                if self.reap_expired():
+                    self.save()
             else:
                 for sub in doc['subscriptions'].values():
                     self.retire(sub)
@@ -309,7 +323,8 @@ class EventService:
 
     def save(self):
         raw = canonical({'binding': self.binding, 'policy': self.policy,
-            'subscriptions': self.subscriptions, 'retired_keys': self.retired_keys}).encode()
+            'subscriptions': self.subscriptions, 'retired_keys': self.retired_keys,
+            'last_lease_expired_at': self.last_lease_expired_at}).encode()
         if len(raw) > 1024 * 1024:
             raise EventError(-32603, 'subscription_capacity')
         temp = self.path.with_suffix('.tmp')
@@ -360,14 +375,41 @@ class EventService:
         sid = 'sub_' + hashlib.sha256(canonical([self.binding, NAME, arguments, url]).encode()).hexdigest()
         return sid, arguments, url
 
+    def latest_lease_expired_at(self, now=None):
+        current = time.time() if now is None else now
+        latest = parse_timestamp(self.last_lease_expired_at)
+        expired_epochs = [sub['expires'] for sub in self.subscriptions.values() if sub['expires'] <= current]
+        if expired_epochs:
+            newest = max(expired_epochs)
+            if latest is None or newest >= latest:
+                return timestamp(newest)
+        return self.last_lease_expired_at
+
+    def record_lease_expiry(self, expires):
+        latest = parse_timestamp(self.last_lease_expired_at)
+        if latest is None or expires >= latest:
+            self.last_lease_expired_at = timestamp(expires)
+
+    def reap_expired(self, now=None):
+        current = time.time() if now is None else now
+        expired = [sid for sid, sub in self.subscriptions.items() if sub['expires'] <= current]
+        for sid in expired:
+            sub = self.subscriptions.pop(sid)
+            self.record_lease_expiry(sub['expires'])
+            self.retire(sub)
+        return bool(expired)
+
     def health(self):
         with self.request_lock:
             requests = copy.deepcopy(self.request_diagnostics)
         with self.lock:
-            active = sum(sub['expires'] > time.time() for sub in self.subscriptions.values())
+            now = time.time()
+            active = sum(sub['expires'] > now for sub in self.subscriptions.values())
+            last_expired = self.latest_lease_expired_at(now)
             diagnostics = dict(self.diagnostics)
             diagnostics['watch_gaps'] += self.reply_queue_gaps
-            return dict(diagnostics, **self.audit.health(), request_diagnostics=requests, active_subscriptions=active,
+            return dict(diagnostics, **self.audit.health(), request_diagnostics=requests,
+                active_subscriptions=active, last_lease_expired_at=last_expired,
                 watching_routes=sum(thread.is_alive() and ready.is_set() for thread, ready, _ in self.watchers.values()),
                 uninitialized_agent_session_ids=list(self.uninitialized),
                 pending_key_deletions=len(self.retired_keys),
@@ -528,15 +570,20 @@ class EventService:
                 self.request_stage(request, 'validate')
                 if set(params['delivery']) != {'mode', 'url'}:
                     raise EventError(-32602, 'invalid_delivery')
+                now = time.time()
                 old = self.subscriptions.pop(sid, None)
                 before = list(self.retired_keys)
+                before_expired = self.last_lease_expired_at
                 if old is not None:
+                    if old['expires'] <= now:
+                        self.record_lease_expiry(old['expires'])
                     self.retire(old)
                 self.request_stage(request, 'persist_unsubscribe')
                 try:
                     self.save()
                 except Exception:
                     self.retired_keys = before
+                    self.last_lease_expired_at = before_expired
                     if old is not None:
                         self.subscriptions[sid] = old
                     raise
@@ -590,15 +637,19 @@ class EventService:
             except Exception:
                 self.cleanup_keys()
                 raise
-            expiration = time.time() + min(ttl, MAX_TTL_MS) / 1000
+            now = time.time()
+            expiration = now + min(ttl, MAX_TTL_MS) / 1000
             old = self.subscriptions.get(sid)
             pending_retired_keys = list(self.retired_keys)
+            before_expired = self.last_lease_expired_at
+            if old is not None and old['expires'] <= now:
+                self.record_lease_expiry(old['expires'])
             self.subscriptions[sid] = {'name': NAME, 'arguments': arguments, 'url': url,
                 'expires': expiration, 'key_ref': key_ref,
-                'since': old['since'] if old is not None else time.time()}
+                'since': old['since'] if old is not None else now}
             if old is not None:
                 self.subscriptions[sid]['previous_key_ref'] = old['key_ref']
-                self.subscriptions[sid]['rotation_until'] = time.time() + 60
+                self.subscriptions[sid]['rotation_until'] = now + 60
             self.retired_keys.remove(key_ref)
             if old is not None and old.get('previous_key_ref'):
                 self.retired_keys.append(old['previous_key_ref'])
@@ -609,6 +660,7 @@ class EventService:
                 # Restore the exact pre-replacement cleanup set. In particular,
                 # the restored lease still owns its previous rotation key.
                 self.retired_keys = pending_retired_keys
+                self.last_lease_expired_at = before_expired
                 if old is None:
                     self.subscriptions.pop(sid, None)
                 else:
@@ -892,28 +944,33 @@ class EventService:
             else:
                 self.arrival(entry, event)
 
+    def sweep(self):
+        with self.lock:
+            now = time.time()
+            before_subscriptions = {sid: dict(sub) for sid, sub in self.subscriptions.items()}
+            before_keys = list(self.retired_keys)
+            before_expired = self.last_lease_expired_at
+            self.reap_expired(now)
+            for sub in self.subscriptions.values():
+                if sub.get('previous_key_ref') and sub['rotation_until'] <= now:
+                    self.retired_keys.append(sub.pop('previous_key_ref'))
+                    sub.pop('rotation_until')
+            if (before_subscriptions != self.subscriptions or before_keys != self.retired_keys
+                    or before_expired != self.last_lease_expired_at):
+                try:
+                    self.save()
+                except Exception:
+                    self.subscriptions = before_subscriptions
+                    self.retired_keys = before_keys
+                    self.last_lease_expired_at = before_expired
+                    raise
+            self.cleanup_keys()
+            self.ensure_watchers()
+
     def run(self):
         while not self.stop.wait(.5):
             try:
-                with self.lock:
-                    before_subscriptions = {sid: dict(sub) for sid, sub in self.subscriptions.items()}
-                    before_keys = list(self.retired_keys)
-                    expired = [sid for sid, sub in self.subscriptions.items() if sub['expires'] <= time.time()]
-                    for sid in expired:
-                        self.retire(self.subscriptions.pop(sid))
-                    for sub in self.subscriptions.values():
-                        if sub.get('previous_key_ref') and sub['rotation_until'] <= time.time():
-                            self.retired_keys.append(sub.pop('previous_key_ref'))
-                            sub.pop('rotation_until')
-                    if before_subscriptions != self.subscriptions or before_keys != self.retired_keys:
-                        try:
-                            self.save()
-                        except Exception:
-                            self.subscriptions = before_subscriptions
-                            self.retired_keys = before_keys
-                            raise
-                    self.cleanup_keys()
-                    self.ensure_watchers()
+                self.sweep()
             except Exception:
                 self.note('inbox_watch_unavailable')
 
