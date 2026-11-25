@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import plistlib
+import re
 import stat
 import subprocess
 import time
@@ -14,7 +15,10 @@ import uuid
 import codex_preview
 import codex_queue
 
-APP_BUILD = ('26.1117.41037', '29803')
+VERIFIED_APP_BUILDS = frozenset({
+    ('26.1117.41037', '29803'),
+    ('26.1120.50957', '30866'),
+})
 APP_SIGNATURE = codex_queue.SIGNATURE.replace('identifier "codex"', 'identifier "com.openai.codex"')
 QUEUED_WAKE_TIMEOUT = 10.0  # allow up to 5 seconds for codesign and leave time for the opener
 MARKER = 'AB_WAKE_TEST_OK'
@@ -61,23 +65,51 @@ def budget(timeout):
     return remaining
 
 
-def _owner(queue, remaining):
+def _preflight_probe(label, call, remaining, *args):
+    timeout = remaining()
+    try:
+        result = call(*args, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise WakeError(f'Codex Desktop {label} timed out after {timeout:.2f} s') from None
+    try:
+        remaining()
+    except WakeError:
+        raise WakeError(f'Codex Desktop {label} timed out after {timeout:.2f} s') from None
+    return result
+
+
+def _owner(queue, remaining, *, preflight=False):
     codex_preview.require_owned_store(queue)
-    owner = codex_queue.desktop_queue_owner(
-        queue, lambda argv: codex_queue.checked_output(argv, timeout=min(2, remaining())))
+
+    def read(argv):
+        if preflight:
+            return _preflight_probe('queue owner check', codex_queue.checked_output, remaining, argv)
+        return codex_queue.checked_output(argv, timeout=min(2, remaining()))
+
+    owner = codex_queue.desktop_queue_owner(queue, read)
     if owner is None:
         raise WakeError(CONTEXT_ERROR)
     return owner
 
 
-def _verify_app_build(remaining):
+def _verify_app_build(remaining, *, preflight=False):
     app = codex_queue.APP
     with (app / 'Contents/Info.plist').open('rb') as source:
         metadata = plistlib.load(source)
-    if (not isinstance(metadata, dict)
-            or (metadata.get('CFBundleShortVersionString'), metadata.get('CFBundleVersion')) != APP_BUILD):
-        raise WakeError('This Codex Desktop build has not been verified for queue wake')
-    codex_queue.verify_signature(app, APP_SIGNATURE, min(5, remaining()))
+    if not isinstance(metadata, dict):
+        metadata = {}
+    observed = tuple(
+        value if isinstance(value, str) and re.fullmatch(r'[0-9][0-9A-Za-z.]{0,63}', value) else 'unknown'
+        for value in (metadata.get('CFBundleShortVersionString'), metadata.get('CFBundleVersion'))
+    )
+    if observed not in VERIFIED_APP_BUILDS:
+        accepted = ', '.join(f'{version}/{build}' for version, build in sorted(VERIFIED_APP_BUILDS))
+        raise WakeError('This Codex Desktop build has not been verified for queue wake '
+                        f'(observed {observed[0]}/{observed[1]}; accepted {accepted})')
+    if preflight:
+        _preflight_probe('app signature check', codex_queue.verify_signature, remaining, app, APP_SIGNATURE)
+    else:
+        codex_queue.verify_signature(app, APP_SIGNATURE, min(5, remaining()))
 
 
 def _open_wake_url(thread, timeout):
@@ -91,13 +123,16 @@ def prepare(timeout=10):
     remaining = budget(timeout)
     try:
         state, queue = codex_queue.default_stores()
-        _verify_app_build(remaining)
-        codex_queue.verify_signature(codex_queue.CLI_BUNDLE, codex_queue.SIGNATURE, min(5, remaining()))
+        _verify_app_build(remaining, preflight=True)
+        _preflight_probe('CLI signature check', codex_queue.verify_signature, remaining,
+                         codex_queue.CLI_BUNDLE, codex_queue.SIGNATURE)
         # The existing public config reader has a bounded independent budget.
         if remaining() < codex_preview.CONFIG_TIMEOUT or codex_preview.state_path(str(codex_queue.CLI)) != state:
             raise WakeError(CONTEXT_ERROR)
         codex_preview.require_owned_store(state)
-        return Desktop(state, queue, _owner(queue, remaining))
+        owner = _owner(queue, remaining, preflight=True)
+        remaining()
+        return Desktop(state, queue, owner)
     except WakeError:
         raise
     except (OSError, RuntimeError, ValueError, TypeError, KeyError, subprocess.SubprocessError):

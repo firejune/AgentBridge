@@ -447,10 +447,11 @@ class QueueRouteTests(DefaultDesktopFixture):
 
 class WakePreflightTests(DefaultDesktopFixture):
     def setUp(self):
+        self.real_owner = codex_queue.desktop_queue_owner
         super().setUp()
         self.app = self.cwd / 'Fake.app'
         (self.app / 'Contents').mkdir(parents=True)
-        self.write_build(*codex_wake_open.APP_BUILD)
+        self.write_build('26.1117.41037', '29803')
         patcher = patch.object(codex_queue, 'APP', self.app)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -460,17 +461,66 @@ class WakePreflightTests(DefaultDesktopFixture):
             plistlib.dump({'CFBundleShortVersionString': version, 'CFBundleVersion': build}, output)
 
     def test_verified_build_signatures_and_stores_return_the_owner(self):
-        self.assertEqual(codex_wake_open.prepare(30),
-                         codex_wake_open.Desktop(self.state, self.queue, ('4242', '77', HELPER)))
-        self.assertEqual(self.signed, [('-R=' + codex_wake_open.APP_SIGNATURE, str(self.app)),
-                                       ('-R=' + codex_queue.SIGNATURE, str(codex_queue.CLI_BUNDLE))])
-        self.assertEqual(self.owned, [self.state, self.queue])
+        for build in (('26.1117.41037', '29803'), ('26.1120.50957', '30866')):
+            with self.subTest(build=build):
+                self.write_build(*build)
+                self.signed.clear()
+                self.owned.clear()
+                self.assertEqual(codex_wake_open.prepare(30),
+                                 codex_wake_open.Desktop(self.state, self.queue, ('4242', '77', HELPER)))
+                self.assertEqual(self.signed, [('-R=' + codex_wake_open.APP_SIGNATURE, str(self.app)),
+                                               ('-R=' + codex_queue.SIGNATURE, str(codex_queue.CLI_BUNDLE))])
+                self.assertEqual(self.owned, [self.state, self.queue])
 
     def test_an_unverified_app_build_is_named_before_any_signature_check(self):
         self.write_build('99.0.1', '1')
-        with self.assertRaisesRegex(codex_wake_open.WakeError, 'build has not been verified for queue wake'):
-            codex_wake_open.prepare(30)
+        self.assertEqual(self.refusal(), 'This Codex Desktop build has not been verified for queue wake '
+                         '(observed 99.0.1/1; accepted 26.1117.41037/29803, 26.1120.50957/30866)')
         self.assertEqual(self.signed, [])
+
+    def test_unusable_bundle_fields_cannot_disclose_paths(self):
+        self.write_build(str(self.app), {'value': str(self.cwd)})
+        self.assertIn('observed unknown/unknown; accepted', self.refusal())
+        self.assertNotIn(str(self.cwd), self.refusal())
+
+    def test_slow_signatures_and_owner_probe_share_the_preflight_deadline(self):
+        now = 0
+        timeouts = []
+        checked = codex_queue.checked_output
+        helper = str(self.app) + HELPER[HELPER.index('/Contents/Frameworks/'):]
+        read_processes = processes(parent=f'  {UID} {helper}\n')
+
+        def read(argv, timeout):
+            nonlocal now
+            timeouts.append(timeout)
+            if argv[0] == '/usr/bin/codesign':
+                now += 5.5 if argv[-1] == str(self.app) else 0.5
+                return checked(argv, timeout)
+            if argv[0] == '/usr/sbin/lsof':
+                now += 2.5
+            return read_processes(argv)
+
+        with (patch.object(codex_wake_open.time, 'monotonic', lambda: now),
+              patch.object(codex_queue, 'checked_output', read),
+              patch.object(codex_queue, 'desktop_queue_owner', side_effect=self.real_owner)):
+            self.assertEqual(codex_wake_open.prepare().owner, ('4242', '77', helper))
+        self.assertEqual(timeouts, [10, 4.5, 4, 1.5, 1.5])
+
+    def test_probe_timeouts_name_the_failing_stage_without_paths(self):
+        checked = codex_queue.checked_output
+        for trigger, label in ((str(self.app), 'app signature check'),
+                               (str(codex_queue.CLI_BUNDLE), 'CLI signature check'),
+                               (str(self.queue), 'queue owner check')):
+            with self.subTest(label=label):
+                def expire(argv, timeout):
+                    if argv[-1] == trigger:
+                        raise subprocess.TimeoutExpired(argv, timeout)
+                    return checked(argv, timeout)
+
+                with (patch.object(codex_wake_open.time, 'monotonic', return_value=0),
+                      patch.object(codex_queue, 'checked_output', expire),
+                      patch.object(codex_queue, 'desktop_queue_owner', side_effect=self.real_owner)):
+                    self.assertEqual(self.refusal(timeout=10), f'Codex Desktop {label} timed out after 10.00 s')
 
     def test_overrides_bad_signatures_other_stores_and_missing_owners_share_the_context_refusal(self):
         refusals = []
