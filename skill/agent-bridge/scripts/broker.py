@@ -137,6 +137,15 @@ def delivery_destination(route):
     return route['transport'], route['session']
 
 
+UNREACHABLE_WAKE_CODES = frozenset(('no_desktop_session', 'live_unreachable', 'inbox_off', 'archived'))
+
+
+def unreachable_wake(wake):
+    """A kept wake record (#121) showing the routed Claude session could not be reached."""
+    return isinstance(wake, dict) and (wake.get('state') == 'unsupported'
+                                       or wake.get('code') in UNREACHABLE_WAKE_CODES)
+
+
 def valid_claim_token(token):
     if not isinstance(token, str) or len(token) != 36:
         return False
@@ -986,6 +995,19 @@ class State:
             planned = self.retention_plan(planned_at)
             if not self.retention_changes(planned):
                 return {'changed': False}, None  # No deep copy or checkpoint write on an idle tick.
+        if args['op'] == 'register' and self.correspondence is not None:
+            # The route is saved first, as before. Moving pending mail is a separate checkpoint
+            # write; a retry of the same registration finds and moves whatever is left (#257).
+            route = self.register_route(args)
+            moving = self.readdress_candidates(route)
+            if not moving:
+                return self.register_result(route, []), None
+            staged = copy(self)
+            for field in CHECKPOINT_FIELDS:
+                setattr(staged, field, deepcopy(getattr(self, field)))
+            staged.answers = self.answers.copy()
+            staged.pending_publications = []
+            return self.register_result(route, staged.readdress(route, moving)), staged
         if self.correspondence is None or args['op'] not in mutations:
             if planned is not None:
                 return {'changed': self.sweep_retention(planned_at, planned=planned)}, None
@@ -1137,7 +1159,8 @@ class State:
         if op == 'ping':
             return self.ping_result()
         if op == 'register':
-            return self.register_route(args)
+            route = self.register_route(args)
+            return self.register_result(route, self.readdress(route, self.readdress_candidates(route)))
         if op == 'routes':
             return [x for (p,_),x in self.endpoints.items() if p==args['project']]
         if op in ('unregister', 'unregister-if-current', 'unregister-archived'):
@@ -1236,6 +1259,55 @@ class State:
             return current
         return self.routing_change('endpoints', (project,name), item)
 
+    @staticmethod
+    def register_result(route, moved):
+        if route['transport'] != 'claude-peer':
+            return route
+        return {**route, 'readdressed': len(moved), 'readdressed_ids': moved}
+
+    def readdress_candidates(self, route):
+        """Pending mail for this project/name that went to an earlier, unreachable Claude session (#257).
+
+        A message moves only when it is pending, has no channel, names the same project and name
+        with a different session in the same directory, and carries a wake record showing that
+        session could not be reached. The wake record guards against a name reused by someone else.
+        """
+        if route['transport'] != 'claude-peer':
+            return []
+        try:
+            cwd = Path(route['cwd']).resolve()
+        except (OSError, RuntimeError, ValueError):
+            return []
+        moving = []
+        for message in self.messages.values():
+            old = message['route']
+            if (message['state'] != 'pending' or message.get('channel') is not None
+                    or old.get('channel') is not None or old['transport'] != 'claude-peer'
+                    or (old['project'], old['name']) != (route['project'], route['name'])
+                    or old['session'] == route['session']
+                    or not any(unreachable_wake(wake) for wake in message.get('wakes') or ())):
+                continue
+            try:
+                if Path(old['cwd']).resolve() != cwd:
+                    continue
+            except (OSError, RuntimeError, ValueError):
+                continue
+            moving.append(message['id'])
+        return moving
+
+    def readdress(self, route, ids):
+        """Point each listed pending message at `route`. Nothing is pushed; `deliver ID` sends it."""
+        for mid in ids:
+            message = self.messages[mid]
+            previous = message['route']['session']
+            message['route'] = deepcopy(route)
+            # The kept wakes describe the previous session. Clearing them keeps the guard per
+            # session: a later registration cannot move this message again on old evidence.
+            message.pop('wakes', None)
+            self.status(message, 'pending',
+                        f"readdressed from Claude session {previous} to {route['session']} on register")
+        return list(ids)
+
     def unregister_route(self, args):
         op = args['op']
         key = (args['project'], args['name'])
@@ -1293,13 +1365,27 @@ class State:
             raise ValueError('Select a recipient or channel')
         blockers = self.delivery_blockers()
         return [{k:m[k] for k in ('id','sender','recipient','state','channel','sender_channel','reply_to','created')}
-                | {'session':m['route']['session'],'generation':m['route'].get('generation')}
+                | {'session':m['route']['session'],'generation':m['route'].get('generation'),
+                   'route_dropped':self.route_dropped(m['route'])}
                 | self.pending_delivery(m, blockers)
                 for m in self.messages.values() if m['project']==args['project']
                 and (not args.get('name') or m['recipient']==args['name'])
                 and (not args.get('channel') or m['channel']==args['channel'])
                 and (not args.get('session') or m['route']['session']==args['session'])
                 and (args.get('all') or m['state'] not in ('done','answered'))]
+
+    def route_dropped(self, route):
+        """True when the message's route is no longer the registered one (#257). Broker state only.
+
+        A route dropped on restore, unregistered, or registered again under another session or
+        transport no longer reaches anyone. Channel routes compare with their channel binding.
+        """
+        if route.get('channel') is not None:
+            item = self.channels.get((route['project'], route['channel']))
+            current = item['route'] if item and item.get('active') else None
+        else:
+            current = self.endpoints.get((route['project'], route['name']))
+        return current is None or any(current.get(field) != route.get(field) for field in ('transport', 'session'))
 
     def message_action(self, args):
         op = args['op']
