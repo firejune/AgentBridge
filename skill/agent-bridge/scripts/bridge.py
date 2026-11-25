@@ -1644,7 +1644,7 @@ def refuse_uncertain_replay(sent):
 
 
 def send_command(args):
-    sent = refuse_uncertain_replay(broker.request(args.socket, message_fields(args)))
+    sent = refuse_uncertain_replay(broker.request(args.socket, {**message_fields(args), 'warn_unwatched': True}))
     output(with_usage(args, push_if_peer(args.socket, sent)))
     return 0
 
