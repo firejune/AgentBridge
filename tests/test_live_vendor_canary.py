@@ -32,15 +32,15 @@ class CodexDesktopCanary(unittest.TestCase):
         if sys.platform != 'darwin':
             self.skipTest('requires the installed macOS Codex Desktop')
 
-    def test_installed_build_matches_wake_pin(self):
-        pin = 'codex_wake_open.py APP_BUILD'
+    def test_installed_build_is_verified_for_wake(self):
+        pin = 'codex_wake_open.py VERIFIED_APP_BUILDS'
         try:
             with (codex_queue.APP / 'Contents/Info.plist').open('rb') as source:
                 metadata = plistlib.load(source)
         except (OSError, ValueError, plistlib.InvalidFileException):
             self.fail(f'{pin}: could not read the installed app Info.plist')
         observed = metadata.get('CFBundleShortVersionString'), metadata.get('CFBundleVersion')
-        self.assertEqual(observed, codex_wake_open.APP_BUILD, f'{pin}: installed version/build drifted')
+        self.assertIn(observed, codex_wake_open.VERIFIED_APP_BUILDS, f'{pin}: installed version/build drifted')
 
     def test_running_desktop_queue_owner_matches_parser(self):
         pin = 'codex_queue.py default_stores / desktop_queue_owner'

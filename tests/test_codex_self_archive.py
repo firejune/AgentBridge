@@ -65,7 +65,7 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.app = root / 'Test.app'
         self.plist = self.app / 'Contents' / 'Info.plist'
         self.plist.parent.mkdir(parents=True)
-        self.write_app_build(*codex_wake_open.APP_BUILD)
+        self.write_app_build('26.1117.41037', '29803')
         self.patch(codex_queue, 'APP', new=self.app)
         self.patch(codex_queue, 'verify_signature')
         self.opener = self.patch(codex_wake_open, '_open_wake_url')
