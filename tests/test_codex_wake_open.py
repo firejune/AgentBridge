@@ -294,3 +294,45 @@ class DesktopWakeRolloutTests(unittest.TestCase):
             codex_wake_open.adopt(self.desktop, self.route, MODEL, timeout=5)
         self.assertEqual(self.queued, [])
         self.opener.assert_not_called()
+
+
+class LoadedMachineBudgetTests(unittest.TestCase):
+    """Probes spend the remaining wake budget, not a fixed cap a loaded machine overruns."""
+
+    def test_owner_probe_after_creation_gets_the_remaining_budget(self):
+        remaining = codex_wake_open.budget(30)
+        seen = []
+
+        def owner(queue, read):
+            read(['probe'])
+            return ('pid', 'user', 'path')
+
+        def checked(argv, timeout):
+            seen.append(timeout)
+            return ''
+
+        with patch.object(codex_wake_open.codex_preview, 'require_owned_store'), \
+                patch.object(codex_wake_open.codex_queue, 'desktop_queue_owner', side_effect=owner), \
+                patch.object(codex_wake_open.codex_queue, 'checked_output', side_effect=checked):
+            codex_wake_open._owner(Path('/queue'), remaining)
+        self.assertGreater(seen[0], 5)
+
+    def test_owner_probe_timeout_names_its_check(self):
+        import subprocess
+
+        def owner(queue, read):
+            return read(['probe'])
+
+        with patch.object(codex_wake_open.codex_preview, 'require_owned_store'), \
+                patch.object(codex_wake_open.codex_queue, 'desktop_queue_owner', side_effect=owner), \
+                patch.object(codex_wake_open.codex_queue, 'checked_output',
+                             side_effect=subprocess.TimeoutExpired('probe', 1)):
+            with self.assertRaisesRegex(codex_wake_open.WakeError, 'queue owner check timed out after'):
+                codex_wake_open._owner(Path('/queue'), codex_wake_open.budget(30))
+
+    def test_post_creation_wake_budget_covers_two_loaded_codesigns(self):
+        self.assertGreaterEqual(codex_wake_open.QUEUED_WAKE_TIMEOUT, 30)
+
+
+if __name__ == '__main__':
+    unittest.main()

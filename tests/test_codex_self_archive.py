@@ -593,7 +593,8 @@ class QueuedSelfArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result['wake_requested'], True)
         self.opener.assert_called_once()
         self.assertEqual(self.opener.call_args.args[0], self.sid)
-        self.assertEqual(codex_queue.verify_signature.call_args.args[-1], 5)
+        # The wake's own budget, not a fixed 5 s cap, bounds codesign on a loaded machine.
+        self.assertGreater(codex_queue.verify_signature.call_args.kwargs['timeout'], 5)
 
     async def test_existing_archive_bit_without_native_rollout_is_refused(self):
         self.record_archive_bit(self.rollout)

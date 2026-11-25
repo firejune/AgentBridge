@@ -20,7 +20,7 @@ VERIFIED_APP_BUILDS = frozenset({
     ('26.1120.50957', '30866'),
 })
 APP_SIGNATURE = codex_queue.SIGNATURE.replace('identifier "codex"', 'identifier "com.openai.codex"')
-QUEUED_WAKE_TIMEOUT = 10.0  # allow up to 5 seconds for codesign and leave time for the opener
+QUEUED_WAKE_TIMEOUT = 30.0  # a loaded machine spends 4-5 s per codesign; leave time for the opener
 MARKER = 'AB_WAKE_TEST_OK'
 PROMPT = (
     'Human-authorized Agent Bridge Desktop wake validation. '
@@ -78,13 +78,11 @@ def _preflight_probe(label, call, remaining, *args):
     return result
 
 
-def _owner(queue, remaining, *, preflight=False):
+def _owner(queue, remaining):
     codex_preview.require_owned_store(queue)
 
     def read(argv):
-        if preflight:
-            return _preflight_probe('queue owner check', codex_queue.checked_output, remaining, argv)
-        return codex_queue.checked_output(argv, timeout=min(2, remaining()))
+        return _preflight_probe('queue owner check', codex_queue.checked_output, remaining, argv)
 
     owner = codex_queue.desktop_queue_owner(queue, read)
     if owner is None:
@@ -92,7 +90,7 @@ def _owner(queue, remaining, *, preflight=False):
     return owner
 
 
-def _verify_app_build(remaining, *, preflight=False):
+def _verify_app_build(remaining):
     app = codex_queue.APP
     with (app / 'Contents/Info.plist').open('rb') as source:
         metadata = plistlib.load(source)
@@ -106,10 +104,7 @@ def _verify_app_build(remaining, *, preflight=False):
         accepted = ', '.join(f'{version}/{build}' for version, build in sorted(VERIFIED_APP_BUILDS))
         raise WakeError('This Codex Desktop build has not been verified for queue wake '
                         f'(observed {observed[0]}/{observed[1]}; accepted {accepted})')
-    if preflight:
-        _preflight_probe('app signature check', codex_queue.verify_signature, remaining, app, APP_SIGNATURE)
-    else:
-        codex_queue.verify_signature(app, APP_SIGNATURE, min(5, remaining()))
+    _preflight_probe('app signature check', codex_queue.verify_signature, remaining, app, APP_SIGNATURE)
 
 
 def _open_wake_url(thread, timeout):
@@ -123,14 +118,14 @@ def prepare(timeout=10):
     remaining = budget(timeout)
     try:
         state, queue = codex_queue.default_stores()
-        _verify_app_build(remaining, preflight=True)
+        _verify_app_build(remaining)
         _preflight_probe('CLI signature check', codex_queue.verify_signature, remaining,
                          codex_queue.CLI_BUNDLE, codex_queue.SIGNATURE)
         # The existing public config reader has a bounded independent budget.
         if remaining() < codex_preview.CONFIG_TIMEOUT or codex_preview.state_path(str(codex_queue.CLI)) != state:
             raise WakeError(CONTEXT_ERROR)
         codex_preview.require_owned_store(state)
-        owner = _owner(queue, remaining, preflight=True)
+        owner = _owner(queue, remaining)
         remaining()
         return Desktop(state, queue, owner)
     except WakeError:
