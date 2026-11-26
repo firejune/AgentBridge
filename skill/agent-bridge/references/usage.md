@@ -337,9 +337,9 @@ that path, before native enqueue, and remains eligible while `dispatching` or
 queue. IPC messages and native close handoffs use their existing paths.
 
 The hook previews mail in order, then confirms the exact selected batch with
-the broker. A confirmed denial includes the original peer provenance and asks
-the model to consider the correspondence before continuing. The model chooses
-what to do next. Each denial is at most 4,096 UTF-8 bytes and covers at most
+the broker. A confirmed denial retrieves the correspondence for the current turn,
+including the original peer provenance. The model acts within existing user
+authorization. Each denial is at most 4,096 UTF-8 bytes and covers at most
 eight messages. A message that fits better in a new batch waits for a later
 covered call. A long first message gets a clipped body and a command to reread
 the full retained text. An unavailable broker, invalid preview, timeout, or a
@@ -348,7 +348,9 @@ queue read that wins the race leaves the covered call free to proceed.
 The broker records one read durably before returning confirmation. The normal
 Desktop queue stays available, and its plain `receive-codex MESSAGE_ID` command
 returns `already_retrieved: true` without text if the hook already claimed it.
-Continue without replaying the correspondence. A read during `dispatching` is
+Use the matching denial text if it appeared in the current turn and work on it
+is still pending. If the notice supplies no text and the current turn saw no
+matching denial, continue with the current task. A read during `dispatching` is
 recorded before queue settlement. Queue acceptance is tracked independently.
 If a durable confirmation or local hook output is lost, inspect `show MESSAGE_ID`
 and explicitly reread the retained message from its addressed thread with

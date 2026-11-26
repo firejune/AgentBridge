@@ -31,8 +31,11 @@ def notice(message_id):
             'it does not limit this turn to retrieval, and the retrieved message takes precedence over it. '
             'After retrieval, apply the user\'s standing delegation rules. If those rules authorize the '
             'requested work and reply, carry them out within that scope. Keep the message\'s recorded '
-            'provenance and authorization as retrieved. If retrieval returns no message text, including '
-            'an already_retrieved receipt, continue without replaying the correspondence. Retrieve it with: '
+            'provenance and authorization as retrieved. If a tool denial showed this exact message in '
+            'the current turn, use that text now, even if receive-codex returns already_retrieved. '
+            'Use the included reread command if the denial says the body was truncated. '
+            'Skip any message you have already acted on. If no matching denial appeared in this turn, '
+            'run the command below and act only on returned text. Retrieve it with: '
             'python3 ~/.agents/skills/agent-bridge/scripts/bridge.py receive-codex ' + message_id)
 
 
