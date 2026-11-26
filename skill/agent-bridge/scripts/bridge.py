@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import agy_live
 import broker
 import codex_archive
+import codex_hook
 import codex_live
 import codex_preview  # Read-only Codex state helpers.
 import codex_new
@@ -958,7 +959,14 @@ def add_broker_commands(sub):
     p.add_argument('--refresh',action='store_true',help='Force a fresh Antigravity quota read before querying')
     p.add_argument('--seed-announcements',metavar='FILE',help='Merge promo-reset announcements (JSONL: at with UTC offset, note) into the state dir, then exit')
     sub.add_parser('ping')
-    sub.add_parser('stop')
+    p = sub.add_parser('stop', help='Request a cooperative Codex stop, or stop the broker when no target is given')
+    p.add_argument('name', nargs='?')
+    p.add_argument('--project')
+    p.add_argument('--reason')
+    p.add_argument('--channel', action='store_true', help='Treat NAME as an active channel pinned to a Codex route')
+    p = sub.add_parser('codex-hook', help='Plan or apply an opt-in Codex cooperative stop hook')
+    p.add_argument('action', choices=('install', 'status', 'uninstall'))
+    p.add_argument('--apply', action='store_true', help='Write the shown change to hooks.json')
     for cmd in ('install-service','uninstall-service'):
         p = sub.add_parser(cmd,help='Opt-in per-user launchd service management')
         p.add_argument('--state-dir')
@@ -1442,7 +1450,7 @@ def session_command(args):
     return 0
 
 
-REQUEST_OPS = {'stop': 'shutdown', 'ask': 'send'}
+REQUEST_OPS = {'ask': 'send'}
 NOT_REQUEST_FIELDS = ('cmd', 'socket', 'file', 'discover', 'new', 'title', 'model', 'codex_mode', 'state_dir', 'no_model')
 
 
@@ -1472,6 +1480,27 @@ def require_wait_timeout(args):
 
 def request_command(args):
     output(broker.request(args.socket, request_fields(args)))
+    return 0
+
+
+def stop_command(args):
+    if args.name is None:
+        if args.project is not None or args.reason is not None or args.channel:
+            raise ValueError('A targeted stop needs NAME and --project')
+        request = {'op': 'shutdown'}
+    else:
+        if args.project is None:
+            raise ValueError('A targeted stop needs NAME and --project')
+        request = {'op': 'codex-stop', 'name': args.name, 'project': args.project,
+                   'reason': args.reason, 'channel': args.channel}
+    output(broker.request(args.socket, request))
+    return 0
+
+
+def codex_hook_command(args):
+    if args.action == 'status' and args.apply:
+        raise ValueError('--apply is only available for install and uninstall')
+    output(codex_hook.configure(args.action, args.apply, args.socket, sys.argv[0]))
     return 0
 
 
@@ -1670,6 +1699,7 @@ def wait_command(args):
 
 
 COMMANDS = {
+    'stop': stop_command, 'codex-hook': codex_hook_command,
     'run': run_command, 'handover': handover_command, 'serve': serve_command,
     'retention': retention_command, 'session-usage': session_usage_command, 'usage': usage_command,
     'install-service': service_command, 'uninstall-service': service_command,
@@ -1682,7 +1712,7 @@ COMMANDS = {
     'send': send_command, 'reply': send_command, 'ask': ask_command, 'wait': wait_command,
     'ping': ping_command, 'routes': routes_command, 'show': show_command,
     # Plain requests: the parsed options are the broker operation.
-    **{name: request_command for name in ('stop', 'channels', 'channel-bind', 'channel-close', 'inbox',
+    **{name: request_command for name in ('channels', 'channel-bind', 'channel-close', 'inbox',
                                           'conversation', 'ack', 'progress', 'resolve')},
 }
 

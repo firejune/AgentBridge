@@ -264,6 +264,28 @@ python3 "$bridge_cli" wt sweep --apply  # 대상 워크트리 및 브랜치 실�
 
 원격 MCP Events에는 `events_enabled: true`, `inbox_enabled: true`, `bridge:read`가 필요하다. 활성 구독과 일치하는 서명된 `bridge.inbox.message.created` 웹훅이 도착하면 웹의 ChatGPT Work 채팅이나 Cloud를 선택한 Desktop Work 채팅이 깨어날 수 있다. 알림에 `operation_id`가 있으면 `bridge_operation_get`으로 기록된 답장을 읽는다. 독립 메시지는 수신함 도구로 읽고 명시적으로 ACK한다. 알림이 누락되면 수신함과 알고 있는 작업 ID를 다시 조회한다. 알림의 재생과 자동 재시도는 지원하지 않는다. [Events 계약과 설정](../../skill/agent-bridge/references/remote-mcp.md#optional-mcp-events)을 참고한다.
 
+### Codex 협조적 중단
+
+Codex 호스트에서 `bridge.py codex-hook install`로 변경 내용을 확인한 뒤
+`bridge.py codex-hook install --apply`를 실행하면 `$CODEX_HOME/hooks.json`
+(기본 경로 `~/.codex/hooks.json`)에 훅이 추가된다. 사용 전에 Codex에서 훅을
+검토하고 신뢰해야 한다. `bridge.py codex-hook status`로 설치 여부를 확인한다.
+제거는 `bridge.py codex-hook uninstall`로 미리 보고 `--apply`로 적용한다.
+제거할 때 설치가 추가한 바이트만 되돌린다. 관리 항목을 수정하거나 다시 포맷한
+경우에는 직접 검토할 수 있도록 파일을 보존한다. 별도 브로커 소켓은
+`bridge.py --socket PATH codex-hook install --apply`로 지정한다.
+
+`bridge.py stop NAME --project P [--reason TEXT]`는 정확히 등록된 Codex
+스레드에 요청 한 건을 남긴다. 활성 채널에 고정된 Codex 라우트에는
+`--channel`을 붙인다. 브로커는 요청을 메모리에 최대 30초간 보관한다.
+해당 스레드의 다음 지원 대상 `PreToolUse` 호출에서 훅이 한 번 호출을 차단하고
+모델에 턴 종료를 요청한다. 브로커에 연결할 수 없거나 응답이 늦으면 호출을
+허용한다. 차단 사유를 받은 모델은 같은 턴을 계속할 수 있다. 이미 시작된 도구나
+생성은 이어질 수 있고, 지원 대상 호출이 없는 턴은 자체적으로 끝난다.
+요청이 남아 있는 동안 턴이 끝나면 만료 전 같은 스레드의 이후 턴에 적용될 수
+있다. 영수증은 브로커 접수만 확인한다. 대상 없이 `bridge.py stop`을 실행하면
+기존처럼 브로커가 종료된다.
+
 ## 개발 및 검증
 
 변경 사항을 커밋하기 전에 전체 단위·통합 테스트 스위트를 실행해 검증한다.

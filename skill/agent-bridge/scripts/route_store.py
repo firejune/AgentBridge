@@ -50,13 +50,15 @@ def sync_directory(directory):
         os.close(fd)
 
 
-def atomic_write(path, data, prefix='.correspondence-', *, measure=nullcontext):
+def atomic_write(path, data, prefix='.correspondence-', *, measure=nullcontext, mode=None):
     name = None
     try:
         with measure('write'):
             fd, name = tempfile.mkstemp(prefix=prefix, dir=path.parent)
         with os.fdopen(fd, 'wb') as output:
             with measure('write'):
+                if mode is not None:
+                    os.fchmod(output.fileno(), mode)
                 output.write(data)
                 output.flush()
             sync_descriptor(output.fileno(), measure)
