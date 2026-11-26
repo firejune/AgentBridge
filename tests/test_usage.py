@@ -1375,3 +1375,209 @@ class ClaudeUsageTests(unittest.TestCase):
         self.assertNotEqual(row['risk']['state'], 'exhausted')
         # The returning read is one row, not a re-append of the whole series.
         self.assertEqual(len([r for r in self.store.load() if (r['limit_id'], r['slot']) == ('ide', 'secondary')]), 3)
+
+
+CLAUDE_PLAN = {'status': 'ok', 'plan': 'Team', 'extraUsage': {'enabled': False, 'currency': 'USD'}, 'windows': [
+    {'label': '5-hour limit', 'percentUsed': 19, 'resetsAt': '2026-10-23T07:50:00.233Z', 'resetsIn': '4h 50m'},
+    {'label': 'Weekly · all models', 'percentUsed': 64, 'resetsAt': '2026-10-26T19:00:00.233Z', 'resetsIn': '3d'},
+    {'label': 'Weekly · Fable', 'percentUsed': 46, 'resetsAt': '2026-10-26T19:00:00.233Z', 'resetsIn': '3d'}]}
+REPORT_ORG, REPORT_ACCOUNT = 'org-should-never-be-stored', 'acct-report-never-stored'
+
+
+def plan(*used):
+    windows = [dict(w, percentUsed=u) for w, u in zip(CLAUDE_PLAN['windows'], used)]
+    return dict(CLAUDE_PLAN, windows=windows)
+
+
+class ClaudeReportTests(unittest.TestCase):
+    """Issue #264: a Claude session reports its get_usage plan; fakes only, no network or real state."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='ab-report-', dir='/tmp')
+        self.root = Path(self.temp.name)
+        self.state = self.root / 'state'
+        self.desktop = self.root / 'desktop'
+        self.desktop.mkdir()
+        self.env = {usage.CLAUDE_CALLER_ENV: 'session-under-test', 'CLAUDE_CODE_ORGANIZATION_UUID': REPORT_ORG,
+                    'CLAUDE_CODE_ACCOUNT_UUID': REPORT_ACCOUNT}
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def report(self, payload=CLAUDE_PLAN, now=T0, env=None):
+        return usage.report_claude(self.state, payload, env=self.env if env is None else env, now=now)
+
+    def stored(self):
+        path = self.state / 'usage' / 'claude.jsonl'
+        return path.read_text() if path.exists() else ''
+
+    def desktop_read(self, org, now=T0):
+        rows = [dict(t=ms(now - timedelta(minutes=5)), org=org, u={'fh': 5, 'sd': 30})]
+        (self.desktop / 'plan-usage-history.json').write_text(json.dumps(dict(version=2, samples=rows)))
+        store = usage.UsageStore(self.state / 'usage', provider='claude')
+        usage.sample(store, lambda: usage.read_claude(live=False, desktop_dir=self.desktop,
+                                                     config_path=self.root / 'none.json', clock=lambda: now),
+                     lambda: now)
+
+    def query(self, now):
+        return usage.query(self.state, '6h', 'claude', now=now)[1]
+
+    def test_plan_maps_known_labels_and_skips_unknown_ones(self):
+        payload = dict(CLAUDE_PLAN, windows=CLAUDE_PLAN['windows'] + [{'label': 'Daily · mystery', 'percentUsed': 3}])
+        receipt = self.report(payload)
+        self.assertEqual([(w['limit_id'], w['slot'], w['used_percent']) for w in receipt['windows']],
+                         [('session', 'primary', 19), ('session', 'secondary', 64), ('session', 'weekly:Fable', 46)])
+        records = usage.UsageStore(self.state / 'usage', provider='claude').load()
+        self.assertEqual({(r['slot'], r['window_mins']) for r in records},
+                         {('primary', 300), ('secondary', 10080), ('weekly:Fable', 10080)})
+        self.assertEqual(records[0]['resets_at'], '2026-10-23T07:50:00.233000+00:00')
+        self.assertEqual({r['source'] for r in records}, {usage.CLAUDE_REPORT_SOURCE})
+        self.assertEqual({r['observed_at'] for r in records}, {usage.utc(T0)})
+
+    def test_the_whole_get_usage_result_uses_only_its_plan(self):
+        whole = self.report({'plan': CLAUDE_PLAN, 'context': {'percentUsed': 99}})
+        expected = [dict(limit_id=r['limit_id'], slot=r['slot'], used_percent=r['used_percent'], resets_at=r['resets_at'])
+                    for r in usage.normalize_claude_report(CLAUDE_PLAN, T0, 'k')]
+        self.assertEqual(whole['windows'], expected)
+
+    def test_invalid_reports_are_refused_and_nothing_is_written(self):
+        def window(**change):
+            return dict(CLAUDE_PLAN, windows=[dict(CLAUDE_PLAN['windows'][0], **change)])
+        for bad in (dict(CLAUDE_PLAN, status='error'), {'windows': CLAUDE_PLAN['windows']}, [], 'x',
+                    dict(CLAUDE_PLAN, windows=None), dict(CLAUDE_PLAN, windows=[]),
+                    dict(CLAUDE_PLAN, windows=[{'label': 'Daily · mystery', 'percentUsed': 3}]),
+                    window(percentUsed=101), window(percentUsed=-1), window(percentUsed='19'), window(percentUsed=True),
+                    window(percentUsed=None), window(resetsAt='tomorrow'), window(resetsAt=5), window(label=None),
+                    dict(CLAUDE_PLAN, windows=CLAUDE_PLAN['windows'][:1] * 2)):
+            with self.assertRaises(ValueError, msg=bad):
+                self.report(bad)
+        self.assertEqual(self.stored(), '')
+
+    def test_refused_outside_a_claude_session_or_without_an_account(self):
+        outside = {k: v for k, v in self.env.items() if k != usage.CLAUDE_CALLER_ENV}
+        with self.assertRaisesRegex(ValueError, 'only from a Claude Code session'):
+            self.report(env=outside)
+        with self.assertRaisesRegex(ValueError, 'no Claude organization or account'):
+            self.report(env={usage.CLAUDE_CALLER_ENV: 's'})
+        self.assertEqual(self.stored(), '')
+
+    def test_account_is_the_hashed_seat_else_the_organization_and_never_raw(self):
+        receipt = self.report()
+        org_only = {usage.CLAUDE_CALLER_ENV: 's', 'CLAUDE_CODE_ORGANIZATION_UUID': REPORT_ORG}
+        self.report(now=T0 + timedelta(minutes=1), env=org_only)
+        accounts = [r['account'] for r in usage.UsageStore(self.state / 'usage', provider='claude').load()]
+        self.assertEqual(accounts[:3], [usage.account_key(REPORT_ACCOUNT)] * 3)
+        self.assertEqual(accounts[3:], [usage.account_key(REPORT_ORG)] * 3)
+        for raw in (REPORT_ORG, REPORT_ACCOUNT):
+            self.assertNotIn(raw, self.stored())
+            self.assertNotIn(raw, json.dumps(receipt))
+        self.assertNotIn('account', json.dumps(receipt))
+
+    def test_reports_give_burn_rate_and_reset_events(self):
+        self.report(plan(10, 60, 40), now=T0)
+        self.report(plan(20, 62, 41), now=T0 + timedelta(hours=1))
+        self.report(plan(20, 62, 41), now=T0 + timedelta(hours=1, minutes=20))  # A report is never deduplicated.
+        self.report(plan(2, 63, 42), now=T0 + timedelta(hours=2))
+        summary = self.query(T0 + timedelta(hours=2))
+        rows = {r['slot']: r for r in summary['buckets']}
+        self.assertEqual(len(rows['primary']['resets']), 1)
+        self.assertAlmostEqual(rows['secondary']['rate']['percent_per_hour'], 1.5)
+        self.assertEqual(rows['secondary']['rate']['samples'], 4)
+        self.assertEqual(rows['secondary']['risk']['state'], 'at_risk')  # 37% at 1.5%p/h runs out before 10-26.
+        events = usage.EventStore(self.state / 'usage', provider='claude').load()
+        self.assertTrue(any(e['limit_id'] == 'session' and e['slot'] == 'primary' for e in events))
+
+    def test_newest_report_account_is_current_and_other_accounts_are_hidden(self):
+        self.desktop_read('org-other')
+        self.report(now=T0 + timedelta(minutes=1))
+        summary = self.query(T0 + timedelta(minutes=11))
+        self.assertEqual([(r['limit_id'], r['slot']) for r in summary['buckets']],
+                         [('session', 'primary'), ('session', 'secondary'), ('session', 'weekly:Fable')])
+        self.assertTrue(all(r['current'] for r in summary['buckets']))
+        self.assertEqual(summary['claude_report']['hidden'],
+                         [dict(limit_id='desktop', slot='primary'), dict(limit_id='desktop', slot='secondary')])
+        self.assertEqual(summary['claude_report']['age_seconds'], 600)
+        text = usage.format_summary(summary, T0 + timedelta(minutes=11))
+        self.assertTrue(text.startswith('claude: current login = latest session report ('))
+        self.assertIn('10m ago)', text.splitlines()[0])
+        self.assertIn('claude: 2 buckets of another account hidden', text)
+        self.assertNotIn('claude/desktop', text)
+        self.assertIn('claude/session [current login] 5h: 81% left', text)
+
+    def test_org_keyed_desktop_rows_are_not_the_seat_and_a_new_login_takes_over(self):
+        # Desktop history is keyed by organization, a report by seat: on a Team plan
+        # the org's figures are not this member's limits, so they never show as current.
+        self.desktop_read(REPORT_ORG)
+        self.report(now=T0 + timedelta(minutes=1))
+        summary = self.query(T0 + timedelta(minutes=2))
+        self.assertEqual(len(summary['claude_report']['hidden']), 2)
+        self.assertEqual([r['limit_id'] for r in summary['buckets']], ['session'] * 3)
+        other = dict(self.env, CLAUDE_CODE_ACCOUNT_UUID='seat-new-login')
+        self.report(plan(1, 2, 3), now=T0 + timedelta(minutes=3), env=other)
+        summary = self.query(T0 + timedelta(minutes=4))
+        self.assertEqual([r['limit_id'] for r in summary['buckets']], ['session'] * 3)
+        self.assertEqual(summary['buckets'][0]['used_percent'], 1)
+        self.assertEqual(len(summary['claude_report']['hidden']), 2)
+
+    def test_collector_failure_does_not_fail_a_fresh_report(self):
+        self.report(plan(10, 60, 40), now=T0)
+        self.report(plan(12, 61, 41), now=T0 + timedelta(minutes=30))
+        store = usage.UsageStore(self.state / 'usage', provider='claude')
+        reader = lambda: dict(desktop=dict(error='desktop history unreadable'),
+                              ide=dict(error='no usage cache for the Claude Code login'))
+        usage.sample(store, reader, lambda: T0 + timedelta(minutes=31))
+        summary = self.query(T0 + timedelta(minutes=32))
+        rows = {r['slot']: r for r in summary['buckets']}
+        self.assertTrue(summary['claude_report']['fresh'])
+        self.assertNotEqual(rows['primary']['freshness'], 'failed')
+        self.assertNotEqual(rows['secondary']['risk']['state'], 'unknown')
+        self.assertIsNotNone(summary['last_failure'])
+
+    def test_without_a_report_claude_rows_are_unchanged(self):
+        self.desktop_read('org-other')
+        summary = self.query(T0)
+        self.assertNotIn('claude_report', summary)
+        self.assertEqual([r['limit_id'] for r in summary['buckets']], ['desktop', 'desktop'])
+        self.assertFalse(any(r.get('current') for r in summary['buckets']))
+
+    def run_cli(self, env, *extra, stdin=None):
+        out = io.StringIO()
+        argv = ['--socket', '/tmp/ab-never.sock', 'usage', '--state-dir', str(self.state), *extra]
+        clean = {k: v for k, v in os.environ.items() if not k.startswith('CLAUDE_CODE_')}
+        with patch.dict(os.environ, dict(clean, **env), clear=True), redirect_stdout(out), \
+                patch('sys.stdin', io.StringIO(stdin or '')):
+            code = bridge.main(argv)
+        return code, out.getvalue()
+
+    def test_warning_only_without_a_report_fresher_than_an_hour(self):
+        self.desktop_read('org-other')
+        code, text = self.run_cli(self.env)
+        self.assertEqual((code, text.splitlines()[0]), (0, usage.CLAUDE_CALLER_WARNING))
+        code, receipt = self.run_cli(self.env, '--report-claude', '-', stdin=json.dumps(CLAUDE_PLAN))
+        self.assertEqual((code, json.loads(receipt)['recorded']), (0, 3))
+        for raw in (REPORT_ORG, REPORT_ACCOUNT, 'session-under-test'):
+            self.assertNotIn(raw, receipt)
+        _, text = self.run_cli(self.env)
+        self.assertNotIn(usage.CLAUDE_CALLER_WARNING, text)
+        self.assertNotIn('warning', json.loads(self.run_cli(self.env, '--json')[1]))
+        stale = dict(usage.query(self.state, '6h', 'claude', now=datetime.now(timezone.utc) + timedelta(minutes=61))[1])
+        self.assertFalse(stale['claude_report']['fresh'])
+        self.assertEqual(usage.claude_caller_warning(stale, 'claude', env=self.env), usage.CLAUDE_CALLER_WARNING)
+        self.assertIn('older than 1h', usage.format_summary(stale, datetime.now(timezone.utc)))
+
+    def test_json_carries_the_report_and_drops_hidden_records(self):
+        self.desktop_read('org-other', now=datetime.now(timezone.utc))
+        self.run_cli(self.env, '--report-claude', '-', stdin=json.dumps(CLAUDE_PLAN))
+        found = json.loads(self.run_cli({}, '--json', '--provider', 'claude')[1])
+        self.assertEqual(len(found['claude_report']['hidden']), 2)
+        self.assertEqual({r['limit_id'] for r in found['records'] if r['status'] != 'failed'}, {'session'})
+        self.assertTrue(all(r['current'] for r in found['buckets']))
+        combined = json.loads(self.run_cli({}, '--json')[1])
+        self.assertEqual(combined['claude_report'], found['claude_report'] | {'age_seconds': combined['claude_report']['age_seconds']})
+
+    def test_cli_refuses_bad_input_without_echoing_it(self):
+        code, text = self.run_cli(self.env, '--report-claude', '-', stdin='{not json ' + REPORT_ORG)
+        self.assertEqual(code, 1)
+        self.assertNotIn(REPORT_ORG, text)
+        code, text = self.run_cli({}, '--report-claude', '-', stdin=json.dumps(CLAUDE_PLAN))
+        self.assertEqual(code, 1)
+        self.assertIn('only from a Claude Code session', json.loads(text)['error'])
