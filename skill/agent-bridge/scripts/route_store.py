@@ -238,9 +238,15 @@ def verify_route(route):
         if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
             raise ValueError('Peer socket unavailable')
     else:
-        observation = sessions.inspect_session(
-            transport, route['session'], route['executable'], codex_mode='auto')
-        target = observation['session']
+        # Antigravity raises the same error for an unreachable or slow language
+        # server as for a missing conversation, so a failed lookup is not
+        # evidence of deletion. Archived routes leave through close/sweep (#262).
+        try:
+            observation = sessions.inspect_session(
+                transport, route['session'], route['executable'], codex_mode='auto')
+            target = observation['session']
+        except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired):
+            return 'Antigravity metadata unavailable; saved identity retained unverified'
     if (target['id'] != route['session']
             or Path(target['cwd']).resolve(strict=True) != cwd):
         raise ValueError('Session or workspace differs')

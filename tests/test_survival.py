@@ -964,6 +964,21 @@ class PersistenceTests(unittest.TestCase):
             route_store.verify_route(route)
             inspect.assert_called_once_with('agy', sid, None, codex_mode='auto')
 
+    def test_agy_lookup_failure_retains_route_but_mismatch_drops_it(self):
+        sid = str(uuid.uuid4())
+        route = dict(project='demo', name='alpha', cwd=str(self.root), session=sid,
+                     transport='agy', executable=None)
+        for error in (ValueError('Antigravity language server not reachable'),
+                      subprocess.TimeoutExpired('agy', 5), OSError('connection refused')):
+            with patch.object(route_store.sessions, 'inspect_session', side_effect=error):
+                self.assertIn('retained unverified', route_store.verify_route(route))
+        for bad in (dict(id=str(uuid.uuid4()), cwd=str(self.root)),
+                    dict(id=sid, cwd=str(self.root / 'other'))):
+            (self.root / 'other').mkdir(exist_ok=True)
+            with patch.object(route_store.sessions, 'inspect_session', return_value={'session': bad}), \
+                    self.assertRaises(ValueError):
+                route_store.verify_route(route)
+
 
 class SurvivalSocketTests(unittest.TestCase):
     def test_lowered_limit_retains_protected_reply_over_real_socket(self):
