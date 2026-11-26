@@ -126,8 +126,13 @@ class QueueNoticeTests(unittest.TestCase):
         self.assertNotIn('authorized by', notice)
         self.assertIn('showed this exact message in the current turn, use that text now, '
                       'even if receive-codex returns already_retrieved', notice)
+        self.assertIn('Use the included reread command if the denial says the body was truncated.', notice)
+        self.assertIn('The same message ID may appear in both places.', notice)
         self.assertIn('Skip any message you have already acted on.', notice)
-        self.assertIn('run the command below and act only on returned text', notice)
+        self.assertIn('run the command below, keep its output visible, and act only on returned text', notice)
+        self.assertIn('If you see neither a command result nor a matching denial, '
+                      'run the same read command once more unless the hook told you to stop.', notice)
+        self.assertEqual(notice.count('bridge.py receive-codex'), 1)
         # The scope sentence still reaches the thread, in the envelope receive-codex returns.
         self.assertIn(delivery.PEER_SCOPE, delivery.envelope(message))
 

@@ -11,18 +11,16 @@ import codex_hook_mail
 
 SOCKET_BUDGET = 0.25
 MAX_INPUT = 4 * 1024 * 1024
-MAIL_DELIVERY_PREFIX = ('Agent Bridge retrieved the peer mail below for this turn. Act on it within '
-                        'existing user authorization. For truncated mail, use its reread command.')
 
 
 def claim(socket, session, deadline):
-    request = {'op': 'codex-pretool-claim', 'session': session, 'deadline': deadline}
+    request = {'op': codex_hook_mail.CLAIM_OP, 'session': session, 'deadline': deadline}
     try:
         return broker.request(socket, request, deadline=deadline)
     except ValueError as error:
         if str(error) != 'Unknown operation':
             raise
-        # A pre-feature broker still serves the cooperative stop contract.
+        # An older broker still serves stop. Its old mail operations can consume the queue read.
         result = broker.request(socket, {**request, 'op': 'codex-stop-claim'}, deadline=deadline)
         return {**result, 'kind': 'stop'} if isinstance(result, dict) else None
 
@@ -72,22 +70,21 @@ def run(socket, source, output):
         if (result.keys() != {'kind', 'id', 'reason'} or result['kind'] != 'mail'
                 or not codex_hook_mail.valid_reason(reason) or time.monotonic() >= deadline):
             return
-        # Preserve the bounded body and commit its original broker digest.
-        payload = denial(MAIL_DELIVERY_PREFIX + reason[len(codex_hook_mail.PREFIX):])
-        confirmed = broker.request(socket, {'op': 'codex-pretool-commit', 'session': session, 'id': result['id'],
-                                     'deadline': deadline, 'digest': codex_hook_mail.reason_digest(reason)},
-                                   deadline=deadline)
+        payload = denial(reason)
+        offer = broker.request(socket, {'op': codex_hook_mail.OFFER_OP, 'session': session, 'id': result['id'],
+                                        'deadline': deadline, 'digest': codex_hook_mail.reason_digest(reason)},
+                               deadline=deadline)
         if time.monotonic() >= deadline:
             return
-        if confirmed == {'kind': 'mail', 'id': result['id']}:
+        if offer == {'kind': 'mail', 'id': result['id']}:
             output.write(payload)
             output.flush()
-        elif (isinstance(confirmed, dict) and confirmed.get('kind') == 'stop'
-              and codex_hook_mail.exact_uuid(confirmed.get('id'))):
-            emit_stop(confirmed, socket, session, deadline, output)
+        elif (isinstance(offer, dict) and offer.get('kind') == 'stop'
+              and codex_hook_mail.exact_uuid(offer.get('id'))):
+            emit_stop(offer, socket, session, deadline, output)
     except (OSError, ValueError, TypeError, RecursionError):
-        # A read commit can outlive a lost response or failed local write.
-        # Its body remains available through explicit reread.
+        # An offer can outlive a lost response or failed local write. The
+        # ordinary queue read still has the body.
         return
 
 

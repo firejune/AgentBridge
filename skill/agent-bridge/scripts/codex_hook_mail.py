@@ -9,8 +9,11 @@ import uuid
 MAX_REASON_BYTES = 4096
 MAX_MESSAGES = 8
 MAX_CLAIMS = 256
-PREFIX = ('Agent Bridge peer correspondence may change your current task. '
-          'Read it before continuing and decide how to proceed within existing user authorization.')
+# Separate operations from the legacy claim/commit pair, which recorded a read.
+CLAIM_OP = 'codex-pretool-offer-claim'
+OFFER_OP = 'codex-pretool-offer'
+PREFIX = ('Agent Bridge is offering peer correspondence. Act within existing user authorization. '
+          'The queue may show this message again. Use its message ID to avoid repeating work.')
 
 
 def exact_uuid(value):

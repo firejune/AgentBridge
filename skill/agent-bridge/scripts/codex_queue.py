@@ -34,8 +34,10 @@ def notice(message_id):
             'provenance and authorization as retrieved. If a tool denial showed this exact message in '
             'the current turn, use that text now, even if receive-codex returns already_retrieved. '
             'Use the included reread command if the denial says the body was truncated. '
-            'Skip any message you have already acted on. If no matching denial appeared in this turn, '
-            'run the command below and act only on returned text. Retrieve it with: '
+            'The same message ID may appear in both places. Skip any message you have already acted on. '
+            'If no matching denial appeared in this turn, run the command below, keep its output visible, '
+            'and act only on returned text. If you see neither a command result nor a matching denial, '
+            'run the same read command once more unless the hook told you to stop. Retrieve it with: '
             'python3 ~/.agents/skills/agent-bridge/scripts/bridge.py receive-codex ' + message_id)
 
 
