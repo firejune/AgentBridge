@@ -1460,13 +1460,13 @@ class ClaudeReportTests(unittest.TestCase):
             self.report(env={usage.CLAUDE_CALLER_ENV: 's'})
         self.assertEqual(self.stored(), '')
 
-    def test_account_is_the_hashed_organization_else_the_account_and_never_raw(self):
+    def test_account_is_the_hashed_seat_else_the_organization_and_never_raw(self):
         receipt = self.report()
-        org_only = {usage.CLAUDE_CALLER_ENV: 's', 'CLAUDE_CODE_ACCOUNT_UUID': REPORT_ACCOUNT}
+        org_only = {usage.CLAUDE_CALLER_ENV: 's', 'CLAUDE_CODE_ORGANIZATION_UUID': REPORT_ORG}
         self.report(now=T0 + timedelta(minutes=1), env=org_only)
         accounts = [r['account'] for r in usage.UsageStore(self.state / 'usage', provider='claude').load()]
-        self.assertEqual(accounts[:3], [usage.account_key(REPORT_ORG)] * 3)
-        self.assertEqual(accounts[3:], [usage.account_key(REPORT_ACCOUNT)] * 3)
+        self.assertEqual(accounts[:3], [usage.account_key(REPORT_ACCOUNT)] * 3)
+        self.assertEqual(accounts[3:], [usage.account_key(REPORT_ORG)] * 3)
         for raw in (REPORT_ORG, REPORT_ACCOUNT):
             self.assertNotIn(raw, self.stored())
             self.assertNotIn(raw, json.dumps(receipt))
@@ -1503,13 +1503,15 @@ class ClaudeReportTests(unittest.TestCase):
         self.assertNotIn('claude/desktop', text)
         self.assertIn('claude/session [current login] 5h: 81% left', text)
 
-    def test_same_account_desktop_rows_stay_and_a_new_login_takes_over(self):
+    def test_org_keyed_desktop_rows_are_not_the_seat_and_a_new_login_takes_over(self):
+        # Desktop history is keyed by organization, a report by seat: on a Team plan
+        # the org's figures are not this member's limits, so they never show as current.
         self.desktop_read(REPORT_ORG)
         self.report(now=T0 + timedelta(minutes=1))
         summary = self.query(T0 + timedelta(minutes=2))
-        self.assertEqual(summary['claude_report']['hidden'], [])
-        self.assertEqual([r['limit_id'] for r in summary['buckets']], ['session'] * 3 + ['desktop'] * 2)
-        other = dict(self.env, CLAUDE_CODE_ORGANIZATION_UUID='org-new-login')
+        self.assertEqual(len(summary['claude_report']['hidden']), 2)
+        self.assertEqual([r['limit_id'] for r in summary['buckets']], ['session'] * 3)
+        other = dict(self.env, CLAUDE_CODE_ACCOUNT_UUID='seat-new-login')
         self.report(plan(1, 2, 3), now=T0 + timedelta(minutes=3), env=other)
         summary = self.query(T0 + timedelta(minutes=4))
         self.assertEqual([r['limit_id'] for r in summary['buckets']], ['session'] * 3)

@@ -346,7 +346,9 @@ def claude_caller_warning(summary, provider, env=None):
 # polled; a session sends one when it has read its usage anyway.
 CLAUDE_REPORT_ID = 'session'
 CLAUDE_REPORT_SOURCE = 'claude desktop get_usage (session report)'
-CLAUDE_REPORT_ACCOUNT_ENVS = ('CLAUDE_CODE_ORGANIZATION_UUID', 'CLAUDE_CODE_ACCOUNT_UUID')
+# The seat, not the org: Team limits are per member, and claude/ide rows already
+# hash accountUuid, so the same login keeps one key across surfaces.
+CLAUDE_REPORT_ACCOUNT_ENVS = ('CLAUDE_CODE_ACCOUNT_UUID', 'CLAUDE_CODE_ORGANIZATION_UUID')
 CLAUDE_REPORT_FRESH_SECONDS = 3600
 CLAUDE_REPORT_LABELS = {'5-hour limit': ('primary', 300), 'Weekly · all models': ('secondary', 10080)}
 CLAUDE_REPORT_MODEL = re.compile(r'Weekly · (\S(?:.*\S)?)')
