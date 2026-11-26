@@ -1039,6 +1039,11 @@ RISK_BURN_SINCE = timedelta(hours=3)
 RISK_BURN_LABEL = '3h'
 
 
+def seconds_until_reset(row, now):
+    reset = row['resets_at']
+    return None if reset is None else (parse_time(reset) - now).total_seconds()
+
+
 def risk(row, rate, now):
     used, remaining = row['used_percent'], row['remaining_percent']
     if (used is not None and used >= 100) or row['allowed'] is False:
@@ -1049,7 +1054,7 @@ def risk(row, rate, now):
         return dict(state='unknown', reason='remaining or resets_at missing')
     if rate is None:
         return dict(state='unknown', reason=f'fewer than 2 samples in the last {RISK_BURN_LABEL}')
-    until = (parse_time(row['resets_at']) - now).total_seconds()
+    until = seconds_until_reset(row, now)
     if until <= 0:
         return dict(state='unknown', reason='reset is due; waiting for a new sample')
     burn = rate['percent_per_hour']
@@ -1066,6 +1071,64 @@ def assess(summary, records, now):
     for row in summary['buckets']:
         row['risk'] = risk(row, short.get((row['limit_id'], row['slot'])), now) if has_capacity_verdict(row) else None
     return summary
+
+
+def recommendation_unknown(row, until, window):
+    if row is None:
+        return f'{window} reading missing'
+    if row['freshness'] != 'fresh':
+        return f"{window} reading {row['freshness']}"
+    if row['remaining_percent'] is None or until is None:
+        return f'{window} remaining quota or reset time missing'
+    if until <= 0:
+        return f'{window} reset due; waiting for a new reading'
+    return None
+
+
+def assess_recommendation(pool, weekly, short, now):
+    remaining = weekly['remaining_percent'] if weekly else None
+    reset = weekly['resets_at'] if weekly else None
+    entry = dict(pool=pool, state='unknown', headroom=None, remaining_percent=remaining, resets_at=reset)
+    until = seconds_until_reset(weekly, now) if weekly else None
+    reason = recommendation_unknown(weekly, until, 'weekly')
+    if reason:
+        return dict(entry, reason=reason)
+    if remaining == 0 or weekly['allowed'] is False:
+        return dict(entry, state='excluded', reason='weekly quota exhausted')
+    if not weekly['window_mins'] or weekly['window_mins'] < 0:
+        return dict(entry, reason='weekly window length missing or invalid')
+    if pool != 'codex':
+        short_until = seconds_until_reset(short, now) if short else None
+        reason = recommendation_unknown(short, short_until, 'short window')
+        if reason:
+            return dict(entry, reason=reason)
+        if short['remaining_percent'] < 10:
+            return dict(entry, state='excluded', reason=f"short window below 10% until {short['resets_at']}")
+    headroom = remaining - until / (weekly['window_mins'] * 60) * 100
+    return dict(entry, state='eligible', headroom=headroom, reason=None)
+
+
+def recommend(summary, now):
+    """Rank provider pools using only the already filtered subscription summary."""
+    rows = {(r['provider'], r['limit_id'], r['slot']): r for r in summary['buckets']
+            if r['provider'] != 'claude' or r.get('current')}
+    codex_weekly = next((r for r in rows.values() if r['provider'] == 'codex'
+                         and r['limit_id'] == 'codex' and r['window_mins'] == 7 * 24 * 60), None)
+    pools = (
+        ('claude', rows.get(('claude', CLAUDE_REPORT_ID, 'secondary')), ('claude', CLAUDE_REPORT_ID, 'primary')),
+        ('codex', codex_weekly, None),
+        ('agy', rows.get(('agy', 'gemini-weekly', 'primary')), ('agy', 'gemini-5h', 'primary')),
+    )
+    ranking = [assess_recommendation(pool, weekly, rows.get(short_key), now)
+               for pool, weekly, short_key in pools]
+    ranking.sort(key=lambda row: (row['headroom'] is None, -(row['headroom'] or 0), row['pool']))
+    return dict(pool=ranking[0]['pool'] if ranking[0]['state'] == 'eligible' else None, ranking=ranking)
+
+
+def format_recommendation(result):
+    parts = [f"{row['pool']} {row['headroom']:+.1f}" if row['state'] == 'eligible'
+             else f"{row['pool']} {row['state']} ({row['reason']})" for row in result['ranking']]
+    return f"recommend: {result['pool'] or 'none'} (headroom {' · '.join(parts)})"
 
 
 def risk_text(verdict):
@@ -1215,7 +1278,7 @@ def format_summary(summary, now):
         if row['resets_at'] is None:
             resets = 'resets unknown'
         else:
-            until = (parse_time(row['resets_at']) - now).total_seconds()
+            until = seconds_until_reset(row, now)
             resets = (f"resets {local(row['resets_at'])} (in {span(until)})" if until > 0
                       else f"reset was due {local(row['resets_at'])}")
         window = bucket_window_suffix(row)

@@ -1305,9 +1305,12 @@ def usage_command(args):
     if args.refresh and args.provider in ('all', 'agy'):
         usage.refresh_agy(state_dir)
     records, summary, moment = usage.query(state_dir, args.since, args.provider)
+    recommendation = usage.recommend(summary, moment) if args.provider == 'all' and not args.events else None
+    if recommendation is not None and not args.json:
+        print(usage.format_recommendation(recommendation), flush=True)
     warning = usage.claude_caller_warning(summary, args.provider)
     if warning and not args.json:
-        print(warning, flush=True)  # First, before any Claude bucket (#125).
+        print(warning, flush=True)  # Before any Claude bucket (#125).
     extra = {} if warning is None else {'warning': warning}
     if args.events:
         if args.json:
@@ -1320,6 +1323,8 @@ def usage_command(args):
     elif args.json:
         cutoff = moment-usage.parse_since(args.since)
         payload = {k: v for k, v in summary.items() if k != 'summaries'}
+        if recommendation is not None:
+            payload['recommend'] = recommendation
         hidden = {('claude', h['limit_id'], h['slot']) for h in (summary.get('claude_report') or {}).get('hidden', [])}
         output(dict(**extra, records=[r for r in records if usage.parse_time(r['observed_at'])>=cutoff
                                       and (r.get('provider'), r['limit_id'], r['slot']) not in hidden],

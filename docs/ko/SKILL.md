@@ -198,6 +198,9 @@ python3 "$bridge_cli" usage --report-claude -   # stdin: 방금 get_usage가 돌
 - `--events`는 리셋 이력과 두 기준 시각을 보여 준다: 사용 계획은 **spend horizon**(공식 리셋과 추정 조기 리셋 중 이른 쪽)에 맞추고, 멈출 위험은 **stop risk horizon**(공식 `resets_at`)으로만 판단한다.
 - Claude: `claude/desktop`은 Claude 데스크톱 계정(데스크톱 자체 기록, 사용률만 · 리셋 시각 없음), `claude/ide`는 IDE 확장 · CLI가 쓰는 Claude Code 로그인(키체인 토큰으로 사용량 엔드포인트 실시간 조회, 안 되면 `~/.claude.json` 캐시)이다. 데스크톱 HQ는 여기서 IDE 세션의 한도를, IDE 세션은 데스크톱의 한도를 본다. 어느 읽기도 모델 턴을 시작하지 않는다. 소모율과 위험 판정은 가장 최근 읽기가 본 계정(불투명한 해시)의 표본만 쓰고, 다른 계정의 표본은 섞지 않는다. Claude Code 세션 안에서 `usage`는 경고 한 줄을 먼저 찍는다 — 자기 Claude 한도는 브릿지가 아니라 앱(`get_usage`)에서 읽는다.
 - Claude 세션 보고: Claude 세션이 `get_usage`를 읽은 뒤 그 결과(또는 `plan`만)를 `bridge.py usage --report-claude -`에 파이프로 넘긴다. 읽을 때마다 한 번이고, 폴링 루프로 돌리지 않는다. 보고는 Claude Code 세션(`CLAUDE_CODE_SESSION_ID`)에서만 받는다. 계정은 `CLAUDE_CODE_ACCOUNT_UUID`(없으면 `CLAUDE_CODE_ORGANIZATION_UUID`)의 불투명한 해시다. 읽은 값은 `claude/session`(5시간 · 주간 전 모델 · 모델별 주간)에 쌓이고 소모율과 리셋을 추적한다. 가장 최근 보고의 계정이 지금 Claude 로그인이다 — 그 버킷은 `[current login]`으로 표시돼 맨 앞에 오고, 다른 계정의 버킷은 숨긴다(개수 표시, `--json`은 `claude_report.hidden`). 보고의 나이도 같이 보인다. 1시간 안의 보고가 있으면 위 경고는 찍지 않는다.
+- `usage --provider all`은 주간 잔여 할당량 비율에서 리셋까지 남은 시간 비율을 뺀 값이 가장 높은 풀을 추천한다.
+  현재 Claude 세션 로그인, Codex 7일 구간, Antigravity Gemini 구간을 사용한다.
+  주간 한도 소진 또는 필수 단기 구간의 잔여량이 10% 미만이면 제외한다. 누락·실패·오래된 값은 `unknown`으로 표시한다. JSON에는 `recommend`가 들어간다.
 - `codex`나 `agy` 경로(또는 `claude-peer`끼리의 경로)를 거치는 모든 `send`·`ask`·`reply` 출력에는 `usage` 요약(`ok`, `at_risk`, `exhausted`, `unknown`)이 실린다. `at_risk`나 `exhausted`면 작업 속도를 늦추거나 다른 에이전트로 배정한다.
 
 ## 에이전트 워크트리
