@@ -1518,6 +1518,20 @@ class ClaudeReportTests(unittest.TestCase):
         self.assertEqual(summary['buckets'][0]['used_percent'], 1)
         self.assertEqual(len(summary['claude_report']['hidden']), 2)
 
+    def test_collector_failure_does_not_fail_a_fresh_report(self):
+        self.report(plan(10, 60, 40), now=T0)
+        self.report(plan(12, 61, 41), now=T0 + timedelta(minutes=30))
+        store = usage.UsageStore(self.state / 'usage', provider='claude')
+        reader = lambda: dict(desktop=dict(error='desktop history unreadable'),
+                              ide=dict(error='no usage cache for the Claude Code login'))
+        usage.sample(store, reader, lambda: T0 + timedelta(minutes=31))
+        summary = self.query(T0 + timedelta(minutes=32))
+        rows = {r['slot']: r for r in summary['buckets']}
+        self.assertTrue(summary['claude_report']['fresh'])
+        self.assertNotEqual(rows['primary']['freshness'], 'failed')
+        self.assertNotEqual(rows['secondary']['risk']['state'], 'unknown')
+        self.assertIsNotNone(summary['last_failure'])
+
     def test_without_a_report_claude_rows_are_unchanged(self):
         self.desktop_read('org-other')
         summary = self.query(T0)

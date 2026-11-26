@@ -995,8 +995,11 @@ def summarize(records, now, since):
         observed = parse_time(last['observed_at'])
         age = (now - observed).total_seconds()
         # A failure names its limit_id when only that surface failed (Claude); None is all.
+        # A session report is not read by the collector, so a collector failure
+        # (all surfaces, None) never makes a fresh report look failed (#264).
         failed_after = any(parse_time(r['observed_at']) > observed for r in failures
-                           if r['limit_id'] in (None, limit_id))
+                           if r['limit_id'] == limit_id
+                           or (r['limit_id'] is None and limit_id != CLAUDE_REPORT_ID))
         freshness = ('failed' if failed_after else 'stale' if age > STALE_AFTER_SECONDS
                      or last['status'] == 'stale' else 'fresh')
         window = [r for r in items if parse_time(r['observed_at']) >= cutoff
