@@ -59,6 +59,8 @@ CODEX_STOP_LIMIT = 256
 CODEX_RECEIVE_SECONDS = 10
 CODEX_READ_NO_MATCH = 'No correspondence matches this Codex thread and message ID.'
 CODEX_READ_BEFORE_SETTLEMENT = 'Codex retrieved the message before queue settlement'
+CODEX_READ_AT_TOOL_CALL = 'Codex received the message at a tool call'
+CODEX_READ_FROM_QUEUE = 'Codex received the message from the queue notice'
 READ_ONLY_OPS = ('ping', 'routes', 'channels', 'show', 'conversation', 'inbox', 'retention-plan',
                  'close-operator-status')
 TIMED_CLAIM_OPS = ('claim', 'claim-guarded', 'release-claim')
@@ -535,7 +537,7 @@ class State:
         if not all(self.codex_mail_ready(message, session) for message in messages):
             return None  # The queue won, or the route changed after preview.
         for message in messages:
-            self.codex_mark_read(message)
+            self.codex_mark_read(message, CODEX_READ_AT_TOOL_CALL)
         return {'kind': 'mail', 'id': claim['id']}
 
     def codex_arm_queue(self, args):
@@ -548,10 +550,10 @@ class State:
         message.setdefault('codex_queue_read', 'ready')
         return True
 
-    def codex_mark_read(self, message):
+    def codex_mark_read(self, message, note):
         message['codex_queue_read'] = 'retrieved'
         if message['state'] == 'submitted':
-            self.status(message, 'received')
+            self.status(message, 'received', note)
             return True
         return False
 
@@ -573,7 +575,7 @@ class State:
         if type(deadline) not in (int, float) or not current < deadline <= current + CODEX_RECEIVE_SECONDS:
             raise ValueError('Codex queued read expired before admission')
         self.require_open_route(message['route'])
-        marked = self.codex_mark_read(message)
+        marked = self.codex_mark_read(message, CODEX_READ_FROM_QUEUE)
         return {'message': public_message(message), 'marked_received': marked}
 
     def matches(self, sub, event):

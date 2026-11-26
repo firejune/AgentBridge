@@ -83,7 +83,8 @@ class HookMailTests(unittest.TestCase):
         self.assertNotIn('End the turn', reason)
         self.assertIsNone(self.hook())
         for mid in (first, second):
-            self.assertEqual(self.call('show', id=mid)['state'], 'received')
+            shown = self.call('show', id=mid)
+            self.assertEqual((shown['state'], shown['note']), ('received', broker.CODEX_READ_AT_TOOL_CALL))
             self.assertEqual(self.receive(mid), self.duplicate(mid))
 
     def test_stop_wins_before_proposal_and_while_mail_waits_to_commit(self):
@@ -124,6 +125,7 @@ class HookMailTests(unittest.TestCase):
         with patch.object(broker, 'request', side_effect=read_during_preview):
             self.assertIsNone(self.hook())
         self.assertEqual(self.call('show', id=second)['state'], 'submitted')
+        self.assertEqual(self.call('show', id=first)['note'], broker.CODEX_READ_FROM_QUEUE)
         self.assertNotIn(first, self.hook())
         self.assertEqual(self.receive(second), self.duplicate(second))
 
