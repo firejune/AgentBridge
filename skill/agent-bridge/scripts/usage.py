@@ -333,8 +333,130 @@ def claude_caller_warning(summary, provider, env=None):
     env = os.environ if env is None else env
     if not env.get(CLAUDE_CALLER_ENV):
         return None
+    if claude_report_fresh(summary):
+        return None  # A session reported its own get_usage reading within the hour (#264).
     shown = provider == 'claude' or any(row.get('provider') == 'claude' for row in summary.get('buckets', []))
     return CLAUDE_CALLER_WARNING if shown else None
+
+
+# Issue #264: a Claude session hands over the `plan` of its own `get_usage` reading.
+# None of the readers above sees the login a Desktop session runs under (its token
+# never reaches the session, and Desktop's history skips some organizations), so the
+# account of the newest report is taken as the current Claude login. Reports are not
+# polled; a session sends one when it has read its usage anyway.
+CLAUDE_REPORT_ID = 'session'
+CLAUDE_REPORT_SOURCE = 'claude desktop get_usage (session report)'
+CLAUDE_REPORT_ACCOUNT_ENVS = ('CLAUDE_CODE_ORGANIZATION_UUID', 'CLAUDE_CODE_ACCOUNT_UUID')
+CLAUDE_REPORT_FRESH_SECONDS = 3600
+CLAUDE_REPORT_LABELS = {'5-hour limit': ('primary', 300), 'Weekly · all models': ('secondary', 10080)}
+CLAUDE_REPORT_MODEL = re.compile(r'Weekly · (\S(?:.*\S)?)')
+
+
+def claude_report_slot(label):
+    """(slot, window minutes) for a get_usage window label; None for a label we do not know."""
+    if label in CLAUDE_REPORT_LABELS:
+        return CLAUDE_REPORT_LABELS[label]
+    match = CLAUDE_REPORT_MODEL.fullmatch(label)
+    return (f'weekly:{match[1]}', 10080) if match else None
+
+
+def normalize_claude_report(payload, observed, account):
+    """Records for one get_usage `plan` (or the whole result); refuses anything it cannot vouch for."""
+    if isinstance(payload, dict) and isinstance(payload.get('plan'), dict):
+        payload = payload['plan']  # The whole get_usage result: only its plan is a reading.
+    if not isinstance(payload, dict):
+        raise ValueError('report is not a get_usage plan object')
+    if payload.get('status') != 'ok':
+        raise ValueError('get_usage status is not "ok"; nothing recorded')
+    windows = payload.get('windows')
+    if not isinstance(windows, list):
+        raise ValueError('get_usage plan has no windows list')
+    records, seen = [], set()
+    for index, window in enumerate(windows):
+        if not isinstance(window, dict) or not isinstance(window.get('label'), str):
+            raise ValueError(f'window {index} has no label')
+        slot = claude_report_slot(window['label'])
+        if slot is None:
+            continue  # Unknown labels are skipped, never guessed into a bucket.
+        used = window.get('percentUsed')
+        if isinstance(used, bool) or number(used) is None or not 0 <= used <= 100:
+            raise ValueError(f'window {index}: percentUsed must be a number from 0 to 100')
+        resets = window.get('resetsAt')
+        try:
+            resets_at = None if resets is None else claude_time(resets)
+        except ValueError:
+            resets_at = None
+        if resets is not None and resets_at is None:
+            raise ValueError(f'window {index}: resetsAt must be an ISO 8601 time')
+        if slot[0] in seen:
+            raise ValueError(f'window {index}: label repeats an earlier window')
+        seen.add(slot[0])
+        records.append(claude_record(observed, CLAUDE_REPORT_ID, slot[0], used, slot[1], resets_at,
+                                     CLAUDE_REPORT_SOURCE, account=account))
+    if not records:
+        raise ValueError('get_usage plan has no known window')
+    return records
+
+
+def report_claude(state_dir, payload, env=None, now=None):
+    """Record a Claude session's get_usage reading; returns a receipt without identifiers."""
+    env = os.environ if env is None else env
+    if not env.get(CLAUDE_CALLER_ENV):
+        raise ValueError(f'--report-claude is accepted only from a Claude Code session ({CLAUDE_CALLER_ENV} unset)')
+    account = next((account_key(env.get(name)) for name in CLAUDE_REPORT_ACCOUNT_ENVS if env.get(name)), None)
+    if account is None:
+        raise ValueError('the session environment names no Claude organization or account; nothing recorded')
+    now = now or datetime.now(timezone.utc)
+    records = normalize_claude_report(payload, now, account)
+    store = UsageStore(Path(state_dir).expanduser() / 'usage', provider='claude')
+    if store.append(records, now):
+        EventStore(store.directory, provider='claude').merge(detect(store.load()), now)
+    return dict(recorded=len(records), observed_at=utc(now), source=CLAUDE_REPORT_SOURCE,
+                windows=[dict(limit_id=r['limit_id'], slot=r['slot'], used_percent=r['used_percent'],
+                              resets_at=r['resets_at']) for r in records])
+
+
+def claude_current(summary, records, now):
+    """Show only the current Claude login's buckets: the account of the newest session report (#264).
+
+    With no report, the summary is unchanged. Buckets whose latest read saw another
+    account are dropped and counted, so a figure of another login never reads as ours.
+    """
+    reports = [r for r in records if r.get('source') == CLAUDE_REPORT_SOURCE and r['status'] != 'failed']
+    if not reports:
+        return summary
+    newest = max(reports, key=lambda r: r['observed_at'])
+    latest = {}
+    for item in records:  # Store order is read order, as in current_account().
+        if item['status'] != 'failed':
+            latest[item['limit_id'], item['slot']] = item.get('account')
+    shown, hidden = [], []
+    for row in summary['buckets']:
+        if latest.get((row['limit_id'], row['slot'])) == newest['account']:
+            shown.append(dict(row, current=True))
+        else:
+            hidden.append(dict(limit_id=row['limit_id'], slot=row['slot']))
+    shown.sort(key=lambda row: row['limit_id'] != CLAUDE_REPORT_ID)  # Stable: the report's rows first.
+    age = (now - parse_time(newest['observed_at'])).total_seconds()
+    summary['buckets'] = shown
+    summary['claude_report'] = dict(observed_at=newest['observed_at'], age_seconds=age,
+                                    fresh=age <= CLAUDE_REPORT_FRESH_SECONDS, hidden=hidden)
+    return summary
+
+
+def claude_report_fresh(summary):
+    reports = [summary] + list(summary.get('summaries') or [])
+    return any((item.get('claude_report') or {}).get('fresh') for item in reports)
+
+
+def format_claude_report(report):
+    lines = [f"claude: current login = latest session report ({local(report['observed_at'])}, "
+             f"{span(report['age_seconds'])} ago" + ('' if report['fresh'] else ', older than 1h') + ')']
+    if report['hidden']:
+        count = len(report['hidden'])
+        lines.append(f"claude: {count} bucket{'s' if count > 1 else ''} of another account hidden "
+                     '(--json lists them under claude_report.hidden)')
+    return lines
 
 
 def claude_config_path():
@@ -641,7 +763,8 @@ class UsageStore:
             same = previous is not None and same_window and all(
                 previous[field] == item[field] for field in (
                     'used_percent', 'window_mins', 'allowed', 'reset_credits', 'status'))
-            if same and (now - parse_time(previous['observed_at'])).total_seconds() < DEDUP_SECONDS:
+            if (same and item.get('source') != CLAUDE_REPORT_SOURCE  # A report is its own freshness (#264).
+                    and (now - parse_time(previous['observed_at'])).total_seconds() < DEDUP_SECONDS):
                 continue
             kept.append(item)
             last[series(item)] = item
@@ -1080,6 +1203,7 @@ def format_summary(summary, now):
     lines = []
     for row in summary['buckets']:
         name = f"{row['provider']}/{row['limit_id']}" + ('' if row['slot'] == 'primary' else f"/{row['slot']}")
+        name += ' [current login]' if row.get('current') else ''
         remaining = 'unknown' if row['remaining_percent'] is None else f"{pct(row['remaining_percent'])}% left"
         if row['used_percent'] is not None and row['used_percent'] >= 100:
             remaining = 'EXHAUSTED 0% left'
@@ -1112,6 +1236,8 @@ def format_summary(summary, now):
                          + ('' if boundary['resets_at_before'] == boundary['resets_at_after']
                             else ', next reset moved'))
     provider = summary.get('provider', 'codex')
+    if summary.get('claude_report'):
+        lines[:0] = format_claude_report(summary['claude_report'])
     if not summary['buckets']:
         lines.append(f'{provider}: unknown (no successful read recorded)')
     if summary['last_failure']:
@@ -1185,6 +1311,8 @@ def _query_one(directory, since, provider, now):
                        announcements, now)
     summary['provider'] = provider
     assess(summary, records, now)
+    if provider == 'claude':
+        claude_current(summary, records, now)
     summary['announcements'] = announcements
     return records, summary
 
@@ -1210,6 +1338,7 @@ def query(state_dir, since='6h', provider='codex', now=None):
             announcements=[a for item in summaries for a in item['announcements']],
             summaries=summaries,
         )
+        combined.update({'claude_report': item['claude_report'] for item in summaries if 'claude_report' in item})
         return all_records, combined, now
     if provider not in PROVIDERS:
         raise ValueError(f'Collected providers are {", ".join(PROVIDERS)}')

@@ -958,6 +958,7 @@ def add_broker_commands(sub):
     p.add_argument('--events',action='store_true',help='Reset events, early-reset intervals, the next-reset estimate and the spend/stop-risk horizons')
     p.add_argument('--refresh',action='store_true',help='Force a fresh Antigravity quota read before querying')
     p.add_argument('--seed-announcements',metavar='FILE',help='Merge promo-reset announcements (JSONL: at with UTC offset, note) into the state dir, then exit')
+    p.add_argument('--report-claude',metavar='FILE',help="Record this Claude session's get_usage plan (JSON file, or - for stdin) as the current Claude login, then exit")
     sub.add_parser('ping')
     p = sub.add_parser('stop', help='Request a cooperative Codex stop, or stop the broker when no target is given')
     p.add_argument('name', nargs='?')
@@ -1293,6 +1294,14 @@ def usage_command(args):
     if args.seed_announcements:
         output(usage.seed_announcements(state_dir, args.seed_announcements))
         return 0
+    if args.report_claude:
+        text = sys.stdin.read() if args.report_claude == '-' else Path(args.report_claude).read_text()
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            raise ValueError('--report-claude takes a JSON get_usage plan') from None  # never echo the input
+        output(usage.report_claude(state_dir, payload))
+        return 0
     if args.refresh and args.provider in ('all', 'agy'):
         usage.refresh_agy(state_dir)
     records, summary, moment = usage.query(state_dir, args.since, args.provider)
@@ -1311,7 +1320,9 @@ def usage_command(args):
     elif args.json:
         cutoff = moment-usage.parse_since(args.since)
         payload = {k: v for k, v in summary.items() if k != 'summaries'}
-        output(dict(**extra, records=[r for r in records if usage.parse_time(r['observed_at'])>=cutoff],
+        hidden = {('claude', h['limit_id'], h['slot']) for h in (summary.get('claude_report') or {}).get('hidden', [])}
+        output(dict(**extra, records=[r for r in records if usage.parse_time(r['observed_at'])>=cutoff
+                                      and (r.get('provider'), r['limit_id'], r['slot']) not in hidden],
                     **payload))
     else:
         print(usage.format_summary(summary, moment), flush=True)
