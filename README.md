@@ -310,7 +310,9 @@ the Desktop queue remains available when Codex is idle or the hook misses the
 message.
 
 The broker records a read once across the hook and the Desktop queue. A later
-queue notice can return `already_retrieved` without the text. A long body includes
+queue notice can return `already_retrieved` without the text. If the current turn
+already saw the matching message in a denial, it uses that text and skips work
+it has already done. A long body includes
 a truncation note and a `receive-codex MESSAGE_ID --reread` command for explicit
 recovery. Use matching Agent Bridge builds for submission, broker and receiving
 CLI. The installer uses the existing hook entry. Review and trust it in Codex if

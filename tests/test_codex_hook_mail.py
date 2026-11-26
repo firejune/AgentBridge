@@ -15,7 +15,6 @@ sys.path.insert(0, str(SCRIPTS))
 import bridge
 import broker
 import codex_hook_mail
-import codex_queue
 import codex_stop_hook
 from delivery import PEER_SCOPE
 from support import RunningBroker
@@ -74,8 +73,8 @@ class HookMailTests(unittest.TestCase):
         self.assertIsNone(self.hook(OTHER))
         self.assertEqual(self.receive(first, session=OTHER), (1, {'error': broker.CODEX_READ_NO_MATCH}))
         reason = self.hook()
-        self.assertIn('may change your current task', reason)
-        self.assertIn('decide how to proceed within existing user authorization', reason)
+        self.assertTrue(reason.startswith('Agent Bridge retrieved the peer mail below for this turn.'))
+        self.assertIn('Act on it within existing user authorization.', reason)
         self.assertIn(PEER_SCOPE, reason)
         self.assertIn('peer -> target', reason)
         self.assertLess(reason.index(first), reason.index(second))
@@ -226,7 +225,6 @@ class HookMailTests(unittest.TestCase):
         result = self.call('finish', id=early, state='pending', event='push_failed', note='Queue prewrite refusal')
         self.assertEqual(result['state'], 'received')
         self.assertFalse(result.get('codex_queue_accepted', False))
-        self.assertIn('continue without replaying the correspondence', codex_queue.notice(early))
 
 
 class HookBudgetTests(unittest.TestCase):

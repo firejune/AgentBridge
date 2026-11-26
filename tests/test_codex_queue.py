@@ -124,6 +124,10 @@ class QueueNoticeTests(unittest.TestCase):
         self.assertIn("apply the user's standing delegation rules", notice)
         self.assertIn('provenance and authorization as retrieved', notice)
         self.assertNotIn('authorized by', notice)
+        self.assertIn('showed this exact message in the current turn, use that text now, '
+                      'even if receive-codex returns already_retrieved', notice)
+        self.assertIn('Skip any message you have already acted on.', notice)
+        self.assertIn('run the command below and act only on returned text', notice)
         # The scope sentence still reaches the thread, in the envelope receive-codex returns.
         self.assertIn(delivery.PEER_SCOPE, delivery.envelope(message))
 

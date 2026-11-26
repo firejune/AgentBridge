@@ -11,6 +11,8 @@ import codex_hook_mail
 
 SOCKET_BUDGET = 0.25
 MAX_INPUT = 4 * 1024 * 1024
+MAIL_DELIVERY_PREFIX = ('Agent Bridge retrieved the peer mail below for this turn. Act on it within '
+                        'existing user authorization. For truncated mail, use its reread command.')
 
 
 def claim(socket, session, deadline):
@@ -70,7 +72,8 @@ def run(socket, source, output):
         if (result.keys() != {'kind', 'id', 'reason'} or result['kind'] != 'mail'
                 or not codex_hook_mail.valid_reason(reason) or time.monotonic() >= deadline):
             return
-        payload = denial(reason)
+        # Preserve the bounded body and commit its original broker digest.
+        payload = denial(MAIL_DELIVERY_PREFIX + reason[len(codex_hook_mail.PREFIX):])
         confirmed = broker.request(socket, {'op': 'codex-pretool-commit', 'session': session, 'id': result['id'],
                                      'deadline': deadline, 'digest': codex_hook_mail.reason_digest(reason)},
                                    deadline=deadline)
