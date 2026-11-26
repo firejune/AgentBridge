@@ -274,6 +274,30 @@ Independently keyed MCP requests can queue for the same authorized session while
 
 Remote MCP Events require `events_enabled: true`, `inbox_enabled: true` and `bridge:read`. A matching signed `bridge.inbox.message.created` webhook can wake a supported ChatGPT Work chat on web or Desktop Work with Cloud selected. Read a captured reply with `bridge_operation_get` when the event carries `operation_id`. Read independent mail with the inbox tools and ACK it explicitly. After a gap, list the inbox and query known operations. Notifications have no replay or automatic retry. [Events contract and setup](skill/agent-bridge/references/remote-mcp.md#optional-mcp-events).
 
+### Cooperative Codex stop
+
+On each Codex host, preview the hook configuration with
+`bridge.py codex-hook install`, then use `bridge.py codex-hook install --apply`
+to add it to `$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`). Review and
+trust the hook in Codex before using it. Check the entry with
+`bridge.py codex-hook status`. Preview removal with `bridge.py codex-hook uninstall`
+or apply it with `--apply`. Removal restores the bytes the installer added and
+preserves other configuration. If the managed entry was reformatted or edited,
+the installer leaves it for manual review. For a custom broker socket, use
+`bridge.py --socket PATH codex-hook install --apply`.
+
+`bridge.py stop NAME --project P [--reason TEXT]` records one request for the
+exact registered Codex thread. Add `--channel` to address an active channel's
+pinned Codex route. The request expires after 30 seconds and is held in broker
+memory. At the next covered `PreToolUse` call for that thread, the hook denies
+one invocation and asks the model to end its turn. It allows the invocation if
+the broker is unreachable or too slow. A denied invocation gives the model
+feedback, and the model can continue the turn. In-flight tools and generation
+can continue, and a turn with no covered call runs to its own end. A request
+still pending when a turn ends can apply to a later turn on the same thread
+before expiry. A receipt confirms only that the broker accepted the request.
+Bare `bridge.py stop` still shuts down the broker.
+
 ## Development & Verification
 
 Run the full unit and integration test suite before committing any changes:

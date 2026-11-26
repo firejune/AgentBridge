@@ -53,6 +53,8 @@ PROVIDER_NOTICE_KEY_PREFIXES = tuple(event + ':' for event in (
 CLOSE_OPERATOR_FILE = 'close-operator.json'
 CLOSE_OPERATOR_GUARD_VERSION = 1
 CLOSING_ROUTE_ERROR = 'Codex route is closing'
+CODEX_STOP_TTL = 30
+CODEX_STOP_LIMIT = 256
 READ_ONLY_OPS = ('ping', 'routes', 'channels', 'show', 'conversation', 'inbox', 'retention-plan',
                  'close-operator-status')
 TIMED_CLAIM_OPS = ('claim', 'claim-guarded', 'release-claim')
@@ -216,6 +218,7 @@ class State:
         self.retention_prepare = retention_prepare
         self.compact_messages = {}
         self.endpoints, self.channels, self.messages, self.keys = {}, {}, {}, {}
+        self.codex_stops = {}
         self.events = deque(maxlen=1024)
         self.sequence = 0
         self.subscribers = []
@@ -416,6 +419,58 @@ class State:
                 raise ValueError('Unregistered endpoint')
         self.require_open_route(item)
         return deepcopy(item)
+
+    def request_codex_stop(self, args):
+        project, name = identifier(args['project']), identifier(args['name'])
+        channel = args.get('channel', False)
+        if type(channel) is not bool:
+            raise ValueError('Invalid Codex stop route selector')
+        route = self.route(project, channel=name) if channel else self.route(project, name=name)
+        if route['transport'] != 'codex':
+            raise ValueError('Cooperative stop requires a Codex route')
+        reason = args.get('reason')
+        if reason is not None and (not isinstance(reason, str) or not reason.strip()
+                                   or len(reason) > 256 or not reason.isprintable()):
+            raise ValueError('Stop reason must be 1 to 256 printable characters')
+        current = time.monotonic()
+        self.codex_stops = {sid: item for sid, item in self.codex_stops.items() if item['until'] > current}
+        if route['session'] in self.codex_stops:
+            raise ValueError('A cooperative stop is already pending for this Codex thread')
+        if len(self.codex_stops) >= CODEX_STOP_LIMIT:
+            raise ValueError('Too many pending Codex stop requests')
+        receipt = {'id': str(uuid.uuid4()), 'requested_at': now(), 'reason': reason}
+        self.codex_stops[route['session']] = {**receipt, 'until': current + CODEX_STOP_TTL,
+                                             'route': route, 'claimed': False}
+        return {'id': receipt['id'], 'requested_at': receipt['requested_at'],
+                'state': 'requested', 'expires_in': CODEX_STOP_TTL}
+
+    def codex_stop_hook_action(self, args):
+        session = args['session']
+        current = time.monotonic()
+        item = self.codex_stops.get(session)
+        if item is None:
+            return None
+        if item['until'] <= current:
+            del self.codex_stops[session]
+            return None
+        if args['op'] == 'codex-stop-finish':
+            if item['claimed'] and args.get('id') == item['id']:
+                del self.codex_stops[session]
+                return True
+            return False
+        deadline = args.get('deadline')
+        if type(deadline) not in (int, float) or not current < deadline <= current + 1 or item['claimed']:
+            return None
+        route = item['route']
+        try:
+            active = self.route(route['project'], route['name'], channel=route.get('channel'))
+        except ValueError:
+            active = None
+        if active != route:
+            del self.codex_stops[session]
+            return None
+        item['claimed'] = True
+        return {key: item[key] for key in ('id', 'requested_at', 'reason')}
 
     def matches(self, sub, event):
         if event['type'] == 'close_archive':
@@ -1119,6 +1174,10 @@ class State:
 
     def apply_action(self, args, *, verified_close=False):
         op = args['op']
+        if op == 'codex-stop':
+            return self.request_codex_stop(args)
+        if op in ('codex-stop-claim', 'codex-stop-finish'):
+            return self.codex_stop_hook_action(args)
         if op == 'archive-correspondence':
             return self.archive_correspondence(args, verified_close=verified_close)
         if op == 'close-prepare':
