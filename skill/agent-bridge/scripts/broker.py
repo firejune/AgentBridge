@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import route_store
 import retros
 import codex_archive
+import codex_hook_mail
 import codex_preview
 import codex_queue
 import codex_wake_open
@@ -55,6 +56,9 @@ CLOSE_OPERATOR_GUARD_VERSION = 1
 CLOSING_ROUTE_ERROR = 'Codex route is closing'
 CODEX_STOP_TTL = 30
 CODEX_STOP_LIMIT = 256
+CODEX_RECEIVE_SECONDS = 10
+CODEX_READ_NO_MATCH = 'No correspondence matches this Codex thread and message ID.'
+CODEX_READ_BEFORE_SETTLEMENT = 'Codex retrieved the message before queue settlement'
 READ_ONLY_OPS = ('ping', 'routes', 'channels', 'show', 'conversation', 'inbox', 'retention-plan',
                  'close-operator-status')
 TIMED_CLAIM_OPS = ('claim', 'claim-guarded', 'release-claim')
@@ -204,7 +208,7 @@ class IdempotencyConflict(ValueError):
 
 class State:
     def __init__(self, max_messages=2048, store=None, retention_ttl=False, retention_prepare=False,
-                 *, checkpoint_executor=None):
+                 *, checkpoint_executor=None, socket_path=DEFAULT_SOCKET):
         if max_messages < 1:
             raise ValueError('Message retention size must be positive')
         self.instance = str(uuid.uuid4())
@@ -219,6 +223,8 @@ class State:
         self.compact_messages = {}
         self.endpoints, self.channels, self.messages, self.keys = {}, {}, {}, {}
         self.codex_stops = {}
+        self.codex_mail_claims = {}
+        self.socket_path = socket_path
         self.events = deque(maxlen=1024)
         self.sequence = 0
         self.subscribers = []
@@ -260,7 +266,10 @@ class State:
                 if mid in reply_parents or ('close_request' in message and message['state'] == 'done'):
                     self.answers[mid].set()
                 if message['state'] == 'dispatching':
-                    message.update(state='uncertain', note='Broker restarted during delivery; resolve explicitly')
+                    if message.get('codex_queue_read') == 'retrieved':
+                        self.status(message, 'received', CODEX_READ_BEFORE_SETTLEMENT)
+                    else:
+                        message.update(state='uncertain', note='Broker restarted during delivery; resolve explicitly')
             # Every broker epoch reconciles the checkpoint and metadata index,
             # including removal of receipts/snapshots bound to the retired epoch.
             # Periodic no-op sweeps still avoid cloning and checkpoint writes.
@@ -472,6 +481,101 @@ class State:
         item['claimed'] = True
         return {key: item[key] for key in ('id', 'requested_at', 'reason')}
 
+    def codex_route_matches(self, message, session):
+        return (message is not None and delivery_destination(message['route']) == ('codex', session)
+                and not self.route_dropped(message['route']))
+
+    def codex_mail_ready(self, message, session):
+        if (message is None or message.get('codex_queue_read') != 'ready' or message.get('body_expired')
+                or 'close_request' in message or message['state'] not in ('dispatching', 'submitted')
+                or not self.codex_route_matches(message, session)):
+            return False
+        try:
+            self.require_open_route(message['route'])
+        except ValueError:
+            return False
+        return True
+
+    def codex_pretool_action(self, args):
+        session, deadline = args.get('session'), args.get('deadline')
+        current = time.monotonic()
+        if (not codex_hook_mail.exact_uuid(session) or type(deadline) not in (int, float)
+                or not current < deadline <= current + 1):
+            return None
+        preview = args['op'] == 'codex-pretool-claim'
+        if not preview:
+            claim = self.codex_mail_claims.get(session)
+            if (claim is None or claim['id'] != args.get('id') or claim['deadline'] != deadline
+                    or claim['digest'] != args.get('digest')):
+                return None
+            # Claims are deliberately volatile. A failed checkpoint leaves the
+            # mail available, and a later tool call can make a new selection.
+            del self.codex_mail_claims[session]
+        stop = self.codex_stop_hook_action({'op': 'codex-stop-claim', 'session': session,
+                                             'deadline': deadline})
+        if stop is not None:
+            return {'kind': 'stop', **stop}
+        if session in self.codex_stops:  # A concurrent invocation owns the pending stop.
+            return None
+        if preview:
+            for key, item in tuple(self.codex_mail_claims.items()):
+                if item['deadline'] <= current:
+                    del self.codex_mail_claims[key]
+            if session in self.codex_mail_claims or len(self.codex_mail_claims) >= codex_hook_mail.MAX_CLAIMS:
+                return None
+            messages = (m for m in self.messages.values() if self.codex_mail_ready(m, session))
+            ids, reason = codex_hook_mail.bounded_reason(messages, self.socket_path)
+            if not ids:
+                return None
+            claim_id = str(uuid.uuid4())
+            self.codex_mail_claims[session] = {'id': claim_id, 'deadline': deadline, 'ids': ids,
+                                               'digest': codex_hook_mail.reason_digest(reason)}
+            return {'kind': 'mail', 'id': claim_id, 'reason': reason}
+        messages = [self.messages.get(mid) for mid in claim['ids']]
+        if not all(self.codex_mail_ready(message, session) for message in messages):
+            return None  # The queue won, or the route changed after preview.
+        for message in messages:
+            self.codex_mark_read(message)
+        return {'kind': 'mail', 'id': claim['id']}
+
+    def codex_arm_queue(self, args):
+        message = self.get(args['id'])
+        route = message['route']
+        if (route['transport'] != 'codex' or 'close_request' in message or message['state'] != 'dispatching'
+                or not self.codex_route_matches(message, route['session'])):
+            raise ValueError('Codex queue message is no longer eligible for submission')
+        self.require_open_route(route)
+        message.setdefault('codex_queue_read', 'ready')
+        return True
+
+    def codex_mark_read(self, message):
+        message['codex_queue_read'] = 'retrieved'
+        if message['state'] == 'submitted':
+            self.status(message, 'received')
+            return True
+        return False
+
+    def codex_read_queue(self, args):
+        mid, session = args.get('id'), args.get('session')
+        if not codex_hook_mail.exact_uuid(mid) or not codex_hook_mail.exact_uuid(session):
+            raise ValueError(CODEX_READ_NO_MATCH)
+        message = self.messages.get(mid) or self.compact_messages.get(mid)
+        if message is None or not message.get('codex_queue_read'):
+            return {'legacy': True}
+        if not self.codex_route_matches(message, session):
+            raise ValueError(CODEX_READ_NO_MATCH)
+        if message.get('codex_queue_read') == 'retrieved' or message['state'] in ('received', 'in_progress'):
+            return {'already_retrieved': True}
+        if message.get('body_expired') or message['state'] not in ('dispatching', 'submitted', 'uncertain'):
+            return {'legacy': True}  # Preserve existing diagnostic details for a body that cannot be read.
+        deadline = args.get('deadline')
+        current = time.monotonic()
+        if type(deadline) not in (int, float) or not current < deadline <= current + CODEX_RECEIVE_SECONDS:
+            raise ValueError('Codex queued read expired before admission')
+        self.require_open_route(message['route'])
+        marked = self.codex_mark_read(message)
+        return {'message': public_message(message), 'marked_received': marked}
+
     def matches(self, sub, event):
         if event['type'] == 'close_archive':
             return route_key(event['route']) == sub['route']
@@ -521,6 +625,8 @@ class State:
             m.setdefault('delivered_at', time.time())
         if state == 'pending':
             m.pop('delivered_at', None)
+            if m.get('codex_queue_read') == 'ready':
+                m.pop('codex_queue_read')
         if m.get('body_expired'):
             # A late answer changes correlation metadata, never recreates content.
             m['events'] = []
@@ -893,12 +999,16 @@ class State:
                 and (age := dispatch_age(message, current)) is not None and age > DISPATCH_LIMIT]
 
     def expire_dispatches(self, current=None):
-        # Only `dispatching` moves, and only to `uncertain`: never back to
-        # `pending`, never a resend. A late `finish` then meets a cleared claim.
+        # An unresolved dispatch never returns to `pending`. A timely body read
+        # is independent of the queue settlement and can already prove receipt.
         current = time.time() if current is None else current
         expired = self.expired_dispatches(current)
         for mid in expired:
-            self.status(self.messages[mid], 'uncertain', DISPATCH_EXPIRED_NOTE, 'push_failed')
+            message = self.messages[mid]
+            if message.get('codex_queue_read') == 'retrieved':
+                self.status(message, 'received', CODEX_READ_BEFORE_SETTLEMENT)
+            else:
+                self.status(message, 'uncertain', DISPATCH_EXPIRED_NOTE, 'push_failed')
         return {'expired': len(expired)}
 
     def purge_archive_events(self, removed):
@@ -1033,7 +1143,12 @@ class State:
                      'claim-guarded', 'release-claim', 'note-pending',
                      'inbox_ack', 'inbox_reply', 'provider-failure', 'provider-retry', 'retention-sweep',
                      'archive-correspondence', 'close-dispatch', 'close-operator', 'close-retro-notify',
-                     'dispatch-expire')
+                     'dispatch-expire', 'codex-queue-arm', 'codex-queue-read', 'codex-pretool-commit')
+        if args['op'] == 'codex-queue-read' and codex_hook_mail.exact_uuid(args.get('id')):
+            message = self.messages.get(args['id'])
+            if (message is None or message.get('codex_queue_read') != 'ready'
+                    or message['state'] not in ('dispatching', 'submitted', 'uncertain')):
+                return self.codex_read_queue(args), None  # No mutation needed for an old or completed read.
         archive = args['op'] == 'archive-correspondence'
         if archive and args.get('check_only') is True:
             return self.archive_correspondence(args), None
@@ -1079,6 +1194,8 @@ class State:
         result = ({'changed': staged.sweep_retention(planned_at, planned=planned)}
                   if planned is not None else staged.apply_action(args, verified_close=verified_close))
         if args['op'] == 'retention-sweep' and not result['changed']:
+            return result, None
+        if args['op'] == 'codex-pretool-commit' and (result is None or result['kind'] != 'mail'):
             return result, None
         if (args['op'] in ('inbox_reply', 'provider-failure', 'provider-retry', 'release-claim', 'note-pending')
                 and not staged.pending_publications):
@@ -1178,6 +1295,12 @@ class State:
             return self.request_codex_stop(args)
         if op in ('codex-stop-claim', 'codex-stop-finish'):
             return self.codex_stop_hook_action(args)
+        if op in ('codex-pretool-claim', 'codex-pretool-commit'):
+            return self.codex_pretool_action(args)
+        if op == 'codex-queue-arm':
+            return self.codex_arm_queue(args)
+        if op == 'codex-queue-read':
+            return self.codex_read_queue(args)
         if op == 'archive-correspondence':
             return self.archive_correspondence(args, verified_close=verified_close)
         if op == 'close-prepare':
@@ -1472,11 +1595,15 @@ class State:
             raise ValueError('Recovery requires a supported state and explanation')
         if op == 'resolve' and state == 'pending' and m.get('codex_queue_accepted'):
             raise ValueError('Codex Desktop already accepted this notification; it cannot be redelivered')
+        if op == 'resolve' and state == 'pending' and m.get('codex_queue_read') == 'retrieved':
+            raise ValueError('Codex already retrieved the message; it cannot be redelivered')
         if state not in TERMINAL_STATES:
             self.require_open_route(m['route'])
             self.require_open_route(m['return_route'])
             if m.get('reason') == message_store.ARCHIVED_REASON:
                 raise ValueError('Archived delivery is terminal')
+        if op == 'resolve' and state == 'submitted' and m.get('codex_queue_read') == 'retrieved':
+            return self.status(m, 'received', args.get('note'))
         return self.status(m,state,args.get('note'))
 
     def note_pending(self, m, args):
@@ -1555,6 +1682,8 @@ class State:
         if reason is not None and (reason != message_store.ARCHIVED_REASON
                 or args['state'] != 'failed' or m['route']['transport'] != 'codex'):
             raise ValueError('Invalid delivery reason')
+        if m.get('codex_queue_read') == 'retrieved':
+            return self.status(m, 'received', CODEX_READ_BEFORE_SETTLEMENT)
         # Keep the normalized wake outcome on the message before it is published (#121).
         peer_wake.record_wake(m, args.get('wake'))
         return self.status(m,args['state'],args.get('note'),event,reason)
@@ -1569,6 +1698,8 @@ class State:
                 raise ValueError('Delivery claim changed. Inspect the current state.')
             m['codex_queue_accepted'] = True
             self.status(m, 'submitted', args.get('note'), 'pushed')
+            if m.get('codex_queue_read') == 'retrieved':
+                self.status(m, 'received')
         elif m['state'] in ('received', 'in_progress', 'answered', 'done'):
             # A close operator can claim and finish before the queue CLI returns.
             m['codex_queue_accepted'] = True
@@ -2262,7 +2393,7 @@ async def serve(path, max_messages=2048, state_dir=None, usage_interval=usage.DE
         # default executor. Keep checkpoint IO independent of those workers.
         checkpoint_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='ab-checkpoint')
         state = State(max_messages, store, retention_ttl=retention_ttl, retention_prepare=retention_prepare,
-                      checkpoint_executor=checkpoint_executor)
+                      checkpoint_executor=checkpoint_executor, socket_path=path)
         if retention_ttl or retention_prepare:
             retention_task = asyncio.create_task(retention_loop(state))
         dispatch_task = asyncio.create_task(dispatch_loop(state))

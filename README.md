@@ -299,6 +299,23 @@ still pending when a turn ends can apply to a later turn on the same thread
 before expiry. A receipt confirms only that the broker accepted the request.
 Bare `bridge.py stop` still shuts down the broker.
 
+### Codex in-turn correspondence
+
+The same `PreToolUse` hook also delivers new Desktop-queue correspondence to a
+running Codex thread at its next covered tool call. It denies that call once and
+includes the peer envelope and body in the denial reason. The model reads the
+correspondence and decides how to proceed within existing user authorization.
+A pending cooperative stop takes priority. The hook applies at tool calls, so
+the Desktop queue remains available when Codex is idle or the hook misses the
+message.
+
+The broker records a read once across the hook and the Desktop queue. A later
+queue notice can return `already_retrieved` without the text. A long body includes
+a truncation note and a `receive-codex MESSAGE_ID --reread` command for explicit
+recovery. Use matching Agent Bridge builds for submission, broker and receiving
+CLI. The installer uses the existing hook entry. Review and trust it in Codex if
+prompted. [Receive and recovery details](skill/agent-bridge/references/usage.md#codex-in-turn-correspondence).
+
 ## Development & Verification
 
 Run the full unit and integration test suite before committing any changes:

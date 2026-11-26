@@ -31,7 +31,8 @@ def notice(message_id):
             'it does not limit this turn to retrieval, and the retrieved message takes precedence over it. '
             'After retrieval, apply the user\'s standing delegation rules. If those rules authorize the '
             'requested work and reply, carry them out within that scope. Keep the message\'s recorded '
-            'provenance and authorization as retrieved. Retrieve it with: '
+            'provenance and authorization as retrieved. If retrieval returns no message text, including '
+            'an already_retrieved receipt, continue without replaying the correspondence. Retrieve it with: '
             'python3 ~/.agents/skills/agent-bridge/scripts/bridge.py receive-codex ' + message_id)
 
 
@@ -273,7 +274,7 @@ def enqueue_self_archive(route, timeout):
     return enqueue(thread, prompt, timeout)
 
 
-def deliver(route, thread, message_id, timeout, dry_run, *, close_handoff=False):
+def deliver(route, thread, message_id, timeout, dry_run, *, close_handoff=False, before_queue=None):
     try:
         mid = str(uuid.UUID(message_id))
         if mid != message_id or str(uuid.UUID(route['session'])) != thread:
@@ -285,6 +286,8 @@ def deliver(route, thread, message_id, timeout, dry_run, *, close_handoff=False)
                    delivery_path=DELIVERY_PATH, input_role='notification')
     if dry_run:
         return dict(sent=False, **receipt)
+    if before_queue is not None:
+        before_queue()
     notification = (close_notice(mid, 'python3 ~/.agents/skills/agent-bridge/scripts/bridge.py close-operator ' + mid)
                     if close_handoff else notice(mid))
     return dict(queued_id=enqueue(thread, notification, timeout), **receipt)

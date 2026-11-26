@@ -89,10 +89,32 @@ def receive_codex(args):
     except ValueError:
         raise ValueError(invalid) from None
 
-    unmatched = 'No correspondence matches this Codex thread and message ID.'
+    unmatched = broker.CODEX_READ_NO_MATCH
     bad_response = 'Agent Bridge broker did not return a usable message response.'
+    legacy = args.reread
+    marked = False
     try:
-        message = broker.request(args.socket, {'op': 'show', 'id': args.id})
+        if not legacy:
+            deadline = time.monotonic() + broker.CODEX_RECEIVE_SECONDS
+            try:
+                result = broker.request(args.socket, {'op': 'codex-queue-read', 'id': args.id,
+                    'session': thread_id, 'deadline': deadline}, deadline=deadline)
+            except ValueError as error:
+                if str(error) != 'Unknown operation':
+                    raise
+                result = {'legacy': True}  # A definite older broker refusal never consumed the read.
+            if not isinstance(result, dict):
+                raise broker.BrokerResponseError(bad_response)
+            if result.keys() == {'already_retrieved'} and result['already_retrieved'] is True:
+                return {'id': args.id, 'already_retrieved': True, 'marked_received': False}
+            legacy = result.keys() == {'legacy'} and result['legacy'] is True
+            if not legacy:
+                marked = result.get('marked_received')
+                if type(marked) is not bool:
+                    raise broker.BrokerResponseError(bad_response)
+                message = result.get('message')
+        if legacy:
+            message = broker.request(args.socket, {'op': 'show', 'id': args.id})
     except (broker.BrokerConnectError, OSError) as error:
         if error.errno in (errno.EACCES, errno.EPERM):
             raise ValueError('Agent Bridge broker socket access was denied. '
@@ -106,6 +128,8 @@ def receive_codex(args):
         # The existing wire response has no machine-readable error code.
         if str(error) == broker.UNKNOWN_MESSAGE_ERROR:
             raise ValueError(unmatched) from None
+        if str(error) in (unmatched, broker.CLOSING_ROUTE_ERROR, 'Codex queued read expired before admission'):
+            raise ValueError(str(error)) from None
         raise ValueError(bad_response) from None
     if not isinstance(message, dict) or not isinstance(message.get('route'), dict):
         raise ValueError(bad_response)
@@ -134,7 +158,8 @@ def receive_codex(args):
         raise ValueError(bad_response) from None
     # A message already received or in progress was read before; acking again would add an event
     # (or move in_progress back) for nothing (issue #153).
-    marked = state not in ('received', 'in_progress') and mark_received(args.socket, args.id)
+    if legacy:
+        marked = state not in ('received', 'in_progress') and mark_received(args.socket, args.id)
     return {'id': args.id, 'sender': message['sender'], 'text': text,
             'provenance': 'agent_bridge_peer', 'authorization': 'none', 'marked_received': marked}
 
@@ -1190,6 +1215,7 @@ def add_message_commands(sub):
         p.add_argument('id')
     p = sub.add_parser('receive-codex', help='Read one dispatched peer message from its addressed Codex thread')
     p.add_argument('id', metavar='MESSAGE_ID')
+    p.add_argument('--reread', action='store_true', help='Explicitly recover the full retained text after a prior read')
     p = sub.add_parser('progress')
     p.add_argument('id')
     p.add_argument('--note',required=True)

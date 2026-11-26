@@ -343,7 +343,8 @@ def close_notice(message_id, claim_command):
             'result, run only the verification step. Do not send a bridge reply to this control request.')
 
 
-def deliver(route, message_id, text, timeout=10, dry_run=False, path=None, *, allow_queue=True, close_handoff=False):
+def deliver(route, message_id, text, timeout=10, dry_run=False, path=None, *, allow_queue=True, close_handoff=False,
+            before_queue=None):
     workspace, archived = exact_saved_workspace(route)
     if archived is True:
         raise ThreadArchived()
@@ -393,7 +394,9 @@ def deliver(route, message_id, text, timeout=10, dry_run=False, path=None, *, al
         if allow_queue and not client.mutation_sent and error.default_absent:
             import codex_queue
 
-            return codex_queue.deliver(route, thread, message_id, timeout, dry_run, close_handoff=close_handoff)
+            preparation = {} if before_queue is None else {'before_queue': before_queue}
+            return codex_queue.deliver(route, thread, message_id, timeout, dry_run, close_handoff=close_handoff,
+                                       **preparation)
         raise
     except DeliveryError as error:
         if client.mutation_sent:

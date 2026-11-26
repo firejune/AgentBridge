@@ -1,23 +1,51 @@
 #!/usr/bin/env python3
-"""Deny one covered Codex tool invocation for a matching local stop request."""
+"""Deny one covered Codex tool call for a matching stop request or peer mail."""
 
 import argparse
 import json
 import sys
 import time
-import uuid
 
 import broker
+import codex_hook_mail
 
 SOCKET_BUDGET = 0.25
 MAX_INPUT = 4 * 1024 * 1024
 
 
-def is_uuid(value):
+def claim(socket, session, deadline):
+    request = {'op': 'codex-pretool-claim', 'session': session, 'deadline': deadline}
     try:
-        return isinstance(value, str) and str(uuid.UUID(value)) == value
-    except ValueError:
-        return False
+        return broker.request(socket, request, deadline=deadline)
+    except ValueError as error:
+        if str(error) != 'Unknown operation':
+            raise
+        # A pre-feature broker still serves the cooperative stop contract.
+        result = broker.request(socket, {**request, 'op': 'codex-stop-claim'}, deadline=deadline)
+        return {**result, 'kind': 'stop'} if isinstance(result, dict) else None
+
+
+def denial(reason):
+    return json.dumps({'hookSpecificOutput': {
+        'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',
+        'permissionDecisionReason': reason,
+    }}) + '\n'
+
+
+def emit_stop(result, socket, session, deadline, output):
+    stamp, reason = result.get('requested_at'), result.get('reason')
+    if (not isinstance(stamp, str) or not stamp.isprintable() or len(stamp) > 40
+            or reason is not None and (not isinstance(reason, str)
+                                       or not reason.isprintable() or len(reason) > 256)
+            or time.monotonic() >= deadline):
+        return
+    message = f'Stopped by Agent Bridge at {stamp} by request of the local operator. End the turn now and wait.'
+    if reason:
+        message += f' Operator reason: {reason}'
+    output.write(denial(message))
+    output.flush()
+    broker.request(socket, {'op': 'codex-stop-finish', 'session': session, 'id': result['id']},
+                   deadline=deadline)
 
 
 def run(socket, source, output):
@@ -30,31 +58,33 @@ def run(socket, source, output):
         if not isinstance(event, dict) or event.get('hook_event_name') != 'PreToolUse':
             return
         session = event.get('session_id')
-        if not is_uuid(session):
+        if not codex_hook_mail.exact_uuid(session):
             return
-        result = broker.request(socket, {'op': 'codex-stop-claim', 'session': session,
-                                         'deadline': deadline}, deadline=deadline)
-        if not isinstance(result, dict) or not is_uuid(result.get('id')):
+        result = claim(socket, session, deadline)
+        if not isinstance(result, dict) or not codex_hook_mail.exact_uuid(result.get('id')):
             return
-        stamp, reason = result.get('requested_at'), result.get('reason')
-        if (not isinstance(stamp, str) or not stamp.isprintable() or len(stamp) > 40
-                or reason is not None and (not isinstance(reason, str)
-                                           or not reason.isprintable() or len(reason) > 256)
-                or time.monotonic() >= deadline):
+        if result.get('kind') == 'stop':
+            emit_stop(result, socket, session, deadline, output)
             return
-        message = f'Stopped by Agent Bridge at {stamp} by request of the local operator. End the turn now and wait.'
-        if reason:
-            message += f' Operator reason: {reason}'
-        output.write(json.dumps({'hookSpecificOutput': {
-            'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',
-            'permissionDecisionReason': message,
-        }}) + '\n')
-        output.flush()
-        broker.request(socket, {'op': 'codex-stop-finish', 'session': session, 'id': result['id']},
-                       deadline=deadline)
+        reason = result.get('reason')
+        if (result.keys() != {'kind', 'id', 'reason'} or result['kind'] != 'mail'
+                or not codex_hook_mail.valid_reason(reason) or time.monotonic() >= deadline):
+            return
+        payload = denial(reason)
+        confirmed = broker.request(socket, {'op': 'codex-pretool-commit', 'session': session, 'id': result['id'],
+                                     'deadline': deadline, 'digest': codex_hook_mail.reason_digest(reason)},
+                                   deadline=deadline)
+        if time.monotonic() >= deadline:
+            return
+        if confirmed == {'kind': 'mail', 'id': result['id']}:
+            output.write(payload)
+            output.flush()
+        elif (isinstance(confirmed, dict) and confirmed.get('kind') == 'stop'
+              and codex_hook_mail.exact_uuid(confirmed.get('id'))):
+            emit_stop(confirmed, socket, session, deadline, output)
     except (OSError, ValueError, TypeError, RecursionError):
-        # A failed acknowledgement cannot undo the emitted denial. The broker
-        # keeps the claim unavailable for other calls and expires it normally.
+        # A read commit can outlive a lost response or failed local write.
+        # Its body remains available through explicit reread.
         return
 
 

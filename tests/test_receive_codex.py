@@ -34,11 +34,30 @@ class ReceiveCodexTests(unittest.TestCase):
             'note': 'private diagnostic',
         }
 
-    def receive(self, message_id=None, socket='test.sock'):
+    def receive(self, message_id=None, socket='test.sock', *, reread=True):
         stdout = io.StringIO()
+        argv = ['--socket', socket, 'receive-codex', message_id or self.message_id]
+        if reread:
+            argv.append('--reread')
         with redirect_stdout(stdout):
-            result = bridge.main(['--socket', socket, 'receive-codex', message_id or self.message_id])
+            result = bridge.main(argv)
         return result, json.loads(stdout.getvalue())
+
+    def test_default_read_falls_back_only_after_definite_legacy_response(self):
+        for legacy in (ValueError('Unknown operation'), {'legacy': True}):
+            with self.subTest(legacy=legacy), patch.dict('os.environ', {'CODEX_THREAD_ID': self.thread}), \
+                    patch.object(bridge.broker, 'request', side_effect=[legacy, self.message,
+                                 ValueError('Resolve delivery outcome first')]) as request:
+                status, received = self.receive(reread=False)
+                self.assertEqual(status, 0)
+                self.assertIn(self.body, received['text'])
+                self.assertEqual([call.args[1]['op'] for call in request.call_args_list],
+                                 ['codex-queue-read', 'show', 'ack'])
+        with patch.dict('os.environ', {'CODEX_THREAD_ID': self.thread}), \
+                patch.object(bridge.broker, 'request',
+                             side_effect=bridge.broker.BrokerResponseError('lost response')) as request:
+            self.assertEqual(self.receive(reread=False)[0], 1)
+            request.assert_called_once()
 
     def test_exact_recipient_reads_peer_envelope_and_marks_only_an_unread_message(self):
         def broker_request(path, fields, **kwargs):
@@ -233,11 +252,14 @@ class ReceiveCodexTests(unittest.TestCase):
                 before = checkpoint.read_bytes()
                 durable, = (item for item in json.loads(before)['messages'] if item['id'] == mid)
                 self.assertEqual(durable['state'], 'dispatching')
+                self.assertEqual(durable['codex_queue_read'], 'ready')
                 self.assertEqual(server.call('show', id=mid)['state'], 'dispatching')
-                status, received = self.receive(mid, server.path)
+                status, received = self.receive(mid, server.path, reread=False)
                 self.assertEqual((status, received['id'], received['sender']), (0, mid, 'peer'))
                 self.assertIn(self.body, received['text'])
-                self.assertEqual(checkpoint.read_bytes(), before)
+                self.assertFalse(received['marked_received'])
+                saved, = (item for item in json.loads(checkpoint.read_bytes())['messages'] if item['id'] == mid)
+                self.assertEqual(saved, durable | {'codex_queue_read': 'retrieved'})
                 return str(uuid.uuid4())
 
             with patch.dict('os.environ', {'CODEX_THREAD_ID': self.thread, 'CODEX_HOME': server.temp.name}), \
@@ -252,7 +274,7 @@ class ReceiveCodexTests(unittest.TestCase):
                 pushed = delivery.push_codex(server.path, posted)
             queued.assert_called_once()
             self.assertEqual(pushed['delivery_path'], codex_queue.DELIVERY_PATH)
-            self.assertEqual(server.call('show', id=mid)['state'], 'submitted')
+            self.assertEqual(server.call('show', id=mid)['state'], 'received')
 
 
 if __name__ == '__main__':
