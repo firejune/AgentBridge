@@ -1596,14 +1596,16 @@ class RecommendationTests(unittest.TestCase):
         short = dict(usedPercent=100, windowDurationMins=300, resetsAt=RESET)
         usage.sample(store, lambda: response(100 - remaining, reset, secondary=short), lambda: observed)
 
-    def agy(self, short=.10):
+    def agy(self, short=1, short_reset=timedelta(hours=4)):
         store = usage.UsageStore(self.state / 'usage', provider='agy')
         result = agy_summary(gemini_weekly=.44, gemini_5h=short,
-                             gemini_weekly_reset=usage.utc(T0 + timedelta(hours=119)))
+                             gemini_weekly_reset=usage.utc(T0 + timedelta(hours=119)),
+                             gemini_5h_reset=usage.utc(T0 + short_reset))
         usage.sample(store, lambda: result, lambda: T0)
 
     def claude(self, weekly=65, now=T0):
-        payload = plan(19, weekly, 1)
+        payload = plan(26, weekly, 1)
+        payload['windows'][0]['resetsAt'] = usage.utc(T0 + timedelta(hours=3, minutes=52))
         payload['windows'][1]['resetsAt'] = usage.utc(T0 + timedelta(hours=18))
         usage.report_claude(self.state, payload, env=self.env, now=now)
 
@@ -1615,19 +1617,24 @@ class RecommendationTests(unittest.TestCase):
             self.assertEqual(bridge.main(argv), 0)
         return out.getvalue()
 
-    def test_all_ranks_weekly_headroom_and_keeps_scoped_output(self):
+    def test_all_ranks_by_lower_headroom_and_keeps_scoped_output(self):
         self.codex()
         self.agy()
         self.claude()
         found = json.loads(self.cli('--json'))['recommend']
         self.assertEqual(set(found), {'pool', 'ranking'})
-        self.assertEqual(found['pool'], 'claude')
-        self.assertEqual([r['pool'] for r in found['ranking']], ['claude', 'codex', 'agy'])
-        for row, (remaining, hours) in zip(found['ranking'], ((35, 18), (95, 163), (44, 119))):
+        self.assertEqual(found['pool'], 'codex')
+        self.assertEqual([r['pool'] for r in found['ranking']], ['codex', 'claude', 'agy'])
+        for row, (remaining, hours, short) in zip(found['ranking'], (
+                (95, 163, None), (35, 18, 74 - 232 / 300 * 100), (44, 119, 20.0))):
+            weekly = remaining - hours / 168 * 100
             self.assertEqual(row, dict(pool=row['pool'], state='eligible', reason=None,
-                                       headroom=remaining - hours / 168 * 100, remaining_percent=remaining,
+                                       weekly=weekly, short=short, score=weekly if short is None else min(weekly, short),
+                                       remaining_percent=remaining,
                                        resets_at=usage.utc(T0 + timedelta(hours=hours))))
-        self.assertEqual(self.cli().splitlines()[0], 'recommend: claude (headroom claude +24.3 · codex -2.0 · agy -26.8)')
+        self.assertEqual(self.cli().splitlines()[0],
+                         'recommend: codex (codex -2.0 [7d -2.0] · claude -3.3 [7d +24.3, 5h -3.3]'
+                         ' · agy -26.8 [7d -26.8, 5h +20.0])')
         for provider in ('codex', 'agy', 'claude'):
             with self.subTest(provider=provider):
                 self.assertNotIn('recommend', json.loads(self.cli('--json', '--provider', provider)))
@@ -1635,28 +1642,34 @@ class RecommendationTests(unittest.TestCase):
 
     def test_excludes_short_below_ten_and_weekly_exhausted(self):
         self.codex(remaining=0)
-        self.agy(short=.09)
+        self.agy(short=.09, short_reset=timedelta(minutes=1))
         result = json.loads(self.cli('--provider', 'all', '--json'))['recommend']
         rows = {row['pool']: row for row in result['ranking']}
         self.assertIsNone(result['pool'])
         self.assertEqual(rows['codex']['state'], 'excluded')
         self.assertEqual(rows['codex']['reason'], 'weekly quota exhausted')
         self.assertEqual(rows['agy']['state'], 'excluded')
-        self.assertEqual(rows['agy']['reason'], 'short window below 10% until 2026-10-23T07:33:50+00:00')
+        self.assertEqual(rows['agy']['reason'], 'short window below 10% until 2026-10-23T03:01:00+00:00')
+        self.assertGreater(rows['agy']['short'], 0)
         self.assertEqual(rows['claude']['state'], 'unknown')
-        self.assertTrue(all(row['headroom'] is None for row in rows.values()))
+        self.assertTrue(all(row['score'] is None for row in rows.values()))
         self.assertIn('claude unknown (weekly reading missing)', self.cli().splitlines()[0])
 
-    def test_weekly_window_length_comes_from_row_and_short_reset_must_be_fresh(self):
-        self.agy()
+    def test_both_window_lengths_come_from_rows_and_short_reading_is_required(self):
+        self.agy(short=.10)
         store = usage.UsageStore(self.state / 'usage', provider='agy')
         records = store.load()
         weekly = next(r for r in records if r['limit_id'] == 'gemini-weekly')
         weekly['window_mins'] = 6 * 24 * 60
+        short = next(r for r in records if r['limit_id'] == 'gemini-5h')
+        short['window_mins'] = 6 * 60
         store.save(records, T0)
         result = json.loads(self.cli('--json'))['recommend']
         self.assertEqual(result['pool'], 'agy')
-        self.assertAlmostEqual(result['ranking'][0]['headroom'], 44 - 119 / 144 * 100)
+        self.assertAlmostEqual(result['ranking'][0]['weekly'], 44 - 119 / 144 * 100)
+        expected_short = 10 - 4 / 6 * 100
+        self.assertAlmostEqual(result['ranking'][0]['short'], expected_short)
+        self.assertAlmostEqual(result['ranking'][0]['score'], expected_short)
         store.save([r for r in records if r['limit_id'] != 'gemini-5h'], T0)
         result = json.loads(self.cli('--json'))['recommend']
         self.assertIsNone(result['pool'])

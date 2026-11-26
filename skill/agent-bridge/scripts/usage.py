@@ -1073,39 +1073,38 @@ def assess(summary, records, now):
     return summary
 
 
-def recommendation_unknown(row, until, window):
+def recommendation_window(row, now, window):
     if row is None:
-        return f'{window} reading missing'
+        return None, f'{window} reading missing'
     if row['freshness'] != 'fresh':
-        return f"{window} reading {row['freshness']}"
+        return None, f"{window} reading {row['freshness']}"
+    until = seconds_until_reset(row, now)
     if row['remaining_percent'] is None or until is None:
-        return f'{window} remaining quota or reset time missing'
+        return None, f'{window} remaining quota or reset time missing'
     if until <= 0:
-        return f'{window} reset due; waiting for a new reading'
-    return None
+        return None, f'{window} reset due; waiting for a new reading'
+    if not row['window_mins'] or row['window_mins'] < 0:
+        return None, f'{window} length missing or invalid'
+    return row['remaining_percent'] - until / (row['window_mins'] * 60) * 100, None
 
 
 def assess_recommendation(pool, weekly, short, now):
     remaining = weekly['remaining_percent'] if weekly else None
     reset = weekly['resets_at'] if weekly else None
-    entry = dict(pool=pool, state='unknown', headroom=None, remaining_percent=remaining, resets_at=reset)
-    until = seconds_until_reset(weekly, now) if weekly else None
-    reason = recommendation_unknown(weekly, until, 'weekly')
-    if reason:
-        return dict(entry, reason=reason)
+    weekly_headroom, weekly_reason = recommendation_window(weekly, now, 'weekly')
+    short_headroom, short_reason = (None, None) if pool == 'codex' else recommendation_window(short, now, 'short window')
+    entry = dict(pool=pool, state='unknown', score=None, weekly=weekly_headroom, short=short_headroom,
+                 remaining_percent=remaining, resets_at=reset)
+    if weekly_reason:
+        return dict(entry, reason=weekly_reason)
     if remaining == 0 or weekly['allowed'] is False:
         return dict(entry, state='excluded', reason='weekly quota exhausted')
-    if not weekly['window_mins'] or weekly['window_mins'] < 0:
-        return dict(entry, reason='weekly window length missing or invalid')
-    if pool != 'codex':
-        short_until = seconds_until_reset(short, now) if short else None
-        reason = recommendation_unknown(short, short_until, 'short window')
-        if reason:
-            return dict(entry, reason=reason)
-        if short['remaining_percent'] < 10:
-            return dict(entry, state='excluded', reason=f"short window below 10% until {short['resets_at']}")
-    headroom = remaining - until / (weekly['window_mins'] * 60) * 100
-    return dict(entry, state='eligible', headroom=headroom, reason=None)
+    if short_reason:
+        return dict(entry, reason=short_reason)
+    if short is not None and short['remaining_percent'] < 10:
+        return dict(entry, state='excluded', reason=f"short window below 10% until {short['resets_at']}")
+    score = weekly_headroom if short_headroom is None else min(weekly_headroom, short_headroom)
+    return dict(entry, state='eligible', score=score, reason=None)
 
 
 def recommend(summary, now):
@@ -1121,14 +1120,22 @@ def recommend(summary, now):
     )
     ranking = [assess_recommendation(pool, weekly, rows.get(short_key), now)
                for pool, weekly, short_key in pools]
-    ranking.sort(key=lambda row: (row['headroom'] is None, -(row['headroom'] or 0), row['pool']))
+    ranking.sort(key=lambda row: (row['score'] is None, -(row['score'] or 0), row['pool']))
     return dict(pool=ranking[0]['pool'] if ranking[0]['state'] == 'eligible' else None, ranking=ranking)
 
 
 def format_recommendation(result):
-    parts = [f"{row['pool']} {row['headroom']:+.1f}" if row['state'] == 'eligible'
-             else f"{row['pool']} {row['state']} ({row['reason']})" for row in result['ranking']]
-    return f"recommend: {result['pool'] or 'none'} (headroom {' · '.join(parts)})"
+    parts = []
+    for row in result['ranking']:
+        score = f"{row['score']:+.1f}" if row['state'] == 'eligible' else f"{row['state']} ({row['reason']})"
+        windows = []
+        for label, key in (('7d', 'weekly'), ('5h', 'short')):
+            value = row[key]
+            if value is not None:
+                windows.append(f'{label} {value:+.1f}')
+        breakdown = f" [{', '.join(windows)}]" if windows else ''
+        parts.append(f"{row['pool']} {score}{breakdown}")
+    return f"recommend: {result['pool'] or 'none'} ({' · '.join(parts)})"
 
 
 def risk_text(verdict):
