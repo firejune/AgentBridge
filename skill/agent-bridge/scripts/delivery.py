@@ -443,6 +443,18 @@ def push_codex(path, m, timeout=10, dry_run=False, *, close_dispatch=False, guar
     def rpc(op, **fields):
         return broker.request(path, {'op':op, 'id':m['id'], **fields})
 
+    def arm_queue():
+        try:
+            armed = rpc('codex-queue-arm')
+        except ValueError as error:
+            if str(error) == 'Unknown operation':
+                return  # A pre-feature broker still supports the existing queue notice.
+            armed = None
+        except OSError:
+            armed = None
+        if armed is not True:
+            raise codex_queue.QueueUnavailable('Agent Bridge did not confirm the Codex queue message before submission.')
+
     close_request = m.get('close_request')
     if close_request is not None and not close_dispatch:
         raise ValueError('A close handoff cannot be delivered manually')
@@ -453,14 +465,17 @@ def push_codex(path, m, timeout=10, dry_run=False, *, close_dispatch=False, guar
             raise ValueError('Only pending messages may be delivered')
         rpc('claim', **({'close_id': close_request['close_id']} if close_request else {}))
     allow_queue = Path(path).expanduser() == broker.DEFAULT_SOCKET and (close_request is None or guarded_close)
+    preparation = {'before_queue': arm_queue} if allow_queue and not dry_run and close_request is None else {}
     try:
         receipt = codex_live.deliver(
             m['route'], m['id'], peer_text(m, path, escape_peer=False), timeout, dry_run=dry_run,
-            allow_queue=allow_queue, close_handoff=close_request is not None)
+            allow_queue=allow_queue, close_handoff=close_request is not None, **preparation)
     except codex_live.ThreadArchived as error:
         if dry_run:
             return dict(state=m['state'], sent=False, reason=ARCHIVED_REASON, error=str(error))
         message = rpc('finish', state='failed', reason=ARCHIVED_REASON, event='push_failed')
+        if message.get('codex_queue_read') == 'retrieved':
+            return message
         raise PushFailed(str(error), message) from None
     except codex_live.DeliveryError as error:
         if dry_run:
@@ -470,6 +485,8 @@ def push_codex(path, m, timeout=10, dry_run=False, *, close_dispatch=False, guar
         message = rpc('finish', state=state, note=str(error), **fields)
         # The enrolled operator can claim or finish before the queue CLI returns.
         if close_request is not None and message['state'] in ('in_progress', 'done'):
+            return message
+        if message.get('codex_queue_read') == 'retrieved':
             return message
         if isinstance(error, codex_queue.QueueUnavailable):
             raise QueuePushFailed(error, message) from None

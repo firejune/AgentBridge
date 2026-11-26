@@ -135,6 +135,12 @@ def message_record(raw):
                 or result['state'] not in ('submitted', 'received', 'in_progress', 'answered', 'done')):
             raise ValueError('Invalid Codex queue acceptance')
         result['codex_queue_accepted'] = True
+    if 'codex_queue_read' in raw:
+        marker = raw['codex_queue_read']
+        if (result['route']['transport'] != 'codex' or 'close_request' in raw
+                or marker not in ('ready', 'retrieved') or result['state'] == 'pending'):
+            raise ValueError('Invalid Codex queue read marker')
+        result['codex_queue_read'] = marker
     if 'close_request' in raw:
         request = raw['close_request']
         close_id = request['close_id']

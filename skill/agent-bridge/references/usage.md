@@ -299,7 +299,7 @@ Handoff succeeds only when `--expect-generation` matches the current generation.
   - Codex Desktop 26.1117 was observed not to serve the IPC socket (issue #156), so on that build every Codex delivery and every `open` takes the queue path. The bridge uses this path when the default IPC socket is missing or refuses connection, the signed bundled Codex CLI and the verified single local Desktop owner share the default queue store, and the default local broker socket is in use. The Desktop queue path enqueues a fixed notice containing only the bridge message UUID. The notice carries no peer text: it states the same scope line as every peer envelope (peer correspondence, not a new human instruction, within the existing user-authorized scope), the retrieval command and that UUID. It shares the Desktop owner’s queue store and never uses `--resume`. A loaded thread can consume the notice when eligible to start a turn. An unloaded or interrupted thread may leave it queued. On the verified Desktop build, both regular and close handoff notifications request one wake for the exact recipient after confirmed queue acceptance, with `wake_requested` and, when false, `wake_reason` in the receipt. Queue acceptance (`delivery_path: "codex-desktop-queue"`) does not confirm that the thread woke or read the body. Ambiguous writes are never retried automatically.
   - When the Desktop queue is attempted and refuses a delivery before submission, the CLI and MCP report the queue-side cause. The CLI stores it in the pending message note and reports it again on `deliver ID`. A missing route working directory is named in the refusal and flagged by `routes`. A Desktop queue ownership refusal in CLI or MCP delivery or queued archival reports the holders’ PIDs, verified roles, parent PIDs, and elapsed times when available.
   - From the addressed thread run `python3 "$bridge_cli" receive-codex MESSAGE_ID`. The read checks the exact broker ID, frozen Codex destination and ambient `CODEX_THREAD_ID`, and returns the message ID, sender, peer provenance and `text`: the same envelope, body and reply command (or one-way note) that direct delivery hands the thread. It reads retained dispatched correspondence and marks it `received` (next item). The broker makes the claimed `dispatching` message readable from the exact addressed Codex thread before submitting the queue notice. `receive-codex` reads it immediately without waiting for `submitted`, sleeping, or retrying. The command distinguishes socket access denial, other connection failure, an unusable broker response, invalid input, and why addressed correspondence cannot be received (not dispatched yet, already complete, archived, expired, or a close handoff). Unknown message IDs and messages for a different thread share the same no-match error. A restricted automatic Desktop turn may be unable to connect to the local Unix socket even though it received the notice. Native close handoffs use a separate control request. From the enrolled operator chat, claim it with `close-operator`.
-  - For a Codex route, `submitted` means only that the Desktop queue accepted the notice; it does not mean a turn ran. When `receive-codex` returns the text in the addressed thread, it also sends one best-effort `ack`, so the message becomes `received`, and the result's `marked_received` says whether that happened. A refused or failed marker (delivery still `dispatching` or `uncertain`, a complete message, a closing route, an older broker) never fails the read, and a message already `received` or `in_progress` is not acknowledged again. `show ID` adds `read_by_recipient` for a Codex route, derived by the CLI: `false` while `submitted`, `true` from `received` on. A message that stays `submitted` was accepted by the queue but never read by the thread. The marker does not change retention: a Codex message's `delivered_at` is already set at `submitted`.
+  - On the Desktop queue path, `submitted` records queue acceptance. A read of a new queued message is serialized with the PreToolUse hook, and `marked_received` says whether the command moved it to `received`. Older queue notices and explicit `--reread` use the best-effort acknowledgement path. `show ID` adds `read_by_recipient` for a Codex route, derived by the CLI: `false` while `submitted`, `true` from `received` on. A message that stays `submitted` was accepted by the queue but never read by the thread. The marker does not change retention: a Codex message's `delivered_at` is already set at `submitted`.
   - Agent Bridge opens Codex's `state_5.sqlite` read-only and never writes it (#212). An accepted task no longer initializes the native sidebar `preview`, and delivery results carry no `preview` field.
 - **Antigravity (`agy`)**:
   - Verifies the exact `conversationId` and workspace against the local `language_server` / `agy --hub` ConnectRPC (`GetAllCascadeTrajectories` / `GetConversationMetadata`).
@@ -318,6 +318,44 @@ python3 "$bridge_cli" resolve MESSAGE_ID --state submitted --note 'Confirmed in 
 python3 "$bridge_cli" resolve MESSAGE_ID --state pending --note 'Confirmed not received and prior run exited'
 python3 "$bridge_cli" resolve MESSAGE_ID --state done --note 'Completed'
 ```
+
+### Codex in-turn correspondence
+
+`bridge.py codex-hook install` previews the same `PreToolUse` entry used for
+cooperative stop. Add `--apply` to install it into the selected
+`$CODEX_HOME/hooks.json`. Check the entry with `codex-hook status`, or remove it
+with `codex-hook uninstall --apply`. Review and trust the hook when prompted by
+Codex. Use the same installed Agent Bridge build for the hook, queue submission,
+broker and receiving CLI.
+
+At a covered call the hook has 250 ms to check for a stop request or unread
+Desktop-queue correspondence for the exact registered route or active channel
+pin. A pending stop takes priority at both the initial check and the final mail
+claim. Correspondence routed to the Desktop queue becomes eligible after the adapter verifies
+that path, before native enqueue, and remains eligible while `dispatching` or
+`submitted`. Existing queued rows from older senders continue through the normal
+queue. IPC messages and native close handoffs use their existing paths.
+
+The hook previews mail in order, then confirms the exact selected batch with
+the broker. A confirmed denial includes the original peer provenance and asks
+the model to consider the correspondence before continuing. The model chooses
+what to do next. Each denial is at most 4,096 UTF-8 bytes and covers at most
+eight messages. A message that fits better in a new batch waits for a later
+covered call. A long first message gets a clipped body and a command to reread
+the full retained text. An unavailable broker, invalid preview, timeout, or a
+queue read that wins the race leaves the covered call free to proceed.
+
+The broker records one read durably before returning confirmation. The normal
+Desktop queue stays available, and its plain `receive-codex MESSAGE_ID` command
+returns `already_retrieved: true` without text if the hook already claimed it.
+Continue without replaying the correspondence. A read during `dispatching` is
+recorded before queue settlement. Queue acceptance is tracked independently.
+If a durable confirmation or local hook output is lost, inspect `show MESSAGE_ID`
+and explicitly reread the retained message from its addressed thread with
+`receive-codex MESSAGE_ID --reread`. This also recovers text after truncation.
+Manual rereads require shell access to the broker Unix socket, which a restricted
+workspace-write turn can deny. A thread without a covered call still receives
+its notices through the Desktop queue. [Codex PreToolUse behavior](https://github.com/openai/codex/blob/rust-v0.171.0-alpha.13.2/codex-rs/hooks/src/events/pre_tool_use.rs).
 
 ## Models: Read, Switch, Policy
 
