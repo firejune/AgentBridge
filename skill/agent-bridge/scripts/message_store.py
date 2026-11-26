@@ -141,6 +141,11 @@ def message_record(raw):
                 or marker not in ('ready', 'retrieved') or result['state'] == 'pending'):
             raise ValueError('Invalid Codex queue read marker')
         result['codex_queue_read'] = marker
+    if 'codex_hook_offer_recorded' in raw:
+        if (raw['codex_hook_offer_recorded'] is not True or result['route']['transport'] != 'codex'
+                or 'close_request' in raw):
+            raise ValueError('Invalid Codex hook offer marker')
+        result['codex_hook_offer_recorded'] = True
     if 'close_request' in raw:
         request = raw['close_request']
         close_id = request['close_id']

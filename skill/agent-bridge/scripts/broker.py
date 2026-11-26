@@ -59,7 +59,6 @@ CODEX_STOP_LIMIT = 256
 CODEX_RECEIVE_SECONDS = 10
 CODEX_READ_NO_MATCH = 'No correspondence matches this Codex thread and message ID.'
 CODEX_READ_BEFORE_SETTLEMENT = 'Codex retrieved the message before queue settlement'
-CODEX_READ_AT_TOOL_CALL = 'Codex received the message at a tool call'
 CODEX_READ_FROM_QUEUE = 'Codex received the message from the queue notice'
 READ_ONLY_OPS = ('ping', 'routes', 'channels', 'show', 'conversation', 'inbox', 'retention-plan',
                  'close-operator-status')
@@ -489,6 +488,7 @@ class State:
 
     def codex_mail_ready(self, message, session):
         if (message is None or message.get('codex_queue_read') != 'ready' or message.get('body_expired')
+                or message.get('codex_hook_offer_recorded')
                 or 'close_request' in message or message['state'] not in ('dispatching', 'submitted')
                 or not self.codex_route_matches(message, session)):
             return False
@@ -504,7 +504,7 @@ class State:
         if (not codex_hook_mail.exact_uuid(session) or type(deadline) not in (int, float)
                 or not current < deadline <= current + 1):
             return None
-        preview = args['op'] == 'codex-pretool-claim'
+        preview = args['op'] == codex_hook_mail.CLAIM_OP
         if not preview:
             claim = self.codex_mail_claims.get(session)
             if (claim is None or claim['id'] != args.get('id') or claim['deadline'] != deadline
@@ -537,7 +537,9 @@ class State:
         if not all(self.codex_mail_ready(message, session) for message in messages):
             return None  # The queue won, or the route changed after preview.
         for message in messages:
-            self.codex_mark_read(message, CODEX_READ_AT_TOOL_CALL)
+            # Persist the one-shot offer before emitting the denial. The queue
+            # read stays armed even if the denial never reaches the model.
+            message['codex_hook_offer_recorded'] = True
         return {'kind': 'mail', 'id': claim['id']}
 
     def codex_arm_queue(self, args):
@@ -1145,7 +1147,7 @@ class State:
                      'claim-guarded', 'release-claim', 'note-pending',
                      'inbox_ack', 'inbox_reply', 'provider-failure', 'provider-retry', 'retention-sweep',
                      'archive-correspondence', 'close-dispatch', 'close-operator', 'close-retro-notify',
-                     'dispatch-expire', 'codex-queue-arm', 'codex-queue-read', 'codex-pretool-commit')
+                     'dispatch-expire', 'codex-queue-arm', 'codex-queue-read', codex_hook_mail.OFFER_OP)
         if args['op'] == 'codex-queue-read' and codex_hook_mail.exact_uuid(args.get('id')):
             message = self.messages.get(args['id'])
             if (message is None or message.get('codex_queue_read') != 'ready'
@@ -1197,7 +1199,7 @@ class State:
                   if planned is not None else staged.apply_action(args, verified_close=verified_close))
         if args['op'] == 'retention-sweep' and not result['changed']:
             return result, None
-        if args['op'] == 'codex-pretool-commit' and (result is None or result['kind'] != 'mail'):
+        if args['op'] == codex_hook_mail.OFFER_OP and (result is None or result['kind'] != 'mail'):
             return result, None
         if (args['op'] in ('inbox_reply', 'provider-failure', 'provider-retry', 'release-claim', 'note-pending')
                 and not staged.pending_publications):
@@ -1297,7 +1299,7 @@ class State:
             return self.request_codex_stop(args)
         if op in ('codex-stop-claim', 'codex-stop-finish'):
             return self.codex_stop_hook_action(args)
-        if op in ('codex-pretool-claim', 'codex-pretool-commit'):
+        if op in (codex_hook_mail.CLAIM_OP, codex_hook_mail.OFFER_OP):
             return self.codex_pretool_action(args)
         if op == 'codex-queue-arm':
             return self.codex_arm_queue(args)

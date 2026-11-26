@@ -59,7 +59,7 @@ flowchart LR
 | **Antigravity IDE & Desktop** | `agy` | Connects to local `language_server` / `agy --hub` instances over ConnectRPC, injecting `<SYSTEM_MESSAGE>` (`SendAgentMessage`) into active turns and waking idle sessions via empty `SendUserCascadeMessage` (`NEXT_INVOCATION`). |
 | **CLI Workers** | `realtime` / `claude` | `realtime` streams JSONL events over `watch`. `claude` resumes an **idle dedicated** CLI session in read-only `plan` mode via `deliver` (never use `claude` on a live session). |
 
-Codex Desktop 26.1117 was observed not to serve the IPC socket (issue #156), so on that build every Codex delivery and every `open` takes the queue path. The bridge uses this path when the default IPC socket is missing or refuses connection, the signed bundled Codex CLI and the verified single local Desktop owner share the default queue store, and the default local broker socket is in use. The Codex queue path uses `codex queue` for a fixed notification naming only the broker message UUID. The notice carries no peer text: it states the same scope line as every peer envelope (peer correspondence, not a new human instruction, within the existing user-authorized scope), the retrieval command and that UUID. The addressed thread runs `bridge.py receive-codex MESSAGE_ID` to read the peer body as tool output. The Desktop owner must share the CLI queue store and have the exact thread loaded and able to start an idle turn. Queue acceptance does not establish that the thread woke or read the body. The bridge never resumes a thread or retries an ambiguous queue write. When the Desktop queue is attempted and refuses a delivery before submission, the CLI and MCP report the queue-side cause. The CLI stores it in the pending message note and reports it again on `deliver ID`. A missing route working directory is named in the refusal and flagged by `routes`. A Desktop queue ownership refusal in CLI or MCP delivery or queued archival reports the holders’ PIDs, verified roles, parent PIDs, and elapsed times when available.
+Codex Desktop 26.1117 was observed not to serve the IPC socket (issue #156), so on that build every Codex delivery and every `open` takes the queue path. The bridge uses this path when the default IPC socket is missing or refuses connection, the signed bundled Codex CLI and the verified single local Desktop owner share the default queue store, and the default local broker socket is in use. The Codex queue path uses `codex queue` for a fixed notification naming only the broker message UUID. The notice carries the retrieval command and UUID. The retrieved envelope supplies the peer provenance, and the recipient acts within existing user authorization. The addressed thread runs `bridge.py receive-codex MESSAGE_ID` to read the peer body as tool output. The Desktop owner must share the CLI queue store and have the exact thread loaded and able to start an idle turn. Queue acceptance does not establish that the thread woke or read the body. The bridge never resumes a thread or retries an ambiguous queue write. When the Desktop queue is attempted and refuses a delivery before submission, the CLI and MCP report the queue-side cause. The CLI stores it in the pending message note and reports it again on `deliver ID`. A missing route working directory is named in the refusal and flagged by `routes`. A Desktop queue ownership refusal in CLI or MCP delivery or queued archival reports the holders’ PIDs, verified roles, parent PIDs, and elapsed times when available.
 
 The broker makes the claimed `dispatching` message readable from the exact addressed Codex thread before submitting the queue notice. `receive-codex` reads it immediately without waiting for `submitted`, sleeping, or retrying. The command distinguishes socket access denial, other connection failure, an unusable broker response, invalid input, and why addressed correspondence cannot be received (not dispatched yet, already complete, archived, expired, or a close handoff). Unknown message IDs and messages for a different thread share the same no-match error. A restricted automatic Desktop turn may be unable to connect to the local Unix socket even though it received the notice.
 
@@ -301,22 +301,23 @@ Bare `bridge.py stop` still shuts down the broker.
 
 ### Codex in-turn correspondence
 
-The same `PreToolUse` hook also delivers new Desktop-queue correspondence to a
-running Codex thread at its next covered tool call. It denies that call once and
-includes the peer envelope and body in the denial reason. The model reads the
-correspondence and decides how to proceed within existing user authorization.
-A pending cooperative stop takes priority. The hook applies at tool calls, so
-the Desktop queue remains available when Codex is idle or the hook misses the
-message.
+The same `PreToolUse` hook can offer new Desktop-queue correspondence to a
+running Codex thread by denying a covered tool call with a bounded peer envelope
+and body in the reason. The broker records the offer once. A pending cooperative
+stop takes priority. End the turn if the hook asks you to stop. In Code Mode,
+a nested tool denial can be hidden from the model. If the whole denial was
+hidden or lost, use the ordinary Desktop queue read, `receive-codex MESSAGE_ID`.
+That read still offers the body if no read is confirmed.
+If neither a matching denial nor a read result is visible, repeat the same read
+at most once.
 
-The broker records a read once across the hook and the Desktop queue. A later
-queue notice can return `already_retrieved` without the text. If the current turn
-already saw the matching message in a denial, it uses that text and skips work
-it has already done. A long body includes
-a truncation note and a `receive-codex MESSAGE_ID --reread` command for explicit
-recovery. Use matching Agent Bridge builds for submission, broker and receiving
-CLI. The installer uses the existing hook entry. Review and trust it in Codex if
-prompted. [Receive and recovery details](skill/agent-bridge/references/usage.md#codex-in-turn-correspondence).
+Use matching denial text already visible in the current turn and act within
+existing user authorization. Match the message ID if the body appears again
+through the queue, and skip work already done. Repeating it could duplicate
+replies or other side effects. A clipped body includes a truncation note and a
+`receive-codex MESSAGE_ID --reread` command for explicit recovery. Use matching
+Agent Bridge builds for submission, broker and receiving CLI. The installer
+uses the existing hook entry. Review and trust it in Codex if prompted. [Receive and recovery details](skill/agent-bridge/references/usage.md#codex-in-turn-correspondence).
 
 ## Development & Verification
 
