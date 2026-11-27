@@ -108,7 +108,7 @@ def _verify_app_build(remaining):
 
 
 def _open_wake_url(thread, timeout):
-    subprocess.run(['/usr/bin/open', '-a', str(codex_queue.APP), f'codex://threads/wake/{thread}'],
+    subprocess.run(['/usr/bin/open', '-g', '-a', str(codex_queue.APP), f'codex://threads/wake/{thread}'],
                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                    timeout=timeout, check=True)
 

@@ -173,6 +173,18 @@ class DesktopWakeAttestationTests(unittest.TestCase):
             self.assertEqual(opener.call_args.args[0][-1], 'codex://threads/wake/' + THREAD)
 
 
+class QueuedWakeTests(unittest.TestCase):
+    def test_request_opens_exact_thread_in_background(self):
+        with patch.object(codex_wake_open, '_verify_app_build'), \
+                patch.object(codex_wake_open.subprocess, 'run') as opener:
+            codex_wake_open.request_queued_wake(THREAD)
+
+        opener.assert_called_once()
+        self.assertEqual(opener.call_args.args[0],
+                         ['/usr/bin/open', '-g', '-a', str(codex_wake_open.codex_queue.APP),
+                          f'codex://threads/wake/{THREAD}'])
+
+
 class DesktopWakeRolloutTests(unittest.TestCase):
     """adopt() over a real rollout file: only the queue write, the app link and the store row are faked."""
 
@@ -249,7 +261,7 @@ class DesktopWakeRolloutTests(unittest.TestCase):
             'sandboxPolicy': {'type': 'readOnly'}}})
         self.opener.assert_called_once()
         self.assertEqual(self.opener.call_args.args[0],
-                         ['/usr/bin/open', '-a', str(codex_wake_open.codex_queue.APP),
+                         ['/usr/bin/open', '-g', '-a', str(codex_wake_open.codex_queue.APP),
                           f'codex://threads/wake/{THREAD}'])
 
     def test_workspace_permissions_are_read_from_the_fresh_rollout(self):
