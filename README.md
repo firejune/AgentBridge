@@ -307,7 +307,9 @@ and body in the reason. The broker records the offer once. A pending cooperative
 stop takes priority. End the turn if the hook asks you to stop. In Code Mode,
 a nested tool denial can be hidden from the model. If the whole denial was
 hidden or lost, use the ordinary Desktop queue read, `receive-codex MESSAGE_ID`.
-That read still offers the body if no read is confirmed.
+That read still offers the body if no queue read or settlement is recorded.
+If it returns `already_handled: true` for an answered or completed message,
+stop processing that message.
 If neither a matching denial nor a read result is visible, repeat the same read
 at most once.
 
@@ -315,7 +317,7 @@ Use matching denial text already visible in the current turn and act within
 existing user authorization. Match the message ID if the body appears again
 through the queue, and skip work already done. Repeating it could duplicate
 replies or other side effects. A clipped body includes a truncation note and a
-`receive-codex MESSAGE_ID --reread` command for explicit recovery. Use matching
+`receive-codex MESSAGE_ID --reread` command for explicit recovery of the retained body, even after settlement. Use matching
 Agent Bridge builds for submission, broker and receiving CLI. The installer
 uses the existing hook entry. Review and trust it in Codex if prompted. [Receive and recovery details](skill/agent-bridge/references/usage.md#codex-in-turn-correspondence).
 

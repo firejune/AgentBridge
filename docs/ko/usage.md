@@ -298,7 +298,7 @@ python3 "$bridge_cli" channel-bind modal-view --project my-app --owner codex-age
   - Codex Desktop 26.1117은 IPC 소켓을 제공하지 않는 것으로 관찰됐다(이슈 #156). 그 빌드에서는 모든 Codex 전달과 `open`이 큐 경로를 탄다. 기본 IPC 소켓이 없거나 연결을 거부하고, 서명된 앱 번들 Codex CLI와 확인된 단일 로컬 Desktop 소유자가 기본 큐 저장소를 공유하며, 기본 로컬 브로커 소켓을 사용할 때 이 경로를 사용한다. Desktop 큐 경로는 브릿지 메시지 UUID만 담은 고정 알림을 큐에 넣는다. 알림에는 조회 명령과 UUID가 담긴다. 조회한 봉투에 동료 출처가 표시되며 수신자는 기존 사용자 승인 범위에서 대응한다. Desktop 소유자와 같은 큐 저장소를 사용하며 `--resume`을 쓰지 않는다. 로드된 대화는 턴을 시작할 수 있을 때 알림을 가져간다. 로드되지 않았거나 중단된 대화는 알림을 큐에 남겨 둘 수 있다. 검증된 Desktop 빌드에서는 일반 알림과 종료 인계 알림 모두 큐 접수가 확인된 뒤 정확한 수신 스레드에 wake를 한 번 요청하고, 영수증에 `wake_requested`와 값이 false일 때의 `wake_reason`을 반환한다. 큐 접수(`delivery_path: "codex-desktop-queue"`)만으로 대화가 깨어났거나 본문을 읽었다고 판정하지 않는다. 결과가 모호한 쓰기는 자동 재시도하지 않는다.
   - Desktop 큐 경로를 시도한 뒤 제출 전에 거부되면 CLI와 MCP가 큐 측 원인을 보고한다. CLI는 대기 중인 메시지의 노트에 원인을 기록하고 `deliver ID`에서도 같은 원인을 표시한다. 등록한 작업 디렉터리가 사라지면 거부 메시지에 경로를 표시하고 `routes`에도 경고를 표시한다. CLI·MCP 전달이나 큐를 이용한 보관에서 Desktop 큐 소유권을 확인할 수 없으면 보유 프로세스의 PID, 확인된 역할, 부모 PID, 경과 시간을 파악 가능한 범위에서 보고한다.
   - 수신 Codex 대화에서 `python3 "$bridge_cli" receive-codex MESSAGE_ID`를 실행한다. 정확한 브로커 ID, 메시지에 고정된 Codex 목적지, 환경의 `CODEX_THREAD_ID`를 대조해 메시지 ID·발신자·동료 출처와 `text`를 반환한다. `text`는 직접 전달이 대화에 넘기는 것과 같은 봉투·본문·회신 명령(또는 단방향 안내)이다. 이미 전달을 시도했고 보관 중인 서신의 조회를 확정한다(다음 항목). 브로커는 큐 알림을 제출하기 전에 전달을 맡긴 `dispatching` 메시지를 정확한 수신 Codex 스레드에서 읽을 수 있게 한다. `receive-codex`는 `submitted`를 기다리거나, 지연을 넣거나, 재시도하지 않고 즉시 읽는다. 이 명령은 소켓 접근 거부, 그 밖의 연결 실패, 사용할 수 없는 브로커 응답, 잘못된 입력, 수신 서신을 읽을 수 없는 이유(아직 전달 전, 이미 완료, 보관됨, 본문 만료, 종료 인계)를 구분한다. 알 수 없는 메시지 ID와 다른 스레드로 보낸 메시지는 같은 불일치 오류를 반환한다. 권한이 제한된 Desktop 자동 턴은 알림을 받았어도 로컬 Unix 소켓에 연결하지 못할 수 있다. 네이티브 종료 인계는 별도의 제어 요청을 사용한다. 등록된 담당자 대화에서 `close-operator`로 요청을 받는다.
-  - Desktop 큐 경로에서 `submitted`는 큐 접수를 기록한다. 일반 큐 조회가 본문 조회를 확정한다. `submitted` 이후에 조회하면 기존 노트(“Codex received the message from the queue notice”)와 함께 `received`로 전환된다. `dispatching` 중에 먼저 조회하면 조회를 기록하고, 나중에 큐 접수가 확정될 때 노트 없이 `received`로 전환된다. `marked_received`는 조회 명령 자체가 상태를 `received`로 바꿨는지 알려 준다. 이후 일반 조회에서는 본문 없이 `already_retrieved: true`가 반환될 수 있다. 이전 빌드가 저장한 조회 기록도 그대로 적용된다. 이전 큐 알림과 명시적 `--reread`는 기존처럼 최선 노력으로 조회를 표시한다. `show ID`는 Codex 경로의 메시지에 CLI가 계산한 `read_by_recipient`를 덧붙인다. `submitted`이면 `false`, `received` 이후면 `true`다. `submitted`에 머문 메시지는 큐 접수가 기록됐고 확정된 조회가 없는 상태다. 이 표시는 보존 기한을 바꾸지 않는다. Codex 메시지의 `delivered_at`은 이미 `submitted`에서 기록된다.
+  - Desktop 큐 경로에서 `submitted`는 큐 접수를 기록한다. 일반 큐 조회가 본문 조회를 확정한다. `submitted` 이후에 조회하면 기존 노트(“Codex received the message from the queue notice”)와 함께 `received`로 전환된다. `dispatching` 중에 먼저 조회하면 조회를 기록하고, 나중에 큐 접수가 확정될 때 노트 없이 `received`로 전환된다. `marked_received`는 조회 명령 자체가 상태를 `received`로 바꿨는지 알려 준다. 본문을 보관 중인 `answered`·`done` 서신은 일반 큐 조회에서 본문 없이 `already_handled: true`를 반환한다. 해당 서신의 처리를 끝낸다. `received`·`in_progress`라도 큐 조회 기록이 없으면 본문을 반환한다. 처리 완료 전에는 이전 빌드가 저장한 기록을 포함해 큐 조회 기록이 있으면 본문 없이 `already_retrieved: true`를 반환한다. 이전 큐 알림과 명시적 `--reread`는 기존처럼 최선 노력으로 조회를 표시한다. `show ID`는 Codex 경로의 메시지에 CLI가 계산한 `read_by_recipient`를 덧붙인다. `submitted`이면 `false`, `received` 이후면 `true`다. `submitted`에 머문 메시지는 큐 접수가 기록됐고 확정된 조회가 없는 상태다. 이 표시는 보존 기한을 바꾸지 않는다. Codex 메시지의 `delivered_at`은 이미 `submitted`에서 기록된다.
   - Agent Bridge는 Codex의 `state_5.sqlite`를 읽기 전용으로만 열고 쓰지 않는다(#212). 수락된 과제가 네이티브 사이드바 `preview`를 초기화하지 않으며, 전달 결과에 `preview` 항목이 없다.
 - **Antigravity (`agy`)**:
   - 로컬 `language_server` / `agy --hub`의 ConnectRPC로 정확한 `conversationId`와 워크스페이스를 검증한다.
@@ -351,16 +351,17 @@ Code Mode에서 중첩 도구 호출이 거부되면 해당 도구의 Promise가
 `answered`로 전환될 수 있다.
 
 현재 턴에서 같은 서신의 거부 사유를 이미 봤다면 그 본문을 사용한다. 거부 사유 전체가
-숨겨졌거나 유실됐다면 일반 `receive-codex MESSAGE_ID` 조회를 사용한다. 조회가 확정되지
-않았으면 이 조회에서 본문을 받을 수 있다. 조회 결과가 보이게 한다. 같은 서신의 거부
+숨겨졌거나 유실됐다면 일반 `receive-codex MESSAGE_ID` 조회를 사용한다. 큐 조회나 처리 완료 기록이
+없으면 본문을 받을 수 있다. 조회 결과가 보이게 한다. `already_handled: true`가
+반환되면 해당 서신의 처리를 끝낸다. 같은 서신의 거부
 사유와 조회 결과가 둘 다 보이지 않을 때만 큐 알림의 안내에 따라 같은 조회를 한 번 더
 실행할 수 있다. 훅이 중단을 요청하면 턴을 끝낸다. 큐에서 본문이 다시 나오면 메시지
 ID를 대조하고 이미 처리한 작업은 건너뛴다. 같은 작업을 반복하면 회신, 도구 호출 또는
 다른 부수 효과가 중복될 수 있다.
 
 보이는 거부 사유에서 본문이 잘렸다면 정확한 수신 스레드에서
-`receive-codex MESSAGE_ID --reread`로 보관 중인 전체 본문을 읽는다. 일반 조회가 먼저
-끝난 경우에도 이 명령을 쓸 수 있다. 수동 조회에는 브로커 Unix 소켓 접근이 필요하며,
+`receive-codex MESSAGE_ID --reread`로 보관 중인 전체 본문을 읽는다. 일반 조회나 처리를 마친 뒤에도
+본문이 보관 중이면 이 명령을 쓸 수 있다. 수동 조회에는 브로커 Unix 소켓 접근이 필요하며,
 제한된 workspace-write 턴에서는 접근이 거부될 수 있다. 지원 대상 호출이 없는 스레드는
 Desktop 큐로 알림을 받는다. [Codex PreToolUse 동작](https://github.com/openai/codex/blob/rust-v0.171.0-alpha.13.2/codex-rs/hooks/src/events/pre_tool_use.rs).
 

@@ -105,6 +105,8 @@ def receive_codex(args):
                 result = {'legacy': True}  # A definite older broker refusal never consumed the read.
             if not isinstance(result, dict):
                 raise broker.BrokerResponseError(bad_response)
+            if result.keys() == {'already_handled'} and result['already_handled'] is True:
+                return {'id': args.id, 'already_handled': True, 'marked_received': False}
             if result.keys() == {'already_retrieved'} and result['already_retrieved'] is True:
                 return {'id': args.id, 'already_retrieved': True, 'marked_received': False}
             legacy = result.keys() == {'legacy'} and result['legacy'] is True
@@ -145,9 +147,11 @@ def receive_codex(args):
     state = message.get('state')
     if state == 'pending':
         raise ValueError('The addressed correspondence has not been dispatched yet.')
-    if state in broker.TERMINAL_STATES:
+    settled_reread = (args.reread and message.get('codex_queue_read') in ('ready', 'retrieved')
+                      and state in broker.RECIPIENT_SETTLED_STATES)
+    if state in broker.TERMINAL_STATES and not settled_reread:
         raise ValueError(f'The addressed correspondence is already {state}; nothing is left to receive.')
-    if state not in ('dispatching', 'submitted', 'uncertain', 'received', 'in_progress'):
+    if state not in broker.CODEX_QUEUE_READABLE_STATES and not settled_reread:
         raise ValueError(bad_response)  # Not a state this CLI knows; never echo it.
     if not isinstance(message.get('body'), str) or not isinstance(message.get('sender'), str):
         raise ValueError(bad_response)
@@ -156,10 +160,9 @@ def receive_codex(args):
         text = peer_text(message, args.socket, escape_peer=False)
     except (KeyError, TypeError):
         raise ValueError(bad_response) from None
-    # A message already received or in progress was read before; acking again would add an event
-    # (or move in_progress back) for nothing (issue #153).
     if legacy:
-        marked = state not in ('received', 'in_progress') and mark_received(args.socket, args.id)
+        # Avoid extra ACK events and preserve progress or settlement on an explicit reread.
+        marked = not settled_reread and state not in ('received', 'in_progress') and mark_received(args.socket, args.id)
     return {'id': args.id, 'sender': message['sender'], 'text': text,
             'provenance': 'agent_bridge_peer', 'authorization': 'none', 'marked_received': marked}
 
