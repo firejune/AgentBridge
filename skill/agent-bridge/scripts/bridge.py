@@ -392,7 +392,8 @@ def open_codex_result(args):
             title = default_title = f'{args.project}/{name}'
         result = sessions.open_session('codex', cwd=args.cwd, title=title, model=args.model,
             timeout=args.timeout, host=args.host, ide=args.ide, force_new=args.new, allow_queue_wake=True,
-            queue_wake_workspace_write=getattr(args, 'queue_wake_workspace_write', False))
+            queue_wake_workspace_write=getattr(args, 'queue_wake_workspace_write', False),
+            codex_foreground=args.cmd == 'open')
     except RegistrationConflict as error:
         result.update(error=str(error), route_conflict=error.route)
     except broker.BrokerConnectError:

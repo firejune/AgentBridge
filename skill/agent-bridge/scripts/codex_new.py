@@ -49,10 +49,11 @@ def adoption_url(sid):
     return 'codex://threads/' + str(uuid.UUID(sid))
 
 
-def open_link(url, timeout=10):
+def open_link(url, timeout=10, *, foreground=False):
     if not shutil.which('open'):
         raise CreationError('Adopting a Codex thread in Desktop needs the macOS `open` command')
-    result = subprocess.run(['open', url], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+    argv = ['open', url] if foreground else ['open', '-g', url]
+    result = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, timeout=timeout)
     if result.returncode:
         raise CreationError('The exact Codex thread link was not opened')
@@ -428,7 +429,7 @@ def adopt_by_owner(attempt, result, client, sid, model, deadline, poll):
 
 def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_factory=None,
                owner_factory=None, poll=0.5, policy=None, force_new=False, *,
-               allow_queue_wake=False, queue_wake_workspace_write=False):
+               allow_queue_wake=False, queue_wake_workspace_write=False, foreground=False):
     import sessions
     result = open_result()
     attempt = _Attempt()
@@ -511,7 +512,7 @@ def open_codex(cwd, title=None, model=None, timeout=180, opener=None, client_fac
             adopt_by_wake(attempt, result, wake, sid, folder, model, remaining(timeout),
                           queue_wake_workspace_write=queue_wake_workspace_write)
         elif opener is None:
-            open_link(result['url'], remaining())
+            open_link(result['url'], remaining(), foreground=foreground)
         else:
             opener(result['url'])
         while wake is None:

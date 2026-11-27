@@ -19,6 +19,7 @@ import broker
 import codex_live
 import codex_new
 import codex_wake_open
+import mcp_phase1
 from new_session_policy import CODEX_DESKTOP_WAKE_PERMISSIONS
 import sessions
 from support import RunningBroker
@@ -407,6 +408,38 @@ class NewCodexTests(unittest.TestCase):
         value = json.loads(lines[0])
         self.assertIsInstance(value, dict)
         return code, value
+
+    def test_desktop_ipc_adoption_only_brings_explicit_local_open_to_front(self):
+        cases = (
+            ('local open', ['open', '--provider', 'codex'], ['open']),
+            ('local open with registration',
+             ['open', '--provider', 'codex', '--register', 'worker', '--project', 'demo'], ['open']),
+            ('register --new',
+             ['register', 'worker', '--project', 'demo', '--transport', 'codex', '--new'], ['open', '-g']),
+            ('MCP create', None, ['open', '-g']),
+        )
+        url = f'codex://threads/{self.sid}'
+        for kind, command, argv in cases:
+            with self.subTest(kind=kind), \
+                    ModelDesktop(model='requested-model', permissions=full_permissions()) as desktop, \
+                    patch.dict(os.environ, {'AGENT_BRIDGE_CODEX_IPC': desktop.path}), \
+                    patch.object(sessions, 'CodexClient', side_effect=self.factory), \
+                    patch.object(codex_new.shutil, 'which', return_value='/usr/bin/open'), \
+                    patch.object(codex_new.subprocess, 'run',
+                                 return_value=subprocess.CompletedProcess([], 0)) as launch, \
+                    patch.object(broker, 'request', side_effect=empty_registration_rpc), \
+                    patch('sys.stdout', io.StringIO()) as output:
+                if command is None:
+                    backend = mcp_phase1.Backend(str(Path(self.root) / 'broker.sock'))
+                    with patch.object(mcp_phase1.models, 'explicit_session_model', return_value='requested-model'):
+                        self.assertEqual(backend.create({'agent_type': 'codex', 'cwd': self.root,
+                                                         'model': 'requested-model'}), self.sid)
+                else:
+                    self.assertEqual(bridge.main([*command, '--cwd', self.root, '--state-dir', self.root,
+                                                  '--model', 'requested-model']), 0, output.getvalue())
+                    self.assertEqual(json.loads(output.getvalue())['adoption_mode'], 'desktop-ipc')
+                launch.assert_called_once()
+                self.assertEqual(launch.call_args.args[0], [*argv, url])
 
     def test_issue44_shape_success_refusal_and_early_failure(self):
         with ModelDesktop() as desktop:
