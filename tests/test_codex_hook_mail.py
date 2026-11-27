@@ -107,11 +107,59 @@ class HookMailTests(unittest.TestCase):
         self.assertEqual([m['id'] for m in self.call('conversation', id=mid)], [mid, reply['id']])
         completed = self.call('show', id=mid)
         self.assertEqual(completed['state'], 'answered')
-        for reread in (False, True):
-            self.assertEqual(self.receive(mid, reread=reread),
-                             (1, {'error': 'The addressed correspondence is already answered; nothing is left to receive.'}))
+        self.assert_handled(mid, 'Answer through the bridge')
         self.assertEqual(self.call('show', id=mid), completed)
         self.assertIsNone(self.hook())
+
+    def assert_handled(self, mid, body):
+        request = broker.request
+        with patch.object(broker, 'request', wraps=request) as calls:
+            self.assertEqual(self.receive(mid),
+                             (0, {'id': mid, 'already_handled': True, 'marked_received': False}))
+            self.assertEqual([call.args[1]['op'] for call in calls.call_args_list], ['codex-queue-read'])
+        self.assertEqual(self.receive(mid, session=OTHER), (1, {'error': broker.CODEX_READ_NO_MATCH}))
+        with patch.object(broker, 'request', wraps=request) as calls:
+            status, reread = self.receive(mid, reread=True)
+            self.assertEqual((status, reread['marked_received']), (0, False))
+            self.assertIn(body, reread['text'])
+            self.assertEqual([call.args[1]['op'] for call in calls.call_args_list], ['show'])
+        self.assertEqual(self.receive(mid, reread=True, session=OTHER), (1, {'error': broker.CODEX_READ_NO_MATCH}))
+
+    def test_done_queue_message_stops_even_after_a_prior_queue_read(self):
+        mid = self.message('Work completed after queue read')
+        self.assertEqual(self.receive(mid)[0], 0)
+        self.call('resolve', id=mid, state='done', note='Work complete')
+        completed = self.call('show', id=mid)
+        self.assertEqual((completed['state'], completed['codex_queue_read']), ('done', 'retrieved'))
+        self.assert_handled(mid, 'Work completed after queue read')
+        self.assertEqual(self.call('show', id=mid), completed)
+
+    def test_received_and_in_progress_remain_readable_without_a_prior_queue_read(self):
+        for op, state in (('ack', 'received'), ('progress', 'in_progress')):
+            with self.subTest(state=state):
+                body = f'Unsettled message marked {state}'
+                mid = self.message(body)
+                self.assertIn(mid, self.hook())
+                self.call(op, id=mid)
+                before = self.call('show', id=mid)
+                self.assertEqual((before['state'], before['codex_queue_read']), (state, 'ready'))
+                status, result = self.receive(mid)
+                self.assertEqual((status, result['marked_received']), (0, False))
+                self.assertIn(body, result['text'])
+                self.assertEqual(self.call('show', id=mid), before | {'codex_queue_read': 'retrieved'})
+                self.assertEqual(self.receive(mid), self.duplicate(mid))
+
+    def test_legacy_done_and_queue_failure_keep_their_diagnostics(self):
+        legacy = self.message('Before queue read markers', armed=False, submitted=False)
+        self.call('resolve', id=legacy, state='done', note='Work complete')
+        failed = self.message('Delivery failed', submitted=False)
+        self.call('finish', id=failed, state='failed', note='Delivery failed')
+        for mid, state in ((legacy, 'done'), (failed, 'failed')):
+            for reread in (False, True):
+                with self.subTest(state=state, reread=reread):
+                    self.assertEqual(self.receive(mid, reread=reread), (1, {
+                        'error': f'The addressed correspondence is already {state}; nothing is left to receive.',
+                    }))
 
     def test_stop_wins_before_proposal_and_while_mail_waits_to_commit(self):
         first = self.message('Peer correction')

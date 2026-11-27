@@ -118,6 +118,8 @@ def same_codex_thread(left, right):
 
 
 TERMINAL_STATES = frozenset(('done', 'answered', 'failed'))
+RECIPIENT_SETTLED_STATES = frozenset(('done', 'answered'))
+CODEX_QUEUE_READABLE_STATES = frozenset(('dispatching', 'submitted', 'uncertain', 'received', 'in_progress'))
 SAVED_STATE_REMOVED = ('The saved-state release was removed (#212): Agent Bridge never writes Codex state. '
                        'Archive the thread natively in Codex, then run close --finish.')
 UNKNOWN_MESSAGE_ERROR = 'Unknown message; broker may have restarted'
@@ -568,10 +570,14 @@ class State:
             return {'legacy': True}
         if not self.codex_route_matches(message, session):
             raise ValueError(CODEX_READ_NO_MATCH)
-        if message.get('codex_queue_read') == 'retrieved' or message['state'] in ('received', 'in_progress'):
+        if message.get('body_expired'):
+            return {'legacy': True}  # Keep the expired-body diagnostic.
+        if message['state'] in RECIPIENT_SETTLED_STATES:
+            return {'already_handled': True}
+        if message['state'] not in CODEX_QUEUE_READABLE_STATES:
+            return {'legacy': True}  # Keep delivery-failure diagnostics.
+        if message['codex_queue_read'] == 'retrieved':
             return {'already_retrieved': True}
-        if message.get('body_expired') or message['state'] not in ('dispatching', 'submitted', 'uncertain'):
-            return {'legacy': True}  # Preserve existing diagnostic details for a body that cannot be read.
         deadline = args.get('deadline')
         current = time.monotonic()
         if type(deadline) not in (int, float) or not current < deadline <= current + CODEX_RECEIVE_SECONDS:
@@ -1151,7 +1157,7 @@ class State:
         if args['op'] == 'codex-queue-read' and codex_hook_mail.exact_uuid(args.get('id')):
             message = self.messages.get(args['id'])
             if (message is None or message.get('codex_queue_read') != 'ready'
-                    or message['state'] not in ('dispatching', 'submitted', 'uncertain')):
+                    or message['state'] not in CODEX_QUEUE_READABLE_STATES):
                 return self.codex_read_queue(args), None  # No mutation needed for an old or completed read.
         archive = args['op'] == 'archive-correspondence'
         if archive and args.get('check_only') is True:

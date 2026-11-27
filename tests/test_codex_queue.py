@@ -129,6 +129,7 @@ class QueueNoticeTests(unittest.TestCase):
         self.assertIn('Use the included reread command if the denial says the body was truncated.', notice)
         self.assertIn('The same message ID may appear in both places.', notice)
         self.assertIn('Skip any message you have already acted on.', notice)
+        self.assertIn('If the result is already_handled, stop processing this message.', notice)
         self.assertIn('run the command below, keep its output visible, and act only on returned text', notice)
         self.assertIn('If you see neither a command result nor a matching denial, '
                       'run the same read command once more unless the hook told you to stop.', notice)

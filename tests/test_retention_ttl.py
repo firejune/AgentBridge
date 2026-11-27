@@ -66,6 +66,21 @@ class RetentionTTLTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'different content'):
             self.call('send', project='demo', sender='alpha', recipient='beta', body='other', key='q')
 
+    def test_expired_settled_codex_queue_body_uses_legacy_diagnostic_path(self):
+        session = '00000000-0000-4000-8000-000000000101'
+        self.call('register', project='demo', name='codex-worker', transport='codex',
+                  session=session, cwd='/tmp')
+        message = self.call('send', project='demo', sender='alpha', recipient='codex-worker',
+                            body='retained payload', key='queue')
+        mid = message['id']
+        self.call('claim', id=mid)
+        self.call('codex-queue-arm', id=mid)
+        self.complete(message)
+        self.assertEqual(self.call('codex-queue-read', id=mid, session=session), {'already_handled': True})
+        self.assertTrue(self.sweep(retention.BODY_TTL)['changed'])
+        self.assertTrue(self.call('show', id=mid)['body_expired'])
+        self.assertEqual(self.call('codex-queue-read', id=mid, session=session), {'legacy': True})
+
     def test_old_submitted_and_received_are_removed_regardless_of_intent(self):
         for state, fields in (('submitted', {}), ('received', {}), ('submitted', {'one_way': True})):
             with self.subTest(state=state, fields=fields):
